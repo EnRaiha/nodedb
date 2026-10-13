@@ -9,8 +9,13 @@
 //! per-tick budget.
 //!
 //! `REFRESH CONTINUOUS AGGREGATE` then waits for its cut. The core holds the
-//! wait request and answers it from the tick once the cut is fully folded,
-//! so the fold never blocks the core. The request deadline bounds the wait.
+//! wait request. While it holds a wait, every `tick()` runs one budgeted fold
+//! pass and answers the waits whose cut is fully folded. So the wait never
+//! depends on the maintenance pass, and the fold never blocks the core. The
+//! request deadline bounds the wait.
+//!
+//! The cut applies on the core that owns the root's vShard. A wait that
+//! reaches any other core answers at once: that core holds no cut state.
 
 use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan, RefreshCut};
 use nodedb_types::timeseries::PartitionState;
@@ -25,6 +30,8 @@ use crate::types::{DatabaseId, TenantId};
 /// A `REFRESH CONTINUOUS AGGREGATE` waiting for its cut.
 pub struct CaggRefreshWaiter {
     task: ExecutionTask,
+    /// The aggregate's root source, as the wait names it.
+    root: String,
     name: String,
     refresh_id: u64,
 }
@@ -108,19 +115,20 @@ impl CoreLoop {
     ) -> Option<ExecutionTask> {
         let wait = match task.plan() {
             PhysicalPlan::Meta(MetaOp::AwaitContinuousAggregateRefresh {
+                collection,
                 name,
                 refresh_id,
-                ..
-            }) => Some((name.clone(), *refresh_id)),
+            }) => Some((collection.as_str().to_string(), name.clone(), *refresh_id)),
             _ => None,
         };
-        let Some((name, refresh_id)) = wait else {
+        let Some((root, name, refresh_id)) = wait else {
             return Some(task);
         };
         self.maintenance
             .cagg_refresh_waiters
             .push(CaggRefreshWaiter {
                 task,
+                root,
                 name,
                 refresh_id,
             });
@@ -129,13 +137,22 @@ impl CoreLoop {
         None
     }
 
-    /// The answer to a refresh wait now, or `None` while its cut folds.
+    /// The answer to a refresh wait of aggregate `name`, rooted at `root`,
+    /// now, or `None` while its cut folds. A core that does not own `root`
+    /// holds no cut state, so it answers at once: the owning core's answer
+    /// is the wait's verdict.
     pub(in crate::data::executor) fn cagg_refresh_answer(
         &self,
         task: &ExecutionTask,
+        root: &str,
         name: &str,
         refresh_id: u64,
     ) -> Option<Response> {
+        match self.owns_collection(task.request.database_id, root) {
+            Ok(true) => {}
+            Ok(false) => return Some(self.response_ok(task)),
+            Err(e) => return Some(self.response_error(task, e)),
+        }
         let status = self.continuous_agg_mgr.cut_status(
             task.request.database_id.as_u64(),
             task.request.tenant_id.as_u64(),
@@ -161,18 +178,45 @@ impl CoreLoop {
     }
 
     /// Answer every refresh wait whose cut completed, whose aggregate is
-    /// stale, or whose deadline passed. Called from `tick()`.
+    /// stale, or whose deadline passed. Called from `tick()` and after each
+    /// fold pass.
     pub fn answer_cagg_refresh_waiters(&mut self) {
         if self.maintenance.cagg_refresh_waiters.is_empty() {
             return;
         }
         let waiters = std::mem::take(&mut self.maintenance.cagg_refresh_waiters);
         for waiter in waiters {
-            match self.cagg_refresh_answer(&waiter.task, &waiter.name, waiter.refresh_id) {
+            let answer = self.cagg_refresh_answer(
+                &waiter.task,
+                &waiter.root,
+                &waiter.name,
+                waiter.refresh_id,
+            );
+            match answer {
                 Some(response) => self.send_cagg_refresh_answer(response),
                 None => self.maintenance.cagg_refresh_waiters.push(waiter),
             }
         }
+    }
+
+    /// Drive the refresh waits and continuous-aggregate reads this core
+    /// holds. Called from `tick()`.
+    ///
+    /// While a wait or a read is held, each call runs one fold pass under the
+    /// per-tick budget, then answers what is done. So a held request
+    /// completes on any loop that runs `tick()`, without the maintenance
+    /// pass. With nothing held, the call does nothing.
+    pub fn drive_cagg_waiters(&mut self) {
+        if self.maintenance.cagg_refresh_waiters.is_empty()
+            && self.maintenance.cagg_read_waiters.is_empty()
+        {
+            return;
+        }
+        let now_ms = self.ingest_now_ms();
+        self.fold_pending_cagg_partitions(now_ms);
+        // A pass with no root to work returns before it answers.
+        self.answer_cagg_refresh_waiters();
+        self.answer_cagg_read_waiters();
     }
 
     fn send_cagg_refresh_answer(&mut self, response: Response) {
@@ -307,14 +351,81 @@ mod tests {
         assert_eq!(apply(&mut core, 4), Status::Ok);
 
         let task = task_at(10);
-        assert!(core.cagg_refresh_answer(&task, "by_host", 4).is_none());
+        assert!(
+            core.cagg_refresh_answer(&task, COLLECTION, "by_host", 4)
+                .is_none()
+        );
         core.fold_pending_cagg_partitions(0);
-        assert!(core.cagg_refresh_answer(&task, "by_host", 4).is_none());
+        assert!(
+            core.cagg_refresh_answer(&task, COLLECTION, "by_host", 4)
+                .is_none()
+        );
         core.fold_pending_cagg_partitions(0);
         let answer = core
-            .cagg_refresh_answer(&task, "by_host", 4)
+            .cagg_refresh_answer(&task, COLLECTION, "by_host", 4)
             .expect("the cut is folded");
         assert_eq!(answer.status, Status::Ok);
         assert_eq!(totals(&core, "by_host"), (5, SUM_AB));
+    }
+
+    fn await_task(refresh_id: u64) -> crate::data::executor::task::ExecutionTask {
+        crate::data::executor::core_loop::CoreLoop::replay_task(
+            crate::types::TenantId::new(TENANT),
+            crate::types::DatabaseId::DEFAULT,
+            crate::types::VShardId::new(0),
+            crate::bridge::envelope::PhysicalPlan::Meta(
+                nodedb_physical::physical_plan::MetaOp::AwaitContinuousAggregateRefresh {
+                    collection: nodedb_types::QualifiedCollection::new(
+                        crate::types::DatabaseId::DEFAULT,
+                        COLLECTION,
+                    ),
+                    name: "by_host".into(),
+                    refresh_id,
+                },
+            ),
+            None,
+        )
+    }
+
+    /// A held wait completes from the tick's drive alone. No maintenance
+    /// pass runs, as in a core loop that only calls `tick()`.
+    #[test]
+    fn a_held_wait_folds_from_the_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, mut rx) = make_core_with_dir(dir.path());
+        core.ts_tuning.cagg_fold_partitions_per_tick = 1;
+        register(&mut core, host_def("by_host", RefreshPolicy::Manual));
+        core.fold_pending_cagg_partitions(0);
+        assert_eq!(ingest(&mut core, ROWS_A, 1), Status::Ok);
+        flush(&mut core);
+        assert_eq!(ingest(&mut core, ROWS_B, 2), Status::Ok);
+        assert_eq!(apply(&mut core, 4), Status::Ok);
+
+        assert!(core.hold_cagg_refresh_await(await_task(4)).is_none());
+        assert!(rx.try_pop().is_err(), "the cut still folds");
+        core.drive_cagg_waiters();
+        assert!(rx.try_pop().is_err(), "one partition folds per pass");
+        core.drive_cagg_waiters();
+        let resp = rx.try_pop().expect("the wait is answered").inner;
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(totals(&core, "by_host"), (5, SUM_AB));
+        assert!(core.maintenance.cagg_refresh_waiters.is_empty());
+    }
+
+    /// A wait that reaches a core not owning the root answers at once: only
+    /// the owning core applies the cut.
+    #[test]
+    fn a_wait_on_a_core_not_owning_the_root_answers_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        core.set_num_cores(2);
+        let foreign = (0..64)
+            .map(|i| format!("root_{i}"))
+            .find(|root| !core.owns_cagg_root(0, root))
+            .expect("a root the other core owns");
+        let answer = core
+            .cagg_refresh_answer(&task_at(10), &foreign, "by_host", 4)
+            .expect("answered at once");
+        assert_eq!(answer.status, Status::Ok);
     }
 }

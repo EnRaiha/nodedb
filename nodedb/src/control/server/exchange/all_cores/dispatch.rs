@@ -168,6 +168,22 @@ pub(crate) async fn execute_plan_all_local_cores(
                          capture_base_on_local_cores"
                     .into(),
             }),
+            // A refresh wait runs on the core that owns its root source's
+            // vShard: only that core applies the cut it waits for.
+            MetaOp::AwaitContinuousAggregateRefresh { collection, .. } => {
+                let target = OwningCoreTarget {
+                    tenant_id,
+                    database_id,
+                    vshard_id: nodedb_types::CollectionKey::from_qualified_str(
+                        database_id,
+                        collection.as_str(),
+                    )?
+                    .vshard(),
+                    trace_id,
+                    txn_id,
+                };
+                owning_core_result(state, target, plan).await
+            }
             // Enumerated exhaustively (no `_ =>`) so a new single-blob MetaOp forces a decision.
             MetaOp::WalAppend { .. }
             | MetaOp::Cancel { .. }
@@ -177,7 +193,6 @@ pub(crate) async fn execute_plan_all_local_cores(
             | MetaOp::UnregisterContinuousAggregate { .. }
             | MetaOp::ListContinuousAggregates
             | MetaOp::ContinuousAggregatesRegistered
-            | MetaOp::AwaitContinuousAggregateRefresh { .. }
             | MetaOp::ConvertCollection { .. }
             | MetaOp::PurgeTenant { .. }
             | MetaOp::UnregisterCollection { .. }
@@ -247,31 +262,21 @@ async fn generic_gather(
     txn_id: Option<TxnId>,
 ) -> crate::Result<NodeLevelResult> {
     use crate::control::server::exchange::gather::gather_all_cores;
-    use crate::control::server::exchange::owning_core::dispatch_single_owning_core;
 
     // Forwarded `txn_id`, if any, is stamped on each core's request so a
     // transactional read honours its staged overlay. Inert when `None`.
     if !nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan)
         && let Some(collection) = plan.collection()
     {
-        let vshard_id =
-            nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
-        let resp = dispatch_single_owning_core(
-            state,
+        let target = OwningCoreTarget {
             tenant_id,
             database_id,
-            plan,
-            vshard_id,
+            vshard_id: nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?
+                .vshard(),
             trace_id,
             txn_id,
-        )
-        .await?;
-        return Ok(NodeLevelResult {
-            not_found: crate::control::local_dispatch::is_not_found(&resp),
-            payload: resp.payload.to_vec(),
-            watermark_lsn: resp.watermark_lsn,
-            read_versions: resp.read_versions,
-        });
+        };
+        return owning_core_result(state, target, plan).await;
     }
     let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await?;
     Ok(NodeLevelResult {
@@ -279,6 +284,50 @@ async fn generic_gather(
         watermark_lsn: outcome.watermark_lsn,
         read_versions: outcome.read_versions,
         not_found: false,
+    })
+}
+
+/// The one core a plan runs on, and the request scope it runs under.
+struct OwningCoreTarget {
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    /// The vShard whose owning core runs the plan.
+    vshard_id: crate::types::VShardId,
+    trace_id: TraceId,
+    txn_id: Option<TxnId>,
+}
+
+/// Run `plan` on the core that owns `target.vshard_id`, and return its
+/// payload in the shape that core produced.
+async fn owning_core_result(
+    state: &SharedState,
+    target: OwningCoreTarget,
+    plan: PhysicalPlan,
+) -> crate::Result<NodeLevelResult> {
+    use crate::control::server::exchange::owning_core::dispatch_single_owning_core;
+
+    let OwningCoreTarget {
+        tenant_id,
+        database_id,
+        vshard_id,
+        trace_id,
+        txn_id,
+    } = target;
+    let resp = dispatch_single_owning_core(
+        state,
+        tenant_id,
+        database_id,
+        plan,
+        vshard_id,
+        trace_id,
+        txn_id,
+    )
+    .await?;
+    Ok(NodeLevelResult {
+        not_found: crate::control::local_dispatch::is_not_found(&resp),
+        payload: resp.payload.to_vec(),
+        watermark_lsn: resp.watermark_lsn,
+        read_versions: resp.read_versions,
     })
 }
 

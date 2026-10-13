@@ -9,9 +9,10 @@
 //! aggregate answers from its last refresh cut.
 //!
 //! A read whose root owes nothing answers at once. Otherwise the core holds
-//! the read and the maintenance tick folds the backlog under the per-tick
-//! budget, so the core keeps serving other requests. The tick answers the
-//! read once nothing is owed, or with `DeadlineExceeded` at its deadline.
+//! the read, and every `tick()` folds the backlog under the per-tick budget
+//! (`drive_cagg_waiters`), so the core keeps serving other requests. The
+//! tick answers the read once nothing is owed, or with `DeadlineExceeded` at
+//! its deadline.
 
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_types::timeseries::PartitionState;

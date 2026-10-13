@@ -11,6 +11,8 @@
 //!   partitions an aggregate created or restarted after them lacks, and
 //!   folds the partitions pending refresh cuts name (`cagg_cut.rs`). It
 //!   reads at most `cagg_fold_partitions_per_tick` partitions per call.
+//!   While the core holds a refresh wait or an aggregate read, every
+//!   `tick()` runs the same pass (`drive_cagg_waiters`).
 //! - Retention folds each expiring partition into every aggregate before it
 //!   removes the partition.
 

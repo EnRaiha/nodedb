@@ -187,8 +187,9 @@ impl CoreLoop {
         self.poll_build_completions();
         self.poll_pending_reindex();
         self.answer_reindex_waiters();
-        self.answer_cagg_refresh_waiters();
-        self.answer_cagg_read_waiters();
+        // A held refresh wait or aggregate read folds its own backlog here,
+        // so it completes without the maintenance pass.
+        self.drive_cagg_waiters();
         // Adjust SPSC read depth based on current memory pressure.
         self.apply_spsc_pressure();
         self.drain_requests();

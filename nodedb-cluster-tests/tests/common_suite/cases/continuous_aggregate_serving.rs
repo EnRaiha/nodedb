@@ -11,7 +11,7 @@
 //! leader is killed, both return the rows of the last cut.
 
 use crate::common;
-use common::cluster_harness::shared_steps::{kill_node, leader_index_of};
+use common::cluster_harness::shared_steps::{db_detail, kill_node, leader_index_of};
 use common::cluster_harness::{TestCluster, TestClusterNode, wait_for_async};
 
 use std::time::Duration;
@@ -23,13 +23,20 @@ const CONVERGE: Duration = Duration::from_secs(30);
 const STEP: Duration = Duration::from_millis(100);
 
 /// `(host, s, c)` rows of the aggregate read through `node`, or `None` while
-/// the read fails.
+/// the read fails. A failed read prints the server's error, so a timed-out
+/// wait shows why the read never succeeded.
 async fn view_rows(node: &TestClusterNode) -> Option<Vec<(String, String, String)>> {
-    let messages = node
+    let messages = match node
         .client
         .simple_query(&format!("SELECT host, s, c FROM {VIEW} ORDER BY host"))
         .await
-        .ok()?;
+    {
+        Ok(messages) => messages,
+        Err(e) => {
+            eprintln!("read {VIEW}: {}", db_detail(&e));
+            return None;
+        }
+    };
     Some(
         messages
             .iter()
@@ -48,13 +55,17 @@ async fn view_rows(node: &TestClusterNode) -> Option<Vec<(String, String, String
 /// Whether `rows` are the buckets of the two seeded hosts.
 fn are_seeded(rows: &[(String, String, String)]) -> bool {
     let num = |s: &str| s.parse::<f64>().ok();
-    rows.len() == 2
+    let seeded = rows.len() == 2
         && rows[0].0 == "a"
         && num(&rows[0].1) == Some(4.0)
         && rows[0].2 == "2"
         && rows[1].0 == "b"
         && num(&rows[1].1) == Some(30.0)
-        && rows[1].2 == "2"
+        && rows[1].2 == "2";
+    if !seeded {
+        eprintln!("read {VIEW}: unexpected rows {rows:?}");
+    }
+    seeded
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -92,13 +103,13 @@ async fn continuous_aggregate_reads_from_source_leader() {
                 "INSERT INTO {SRC} (ts, host, value) VALUES ({ts}, '{host}', {value})"
             ))
             .await
-            .unwrap_or_else(|e| panic!("insert row at {ts}: {e}"));
+            .unwrap_or_else(|e| panic!("insert row at {ts}: {}", db_detail(&e)));
     }
     cluster.nodes[reader]
         .client
         .simple_query(&format!("REFRESH CONTINUOUS AGGREGATE {VIEW}"))
         .await
-        .unwrap_or_else(|e| panic!("refresh: {e}"));
+        .unwrap_or_else(|e| panic!("refresh: {}", db_detail(&e)));
 
     let through_reader = &cluster.nodes[reader];
     wait_for_async(

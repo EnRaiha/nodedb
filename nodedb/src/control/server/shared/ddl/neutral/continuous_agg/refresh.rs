@@ -9,9 +9,14 @@
 //! same refresh point.
 //!
 //! The handler proposes the cut, then waits for it to fold on the core
-//! that owns the root's vShard. The fold runs on that core's maintenance
-//! tick under the per-tick budget, so the refresh never blocks the core.
-//! The statement deadline bounds the wait.
+//! that owns the root's vShard. That core folds under the per-tick budget
+//! while it holds the wait, so the refresh never blocks the core. The
+//! statement deadline bounds the wait.
+//!
+//! Both steps run where the root's group lives. A node that replicates the
+//! group proposes the cut, waits for its own replica to apply it, and waits
+//! for the fold on its own core. A node that does not replicate the group
+//! sends each step through the gateway to the group's leader.
 //!
 //! The caller needs read access to the root source, and ownership of the
 //! aggregate (or a tenant admin role).
@@ -19,8 +24,12 @@
 use nodedb_physical::physical_plan::{MetaOp, RefreshCut, TimeseriesOp};
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
-use crate::control::server::dispatch_utils::{AutocommitWrite, dispatch_durable_autocommit_write};
+use crate::control::server::dispatch_utils::{
+    AutocommitWrite, ReadPlacement, dispatch_durable_autocommit_write, owner_response,
+    read_placement,
+};
 use crate::control::server::shared::ddl::user_dispatch::{
     DispatchRequest, RequestAdmission, dispatch_for_identity,
 };
@@ -65,7 +74,11 @@ pub async fn refresh_continuous_aggregate(
         .map_err(|e| DdlError::from_error(&e))?;
 
     // Reached only through `shared::ddl::dispatch`, which every transport
-    // calls after its own admission gate.
+    // calls after its own admission gate. The dispatch places the wait on a
+    // replica of the root's group: here when this node replicates it, on the
+    // group's leader otherwise (`dispatch_utils::owner_read`). A replica that
+    // has not applied the cut yet holds the wait until it has, so the wait
+    // needs no read confirm.
     let plan = PhysicalPlan::Meta(MetaOp::AwaitContinuousAggregateRefresh {
         collection: nodedb_types::QualifiedCollection::new(database_id, &target.root),
         name: name.to_string(),
@@ -79,7 +92,7 @@ pub async fn refresh_continuous_aggregate(
         plan,
         deadline: StatementDeadline::of_statement(state),
         admission: RequestAdmission::AlreadyAdmitted,
-        linearizable: true,
+        linearizable: false,
     })
     .await
     .map_err(|e| DdlError::from_error(&e))?;
@@ -93,6 +106,12 @@ pub async fn refresh_continuous_aggregate(
 
 /// Propose refresh cut `cut` on the data group of `root` and wait for its
 /// apply. A REFRESH and the periodic catch-up both cut through here.
+///
+/// A node that replicates the group proposes the cut and answers once its
+/// own replica applied it. A node that does not replicate the group can
+/// neither propose to it nor apply the cut. It sends the cut through the
+/// gateway to the group's leader, which proposes it and answers once its own
+/// replica applied it.
 pub(crate) async fn propose_refresh_cut(
     state: &SharedState,
     tenant_id: TenantId,
@@ -104,21 +123,41 @@ pub(crate) async fn propose_refresh_cut(
         collection: nodedb_types::QualifiedCollection::new(database_id, root),
         cut,
     });
-    let response = dispatch_durable_autocommit_write(
-        state,
-        AutocommitWrite {
-            tenant_id,
-            database_id,
-            vshard_id: nodedb_types::CollectionKey::from_bare(database_id, root).vshard(),
-            plan,
-            trace_id: TraceId::ZERO,
-            event_source: crate::event::EventSource::User,
-            txn_id: None,
-            // A refresh is a system write.
-            user_roles: Vec::new(),
-        },
-    )
-    .await?;
+    let vshard_id = nodedb_types::CollectionKey::from_bare(database_id, root).vshard();
+    let response = match read_placement(state, vshard_id, None)? {
+        ReadPlacement::Here(_) => {
+            dispatch_durable_autocommit_write(
+                state,
+                AutocommitWrite {
+                    tenant_id,
+                    database_id,
+                    vshard_id,
+                    plan,
+                    trace_id: TraceId::ZERO,
+                    event_source: crate::event::EventSource::User,
+                    txn_id: None,
+                    // A refresh is a system write.
+                    user_roles: Vec::new(),
+                },
+            )
+            .await?
+        }
+        ReadPlacement::Owner => {
+            let ctx = QueryContext {
+                tenant_id,
+                trace_id: TraceId::ZERO,
+                database_id,
+                txn_id: None,
+                linearizable: false,
+            };
+            // A trusted internal write: it carries no caller roles.
+            let outcome = state
+                .installed_gateway()?
+                .execute_internal_outcome(&ctx, plan)
+                .await;
+            owner_response(outcome)?
+        }
+    };
     payload_or_typed_error(response).map(|_| ())
 }
 

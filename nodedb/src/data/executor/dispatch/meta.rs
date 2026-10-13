@@ -80,9 +80,11 @@ impl CoreLoop {
             // The task loop holds a refresh wait until its cut folds. A wait
             // that reaches dispatch answers from the cut's state now.
             MetaOp::AwaitContinuousAggregateRefresh {
-                name, refresh_id, ..
+                collection,
+                name,
+                refresh_id,
             } => self
-                .cagg_refresh_answer(task, name, *refresh_id)
+                .cagg_refresh_answer(task, collection.as_str(), name, *refresh_id)
                 .unwrap_or_else(|| {
                     self.response_error(
                         task,

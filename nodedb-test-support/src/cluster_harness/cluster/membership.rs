@@ -102,6 +102,9 @@ impl TestCluster {
     /// appliers. Panics with every node's positions after 10 s.
     pub async fn exec_ddl_on_any_leader(&self, sql: &str) -> Result<usize, String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // The first error names why the statement was refused at all. A
+        // later retry can only report what the first attempt left behind.
+        let mut first_err: Option<String> = None;
         let mut last_err = String::new();
         while std::time::Instant::now() < deadline {
             for (idx, node) in self.nodes.iter().enumerate() {
@@ -111,13 +114,19 @@ impl TestCluster {
                             .await;
                         return Ok(idx);
                     }
-                    Err(e) => last_err = e,
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(format!("node {idx}: {e}"));
+                        }
+                        last_err = e;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(format!(
-            "no node accepted DDL within 10s; last error: {last_err}"
+            "no node accepted DDL within 10s; first error: {}; last error: {last_err}",
+            first_err.unwrap_or_default()
         ))
     }
 

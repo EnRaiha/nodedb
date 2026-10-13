@@ -5,9 +5,10 @@
 //! A `Periodic(ms)` aggregate takes one refresh cut per period slot
 //! (`now_ms / ms`). The cut is the same replicated write a REFRESH proposes,
 //! so every replica folds the same rows at the same log position. The
-//! metadata leader proposes the cuts. A replica applies a slot only when it
-//! is above the last slot it applied, so a slot proposed twice, by a leader
-//! change or a retry, cuts once.
+//! metadata leader proposes the cuts. It need not replicate the root's data
+//! group: `propose_refresh_cut` then sends the cut to that group's leader.
+//! A replica applies a slot only when it is above the last slot it applied,
+//! so a slot proposed twice, by a leader change or a retry, cuts once.
 
 use std::collections::HashMap;
 use std::sync::Arc;
