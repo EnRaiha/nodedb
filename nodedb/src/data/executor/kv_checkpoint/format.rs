@@ -14,7 +14,11 @@ use super::index_format::KvCheckpointIndexes;
 /// A file stamped with any other version is refused rather than misparsed.
 /// Refusing costs a WAL replay; misparsing would install wrong rows AND a floor
 /// that suppresses the records which would have corrected them.
-pub(crate) const KV_CKPT_FORMAT_VERSION: u16 = 4;
+///
+/// The secondary index content a file carries is keyed by
+/// `engine::kv::index::kv_index_key`; a change to that encoding changes
+/// this version.
+pub(crate) const KV_CKPT_FORMAT_VERSION: u16 = 5;
 
 /// Names the live generation. Writing this file is what publishes a checkpoint.
 #[derive(

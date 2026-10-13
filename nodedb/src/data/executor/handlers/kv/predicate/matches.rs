@@ -53,8 +53,8 @@ impl CoreLoop {
                 count: KV_PREDICATE_SCAN_BATCH,
                 now_ms,
                 match_pattern: None,
-                filter_field: probe.map(|(field, _)| field),
-                filter_value: probe.map(|(_, value)| value),
+                filter_field: probe.as_ref().map(|(field, _)| *field),
+                filter_value: probe.as_ref().map(|(_, key)| key.as_slice()),
                 surrogate_ceiling: None,
             });
             for (key, value) in entries {

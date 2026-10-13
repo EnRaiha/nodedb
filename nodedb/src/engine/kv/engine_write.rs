@@ -6,8 +6,7 @@ use nodedb_types::Surrogate;
 
 use super::engine::KvEngine;
 use super::engine_helpers::{
-    decode_document, document_field_values, expiry_key, extract_all_field_values_from_msgpack,
-    table_key,
+    decode_document, expiry_key, extract_all_field_values_from_msgpack, table_key,
 };
 use super::entry::NO_EXPIRY;
 
@@ -220,16 +219,12 @@ impl KvEngine {
                 .and_then(|t| t.get(key, now_ms))
                 .map(|v| v.to_vec())
                 .unwrap_or_default();
-            let new_document = decode_document(&new_value_bytes);
-            let new_fields = new_document
-                .as_ref()
-                .map(document_field_values)
-                .unwrap_or_default();
             let old_fields = old
                 .as_ref()
                 .map(|v| extract_all_field_values_from_msgpack(v));
 
             if has_indexes {
+                let new_fields = extract_all_field_values_from_msgpack(&new_value_bytes);
                 let new_refs: Vec<(&str, &[u8])> = new_fields
                     .iter()
                     .map(|(k, v)| (k.as_str(), v.as_slice()))
@@ -244,6 +239,7 @@ impl KvEngine {
             }
 
             if has_sorted {
+                let new_document = decode_document(&new_value_bytes);
                 self.sorted_indexes.on_put(tkey, key, new_document.as_ref());
             }
         }
@@ -694,12 +690,13 @@ mod tests {
             surrogate: row_surrogate(b"s1"),
         })
         .expect("a bound row writes");
-        assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
+        let us = nodedb_types::Value::String("us".into());
+        assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", &us).len(), 1);
 
         // No tick — the row is expired but still present.
         assert_eq!(e.delete(0, 1, "sess", &[b"s1".to_vec()], n + 5000), 1);
         assert!(
-            e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+            e.index_lookup_eq(0, 1, "sess", "region", &us).is_empty(),
             "DELETE of an expired-pending-reap key must still clean the index"
         );
     }

@@ -2,7 +2,7 @@
 
 //! Key encoding and field extraction helpers for the KV engine.
 
-use super::sorted_index::number;
+use super::index::kv_index_key;
 
 /// Compute a numeric key for per-collection HashMap lookups.
 ///
@@ -63,55 +63,29 @@ pub(super) fn decode_document(data: &[u8]) -> Option<serde_json::Value> {
     nodedb_types::json_from_msgpack(data).ok()
 }
 
-/// Extract all field name → value bytes pairs from a MessagePack-encoded document.
+/// The top-level fields of a MessagePack-encoded KV value, each with the
+/// key a secondary index files it under ([`kv_index_key`]). Empty when the
+/// value is not a map.
 ///
-/// The value is assumed to be a MessagePack map (as produced by SQL INSERT).
-/// Returns `(field_name, value_bytes)` where `value_bytes` is the secondary
-/// index encoding of the scalar value.
+/// The fields are read as `nodedb_types::Value`, the form a WHERE predicate
+/// compares, so a datetime keeps its instant.
 pub(super) fn extract_all_field_values_from_msgpack(data: &[u8]) -> Vec<(String, Vec<u8>)> {
-    decode_document(data)
-        .map(|doc| document_field_values(&doc))
-        .unwrap_or_default()
-}
-
-/// Every top-level field of `document` with its secondary index encoding.
-/// Empty when `document` is not an object.
-pub(super) fn document_field_values(document: &serde_json::Value) -> Vec<(String, Vec<u8>)> {
-    let Some(obj) = document.as_object() else {
-        return Vec::new();
-    };
-    obj.iter()
-        .map(|(k, v)| (k.clone(), json_value_to_index_bytes(v)))
-        .collect()
-}
-
-/// Extract a single field's value from a MessagePack-encoded document.
-pub(super) fn extract_field_values_from_msgpack(data: &[u8], field: &str) -> Vec<Vec<u8>> {
-    let Ok(value) = nodedb_types::json_from_msgpack(data) else {
-        return Vec::new();
-    };
-
-    let Some(obj) = value.as_object() else {
-        return Vec::new();
-    };
-
-    match obj.get(field) {
-        Some(v) => vec![json_value_to_index_bytes(v)],
-        None => Vec::new(),
+    match nodedb_types::value_from_msgpack(data) {
+        Ok(nodedb_types::Value::Object(map)) => map
+            .iter()
+            .map(|(field, value)| (field.clone(), kv_index_key(value)))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-/// Convert a JSON value to bytes suitable for B-Tree ordering.
-///
-/// Strings are stored as UTF-8 bytes. Numbers use the sorted index number
-/// encoding, so 11 and 11.0 are one key. Booleans as 0/1. Null as empty.
-fn json_value_to_index_bytes(v: &serde_json::Value) -> Vec<u8> {
-    match v {
-        serde_json::Value::String(s) => s.as_bytes().to_vec(),
-        serde_json::Value::Number(n) => number::encode_json_number(n).to_vec(),
-        serde_json::Value::Bool(b) => vec![*b as u8],
-        serde_json::Value::Null => Vec::new(),
-        // Arrays and objects: serialize as JSON string for comparison.
-        other => other.to_string().into_bytes(),
+/// One field's index key in a MessagePack-encoded KV value. Empty when the
+/// value is not a map or lacks the field.
+pub(super) fn extract_field_values_from_msgpack(data: &[u8], field: &str) -> Vec<Vec<u8>> {
+    match nodedb_types::value_from_msgpack(data) {
+        Ok(nodedb_types::Value::Object(map)) => {
+            map.get(field).map(kv_index_key).into_iter().collect()
+        }
+        _ => Vec::new(),
     }
 }

@@ -11,6 +11,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::coverage::IndexCoverage;
+
 /// The shape both secondary index kinds store: index key → the primary keys
 /// filed under it.
 pub type KvIndexTree = BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>>;
@@ -27,19 +29,26 @@ pub struct KvFieldIndex {
     field_position: usize,
     /// value_bytes → set of primary_key_bytes.
     tree: KvIndexTree,
+    /// Which rows the index holds; only a complete index answers equality.
+    coverage: IndexCoverage,
 }
 
 impl KvFieldIndex {
-    pub fn new(field: impl Into<String>, field_position: usize) -> Self {
+    pub fn new(field: impl Into<String>, field_position: usize, coverage: IndexCoverage) -> Self {
         Self {
             field: field.into(),
             field_position,
             tree: BTreeMap::new(),
+            coverage,
         }
     }
 
     pub fn field(&self) -> &str {
         &self.field
+    }
+
+    pub fn coverage(&self) -> IndexCoverage {
+        self.coverage
     }
 
     pub fn field_position(&self) -> usize {
@@ -142,7 +151,7 @@ mod tests {
 
     #[test]
     fn field_index_insert_and_lookup() {
-        let mut idx = KvFieldIndex::new("region", 2);
+        let mut idx = KvFieldIndex::new("region", 2, IndexCoverage::Complete);
         idx.insert(b"us-east".to_vec(), b"key1".to_vec());
         idx.insert(b"us-east".to_vec(), b"key2".to_vec());
         idx.insert(b"eu-west".to_vec(), b"key3".to_vec());
@@ -161,7 +170,7 @@ mod tests {
 
     #[test]
     fn field_index_remove() {
-        let mut idx = KvFieldIndex::new("status", 1);
+        let mut idx = KvFieldIndex::new("status", 1, IndexCoverage::Complete);
         idx.insert(b"active".to_vec(), b"k1".to_vec());
         idx.insert(b"active".to_vec(), b"k2".to_vec());
 
@@ -178,7 +187,7 @@ mod tests {
 
     #[test]
     fn field_index_range_lookup() {
-        let mut idx = KvFieldIndex::new("score", 0);
+        let mut idx = KvFieldIndex::new("score", 0, IndexCoverage::Complete);
         for i in 0u32..10 {
             idx.insert(i.to_be_bytes().to_vec(), format!("k{i}").into_bytes());
         }
@@ -193,7 +202,7 @@ mod tests {
     /// silently come back short.
     #[test]
     fn entries_expose_every_indexed_pair() {
-        let mut idx = KvFieldIndex::new("region", 0);
+        let mut idx = KvFieldIndex::new("region", 0, IndexCoverage::Complete);
         idx.insert(b"us".to_vec(), b"k1".to_vec());
         idx.insert(b"us".to_vec(), b"k2".to_vec());
         idx.insert(b"eu".to_vec(), b"k3".to_vec());

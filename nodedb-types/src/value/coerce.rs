@@ -45,26 +45,9 @@ impl Value {
         }
     }
 
-    /// The text of a string that [`Value::eq_coerced`] can match only against
-    /// a string with identical text: one that reads as neither a number nor
-    /// an instant. `None` for any other value.
-    ///
-    /// An exact-bytes lookup (such as a secondary-index probe) on this text
-    /// finds every row the coerced equality accepts. For any other value it
-    /// can miss rows, such as `'5'` against a stored `5`.
-    pub fn eq_coerced_exact_text(&self) -> Option<&str> {
-        match self {
-            Value::String(s)
-                if parse_numeric_str(s).is_none() && crate::NdbDateTime::parse(s).is_none() =>
-            {
-                Some(s)
-            }
-            _ => None,
-        }
-    }
-
     /// The hash bucket of this value under [`Value::eq_coerced`], for an
-    /// equi-join that must match exactly the pairs a WHERE `=` matches.
+    /// equi-join or an index probe that must find every pair a WHERE `=`
+    /// matches.
     ///
     /// Two values `eq_coerced` reports equal share a bucket. Two values in
     /// one bucket need not be equal (`'1.0'` and `'1'` as text, or two
@@ -314,21 +297,6 @@ mod tests {
             Value::Float(2.78).cmp_coerced(&Value::String("2.78".into())),
             Ordering::Equal
         );
-    }
-
-    #[test]
-    fn exact_text_only_for_strings_without_a_number_or_instant_reading() {
-        assert_eq!(
-            Value::String("us-east".into()).eq_coerced_exact_text(),
-            Some("us-east")
-        );
-        assert_eq!(Value::String("5".into()).eq_coerced_exact_text(), None);
-        assert_eq!(Value::String("2.5".into()).eq_coerced_exact_text(), None);
-        assert_eq!(
-            Value::String("2024-01-02T03:04:05Z".into()).eq_coerced_exact_text(),
-            None
-        );
-        assert_eq!(Value::Integer(5).eq_coerced_exact_text(), None);
     }
 
     #[test]

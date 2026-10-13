@@ -74,6 +74,7 @@ fn export_field_index(index: &KvFieldIndex) -> KvCheckpointFieldIndex {
         // Widened, never narrowed: `usize` is at most 64 bits on every target
         // this runs on, so the file keeps the exact position.
         field_position: index.field_position() as u64,
+        complete: index.coverage().is_complete(),
         entries: export_entries(index.entries()),
     }
 }
@@ -82,6 +83,7 @@ fn export_composite_index(index: &KvCompositeIndex) -> KvCheckpointCompositeInde
     KvCheckpointCompositeIndex {
         fields: index.fields().to_vec(),
         field_positions: index.field_positions().iter().map(|p| *p as u64).collect(),
+        complete: index.coverage().is_complete(),
         entries: export_entries(index.entries()),
     }
 }

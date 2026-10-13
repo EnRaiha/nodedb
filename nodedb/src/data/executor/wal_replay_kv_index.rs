@@ -209,15 +209,12 @@ mod tests {
     }
 
     fn lookup_by_name(core: &CoreLoop, collection: &str, name: &str) -> Vec<Vec<u8>> {
-        // The index stores string field values as raw UTF-8 bytes (see
-        // `json_value_to_index_bytes` in `engine_helpers.rs`), not
-        // msgpack-encoded values.
         core.kv_engine.index_lookup_eq(
             DatabaseId::DEFAULT.as_u64(),
             TID,
             collection,
             "name",
-            name.as_bytes(),
+            &nodedb_types::Value::String(name.into()),
         )
     }
 

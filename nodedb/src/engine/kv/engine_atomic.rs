@@ -459,16 +459,11 @@ impl KvEngine {
             self.expiry.insert(composite, expire_at);
         }
 
-        // Index maintenance — the same pair `KvEngine::put` performs, over the
-        // one field extraction both kinds read.
+        // Index maintenance — the same pair `KvEngine::put` performs.
         if has_secondary_indexes || has_sorted_indexes {
-            let new_document = super::engine_helpers::decode_document(value);
-            let new_fields = new_document
-                .as_ref()
-                .map(super::engine_helpers::document_field_values)
-                .unwrap_or_default();
-
             if has_secondary_indexes {
+                let new_fields =
+                    super::engine_helpers::extract_all_field_values_from_msgpack(value);
                 let old_refs: Option<Vec<(&str, &[u8])>> = old_fields.as_ref().map(|fields| {
                     fields
                         .iter()
@@ -485,6 +480,7 @@ impl KvEngine {
             }
 
             if has_sorted_indexes {
+                let new_document = super::engine_helpers::decode_document(value);
                 self.sorted_indexes.on_put(tkey, key, new_document.as_ref());
             }
         }

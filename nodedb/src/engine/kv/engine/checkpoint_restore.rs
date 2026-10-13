@@ -17,6 +17,7 @@
 //! maintenance can add entries alongside the ones being reinstalled here.
 
 use super::super::engine_helpers::table_key;
+use super::super::index::IndexCoverage;
 use super::super::sorted_index::manager::SortedIndexDef;
 use super::KvEngine;
 
@@ -27,6 +28,8 @@ pub struct RestoreFieldIndexParams<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub field_position: usize,
+    /// Which rows the exported index held.
+    pub coverage: IndexCoverage,
     /// `(field_value, primary_key)` pairs, exactly as exported.
     pub entries: &'a [(Vec<u8>, Vec<u8>)],
 }
@@ -38,6 +41,8 @@ pub struct RestoreCompositeIndexParams<'a> {
     pub collection: &'a str,
     pub fields: &'a [String],
     pub field_positions: &'a [usize],
+    /// Which rows the exported index held.
+    pub coverage: IndexCoverage,
     /// `(composite_key, primary_key)` pairs, exactly as exported — the key is
     /// the already-built one, never re-derived from split-apart field values.
     pub entries: &'a [(Vec<u8>, Vec<u8>)],
@@ -52,12 +57,13 @@ impl KvEngine {
             collection,
             field,
             field_position,
+            coverage,
             entries,
         } = params;
         let tkey = self.name_collection(database_id, tenant_id, collection);
 
         let idx_set = self.indexes.entry(tkey).or_default();
-        idx_set.add_index(field, field_position);
+        idx_set.add_index(field, field_position, coverage);
         // `add_index` reports `false` for an already-registered field. That is
         // not a failure here: the registration is what had to exist, and
         // refilling the index it returned is what this call is for.
@@ -77,12 +83,13 @@ impl KvEngine {
             collection,
             fields,
             field_positions,
+            coverage,
             entries,
         } = params;
         let tkey = self.name_collection(database_id, tenant_id, collection);
 
         let idx_set = self.indexes.entry(tkey).or_default();
-        idx_set.add_composite_index(fields.to_vec(), field_positions.to_vec());
+        idx_set.add_composite_index(fields.to_vec(), field_positions.to_vec(), coverage);
         let Some(index) = idx_set.get_composite_index_mut(fields) else {
             return;
         };

@@ -6,6 +6,7 @@
 
 use super::engine::KvEngine;
 use super::engine_helpers::{extract_field_values_from_msgpack, table_key};
+use super::index::IndexCoverage;
 
 /// Parameters for [`KvEngine::register_index`].
 #[derive(Debug, Clone, Copy)]
@@ -25,8 +26,13 @@ impl KvEngine {
     /// If `backfill` is true, scans all existing entries and populates the index.
     /// Returns the number of entries backfilled (0 if index already existed).
     ///
-    /// **Note**: backfill scans all entries synchronously. For large collections
-    /// (> 10k entries), consider `backfill=false` and rebuilding offline.
+    /// `backfill=false` over a collection that already holds rows gives a
+    /// `SinceRegistration` index: it lacks those rows, so no equality probes
+    /// it and a `WHERE field = x` reads the whole collection. Registered
+    /// before the first row, or with backfill, the index is `Complete` and
+    /// answers every equality, a miss included.
+    ///
+    /// **Note**: backfill scans all entries synchronously.
     pub fn register_index(&mut self, params: RegisterIndexParams<'_>) -> usize {
         let RegisterIndexParams {
             database_id,
@@ -50,9 +56,13 @@ impl KvEngine {
             .entry(tkey)
             .or_insert_with(|| collection.to_string());
 
+        // Every stored row counts, an expired one awaiting its reap included:
+        // a `PERSIST` can still bring it back.
+        let collection_rows = self.tables.get(&tkey).map_or(0, |table| table.len());
+        let coverage = IndexCoverage::of_registration(backfill, collection_rows);
         let idx_set = self.indexes.entry(tkey).or_default();
 
-        if !idx_set.add_index(field, field_position) {
+        if !idx_set.add_index(field, field_position, coverage) {
             return 0; // Already indexed.
         }
 
@@ -117,22 +127,29 @@ impl KvEngine {
         }
     }
 
-    /// Lookup primary keys by exact field value match using a secondary index.
+    /// The primary keys a secondary index files under `value`'s key. On a
+    /// `Complete` index that is every row a WHERE `field = value` accepts; a
+    /// `SinceRegistration` index lacks the rows written before it. A key can
+    /// also hold a value the equality refuses (`'1.0'` beside `'1'`), so a
+    /// caller that needs exact rows checks each one.
     ///
-    /// Returns empty if the field is not indexed.
+    /// Returns empty if the field is not indexed, or `value` equals nothing.
     pub fn index_lookup_eq(
         &self,
         database_id: u64,
         tenant_id: u64,
         collection: &str,
         field: &str,
-        value: &[u8],
+        value: &nodedb_types::Value,
     ) -> Vec<Vec<u8>> {
         let tkey = table_key(database_id, tenant_id, collection);
+        let Some(probe) = super::index::kv_probe_key(value) else {
+            return Vec::new();
+        };
         self.indexes
             .get(&tkey)
             .map(|idx| {
-                idx.lookup_eq(field, value)
+                idx.lookup_eq(field, &probe)
                     .into_iter()
                     .map(|k| k.to_vec())
                     .collect()
@@ -178,6 +195,10 @@ mod tests {
 
     fn make_engine() -> KvEngine {
         KvEngine::new(now(), 16, 0.75, 4, 64, 1000, 1024)
+    }
+
+    fn text(s: &str) -> nodedb_types::Value {
+        nodedb_types::Value::String(s.into())
     }
 
     /// Helper: create a MessagePack-encoded JSON object value.
@@ -242,12 +263,12 @@ mod tests {
         assert_eq!(backfilled, 3);
 
         // Lookup by indexed field.
-        let us_east = e.index_lookup_eq(0, 1, "sessions", "region", b"us-east");
+        let us_east = e.index_lookup_eq(0, 1, "sessions", "region", &text("us-east"));
         assert_eq!(us_east.len(), 2);
         assert!(us_east.contains(&b"s1".to_vec()));
         assert!(us_east.contains(&b"s2".to_vec()));
 
-        let eu_west = e.index_lookup_eq(0, 1, "sessions", "region", b"eu-west");
+        let eu_west = e.index_lookup_eq(0, 1, "sessions", "region", &text("eu-west"));
         assert_eq!(eu_west.len(), 1);
     }
 
@@ -279,7 +300,11 @@ mod tests {
             surrogate: row_surrogate(b"k1"),
         })
         .expect("a bound row writes");
-        assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"active").len(), 1);
+        assert_eq!(
+            e.index_lookup_eq(0, 1, "c", "status", &text("active"))
+                .len(),
+            1
+        );
 
         // Update: status changes.
         e.put(KvPutParams {
@@ -293,8 +318,15 @@ mod tests {
             surrogate: row_surrogate(b"k1"),
         })
         .expect("a bound row writes");
-        assert!(e.index_lookup_eq(0, 1, "c", "status", b"active").is_empty());
-        assert_eq!(e.index_lookup_eq(0, 1, "c", "status", b"inactive").len(), 1);
+        assert!(
+            e.index_lookup_eq(0, 1, "c", "status", &text("active"))
+                .is_empty()
+        );
+        assert_eq!(
+            e.index_lookup_eq(0, 1, "c", "status", &text("inactive"))
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -334,10 +366,10 @@ mod tests {
         })
         .expect("a bound row writes");
 
-        assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 2);
+        assert_eq!(e.index_lookup_eq(0, 1, "c", "region", &text("us")).len(), 2);
 
         e.delete(0, 1, "c", &[b"k1".to_vec()], n);
-        assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 1);
+        assert_eq!(e.index_lookup_eq(0, 1, "c", "region", &text("us")).len(), 1);
     }
 
     #[test]
@@ -392,7 +424,10 @@ mod tests {
         let dropped = e.drop_index(0, 1, "c", "status");
         assert_eq!(dropped, 1);
         assert_eq!(e.index_count(0, 1, "c"), 0);
-        assert!(e.index_lookup_eq(0, 1, "c", "status", b"active").is_empty());
+        assert!(
+            e.index_lookup_eq(0, 1, "c", "status", &text("active"))
+                .is_empty()
+        );
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! (`is_empty()`), which lets the write path skip field extraction entirely.
 
 use super::composite::KvCompositeIndex;
+use super::coverage::IndexCoverage;
 use super::field::KvFieldIndex;
+use super::key::NULL_KEY;
 
 /// Manages all secondary indexes for a single KV collection.
 ///
@@ -23,14 +25,17 @@ pub struct KvIndexSet {
     total_index_writes: u64,
 }
 
+/// The composite key parts of a row: each indexed field's key, NULL's key
+/// for a field the row lacks. Every row is filed, so a prefix probe on the
+/// leading field finds every row holding that value.
 fn composite_vals<'a>(ci: &KvCompositeIndex, values: &'a [(&str, &[u8])]) -> Vec<&'a [u8]> {
     ci.fields()
         .iter()
-        .filter_map(|f| {
+        .map(|f| {
             values
                 .iter()
                 .find(|(name, _)| *name == f.as_str())
-                .map(|(_, v)| *v)
+                .map_or(NULL_KEY, |(_, v)| *v)
         })
         .collect()
 }
@@ -66,11 +71,17 @@ impl KvIndexSet {
     }
 
     /// Add a new index on a field. Returns false if already indexed.
-    pub fn add_index(&mut self, field: &str, field_position: usize) -> bool {
+    pub fn add_index(
+        &mut self,
+        field: &str,
+        field_position: usize,
+        coverage: IndexCoverage,
+    ) -> bool {
         if self.indexes.iter().any(|i| i.field() == field) {
             return false;
         }
-        self.indexes.push(KvFieldIndex::new(field, field_position));
+        self.indexes
+            .push(KvFieldIndex::new(field, field_position, coverage));
         true
     }
 
@@ -99,6 +110,7 @@ impl KvIndexSet {
         &mut self,
         fields: Vec<String>,
         field_positions: Vec<usize>,
+        coverage: IndexCoverage,
     ) -> bool {
         if self
             .composite_indexes
@@ -108,7 +120,7 @@ impl KvIndexSet {
             return false;
         }
         self.composite_indexes
-            .push(KvCompositeIndex::new(fields, field_positions));
+            .push(KvCompositeIndex::new(fields, field_positions, coverage));
         true
     }
 
@@ -140,11 +152,27 @@ impl KvIndexSet {
             .find(|ci| ci.fields() == fields)
     }
 
-    /// Find a composite index that has the given field as a leading prefix.
-    pub fn find_composite_with_prefix(&self, field: &str) -> Option<&KvCompositeIndex> {
+    /// The primary keys a complete index files under `key` for `field`: the
+    /// field's own index, else a composite index leading with the field.
+    ///
+    /// `Some` is every candidate row, so `Some(empty)` means no row matches.
+    /// `None` when no complete index covers the field: a
+    /// `SinceRegistration` index lacks older rows, so the caller reads the
+    /// whole collection.
+    pub fn complete_eq_candidates(&self, field: &str, key: &[u8]) -> Option<Vec<&[u8]>> {
+        if let Some(index) = self
+            .indexes
+            .iter()
+            .find(|i| i.field() == field && i.coverage().is_complete())
+        {
+            return Some(index.lookup_eq(key));
+        }
         self.composite_indexes
             .iter()
-            .find(|ci| ci.fields().first().is_some_and(|f| f == field))
+            .find(|ci| {
+                ci.coverage().is_complete() && ci.fields().first().is_some_and(|f| f == field)
+            })
+            .map(|ci| ci.lookup_prefix(&[key]))
     }
 
     /// Record a PUT and update all indexes with the new field values.
@@ -219,36 +247,22 @@ impl KvIndexSet {
         // Maintain composite indexes.
         for ci in &mut self.composite_indexes {
             // Composite entry, eliding the same no-op update case.
-            match old_field_values {
-                Some(old_values) => {
-                    let old_vals = composite_vals(ci, old_values);
-                    let new_vals = composite_vals(ci, field_values);
-                    if old_vals.len() == ci.fields().len() && new_vals.len() == ci.fields().len() {
-                        if old_vals == new_vals {
-                            if !ci.contains(&new_vals, primary_key) {
-                                ci.insert(&new_vals, primary_key.to_vec());
-                                writes += 1;
-                            }
-                        } else {
-                            ci.remove(&old_vals, primary_key);
-                            writes += 1;
-                            ci.insert(&new_vals, primary_key.to_vec());
-                            writes += 1;
-                        }
-                    } else if old_vals.len() == ci.fields().len() {
-                        ci.remove(&old_vals, primary_key);
-                        writes += 1;
-                    } else if new_vals.len() == ci.fields().len() {
+            let new_vals = composite_vals(ci, field_values);
+            match old_field_values.map(|old_values| composite_vals(ci, old_values)) {
+                Some(old_vals) if old_vals == new_vals => {
+                    if !ci.contains(&new_vals, primary_key) {
                         ci.insert(&new_vals, primary_key.to_vec());
                         writes += 1;
                     }
                 }
+                Some(old_vals) => {
+                    ci.remove(&old_vals, primary_key);
+                    ci.insert(&new_vals, primary_key.to_vec());
+                    writes += 2;
+                }
                 None => {
-                    let new_vals = composite_vals(ci, field_values);
-                    if new_vals.len() == ci.fields().len() {
-                        ci.insert(&new_vals, primary_key.to_vec());
-                        writes += 1;
-                    }
+                    ci.insert(&new_vals, primary_key.to_vec());
+                    writes += 1;
                 }
             }
         }
@@ -272,20 +286,9 @@ impl KvIndexSet {
 
         // Maintain composite indexes on delete.
         for ci in &mut self.composite_indexes {
-            let vals: Vec<&[u8]> = ci
-                .fields()
-                .iter()
-                .filter_map(|f| {
-                    field_values
-                        .iter()
-                        .find(|(name, _)| *name == f.as_str())
-                        .map(|(_, v)| *v)
-                })
-                .collect();
-            if vals.len() == ci.fields().len() {
-                ci.remove(&vals, primary_key);
-                self.total_index_writes += 1;
-            }
+            let vals = composite_vals(ci, field_values);
+            ci.remove(&vals, primary_key);
+            self.total_index_writes += 1;
         }
     }
 
@@ -338,6 +341,50 @@ impl Default for KvIndexSet {
 mod tests {
     use super::*;
 
+    const COMPLETE: IndexCoverage = IndexCoverage::Complete;
+
+    /// A complete index answers a miss with no candidates; a partial one
+    /// answers nothing, so the caller reads every row.
+    #[test]
+    fn only_a_complete_index_answers_an_equality() {
+        let mut set = KvIndexSet::new();
+        set.add_index("region", 0, COMPLETE);
+        set.add_index("status", 1, IndexCoverage::SinceRegistration);
+        set.on_put(b"k1", &[("region", b"us"), ("status", b"on")], None);
+
+        assert_eq!(
+            set.complete_eq_candidates("region", b"us"),
+            Some(vec![b"k1".as_slice()])
+        );
+        assert_eq!(
+            set.complete_eq_candidates("region", b"eu"),
+            Some(Vec::new())
+        );
+        assert_eq!(set.complete_eq_candidates("status", b"on"), None);
+        assert_eq!(set.complete_eq_candidates("name", b"x"), None);
+    }
+
+    /// A partial field index gives way to a complete composite leading with
+    /// the field; a partial composite answers nothing.
+    #[test]
+    fn a_complete_composite_answers_for_its_leading_field() {
+        let mut set = KvIndexSet::new();
+        set.add_index("region", 0, IndexCoverage::SinceRegistration);
+        set.add_composite_index(vec!["region".into(), "status".into()], vec![0, 1], COMPLETE);
+        set.add_composite_index(
+            vec!["status".into(), "region".into()],
+            vec![1, 0],
+            IndexCoverage::SinceRegistration,
+        );
+        set.on_put(b"k1", &[("region", b"us"), ("status", b"on")], None);
+
+        assert_eq!(
+            set.complete_eq_candidates("region", b"us"),
+            Some(vec![b"k1".as_slice()])
+        );
+        assert_eq!(set.complete_eq_candidates("status", b"on"), None);
+    }
+
     #[test]
     fn index_set_zero_index_fast_path() {
         let set = KvIndexSet::new();
@@ -348,8 +395,8 @@ mod tests {
     #[test]
     fn index_set_add_and_remove() {
         let mut set = KvIndexSet::new();
-        assert!(set.add_index("region", 2));
-        assert!(!set.add_index("region", 2)); // Duplicate.
+        assert!(set.add_index("region", 2, COMPLETE));
+        assert!(!set.add_index("region", 2, COMPLETE)); // Duplicate.
         assert_eq!(set.index_count(), 1);
         assert!(!set.is_empty());
 
@@ -361,8 +408,8 @@ mod tests {
     #[test]
     fn index_set_on_put_maintains_indexes() {
         let mut set = KvIndexSet::new();
-        set.add_index("region", 2);
-        set.add_index("status", 3);
+        set.add_index("region", 2, COMPLETE);
+        set.add_index("status", 3, COMPLETE);
 
         let field_values: Vec<(&str, &[u8])> = vec![("region", b"us-east"), ("status", b"active")];
 
@@ -378,7 +425,7 @@ mod tests {
         // An in-place update that leaves the indexed value unchanged must not
         // rewrite the index when the pair is already present.
         let mut set = KvIndexSet::new();
-        set.add_index("status", 0);
+        set.add_index("status", 0, COMPLETE);
         set.on_put(b"k1", &[("status", b"active")], None);
         let writes = set.on_put(
             b"k1",
@@ -394,7 +441,7 @@ mod tests {
     #[test]
     fn index_set_on_put_update_replaces_old() {
         let mut set = KvIndexSet::new();
-        set.add_index("status", 0);
+        set.add_index("status", 0, COMPLETE);
 
         // Insert.
         set.on_put(b"k1", &[("status", b"active")], None);
@@ -413,7 +460,7 @@ mod tests {
     #[test]
     fn index_set_on_delete_cleans_up() {
         let mut set = KvIndexSet::new();
-        set.add_index("region", 0);
+        set.add_index("region", 0, COMPLETE);
 
         set.on_put(b"k1", &[("region", b"us")], None);
         set.on_put(b"k2", &[("region", b"us")], None);
@@ -426,8 +473,8 @@ mod tests {
     #[test]
     fn write_amp_ratio() {
         let mut set = KvIndexSet::new();
-        set.add_index("a", 0);
-        set.add_index("b", 1);
+        set.add_index("a", 0, COMPLETE);
+        set.add_index("b", 1, COMPLETE);
 
         for i in 0..10 {
             let k = format!("k{i}");
@@ -440,7 +487,7 @@ mod tests {
     #[test]
     fn unindexed_field_ignored() {
         let mut set = KvIndexSet::new();
-        set.add_index("region", 0);
+        set.add_index("region", 0, COMPLETE);
 
         // PUT with a field that isn't indexed — should be ignored.
         let writes = set.on_put(b"k1", &[("name", b"alice")], None);
@@ -450,7 +497,7 @@ mod tests {
     #[test]
     fn index_set_composite_on_put() {
         let mut set = KvIndexSet::new();
-        set.add_composite_index(vec!["region".into(), "status".into()], vec![0, 1]);
+        set.add_composite_index(vec!["region".into(), "status".into()], vec![0, 1], COMPLETE);
 
         let writes = set.on_put(b"k1", &[("region", b"us"), ("status", b"active")], None);
         assert!(writes > 0);
@@ -463,10 +510,29 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
+    /// A row lacking a trailing composite field is filed with that field
+    /// NULL, so a prefix probe on the leading field finds it, and its delete
+    /// removes it.
+    #[test]
+    fn a_row_missing_a_composite_field_is_filed_as_null() {
+        let mut set = KvIndexSet::new();
+        set.add_composite_index(vec!["region".into(), "status".into()], vec![0, 1], COMPLETE);
+        let fields = vec!["region".to_string(), "status".to_string()];
+
+        set.on_put(b"k1", &[("region", b"us")], None);
+        let ci = set.get_composite_index(&fields).expect("registered");
+        assert_eq!(ci.lookup_prefix(&[b"us"]), vec![b"k1".as_slice()]);
+        assert_eq!(ci.lookup_eq(&[b"us", NULL_KEY]), vec![b"k1".as_slice()]);
+
+        set.on_delete(b"k1", &[("region", b"us")]);
+        let ci = set.get_composite_index(&fields).expect("registered");
+        assert!(ci.lookup_prefix(&[b"us"]).is_empty());
+    }
+
     #[test]
     fn index_set_composite_on_delete() {
         let mut set = KvIndexSet::new();
-        set.add_composite_index(vec!["a".into(), "b".into()], vec![0, 1]);
+        set.add_composite_index(vec!["a".into(), "b".into()], vec![0, 1], COMPLETE);
 
         set.on_put(b"k1", &[("a", b"x"), ("b", b"y")], None);
         set.on_delete(b"k1", &[("a", b"x"), ("b", b"y")]);
@@ -483,7 +549,7 @@ mod tests {
         // present. A row written before a backfill=false registration was never
         // indexed, so the next identical PUT has to insert it.
         let mut set = KvIndexSet::new();
-        set.add_index("status", 0);
+        set.add_index("status", 0, COMPLETE);
         // No prior on_put — simulates backfill=false: this row exists but
         // was never run through the indexer.
         let writes = set.on_put(
@@ -501,7 +567,7 @@ mod tests {
     #[test]
     fn composite_backfill_absent_pair_still_gets_inserted() {
         let mut set = KvIndexSet::new();
-        set.add_composite_index(vec!["region".into(), "status".into()], vec![0, 1]);
+        set.add_composite_index(vec!["region".into(), "status".into()], vec![0, 1], COMPLETE);
         let writes = set.on_put(
             b"k1",
             &[("region", b"us-east"), ("status", b"active")],
@@ -523,8 +589,8 @@ mod tests {
     #[test]
     fn export_accessors_see_every_registration() {
         let mut set = KvIndexSet::new();
-        set.add_index("region", 2);
-        set.add_composite_index(vec!["a".into(), "b".into()], vec![0, 1]);
+        set.add_index("region", 2, COMPLETE);
+        set.add_composite_index(vec!["a".into(), "b".into()], vec![0, 1], COMPLETE);
 
         assert_eq!(set.field_indexes().len(), 1);
         assert_eq!(set.field_indexes()[0].field(), "region");

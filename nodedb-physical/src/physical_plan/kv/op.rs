@@ -256,6 +256,12 @@ pub enum KvOp {
         /// Position of the field in the schema column list.
         field_position: usize,
         /// Whether to backfill the index with existing entries.
+        ///
+        /// `false` over a collection that already holds rows gives an index
+        /// that lacks those rows. No equality probes such an index: a
+        /// `WHERE field = x` reads the whole collection, so results stay
+        /// correct and only the speed differs. An index registered before
+        /// the first row, or with backfill, answers every equality.
         backfill: bool,
     },
 
