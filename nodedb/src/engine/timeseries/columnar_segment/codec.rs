@@ -4,7 +4,7 @@
 
 use nodedb_codec::{ColumnCodec, ColumnStatistics, ColumnTypeHint, ResolvedColumnCodec};
 
-use super::super::columnar_memtable::{ColumnData, ColumnType};
+use super::super::columnar_memtable::{ColumnData, ColumnType, NULL_SYMBOL_ID};
 use super::error::SegmentError;
 
 /// Legacy default codecs for partitions written before V2 codec metadata.
@@ -82,7 +82,14 @@ pub(super) fn encode_column(
             let raw: Vec<u8> = values.iter().flat_map(|id| id.to_le_bytes()).collect();
             let encoded = nodedb_codec::encode_bytes_pipeline(&raw, codec.into_column_codec())
                 .map_err(|e| SegmentError::Io(format!("encode sym: {e}")))?;
-            let cardinality = values.iter().copied().max().map_or(0, |m| m + 1);
+            // A NULL cell stores the NULL symbol id, which names no
+            // dictionary entry and does not count toward the cardinality.
+            let cardinality = values
+                .iter()
+                .copied()
+                .filter(|id| *id != NULL_SYMBOL_ID)
+                .max()
+                .map_or(0, |m| m + 1);
             let stats =
                 ColumnStatistics::from_symbols(values, cardinality, codec, encoded.len() as u64);
             Ok((encoded, codec, stats))

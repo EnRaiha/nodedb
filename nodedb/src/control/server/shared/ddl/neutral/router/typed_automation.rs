@@ -39,6 +39,7 @@ pub(super) async fn try_typed(
             trigger::create_trigger(
                 state,
                 identity,
+                database_id,
                 trigger::create::CreateTriggerRequest {
                     or_replace: *or_replace,
                     execution_mode,
@@ -62,9 +63,17 @@ pub(super) async fn try_typed(
             name,
             action,
             new_owner,
-        }) => {
-            Some(trigger::alter_trigger(state, identity, name, action, new_owner.as_deref()).await)
-        }
+        }) => Some(
+            trigger::alter_trigger(
+                state,
+                identity,
+                database_id,
+                name,
+                action,
+                new_owner.as_deref(),
+            )
+            .await,
+        ),
 
         NodedbStatement::Automation(AutomationStmt::DropTrigger {
             name, if_exists, ..
@@ -74,14 +83,14 @@ pub(super) async fn try_typed(
             // (and before any catalog-read error surfaces). The `if_exists:
             // false` case and the existing-trigger case fall through to
             // `drop_trigger`, which re-derives the name / IF EXISTS from `parts`.
-            if *if_exists && !trigger::trigger_exists(state, identity, name) {
+            if *if_exists && !trigger::trigger_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP TRIGGER".to_string(),
                     rows_affected: None,
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(trigger::drop_trigger(state, identity, &parts).await)
+            Some(trigger::drop_trigger(state, identity, database_id, &parts).await)
         }
 
         NodedbStatement::Automation(AutomationStmt::ShowTriggers { .. }) => {

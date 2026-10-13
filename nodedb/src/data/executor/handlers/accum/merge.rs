@@ -2,7 +2,7 @@
 
 //! `merge_from` implementations for `AggAccum` and `GroupState`.
 
-use super::state::{ARRAY_AGG_CAP, AggAccum, GroupState};
+use super::state::{AggAccum, GroupState};
 
 impl AggAccum {
     /// Merge a partial accumulator `other` into `self` (used by tests).
@@ -66,15 +66,14 @@ pub(super) fn merge_accum(dst: &mut AggAccum, other: AggAccum) {
         (AggAccum::Hll { hll: a }, AggAccum::Hll { hll: b }) => {
             a.merge(&b);
         }
-        (AggAccum::TDigest { digest: a }, AggAccum::TDigest { digest: b }) => {
+        (AggAccum::TDigest { digest: a, .. }, AggAccum::TDigest { digest: b, .. }) => {
             a.merge(&b);
         }
         (AggAccum::TopK { ss: a, .. }, AggAccum::TopK { ss: b, .. }) => {
             a.merge(&b);
         }
         (AggAccum::ArrayAgg { values: a }, AggAccum::ArrayAgg { values: b }) => {
-            let remaining = ARRAY_AGG_CAP.saturating_sub(a.len());
-            a.extend(b.into_iter().take(remaining));
+            a.extend(b);
         }
         (
             AggAccum::ArrayAggDistinct {
@@ -82,16 +81,16 @@ pub(super) fn merge_accum(dst: &mut AggAccum, other: AggAccum) {
                 values: va,
             },
             AggAccum::ArrayAggDistinct {
-                seen: sb,
+                seen: _,
                 values: vb,
             },
         ) => {
-            for (bytes_key, value) in sb.into_iter().zip(vb) {
-                if va.len() >= ARRAY_AGG_CAP {
-                    break;
-                }
-                if sa.insert(bytes_key) {
-                    va.push(value);
+            // Each value travels with its own key, so a merge dedups on the
+            // same bytes the feed did.
+            for (bytes_key, value) in vb {
+                if !sa.contains(&bytes_key) {
+                    sa.insert(bytes_key.clone());
+                    va.push((bytes_key, value));
                 }
             }
         }
@@ -99,12 +98,10 @@ pub(super) fn merge_accum(dst: &mut AggAccum, other: AggAccum) {
             AggAccum::PercentileCont { values: a, .. },
             AggAccum::PercentileCont { values: b, .. },
         ) => {
-            let remaining = ARRAY_AGG_CAP.saturating_sub(a.len());
-            a.extend(b.into_iter().take(remaining));
+            a.extend(b);
         }
         (AggAccum::StringAgg { parts: a }, AggAccum::StringAgg { parts: b }) => {
-            let remaining = ARRAY_AGG_CAP.saturating_sub(a.len());
-            a.extend(b.into_iter().take(remaining));
+            a.extend(b);
         }
         _ => {
             // Invariant: same query → same aggregate-spec position → same variant.
@@ -151,13 +148,24 @@ mod tests {
     use nodedb_physical::physical_plan::AggregateSpec;
     use nodedb_types::Value;
 
+    /// A spec over `field`. A parameterized function gets a fixed parameter:
+    /// the median, or the top 3.
     fn make_spec(func: &str, field: &str) -> AggregateSpec {
+        use nodedb_physical::physical_plan::AggregateParam;
+        let param = match func {
+            "approx_topk" => Some(AggregateParam::TopK { k: 3 }),
+            "approx_percentile" | "percentile_cont" => {
+                Some(AggregateParam::Percentile { fraction: 0.5 })
+            }
+            _ => None,
+        };
         AggregateSpec {
             function: func.to_string(),
             field: field.to_string(),
             alias: format!("{func}({field})"),
             user_alias: None,
             expr: None,
+            param,
         }
     }
 
@@ -183,13 +191,64 @@ mod tests {
         nodedb_types::value_to_msgpack(&Value::Object(map)).expect("encode doc")
     }
 
+    /// Materializing aggregates keep every value: a group past 10,000 rows
+    /// is never cut to a prefix.
+    #[test]
+    fn materializing_aggregates_keep_every_value_past_ten_thousand() {
+        const ROWS: i64 = 10_500;
+        for func in ["array_agg", "array_agg_distinct", "string_agg"] {
+            let spec = make_spec(func, "x");
+            let mut accum = AggAccum::new(&spec).unwrap();
+            for i in 0..ROWS {
+                let doc = if func == "string_agg" {
+                    make_doc_str("x", &i.to_string())
+                } else {
+                    make_doc_i64("x", i)
+                };
+                accum.feed(&spec, &doc).expect("feed");
+            }
+            let count = match &accum {
+                AggAccum::ArrayAgg { values } => values.len(),
+                AggAccum::ArrayAggDistinct { values, .. } => values.len(),
+                AggAccum::StringAgg { parts } => parts.len(),
+                _ => panic!("{func} built an unexpected accumulator"),
+            };
+            assert_eq!(count, ROWS as usize, "{func} dropped values");
+        }
+    }
+
+    /// A distinct array merged from two runs dedups by each value's own key,
+    /// so a value both runs saw appears once and no value is paired with
+    /// another value's key.
+    #[test]
+    fn merge_from_array_agg_distinct_dedups_by_value() {
+        let spec = make_spec("array_agg_distinct", "x");
+        let mut a = AggAccum::new(&spec).unwrap();
+        for v in [1, 2, 3] {
+            a.feed(&spec, &make_doc_i64("x", v)).expect("feed a");
+        }
+        let mut b = AggAccum::new(&spec).unwrap();
+        for v in [3, 4, 5, 6, 7, 8] {
+            b.feed(&spec, &make_doc_i64("x", v)).expect("feed b");
+        }
+        a.merge_from(b);
+        let Value::Array(mut values) = a.finalize(&spec).expect("finalize") else {
+            panic!("array_agg_distinct finalizes to an array");
+        };
+        values.sort_by_key(|v| match v {
+            Value::Integer(i) => *i,
+            other => panic!("unexpected value {other:?}"),
+        });
+        assert_eq!(values, (1..=8).map(Value::Integer).collect::<Vec<_>>());
+    }
+
     #[test]
     fn merge_from_count() {
         let spec = make_spec("count", "*");
         let docs_a: Vec<Vec<u8>> = (0..5).map(|_| make_doc_i64("x", 1)).collect();
         let docs_b: Vec<Vec<u8>> = (0..7).map(|_| make_doc_i64("x", 2)).collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             combined.feed(&spec, d).unwrap();
         }
@@ -197,11 +256,11 @@ mod tests {
             combined.feed(&spec, d).unwrap();
         }
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -226,22 +285,22 @@ mod tests {
         let docs_b: Vec<Vec<u8>> = vals_b.iter().map(|&v| make_doc_f64("v", v)).collect();
 
         // Combined baseline.
-        let mut combined_sum = AggAccum::new(&sum_spec);
-        let mut combined_avg = AggAccum::new(&avg_spec);
+        let mut combined_sum = AggAccum::new(&sum_spec).unwrap();
+        let mut combined_avg = AggAccum::new(&avg_spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined_sum.feed(&sum_spec, d).unwrap();
             combined_avg.feed(&avg_spec, d).unwrap();
         }
 
         // Merge path.
-        let mut a_sum = AggAccum::new(&sum_spec);
-        let mut a_avg = AggAccum::new(&avg_spec);
+        let mut a_sum = AggAccum::new(&sum_spec).unwrap();
+        let mut a_avg = AggAccum::new(&avg_spec).unwrap();
         for d in &docs_a {
             a_sum.feed(&sum_spec, d).unwrap();
             a_avg.feed(&avg_spec, d).unwrap();
         }
-        let mut b_sum = AggAccum::new(&sum_spec);
-        let mut b_avg = AggAccum::new(&avg_spec);
+        let mut b_sum = AggAccum::new(&sum_spec).unwrap();
+        let mut b_avg = AggAccum::new(&avg_spec).unwrap();
         for d in &docs_b {
             b_sum.feed(&sum_spec, d).unwrap();
             b_avg.feed(&avg_spec, d).unwrap();
@@ -282,22 +341,22 @@ mod tests {
             .collect();
 
         // Combined baseline.
-        let mut combined_sum = AggAccum::new(&sum_spec);
-        let mut combined_avg = AggAccum::new(&avg_spec);
+        let mut combined_sum = AggAccum::new(&sum_spec).unwrap();
+        let mut combined_avg = AggAccum::new(&avg_spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined_sum.feed(&sum_spec, d).unwrap();
             combined_avg.feed(&avg_spec, d).unwrap();
         }
 
         // Spilled-run merge path.
-        let mut a_sum = AggAccum::new(&sum_spec);
-        let mut a_avg = AggAccum::new(&avg_spec);
+        let mut a_sum = AggAccum::new(&sum_spec).unwrap();
+        let mut a_avg = AggAccum::new(&avg_spec).unwrap();
         for d in &docs_a {
             a_sum.feed(&sum_spec, d).unwrap();
             a_avg.feed(&avg_spec, d).unwrap();
         }
-        let mut b_sum = AggAccum::new(&sum_spec);
-        let mut b_avg = AggAccum::new(&avg_spec);
+        let mut b_sum = AggAccum::new(&sum_spec).unwrap();
+        let mut b_avg = AggAccum::new(&avg_spec).unwrap();
         for d in &docs_b {
             b_sum.feed(&sum_spec, d).unwrap();
             b_avg.feed(&avg_spec, d).unwrap();
@@ -326,15 +385,15 @@ mod tests {
         docs_a: &[Vec<u8>],
         docs_b: &[Vec<u8>],
     ) -> [Value; 2] {
-        let mut combined = AggAccum::new(spec);
+        let mut combined = AggAccum::new(spec).unwrap();
         for d in docs_a.iter().chain(docs_b) {
             combined.feed(spec, d).unwrap();
         }
-        let mut a = AggAccum::new(spec);
+        let mut a = AggAccum::new(spec).unwrap();
         for d in docs_a {
             a.feed(spec, d).unwrap();
         }
-        let mut b = AggAccum::new(spec);
+        let mut b = AggAccum::new(spec).unwrap();
         for d in docs_b {
             b.feed(spec, d).unwrap();
         }
@@ -449,21 +508,21 @@ mod tests {
         let docs_a: Vec<Vec<u8>> = [3i64, 1, 7].iter().map(|&v| make_doc_i64("v", v)).collect();
         let docs_b: Vec<Vec<u8>> = [2i64, 9, 4].iter().map(|&v| make_doc_i64("v", v)).collect();
 
-        let mut combined_min = AggAccum::new(&min_spec);
-        let mut combined_max = AggAccum::new(&max_spec);
+        let mut combined_min = AggAccum::new(&min_spec).unwrap();
+        let mut combined_max = AggAccum::new(&max_spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined_min.feed(&min_spec, d).unwrap();
             combined_max.feed(&max_spec, d).unwrap();
         }
 
-        let mut a_min = AggAccum::new(&min_spec);
-        let mut a_max = AggAccum::new(&max_spec);
+        let mut a_min = AggAccum::new(&min_spec).unwrap();
+        let mut a_max = AggAccum::new(&max_spec).unwrap();
         for d in &docs_a {
             a_min.feed(&min_spec, d).unwrap();
             a_max.feed(&max_spec, d).unwrap();
         }
-        let mut b_min = AggAccum::new(&min_spec);
-        let mut b_max = AggAccum::new(&max_spec);
+        let mut b_min = AggAccum::new(&min_spec).unwrap();
+        let mut b_max = AggAccum::new(&max_spec).unwrap();
         for d in &docs_b {
             b_min.feed(&min_spec, d).unwrap();
             b_max.feed(&max_spec, d).unwrap();
@@ -492,16 +551,16 @@ mod tests {
         let docs_a: Vec<Vec<u8>> = vals_a.iter().map(|&v| make_doc_f64("v", v)).collect();
         let docs_b: Vec<Vec<u8>> = vals_b.iter().map(|&v| make_doc_f64("v", v)).collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined.feed(&spec, d).unwrap();
         }
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -533,15 +592,15 @@ mod tests {
             .map(|&s| make_doc_str("v", s))
             .collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined.feed(&spec, d).unwrap();
         }
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -563,16 +622,16 @@ mod tests {
             .map(|i| make_doc_i64("v", i as i64))
             .collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined.feed(&spec, d).unwrap();
         }
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -591,16 +650,16 @@ mod tests {
 
     #[test]
     fn merge_from_tdigest() {
-        let spec = make_spec("approx_percentile", "0.5:v");
+        let spec = make_spec("approx_percentile", "v");
 
         let docs_a: Vec<Vec<u8>> = (0..100).map(|i| make_doc_f64("v", i as f64)).collect();
         let docs_b: Vec<Vec<u8>> = (100..200).map(|i| make_doc_f64("v", i as f64)).collect();
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -615,16 +674,16 @@ mod tests {
 
     #[test]
     fn merge_from_topk() {
-        let spec = make_spec("approx_topk", "3:v");
+        let spec = make_spec("approx_topk", "v");
         // TopK is heuristic; just verify the top item count is right.
         let docs_a: Vec<Vec<u8>> = (0..50).map(|i| make_doc_i64("v", i % 3)).collect();
         let docs_b: Vec<Vec<u8>> = (0..50).map(|i| make_doc_i64("v", i % 3)).collect();
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -643,16 +702,16 @@ mod tests {
         let docs_a: Vec<Vec<u8>> = [1i64, 2, 3].iter().map(|&v| make_doc_i64("v", v)).collect();
         let docs_b: Vec<Vec<u8>> = [4i64, 5, 6].iter().map(|&v| make_doc_i64("v", v)).collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined.feed(&spec, d).unwrap();
         }
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -674,16 +733,16 @@ mod tests {
             .map(|&s| make_doc_str("v", s))
             .collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined.feed(&spec, d).unwrap();
         }
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }
@@ -694,7 +753,7 @@ mod tests {
 
     #[test]
     fn merge_from_percentile_cont() {
-        let spec = make_spec("percentile_cont", "0.5:v");
+        let spec = make_spec("percentile_cont", "v");
 
         let docs_a: Vec<Vec<u8>> = [1.0f64, 3.0, 5.0]
             .iter()
@@ -705,16 +764,16 @@ mod tests {
             .map(|&v| make_doc_f64("v", v))
             .collect();
 
-        let mut combined = AggAccum::new(&spec);
+        let mut combined = AggAccum::new(&spec).unwrap();
         for d in docs_a.iter().chain(docs_b.iter()) {
             combined.feed(&spec, d).unwrap();
         }
 
-        let mut a = AggAccum::new(&spec);
+        let mut a = AggAccum::new(&spec).unwrap();
         for d in &docs_a {
             a.feed(&spec, d).unwrap();
         }
-        let mut b = AggAccum::new(&spec);
+        let mut b = AggAccum::new(&spec).unwrap();
         for d in &docs_b {
             b.feed(&spec, d).unwrap();
         }

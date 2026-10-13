@@ -3,193 +3,69 @@
 //! Parse `COPY <collection> TO '<path>' [WITH (...)]` and
 //! `COPY (SELECT ...) TO '<path>' [WITH (...)]`.
 
-use nodedb_types::{starts_with_ascii_case_insensitive, strip_prefix_ascii_case_insensitive};
-
-use crate::ddl_ast::statement::{CopyFormat, CopyToSource, MiscStmt, NodedbStatement};
+use crate::ddl_ast::statement::{CopyToSource, MiscStmt, NodedbStatement};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::find_ascii_case_insensitive;
 
+use super::clause::{ClauseCursor, tokenize};
 use super::copy_from::{
-    detect_format_from_path, extract_quoted_string, parse_with_clause, strip_quotes,
+    CopyDirection, copy_collection_name, copy_direction, detect_format_from_path,
+    parse_copy_options,
 };
 
 /// Try to parse a COPY TO statement.
 ///
-/// Returns `None` if the SQL is not a COPY statement. Returns `Some(Err)` on
-/// parse errors. Returns `Some(Ok(CopyToFile {...}))` on success.
+/// Returns `None` unless the statement is `COPY <relation> TO ...`. Returns
+/// `Some(Err)` on parse errors. Returns `Some(Ok(CopyToFile {...}))` on
+/// success.
 pub(super) fn try_parse(upper: &str, trimmed: &str) -> Option<Result<NodedbStatement, SqlError>> {
-    if !starts_with_ascii_case_insensitive(trimmed, "COPY ") {
+    if !upper.starts_with("COPY ") {
         return None;
     }
+    if copy_direction(trimmed) != Some(CopyDirection::To) {
+        return None;
+    }
+    Some(parse_copy_to(trimmed))
+}
 
-    let after_copy = strip_prefix_ascii_case_insensitive(trimmed, "COPY ")
-        .unwrap_or("")
-        .trim_start();
-    let upper_after = strip_prefix_ascii_case_insensitive(upper, "COPY ")
-        .unwrap_or("")
-        .trim_start();
-
-    // Query form: `COPY (SELECT ...) TO '<path>'` — the `(` starts immediately.
-    // Skip FROM/TO prefix checks; parse_copy_to will handle it.
-    if after_copy.starts_with('(') {
-        // Only claim it if there is a `) TO ` somewhere after the closing paren.
-        // We do a quick scan: find the closing paren, then check for TO.
-        if find_matching_paren(after_copy).is_some_and(|close| {
-            let rest = after_copy[close + 1..].trim_start().to_uppercase();
-            rest.starts_with("TO ")
-        }) {
-            return Some(parse_copy_to(trimmed, after_copy));
+fn parse_copy_to(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "COPY");
+    c.expect_keyword("COPY")?;
+    let source = if c.peek_punct('(') {
+        let query = c.raw_paren("query")?;
+        if query.is_empty() {
+            return Err(c.error("empty query in query form"));
         }
-        return None;
-    }
-
-    // Table form: `COPY <collection> TO '<path>'`.
-    // Only handle the TO form; FROM form is handled in copy_from.
-    // For the table form, look at the upper-case tokens before the first quoted string.
-    let has_to = upper_after.contains(" TO ");
-    let has_from = upper_after.contains(" FROM ");
-    if has_from && (!has_to || upper_after.find(" FROM ") < upper_after.find(" TO ")) {
-        return None;
-    }
-    if !has_to {
-        return None;
-    }
-
-    Some(parse_copy_to(trimmed, after_copy))
-}
-
-fn parse_copy_to(trimmed: &str, after_copy: &str) -> Result<NodedbStatement, SqlError> {
-    // Determine if this is the query form or the table form.
-    if after_copy.starts_with('(') {
-        parse_query_form(trimmed)
+        CopyToSource::Query(query.to_string())
     } else {
-        parse_table_form(trimmed)
-    }
-}
-
-/// `COPY <collection> TO '<path>' [WITH (...)]`
-fn parse_table_form(trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    let to_pos = find_ascii_case_insensitive(trimmed, " TO ").ok_or_else(|| SqlError::Parse {
-        detail: "COPY: missing TO keyword".to_string(),
-    })?;
-
-    // Collection name is between "COPY " and " TO ".
-    let coll_raw = trimmed["COPY ".len()..to_pos].trim();
-    if coll_raw.is_empty() {
-        return Err(SqlError::Parse {
-            detail: "COPY: missing collection name before TO".to_string(),
-        });
-    }
-    let collection = strip_quotes(coll_raw).to_lowercase();
-
-    let after_to = trimmed[to_pos + " TO ".len()..].trim_start();
-    let (path, rest, format, delimiter, header) = parse_path_and_opts(after_to)?;
-
-    let _ = rest; // consumed by parse_path_and_opts
-
-    Ok(NodedbStatement::Misc(MiscStmt::CopyToFile {
-        source: CopyToSource::Collection(collection),
-        path,
-        format,
-        delimiter,
-        header,
-    }))
-}
-
-/// `COPY (SELECT ...) TO '<path>' [WITH (...)]`
-fn parse_query_form(trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    // Find the matching close-paren for the leading `(`.
-    let after_copy = strip_prefix_ascii_case_insensitive(trimmed, "COPY ")
-        .unwrap_or("")
-        .trim_start();
-    let close = find_matching_paren(after_copy).ok_or_else(|| SqlError::Parse {
-        detail: "COPY: unclosed parenthesis in query form".to_string(),
-    })?;
-
-    let query = after_copy
-        .strip_prefix('(')
-        .and_then(|body| close.checked_sub(1).and_then(|end| body.get(..end)))
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if query.is_empty() {
-        return Err(SqlError::Parse {
-            detail: "COPY: empty query in query form".to_string(),
-        });
-    }
-
-    // After the closing paren, expect " TO '<path>'"
-    let after_paren = after_copy[close + 1..].trim_start();
-    if !starts_with_ascii_case_insensitive(after_paren, "TO ") {
-        return Err(SqlError::Parse {
-            detail: format!(
-                "COPY: expected TO after query, got: {}",
-                &after_paren[..after_paren.len().min(32)]
-            ),
-        });
-    }
-
-    let after_to = strip_prefix_ascii_case_insensitive(after_paren, "TO ")
-        .unwrap_or("")
-        .trim_start();
-    let (path, _rest, format, delimiter, header) = parse_path_and_opts(after_to)?;
-
-    Ok(NodedbStatement::Misc(MiscStmt::CopyToFile {
-        source: CopyToSource::Query(query),
-        path,
-        format,
-        delimiter,
-        header,
-    }))
-}
-
-type PathAndOpts<'a> = (String, &'a str, Option<CopyFormat>, Option<char>, bool);
-
-/// Parse `'<path>'` then optional `WITH (...)`.
-/// Returns `(path, remainder, format, delimiter, header)`.
-fn parse_path_and_opts(s: &str) -> Result<PathAndOpts<'_>, SqlError> {
-    let (path, rest) = extract_quoted_string(s)?;
-    let rest = rest.trim();
-
-    let (format, delimiter, header) = if rest.is_empty() {
-        (None, None, true)
-    } else {
-        parse_with_clause(rest)?
+        CopyToSource::Collection(copy_collection_name(&mut c)?)
     };
-
+    c.expect_keyword("TO")?;
+    let path = c.string("TO").map_err(|_| {
+        c.error(format!(
+            "expected single-quoted path after TO — found {}",
+            c.describe_next()
+        ))
+    })?;
+    let (format, delimiter, header) = parse_copy_options(&mut c)?;
     let format = match format {
         Some(f) => Some(f),
         None => detect_format_from_path(&path)?,
     };
-
-    Ok((path, rest, format, delimiter, header))
-}
-
-/// Find the index of the closing `)` matching the opening `(` at position 0.
-fn find_matching_paren(s: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_single_quote = false;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '\'' if !in_single_quote => in_single_quote = true,
-            '\'' if in_single_quote => in_single_quote = false,
-            '(' if !in_single_quote => depth += 1,
-            ')' if !in_single_quote => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    Ok(NodedbStatement::Misc(MiscStmt::CopyToFile {
+        source,
+        path,
+        format,
+        delimiter,
+        header,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ddl_ast::parse::dispatch::parse;
+    use crate::ddl_ast::statement::CopyFormat;
 
     fn ok(sql: &str) -> NodedbStatement {
         parse(sql).expect("expected Some").expect("expected Ok")
@@ -297,19 +173,27 @@ mod tests {
         let stmt = ok("COPY (SELECT * FROM users WHERE active = true) TO '/tmp/out.ndjson'");
         match stmt {
             NodedbStatement::Misc(MiscStmt::CopyToFile { source, path, .. }) => {
-                assert!(matches!(source, CopyToSource::Query(_)));
+                assert_eq!(
+                    source,
+                    CopyToSource::Query("SELECT * FROM users WHERE active = true".to_string())
+                );
                 assert_eq!(path, "/tmp/out.ndjson");
-                if let CopyToSource::Query(q) = source {
-                    assert!(q.to_uppercase().starts_with("SELECT"));
-                }
             }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
+    fn from_inside_the_path_does_not_change_the_direction() {
+        let stmt = ok("COPY users TO '/tmp/copy from mars.csv'");
+        assert!(matches!(
+            stmt,
+            NodedbStatement::Misc(MiscStmt::CopyToFile { .. })
+        ));
+    }
+
+    #[test]
     fn copy_from_not_intercepted() {
-        // COPY FROM should not be caught by try_parse (handled by copy_from).
         let stmt = ok("COPY users FROM '/tmp/data.ndjson'");
         assert!(matches!(
             stmt,

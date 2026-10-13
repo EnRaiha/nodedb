@@ -2,7 +2,7 @@
 
 //! SharedState impl methods: quota, audit, polling, memory estimates.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tracing::warn;
 
@@ -289,20 +289,6 @@ impl SharedState {
     pub fn set_session_timeouts_for_test(&mut self, idle_secs: u64, absolute_secs: u64) {
         self.idle_timeout_secs = idle_secs;
         self.session_absolute_timeout_secs = absolute_secs;
-    }
-
-    /// Access to timeseries partition registries.
-    pub fn timeseries_registries(
-        &self,
-    ) -> Option<
-        &Mutex<
-            std::collections::HashMap<
-                String,
-                crate::engine::timeseries::partition_registry::PartitionRegistry,
-            >,
-        >,
-    > {
-        self.ts_partition_registries.as_ref()
     }
 
     /// Check tenant quota before dispatching a request. Returns Ok if allowed.

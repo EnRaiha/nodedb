@@ -57,6 +57,8 @@ impl CoreLoop {
             database_id: task.request.database_id.as_u64(),
             tid,
             collection: &images.collection,
+            // Post-images are document and CRDT rows only.
+            vector_field: None,
         };
         let mut rows = Vec::with_capacity(images.rows.len());
         for (identity, surrogate) in &images.rows {
@@ -74,6 +76,7 @@ impl CoreLoop {
                 identity: identity.clone(),
                 surrogate: *surrogate,
                 bytes,
+                vector: None,
             });
         }
         self.calvin_render_rows(&at, &images.spec, &images.rls_filters, &rows)

@@ -218,7 +218,10 @@ fn plan_recursive_scan_from_parts(
         join_link,
         max_iterations: DEFAULT_MAX_RECURSION_DEPTH,
         distinct: *distinct,
-        limit: 10000,
+        // No LIMIT returns every row of the recursion; an explicit LIMIT
+        // overwrites this. The recursion depth is bounded by
+        // `max_iterations`, which fails loudly when passed.
+        limit: usize::MAX,
         projection,
     }))
 }

@@ -24,6 +24,9 @@ use crate::control::state::SharedState;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::timeseries::TimeseriesOp;
 
+use nodedb_query::agg_key::canonical_agg_key;
+
+use super::group_key::{AlertGroupCell, AlertGroupKey};
 use super::hysteresis::HysteresisTransition;
 use super::notify::dispatch_notifications;
 use super::registry::AlertRegistry;
@@ -132,7 +135,7 @@ async fn evaluate_alert(
         if transition != HysteresisTransition::NoChange {
             info!(
                 alert = alert.name,
-                group = group_key,
+                group = %group_key,
                 value = agg_value,
                 threshold = alert.condition.threshold,
                 transition = ?transition,
@@ -157,10 +160,15 @@ async fn execute_aggregate_scan(
     alert: &AlertDef,
     window_start: i64,
     window_end: i64,
-) -> crate::Result<Vec<(String, f64)>> {
+) -> crate::Result<Vec<(AlertGroupKey, f64)>> {
     // Encode WHERE filter as MessagePack for the Data Plane filter evaluator.
+    // An encode error fails the evaluation: an empty payload would mean "no
+    // filter" and aggregate every row of the window.
     let filters = match &alert.where_filter {
-        Some(f) => zerompk::to_msgpack_vec(f).unwrap_or_default(),
+        Some(f) => zerompk::to_msgpack_vec(f).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("alert '{}' WHERE filter: {e}", alert.name),
+        })?,
         None => Vec::new(),
     };
 
@@ -171,7 +179,10 @@ async fn execute_aggregate_scan(
         ),
         time_range: (window_start, window_end),
         projection: Vec::new(),
-        limit: 10_000, // Safety cap on group cardinality.
+        // Every group of the window is evaluated: a cut would leave groups
+        // past it unalerted with nothing saying so. The Data Plane bounds the
+        // read by its scan byte budget and fails loudly past it.
+        limit: usize::MAX,
         filters,
         sort_keys: Vec::new(),
         bucket_interval_ms: 0, // No time bucketing — aggregate over entire window.
@@ -185,6 +196,8 @@ async fn execute_aggregate_scan(
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
+        having: Vec::new(),
+        tiering: None,
     });
 
     let payload = sync_dispatch::dispatch_system(
@@ -202,18 +215,27 @@ async fn execute_aggregate_scan(
     )
     .await?;
 
-    decode_aggregate_response(&payload, &alert.group_by, &alert.condition.agg_func)
+    decode_aggregate_response(
+        &payload,
+        &alert.group_by,
+        &canonical_agg_key(&alert.condition.agg_func, &alert.condition.column),
+    )
 }
 
-/// Decode the Data Plane's MessagePack response into (group_key, agg_value) pairs.
+/// Decode the Data Plane's MessagePack response into typed
+/// `(group_key, agg_value)` pairs.
 ///
-/// The response is an `rmpv::Value::Array` of `Map` rows. Each row contains
-/// the group-by columns and the aggregate value (e.g., `"avg_temperature"`).
+/// The response is an array of map rows, one per group. Each row holds every
+/// GROUP BY column and the aggregate under its canonical key (for example
+/// `avg(temperature)`). A row that is not a map, a missing column, or a
+/// non-numeric aggregate is an error. A NULL aggregate (every input value
+/// NULL) gives the group nothing to compare, so the group is not evaluated
+/// this window.
 fn decode_aggregate_response(
     payload: &[u8],
     group_by: &[String],
-    agg_func: &str,
-) -> crate::Result<Vec<(String, f64)>> {
+    agg_key: &str,
+) -> crate::Result<Vec<(AlertGroupKey, f64)>> {
     if payload.is_empty() {
         return Ok(Vec::new());
     }
@@ -225,47 +247,56 @@ fn decode_aggregate_response(
 
     let rows = match value {
         rmpv::Value::Array(rows) => rows,
-        _ => return Ok(Vec::new()),
+        other => {
+            return Err(crate::Error::Internal {
+                detail: format!("aggregate response is not a row array: {other}"),
+            });
+        }
     };
 
     let mut results = Vec::with_capacity(rows.len());
     for row in &rows {
         let rmpv::Value::Map(fields) = row else {
-            continue;
+            return Err(crate::Error::Internal {
+                detail: format!("aggregate response row is not a map: {row}"),
+            });
         };
-
-        // Extract group key: concatenate group-by column values.
-        let group_key = if group_by.is_empty() {
-            "__all__".to_string()
-        } else {
-            group_by
+        let field = |name: &str| {
+            fields
                 .iter()
-                .filter_map(|col| {
-                    fields.iter().find_map(|(k, v)| {
-                        if k.as_str().is_some_and(|s| s == col) {
-                            Some(v.as_str().unwrap_or("").to_string())
-                        } else {
-                            None
-                        }
-                    })
+                .find(|(k, _)| k.as_str() == Some(name))
+                .map(|(_, v)| v)
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: format!("aggregate response row has no column '{name}'"),
                 })
-                .collect::<Vec<_>>()
-                .join("\0")
         };
 
-        // Extract aggregate value by matching the agg key pattern: "{func}_{column}".
-        let agg_value = fields.iter().find_map(|(k, v)| {
-            let key_str = k.as_str()?;
-            if key_str.starts_with(agg_func) {
-                v.as_f64().or_else(|| v.as_i64().map(|i| i as f64))
-            } else {
-                None
-            }
-        });
-
-        if let Some(val) = agg_value {
-            results.push((group_key, val));
+        let mut cells = Vec::with_capacity(group_by.len());
+        for column in group_by {
+            cells.push(AlertGroupCell::from_rmpv(column, field(column)?)?);
         }
+        let group_key = AlertGroupKey::from_cells(cells);
+
+        let agg_value = match field(agg_key)? {
+            rmpv::Value::Nil => continue,
+            rmpv::Value::F64(f) => *f,
+            rmpv::Value::F32(f) => f64::from(*f),
+            rmpv::Value::Integer(n) => match (n.as_i64(), n.as_u64()) {
+                (Some(i), _) => i as f64,
+                (None, Some(u)) => u as f64,
+                (None, None) => {
+                    return Err(crate::Error::Internal {
+                        detail: format!("aggregate '{agg_key}' is an integer out of range"),
+                    });
+                }
+            },
+            other => {
+                return Err(crate::Error::Internal {
+                    detail: format!("aggregate '{agg_key}' is not numeric: {other}"),
+                });
+            }
+        };
+        results.push((group_key, agg_value));
     }
 
     Ok(results)
@@ -343,48 +374,114 @@ mod tests {
         assert_eq!(next_eval_interval_ms(&reg), 60_000);
     }
 
+    fn encode_rows(rows: Vec<rmpv::Value>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(rows)).unwrap();
+        buf
+    }
+
+    fn row(fields: Vec<(&str, rmpv::Value)>) -> rmpv::Value {
+        rmpv::Value::Map(
+            fields
+                .into_iter()
+                .map(|(k, v)| (rmpv::Value::String(k.into()), v))
+                .collect(),
+        )
+    }
+
     #[test]
     fn decode_empty_payload() {
-        let result = decode_aggregate_response(&[], &[], "avg").unwrap();
+        let result = decode_aggregate_response(&[], &[], "avg(t)").unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn decode_grouped_response() {
-        // Build a response: [{device_id: "pump-1", avg_temperature: 95.5}]
-        let row = rmpv::Value::Map(vec![
-            (
-                rmpv::Value::String("device_id".into()),
-                rmpv::Value::String("pump-1".into()),
-            ),
-            (
-                rmpv::Value::String("avg_temperature".into()),
-                rmpv::Value::F64(95.5),
-            ),
-        ]);
-        let array = rmpv::Value::Array(vec![row]);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &array).unwrap();
-
-        let results = decode_aggregate_response(&buf, &["device_id".to_string()], "avg").unwrap();
+        let buf = encode_rows(vec![row(vec![
+            ("device_id", rmpv::Value::String("pump-1".into())),
+            ("avg(temperature)", rmpv::Value::F64(95.5)),
+        ])]);
+        let results =
+            decode_aggregate_response(&buf, &["device_id".to_string()], "avg(temperature)")
+                .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "pump-1");
+        assert_eq!(
+            results[0].0,
+            AlertGroupKey::from_cells(vec![AlertGroupCell::Text("pump-1".into())])
+        );
         assert!((results[0].1 - 95.5).abs() < 1e-12);
     }
 
     #[test]
     fn decode_no_group_response() {
-        let row = rmpv::Value::Map(vec![(
-            rmpv::Value::String("max_cpu".into()),
-            rmpv::Value::F64(99.1),
-        )]);
-        let array = rmpv::Value::Array(vec![row]);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &array).unwrap();
-
-        let results = decode_aggregate_response(&buf, &[], "max").unwrap();
+        let buf = encode_rows(vec![row(vec![("max(cpu)", rmpv::Value::F64(99.1))])]);
+        let results = decode_aggregate_response(&buf, &[], "max(cpu)").unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "__all__");
+        assert_eq!(results[0].0, AlertGroupKey::whole_window());
+        assert_eq!(results[0].0.to_string(), "__all__");
         assert!((results[0].1 - 99.1).abs() < 1e-12);
+    }
+
+    /// Integer `1`, text `'1'`, and NULL group cells are three groups. A
+    /// string join of the cells once read every non-text cell as `""`, so
+    /// integer and NULL groups shared one hysteresis state.
+    #[test]
+    fn typed_group_cells_stay_distinct() {
+        let agg = "avg(t)";
+        let buf = encode_rows(vec![
+            row(vec![
+                ("g", rmpv::Value::Integer(1.into())),
+                (agg, rmpv::Value::F64(1.0)),
+            ]),
+            row(vec![
+                ("g", rmpv::Value::String("1".into())),
+                (agg, rmpv::Value::F64(2.0)),
+            ]),
+            row(vec![("g", rmpv::Value::Nil), (agg, rmpv::Value::F64(3.0))]),
+            row(vec![
+                ("g", rmpv::Value::Integer(2.into())),
+                (agg, rmpv::Value::F64(4.0)),
+            ]),
+        ]);
+        let results = decode_aggregate_response(&buf, &["g".to_string()], agg).unwrap();
+        let keys: std::collections::HashSet<_> = results.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys.len(), 4, "every typed group keeps its own key");
+        let rendered: Vec<String> = results.iter().map(|(k, _)| k.to_string()).collect();
+        assert_eq!(rendered, vec!["1", "'1'", "NULL", "2"]);
+    }
+
+    #[test]
+    fn a_row_that_is_not_a_map_is_an_error() {
+        let buf = encode_rows(vec![rmpv::Value::Integer(7.into())]);
+        assert!(matches!(
+            decode_aggregate_response(&buf, &[], "avg(t)"),
+            Err(crate::Error::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_group_column_is_an_error() {
+        let buf = encode_rows(vec![row(vec![("avg(t)", rmpv::Value::F64(1.0))])]);
+        match decode_aggregate_response(&buf, &["zone".to_string()], "avg(t)") {
+            Err(crate::Error::Internal { detail }) => {
+                assert!(detail.contains("'zone'"), "{detail}")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_aggregate_is_an_error_and_null_is_skipped() {
+        let text = encode_rows(vec![row(vec![(
+            "max(t)",
+            rmpv::Value::String("hot".into()),
+        )])]);
+        assert!(decode_aggregate_response(&text, &[], "max(t)").is_err());
+        let null = encode_rows(vec![row(vec![("avg(t)", rmpv::Value::Nil)])]);
+        assert!(
+            decode_aggregate_response(&null, &[], "avg(t)")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

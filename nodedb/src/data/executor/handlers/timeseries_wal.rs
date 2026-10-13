@@ -146,13 +146,12 @@ impl CoreLoop {
                 continue;
             }
 
-            // Decode the record. The columnar path now uses a map-shaped
-            // `ColumnarWalRecord` carrying per-row surrogates; legacy records
-            // (timeseries 4-tuple, and pre-surrogate columnar 4-tuple / older
-            // 3-/2-tuples) fall back through the tuple shapes with empty
-            // surrogates. Records iterate in LSN order (guaranteed by the WAL
-            // segment layout), so provenance-aware replay processes seq in
-            // order.
+            // Decode the record. A columnar insert is a map-shaped
+            // `ColumnarWalRecord` carrying per-row surrogates. The shorter
+            // tuple shapes decode with empty surrogates. A timeseries record
+            // among them names no ingest format, and its replay refuses it.
+            // Records iterate in LSN order (guaranteed by the WAL segment
+            // layout), so provenance-aware replay processes seq in order.
             let Ok(DecodedBatchRecord {
                 kind,
                 collection: raw_collection,
@@ -666,30 +665,12 @@ mod tests {
             crate::data::executor::applied_prefix::ReplayStamp::through(10_000),
         );
 
-        let batch = nodedb_types::timeseries::TimeseriesWalBatch {
-            collection: "metrics_ungated".to_string(),
-            samples: vec![(1u64, 1_000i64, 42.0f64)],
-            provenance: None,
-        };
-        let payload = zerompk::to_msgpack_vec(&batch).expect("encode ts batch");
-        let rec_bytes = zerompk::to_msgpack_vec(&(
-            "timeseries".to_string(),
-            "metrics_ungated".to_string(),
-            payload,
-            Option::<SyncProvenance>::None,
-        ))
-        .expect("encode timeseries tuple");
-        let record = WalRecord::new(WalRecordArgs {
-            record_type: RecordType::TimeseriesBatch as u32,
-            lsn: 150,
-            tenant_id: 7,
-            vshard_id: 0,
-            database_id: 0,
-            payload: rec_bytes,
-            encryption_key: None,
-            preamble_bytes: None,
-        })
-        .expect("wal record");
+        let record = ilp_wal_record(
+            "metrics_ungated",
+            150,
+            7,
+            "metrics_ungated value=42 1000000000",
+        );
 
         h.core.replay_timeseries_wal(
             std::slice::from_ref(&record),
@@ -706,47 +687,22 @@ mod tests {
         );
     }
 
-    /// Replaying a `TimeseriesWalBatch` larger than the memtable's hard limit
-    /// must retain EVERY sample. The batch is one already-committed WAL record;
-    /// dropping samples that push past the ceiling is silent loss of durable
-    /// data on restart. `ingest_metric` therefore never rejects, and the
-    /// resident footprint overshoots the limit rather than truncating.
+    /// Replaying an ingest record larger than the memtable's hard limit must
+    /// retain every row. The record is already committed, so dropping rows
+    /// past the ceiling loses durable data on restart. The record lands whole,
+    /// and the resident footprint overshoots the limit.
     #[test]
-    fn oversized_timeseries_batch_replays_every_sample() {
+    fn oversized_timeseries_record_replays_every_row() {
         let mut h = make_core();
-        // Size the replay memtable's hard limit far below the batch: 100
-        // samples charge 16 B each (1600 B) against a 64 B ceiling, so the old
-        // reject would have kept only the handful that fit.
+        // 100 rows charge 16 B each (1600 B) against a 64 B ceiling.
         h.core.ts_tuning.memtable_hard_limit_bytes = 64;
         h.core.ts_tuning.memtable_budget_bytes = 32;
 
-        const N: usize = 100;
-        let samples: Vec<(u64, i64, f64)> =
-            (0..N).map(|i| (1u64, 1_000 + i as i64, i as f64)).collect();
-        let batch = nodedb_types::timeseries::TimeseriesWalBatch {
-            collection: "metrics_big".to_string(),
-            samples,
-            provenance: None,
-        };
-        let payload = zerompk::to_msgpack_vec(&batch).expect("encode ts batch");
-        let rec_bytes = zerompk::to_msgpack_vec(&(
-            "timeseries".to_string(),
-            "metrics_big".to_string(),
-            payload,
-            Option::<SyncProvenance>::None,
-        ))
-        .expect("encode timeseries tuple");
-        let record = WalRecord::new(WalRecordArgs {
-            record_type: RecordType::TimeseriesBatch as u32,
-            lsn: 200,
-            tenant_id: 7,
-            vshard_id: 0,
-            database_id: 0,
-            payload: rec_bytes,
-            encryption_key: None,
-            preamble_bytes: None,
-        })
-        .expect("wal record");
+        const N: u64 = 100;
+        let lines: Vec<String> = (0..N)
+            .map(|i| format!("metrics_big value={i} {}", 1_000_000_000 + i * 1_000_000))
+            .collect();
+        let record = ilp_wal_record("metrics_big", 200, 7, &lines.join("\n"));
 
         h.core.replay_timeseries_wal(
             std::slice::from_ref(&record),
@@ -772,9 +728,103 @@ mod tests {
             .map_or(0, |registry| registry.total_row_count());
         assert_eq!(
             memtable_rows + partition_rows,
-            N as u64,
-            "every sample of an over-limit replayed batch must be retained; the \
+            N,
+            "every row of an over-limit replayed record must be retained; the \
              record lands whole, then flushes whole once it settled"
+        );
+    }
+
+    /// A timeseries record that names no ingest format is not a shape any
+    /// writer produces. Restart replay halts on it with nothing applied. It
+    /// never guesses a format from the payload bytes.
+    #[test]
+    fn a_timeseries_record_without_a_format_halts_replay() {
+        let mut h = make_core();
+        let sample = zerompk::to_msgpack_vec(&(
+            "metrics_unformatted".to_string(),
+            vec![(1u64, 1_000i64, 42.0f64)],
+            Option::<SyncProvenance>::None,
+        ))
+        .expect("encode sample payload");
+        let payload = zerompk::to_msgpack_vec(&(
+            "timeseries".to_string(),
+            "metrics_unformatted".to_string(),
+            sample,
+            Option::<SyncProvenance>::None,
+        ))
+        .expect("encode timeseries tuple");
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn: 300,
+            tenant_id: 7,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record");
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert!(
+            h.core.replay_halted(),
+            "a record with no ingest format halts replay"
+        );
+        assert!(
+            h.core.replay_halt_error().is_some(),
+            "the halt carries an error for startup to return"
+        );
+        assert!(
+            h.core.columnar_memtables.is_empty(),
+            "nothing of the refused record is applied"
+        );
+    }
+
+    /// A timeseries record naming a format the ingest handler does not
+    /// accept halts replay. It is never logged and skipped.
+    #[test]
+    fn a_timeseries_record_with_an_unknown_format_halts_replay() {
+        let mut h = make_core();
+        let payload = crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
+            crate::control::server::wal_dispatch::TimeseriesIngestRecord {
+                collection: "metrics_unknown",
+                payload: b"metrics_unknown value=1",
+                provenance: None,
+                format: "samples",
+                default_timestamp_ms: 1_700_000_000_000,
+            },
+        )
+        .expect("encode timeseries ingest record");
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn: 310,
+            tenant_id: 7,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record");
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert!(
+            h.core.replay_halted(),
+            "a record with an unknown ingest format halts replay"
+        );
+        assert!(
+            h.core.columnar_memtables.is_empty(),
+            "nothing of the refused record is applied"
         );
     }
 

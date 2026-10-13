@@ -12,7 +12,7 @@ use super::where_search::{SearchBodyClauses, refuse_dropped_clauses, try_extract
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::ast_helpers::{single_table_qualifiers, strip_single_table_qualifiers};
-use crate::resolver::columns::TableScope;
+use crate::resolver::columns::{ColumnNaming, TableScope};
 use crate::temporal::TemporalScope;
 use crate::types::*;
 
@@ -119,7 +119,19 @@ pub(super) fn plan_select(
 
     // 3. Check for JOINs (including LATERAL).
     if let Some(plan) = try_plan_join(select, &scope, catalog, functions, temporal)? {
-        return Ok(PlannedSelect { plan, scope });
+        // ORDER BY sorts the rows the join plan emits. A join emits merged
+        // rows keyed `qualifier.column`. An aggregate over a join emits
+        // group rows keyed by bare column name. A LATERAL plan keeps
+        // references as written.
+        let naming = match &plan {
+            SqlPlan::Join { .. } => ColumnNaming::JoinRow,
+            SqlPlan::Aggregate { .. } => ColumnNaming::OutputRow,
+            _ => ColumnNaming::AsWritten,
+        };
+        return Ok(PlannedSelect {
+            plan,
+            scope: scope.with_column_naming(naming),
+        });
     }
 
     // 3b. Comma-LATERAL syntax: `FROM t, LATERAL (SELECT ...) x`.
@@ -198,8 +210,20 @@ pub(super) fn plan_select(
 
     // 6. Check for GROUP BY / aggregation.
     if has_aggregation(select, functions) {
+        let input_joins = subquery_joins
+            .iter()
+            .any(|sq| sq.join_type != JoinType::Cross);
         let mut plan = crate::planner::aggregate::plan_aggregate(
-            select, table, &filters, &scope, functions, &temporal,
+            crate::planner::aggregate::AggregateQuery {
+                select,
+                order_by: tail.order_by,
+                table,
+                filters: &filters,
+                scope: &scope,
+                temporal: &temporal,
+                input_joins,
+            },
+            functions,
         )?;
 
         // Semi/anti subquery joins belong below the aggregate so they filter
@@ -304,6 +328,7 @@ pub(super) fn plan_select(
         indexes: table.info.indexes.clone(),
         temporal,
         bitemporal: table.info.bitemporal,
+        has_auto_tier: table.info.has_auto_tier,
     })?;
 
     // 10. Wrap with subquery joins (semi/anti/cross) if any.
@@ -385,10 +410,7 @@ fn has_column_comparison(expr: &SqlExpr) -> bool {
 }
 
 /// Check if a SELECT has aggregation (GROUP BY or aggregate functions in projection).
-pub(in crate::planner::select) fn has_aggregation(
-    select: &Select,
-    functions: &FunctionRegistry,
-) -> bool {
+pub(crate) fn has_aggregation(select: &Select, functions: &FunctionRegistry) -> bool {
     let group_by_non_empty = match &select.group_by {
         ast::GroupByExpr::All(_) => true,
         ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),

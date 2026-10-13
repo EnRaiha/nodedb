@@ -94,18 +94,15 @@ pub fn describe_collection(
         }
     }
 
-    // Show storage mode info.
-    if coll.collection_type.is_strict()
-        || coll.collection_type.is_columnar_family()
-        || coll.collection_type.is_kv()
-    {
-        push_describe_row(
-            &mut rows,
-            "__storage",
-            coll.collection_type.as_str(),
-            "false",
-        );
-    }
+    // The storage engine, for every collection kind. It is the name
+    // `WITH (engine='...')` selects it by. A vector-primary collection keeps
+    // its metadata in a document store, but its engine is `vector`.
+    let engine = if matches!(coll.primary, nodedb_types::PrimaryEngine::Vector) {
+        "vector"
+    } else {
+        coll.collection_type.as_str()
+    };
+    push_describe_row(&mut rows, "__storage", engine, "false");
 
     // Timeseries-specific info: show collection_type and config.
     if coll.collection_type.is_timeseries() {

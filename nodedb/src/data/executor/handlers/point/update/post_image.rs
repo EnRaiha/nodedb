@@ -141,10 +141,18 @@ impl CoreLoop {
             }
         }
 
-        // Fast path: non-strict, no generated columns, all literal, identity
-        // untouched — merge at binary level.
+        // A collection with typeguards rewrites and validates the post-image,
+        // so it takes the decode path.
+        let has_guards = self
+            .doc_configs
+            .get(config_key)
+            .is_some_and(|c| !c.crdt_enabled && !c.type_guards.is_empty());
+
+        // Fast path: non-strict, no generated columns, no typeguards, all
+        // literal, identity untouched — merge at binary level.
         if !is_strict
             && !has_generated
+            && !has_guards
             && !has_expr
             && !assigns_identity(None, declared_primary_key, updates)
         {
@@ -244,15 +252,24 @@ impl CoreLoop {
             .check_unchanged(&config_key.2, &doc)
             .map_err(ErrorCode::from)?;
 
-        // Recompute generated columns.
-        if has_generated
-            && let Some(config) = self.doc_configs.get(config_key)
-            && let Err(e) = crate::data::executor::handlers::generated::evaluate_generated_columns(
-                &mut doc,
-                &config.enforcement.generated_columns,
-            )
-        {
-            return Err(e);
+        // Apply typeguards to the post-image: VALUE recomputes, DEFAULT
+        // refills an absent or null field, and the assigned and injected
+        // fields are validated. Then recompute generated columns.
+        if let Some(config) = self.doc_configs.get(config_key) {
+            if has_guards {
+                let assigned = crate::data::executor::handlers::write_body::assigned_names(updates);
+                crate::data::executor::enforcement::typeguard::enforce_type_guards(
+                    &config.type_guards,
+                    &mut doc,
+                    crate::data::executor::enforcement::typeguard::GuardScope::Assigned(&assigned),
+                )?;
+            }
+            if has_generated {
+                crate::data::executor::handlers::generated::evaluate_generated_columns(
+                    &mut doc,
+                    &config.enforcement.generated_columns,
+                )?;
+            }
         }
 
         // A declared numeric column holds the value its type stores, whether

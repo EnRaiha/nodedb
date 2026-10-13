@@ -31,7 +31,7 @@ impl CoreLoop {
     ) -> Response {
         let UpdateFromJoinParams {
             target_collection,
-            source_collection,
+            source_label,
             source_alias,
             target_join_col,
             source_join_col,
@@ -49,17 +49,15 @@ impl CoreLoop {
         debug!(
             core = self.core_id,
             target = %target_collection,
-            source = %source_collection,
+            source = %source_label,
             resolve_only,
             "update from join"
         );
 
-        // Phase 1: Scan source collection, build join map:
-        //   source_join_value (as string) → serde_json::Value (the source document).
-        let source_map = match self.build_source_join_map(
-            task.request.database_id.as_u64(),
-            tid,
-            source_collection,
+        // Index the shipped source rows by join key.
+        let source_map = match super::join_source_map::JoinSource::build(
+            "UPDATE ... FROM",
+            source_label,
             source_join_col,
             source_rows,
         ) {

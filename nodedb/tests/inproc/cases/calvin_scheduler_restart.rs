@@ -45,6 +45,7 @@ fn append_stamped(wal: &WalManager, vshard_id: u32, epoch: u64, position: u32) {
         row_sources: Vec::new(),
         publishes: Vec::new(),
         row_changes: Vec::new(),
+        user_roles: Vec::new(),
     };
     wal.appender(NO_APPLY_KEY)
         .with_event_source(EventSource::User)

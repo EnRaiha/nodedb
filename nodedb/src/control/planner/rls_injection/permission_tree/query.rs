@@ -114,9 +114,9 @@ pub(super) fn apply_query(ctx: &PermCtx<'_>, op: &mut QueryOp) -> crate::Result<
             Ok(())
         }
 
-        // Filter: neither variant takes a resolved child input, so both
-        // collections are read directly by the handler and both slots are
-        // always populated.
+        // Filter: planning sets neither variant's resolved input. The
+        // coordinator sets one inside a transaction, after this pass, and
+        // moves the side's policy onto it. Both slots are populated here.
         QueryOp::NestedLoopJoin {
             left_collection,
             right_collection,
@@ -230,8 +230,6 @@ mod tests {
             on: Vec::new(),
             join_type: "inner".into(),
             limit: 0,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),

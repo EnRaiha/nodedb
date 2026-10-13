@@ -197,6 +197,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         nodedb_wal::WalRecord::new(WalRecordArgs {
             record_type: RecordType::TransactionRedo as u32,

@@ -489,6 +489,7 @@ fn rollback_matrix_columnar_count_after_rollback() {
                 user_alias: None,
                 field: "*".into(),
                 expr: None,
+                param: None,
             }],
             filters: Vec::new(),
             having: Vec::new(),
@@ -596,6 +597,8 @@ fn rollback_matrix_timeseries_then_doc_fail() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: Vec::new(),
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(scan_resp.status, Status::Ok);
@@ -709,6 +712,8 @@ fn rollback_matrix_timeseries_count_after_rollback() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: Vec::new(),
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(scan_resp.status, Status::Ok);

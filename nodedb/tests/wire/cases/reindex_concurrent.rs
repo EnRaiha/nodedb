@@ -38,7 +38,8 @@ async fn reindex_concurrently_vector() {
 
     server
         .exec(
-            "CREATE COLLECTION vecs FIELDS (id TEXT, emb VECTOR(4)) WITH (engine='vector', m=8, ef_construction=50)",
+            "CREATE COLLECTION vecs (id STRING PRIMARY KEY, emb VECTOR(4)) \
+             WITH (engine='vector', vector_field='emb', dim=4, m=8, ef_construction=50)",
         )
         .await
         .unwrap();

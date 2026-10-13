@@ -14,10 +14,11 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use super::group_key::AlertGroupKey;
 use super::types::AlertStatus;
 
-/// State key: database, tenant, alert name, group key.
-type StateKey = (u64, u64, String, String);
+/// State key: database, tenant, alert name, typed group key.
+type StateKey = (u64, u64, String, AlertGroupKey);
 
 /// Per-group alert state.
 #[derive(Debug, Clone)]
@@ -69,8 +70,8 @@ pub struct EvaluateParams<'a> {
     pub tenant_id: u64,
     /// Alert rule name.
     pub alert_name: &'a str,
-    /// Group key (e.g. a device/series identifier) within the alert.
-    pub group_key: &'a str,
+    /// Typed group key (e.g. a device/series identifier) within the alert.
+    pub group_key: &'a AlertGroupKey,
     /// Whether the alert condition evaluated true this window.
     pub condition_met: bool,
     /// The aggregate value that was evaluated.
@@ -118,7 +119,7 @@ impl HysteresisManager {
             database_id,
             tenant_id,
             alert_name.to_string(),
-            group_key.to_string(),
+            group_key.clone(),
         );
         let mut states = self.states.write().unwrap_or_else(|p| p.into_inner());
         let state = states.entry(key).or_insert_with(AlertGroupState::new);
@@ -153,13 +154,13 @@ impl HysteresisManager {
         database_id: u64,
         tenant_id: u64,
         alert_name: &str,
-        group_key: &str,
+        group_key: &AlertGroupKey,
     ) -> Option<AlertGroupState> {
         let key = (
             database_id,
             tenant_id,
             alert_name.to_string(),
-            group_key.to_string(),
+            group_key.clone(),
         );
         self.states
             .read()
@@ -174,7 +175,7 @@ impl HysteresisManager {
         database_id: u64,
         tenant_id: u64,
         alert_name: &str,
-    ) -> Vec<(String, AlertGroupState)> {
+    ) -> Vec<(AlertGroupKey, AlertGroupState)> {
         self.states
             .read()
             .unwrap_or_else(|p| p.into_inner())
@@ -204,6 +205,14 @@ impl Default for HysteresisManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::alert::group_key::AlertGroupCell;
+
+    /// A one-column text group key that lives for the whole test.
+    fn key(name: &str) -> &'static AlertGroupKey {
+        Box::leak(Box::new(AlertGroupKey::from_cells(vec![
+            AlertGroupCell::Text(name.to_string()),
+        ])))
+    }
 
     #[test]
     fn fires_after_consecutive_windows() {
@@ -214,7 +223,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
-            group_key: "g1",
+            group_key: key("g1"),
             condition_met: true,
             value: 91.0,
             fire_after: 3,
@@ -227,7 +236,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
-            group_key: "g1",
+            group_key: key("g1"),
             condition_met: true,
             value: 92.0,
             fire_after: 3,
@@ -240,7 +249,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
-            group_key: "g1",
+            group_key: key("g1"),
             condition_met: true,
             value: 93.0,
             fire_after: 3,
@@ -254,7 +263,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "alert1",
-            group_key: "g1",
+            group_key: key("g1"),
             condition_met: true,
             value: 94.0,
             fire_after: 3,
@@ -273,7 +282,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: true,
             value: 91.0,
             fire_after: 1,
@@ -284,7 +293,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: true,
             value: 92.0,
             fire_after: 1,
@@ -297,7 +306,7 @@ mod tests {
                 database_id: 1,
                 tenant_id: 1,
                 alert_name: "a",
-                group_key: "g",
+                group_key: key("g"),
                 condition_met: true,
                 value: 93.0,
                 fire_after: 1,
@@ -312,7 +321,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: false,
             value: 89.0,
             fire_after: 1,
@@ -325,7 +334,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: false,
             value: 88.0,
             fire_after: 1,
@@ -344,7 +353,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: true,
             value: 91.0,
             fire_after: 3,
@@ -355,7 +364,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: true,
             value: 92.0,
             fire_after: 3,
@@ -366,7 +375,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: false,
             value: 89.0,
             fire_after: 3,
@@ -377,7 +386,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: true,
             value: 91.0,
             fire_after: 3,
@@ -388,7 +397,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met: true,
             value: 92.0,
             fire_after: 3,
@@ -406,7 +415,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "device-1",
+            group_key: key("device-1"),
             condition_met: true,
             value: 91.0,
             fire_after: 1,
@@ -420,7 +429,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "device-2",
+            group_key: key("device-2"),
             condition_met: false,
             value: 80.0,
             fire_after: 1,
@@ -430,7 +439,7 @@ mod tests {
         assert_eq!(r2, HysteresisTransition::NoChange); // Cleared, false → no change.
 
         // device-1 still Active.
-        let state = mgr.get_state(1, 1, "a", "device-1").unwrap();
+        let state = mgr.get_state(1, 1, "a", key("device-1")).unwrap();
         assert_eq!(state.status, AlertStatus::Active);
     }
 
@@ -441,7 +450,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g1",
+            group_key: key("g1"),
             condition_met: true,
             value: 91.0,
             fire_after: 1,
@@ -452,7 +461,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g2",
+            group_key: key("g2"),
             condition_met: true,
             value: 92.0,
             fire_after: 1,
@@ -463,7 +472,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "b",
-            group_key: "g3",
+            group_key: key("g3"),
             condition_met: true,
             value: 93.0,
             fire_after: 1,
@@ -482,7 +491,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g1",
+            group_key: key("g1"),
             condition_met: true,
             value: 91.0,
             fire_after: 1,
@@ -493,7 +502,7 @@ mod tests {
             database_id: 1,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g2",
+            group_key: key("g2"),
             condition_met: true,
             value: 92.0,
             fire_after: 1,
@@ -510,7 +519,7 @@ mod tests {
             database_id,
             tenant_id: 1,
             alert_name: "a",
-            group_key: "g",
+            group_key: key("g"),
             condition_met,
             value: 91.0,
             fire_after: 3,
@@ -535,11 +544,11 @@ mod tests {
         // Database 8 saw one true window, so it must still be Cleared.
         let r = mgr.evaluate(params(8, true, 4000));
         assert_eq!(r, HysteresisTransition::NoChange);
-        let state = mgr.get_state(8, 1, "a", "g").expect("state exists");
+        let state = mgr.get_state(8, 1, "a", key("g")).expect("state exists");
         assert_eq!(state.status, AlertStatus::Cleared);
         assert_eq!(state.consecutive_fire, 1);
 
-        let other = mgr.get_state(7, 1, "a", "g").expect("state exists");
+        let other = mgr.get_state(7, 1, "a", key("g")).expect("state exists");
         assert_eq!(other.status, AlertStatus::Active);
     }
 
@@ -551,8 +560,8 @@ mod tests {
 
         mgr.remove_alert(7, 1, "a");
 
-        assert!(mgr.get_state(7, 1, "a", "g").is_none());
-        assert!(mgr.get_state(8, 1, "a", "g").is_some());
+        assert!(mgr.get_state(7, 1, "a", key("g")).is_none());
+        assert!(mgr.get_state(8, 1, "a", key("g")).is_some());
         assert_eq!(mgr.list_states(8, 1, "a").len(), 1);
     }
 
@@ -560,31 +569,52 @@ mod tests {
     fn list_states_filters_by_database() {
         let mgr = HysteresisManager::new();
         mgr.evaluate(EvaluateParams {
-            group_key: "g1",
+            group_key: key("g1"),
             ..params(7, true, 1000)
         });
         mgr.evaluate(EvaluateParams {
-            group_key: "g2",
+            group_key: key("g2"),
             ..params(7, true, 1000)
         });
         mgr.evaluate(EvaluateParams {
-            group_key: "g3",
+            group_key: key("g3"),
             ..params(8, true, 1000)
         });
 
         let mut db7: Vec<String> = mgr
             .list_states(7, 1, "a")
             .into_iter()
-            .map(|(g, _)| g)
+            .map(|(g, _)| g.to_string())
             .collect();
         db7.sort();
-        assert_eq!(db7, vec!["g1".to_string(), "g2".to_string()]);
+        assert_eq!(db7, vec!["'g1'".to_string(), "'g2'".to_string()]);
 
         let db8: Vec<String> = mgr
             .list_states(8, 1, "a")
             .into_iter()
-            .map(|(g, _)| g)
+            .map(|(g, _)| g.to_string())
             .collect();
-        assert_eq!(db8, vec!["g3".to_string()]);
+        assert_eq!(db8, vec!["'g3'".to_string()]);
+    }
+
+    /// Integer `1`, text `'1'`, and NULL are three groups with three
+    /// independent counters.
+    #[test]
+    fn typed_groups_keep_independent_state() {
+        let mgr = HysteresisManager::new();
+        let int = AlertGroupKey::from_cells(vec![AlertGroupCell::Int(1)]);
+        let text = AlertGroupKey::from_cells(vec![AlertGroupCell::Text("1".into())]);
+        let null = AlertGroupKey::from_cells(vec![AlertGroupCell::Null]);
+        for group_key in [&int, &text, &null] {
+            mgr.evaluate(EvaluateParams {
+                group_key,
+                ..params(7, true, 1000)
+            });
+        }
+        assert_eq!(mgr.list_states(7, 1, "a").len(), 3);
+        for group_key in [&int, &text, &null] {
+            let state = mgr.get_state(7, 1, "a", group_key).expect("state exists");
+            assert_eq!(state.consecutive_fire, 1);
+        }
     }
 }

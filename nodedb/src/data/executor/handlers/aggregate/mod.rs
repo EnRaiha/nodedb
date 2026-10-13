@@ -9,7 +9,8 @@
 //! O(total_matching_docs × avg_doc_size).
 //!
 //! Split by concern so each file stays under the project's hard size limit:
-//! `exec` (dispatch + fast paths), `streaming` (the spill-backed group-by
+//! `exec` (dispatch + fast paths), `input_docs` (the rows an aggregate
+//! folds), `streaming` (the spill-backed group-by
 //! accumulation, itself split into accumulate / finalize / over_docs phases),
 //! `cache_key` (result-cache key derivation), `rows` (post-aggregate alias
 //! renaming, HAVING and ORDER BY sorting), `state_emit` (the distributed-shuffle
@@ -18,6 +19,7 @@
 mod cache_entry;
 mod cache_key;
 pub(in crate::data::executor) mod exec;
+pub(in crate::data::executor) mod input_docs;
 mod invalidate;
 pub(in crate::data::executor::handlers) mod rows;
 pub(in crate::data::executor) mod shuffle_merge;

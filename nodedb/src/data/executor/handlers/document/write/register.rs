@@ -105,6 +105,14 @@ impl CoreLoop {
             vector_fields: vector_fields.to_vec(),
             declared_columns: declared_columns.to_vec(),
             declared_key: declared_key.map(str::to_string),
+            // A violation names the collection the user wrote, never the
+            // database-qualified key the plan carries.
+            type_guards:
+                crate::data::executor::enforcement::typeguard::CompiledTypeGuard::compile_all(
+                    nodedb_types::QualifiedCollection::from_stored(collection.to_string())
+                        .collection_name(task.request.database_id),
+                    &enforcement.type_guards,
+                ),
         };
 
         // Rehydrate the durable CRDT conflict-resolution policy (if any) into

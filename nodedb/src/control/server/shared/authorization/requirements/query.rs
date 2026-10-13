@@ -1,7 +1,11 @@
+use nodedb_physical::physical_plan::GatheredSource;
+
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::gateway::version_set::touched_collections;
+use crate::control::security::identity::{Permission, required_permission};
 
 use super::AuthorizationRequirement;
-use super::collect::{add_general_requirements, add_read};
+use super::collect::{add_collection_requirement, add_general_requirements, add_read};
 
 pub(super) fn collect_query_requirements<'a>(
     plan: &'a PhysicalPlan,
@@ -46,9 +50,18 @@ pub(super) fn collect_query_requirements<'a>(
         }
         PhysicalPlan::Query(QueryOp::Aggregate { input, .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregateState { input, .. }) => {
-            add_general_requirements(plan, out);
-            if let Some(nested) = input {
-                pending.push(nested);
+            match input {
+                // An input-sourced aggregate reads its input. Its own
+                // collection is empty unless it names a provider relation,
+                // and an empty name is no relation to authorize.
+                Some(nested) => {
+                    let permission = required_permission(plan);
+                    for collection in touched_collections(plan) {
+                        add_collection_requirement(&collection, permission, out);
+                    }
+                    pending.push(nested);
+                }
+                None => add_general_requirements(plan, out),
             }
             true
         }
@@ -89,7 +102,23 @@ pub(super) fn collect_query_requirements<'a>(
             add_read(provider, out);
             true
         }
-        PhysicalPlan::Query(QueryOp::ProviderScan { provider: None, .. }) => true,
+        // Gathered rows carry the requirements of the child they came from.
+        // Constant rows carry none, and the tenant-wide fallback applies.
+        PhysicalPlan::Query(QueryOp::ProviderScan {
+            provider: None,
+            sources,
+            ..
+        }) => {
+            for source in sources {
+                match source {
+                    GatheredSource::Collection(collection) => add_read(collection, out),
+                    GatheredSource::Tenant => {
+                        out.push(AuthorizationRequirement::tenant(Permission::Read))
+                    }
+                }
+            }
+            true
+        }
         PhysicalPlan::Vector(VectorOp::Search {
             inline_prefilter_plan,
             ..

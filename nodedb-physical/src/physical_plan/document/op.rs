@@ -6,6 +6,7 @@ use nodedb_types::{
 
 use super::merge_types::MergeClauseOp;
 use super::ollp_edge::OllpPredictedEdge;
+use super::row_source::RowSource;
 use super::sum_target::ResolvedSumTarget;
 use super::timeseries_schema::TimeseriesSchema;
 use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMode, UpdateValue};
@@ -200,10 +201,19 @@ pub enum DocumentOp {
     },
 
     /// Batch insert documents in a single redb transaction.
+    ///
+    /// Every row is judged as a `PointInsert` judges it: a key already
+    /// stored, or one the page names twice, is refused with a `unique`
+    /// violation (23505) and the page writes nothing. With `if_absent` a
+    /// stored key skips its row instead, as `ON CONFLICT DO NOTHING` does.
     BatchInsert {
         collection: QualifiedCollection,
         /// (document_id, value_bytes) pairs.
         documents: Vec<(String, Vec<u8>)>,
+        /// `INSERT ... ON CONFLICT DO NOTHING`: a row whose key is already
+        /// stored is skipped, not refused. See `PointInsert::if_absent`.
+        #[serde(default)]
+        if_absent: bool,
         /// Per-row surrogates, parallel to `documents`: one bound surrogate
         /// per row. A batch with a `Surrogate::ZERO` entry is refused before
         /// any row is written.
@@ -360,16 +370,13 @@ pub enum DocumentOp {
         field: String,
     },
 
-    /// INSERT ... SELECT: copy documents from source to target.
+    /// INSERT ... SELECT: copy the rows of a source relation into the target.
+    /// The Control Plane orchestrates it: it reads `source`, gives each row
+    /// a fresh target surrogate, and writes the rows. It never reaches the
+    /// Data Plane as itself.
     InsertSelect {
         target_collection: QualifiedCollection,
-        source_collection: QualifiedCollection,
-        source_filters: Vec<u8>,
-        source_limit: usize,
-        /// zerompk-encoded `Vec<ComputedColumn>`: one entry per target column,
-        /// its `alias` the target column name and its `expr` the source-row
-        /// expression. Empty means copy each source row unchanged.
-        column_map: Vec<u8>,
+        source: RowSource,
     },
 
     /// Upsert: insert or merge. When `on_conflict_updates` is non-empty,
@@ -401,12 +408,14 @@ pub enum DocumentOp {
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
-    /// Update target rows matched by a join with a source collection: scan
-    /// source, build a merged doc per matching target row (source fields
-    /// qualified `<alias>.<field>`), evaluate `updates`, write back.
+    /// Update target rows matched by a join with a source relation: build a
+    /// merged doc per matching target row (source fields qualified
+    /// `<alias>.<field>`), evaluate `updates`, write back.
     UpdateFromJoin {
         target_collection: QualifiedCollection,
-        source_collection: QualifiedCollection,
+        /// The source relation. The Control Plane reads it and ships its rows
+        /// in `source_rows`; the Data Plane never reads it.
+        source: RowSource,
         /// Qualifier used for source columns in assignment expressions.
         source_alias: String,
         /// Field in the target used for the equi-join.
@@ -419,13 +428,12 @@ pub enum DocumentOp {
         target_filters: Vec<u8>,
         #[serde(default)]
         returning: Option<ReturningSpec>,
-        /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`.
-        /// When `Some`, the join-map is built from these pre-scanned
-        /// `(source_doc_id, raw_stored_bytes)` rows instead of local storage —
-        /// needed because source and target can live on different
-        /// Data-Plane cores. `None` = legacy local-read path.
+        /// The source rows, read by the Control Plane, each a standard
+        /// msgpack map. The Data Plane builds the join map from them only.
+        /// `None` is the unresolved shape every Control-Plane entry point
+        /// intercepts; the Data Plane refuses it.
         #[serde(default)]
-        source_rows: Option<Vec<(String, Vec<u8>)>>,
+        source_rows: Option<Vec<Vec<u8>>>,
         /// See `PointDelete::rls_filters`; every returned row is a target row.
         #[serde(default)]
         rls_filters: Vec<u8>,
@@ -511,7 +519,8 @@ pub enum DocumentOp {
     /// with no source match applying `NotMatchedBySource`.
     Merge {
         target_collection: QualifiedCollection,
-        source_collection: QualifiedCollection,
+        /// See `UpdateFromJoin::source`.
+        source: RowSource,
         /// Qualifier used for source columns in assignment expressions.
         source_alias: String,
         target_join_col: String,
@@ -520,7 +529,8 @@ pub enum DocumentOp {
         #[serde(default)]
         returning: Option<ReturningSpec>,
         /// Control-Plane-pre-assigned surrogates for NOT-MATCHED insert rows,
-        /// keyed by source join value. When `Some`, the handler re-verifies
+        /// keyed by source row id (the row's position in `source_rows`, as
+        /// text). When `Some`, the handler re-verifies
         /// the insert set against these keys (`OllpRetryRequired` on drift,
         /// no write) and applies every arm in one redb transaction. `None`
         /// is the unresolved shape every Control-Plane entry point
@@ -536,7 +546,7 @@ pub enum DocumentOp {
         resolved_insert_identities: Vec<(String, u32)>,
         /// See `UpdateFromJoin::source_rows`.
         #[serde(default)]
-        source_rows: Option<Vec<(String, Vec<u8>)>>,
+        source_rows: Option<Vec<Vec<u8>>>,
         /// See `PointDelete::rls_filters`; every returned row is a target row.
         #[serde(default)]
         rls_filters: Vec<u8>,

@@ -176,6 +176,8 @@ pub(crate) async fn execute_plan_all_local_cores(
             | MetaOp::RegisterContinuousAggregate { .. }
             | MetaOp::UnregisterContinuousAggregate { .. }
             | MetaOp::ListContinuousAggregates
+            | MetaOp::ContinuousAggregatesRegistered
+            | MetaOp::AwaitContinuousAggregateRefresh { .. }
             | MetaOp::ConvertCollection { .. }
             | MetaOp::PurgeTenant { .. }
             | MetaOp::UnregisterCollection { .. }

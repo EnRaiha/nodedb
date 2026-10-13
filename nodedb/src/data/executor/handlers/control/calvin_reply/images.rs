@@ -13,9 +13,9 @@ use super::target::RowEngine;
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::returning_rows::{
-    build_stored_rows_payload, kv_stored_rows_payload, vector_stored_rows_payload,
+    VectorRowColumns, build_stored_rows_payload, kv_stored_rows_payload, vector_stored_rows_payload,
 };
-use crate::data::executor::handlers::transaction::overlay::staged_vector_sidecar;
+use crate::data::executor::handlers::transaction::overlay::StagedVectorRow;
 use crate::data::executor::handlers::transaction::stage_write::unhex_key;
 
 /// One row's identity and the stored bytes of the image `RETURNING`
@@ -24,6 +24,9 @@ pub(super) struct StoredRow {
     pub identity: RowIdentity,
     pub surrogate: Surrogate,
     pub bytes: Vec<u8>,
+    /// A staged vector-primary row's vector. `None` for a base row, whose
+    /// vector is its node's, and for every other engine.
+    pub vector: Option<Vec<f32>>,
 }
 
 /// Where a row lives, for a base read.
@@ -32,18 +35,27 @@ pub(super) struct RowLocation<'a> {
     pub database_id: u64,
     pub tid: u64,
     pub collection: &'a str,
+    /// The vector field a vector-primary plan writes, read off the plan.
+    /// `None` for every other engine.
+    pub vector_field: Option<&'a str>,
 }
 
-/// The stored bytes of a row staged as `body`. A staged vector-primary row
-/// carries its vector beside its sidecar, and only the sidecar is rendered.
-pub(super) fn staged_row_bytes(engine: RowEngine, body: &[u8]) -> Result<Vec<u8>, ErrorCode> {
+/// The stored bytes of a row staged as `body`, with its vector for a staged
+/// vector-primary row, which carries its vector beside its sidecar.
+pub(super) fn staged_row_image(
+    engine: RowEngine,
+    body: &[u8],
+) -> Result<(Vec<u8>, Option<Vec<f32>>), ErrorCode> {
     match engine {
-        RowEngine::Vector => staged_vector_sidecar(body).map_err(ErrorCode::from),
+        RowEngine::Vector => {
+            let row = StagedVectorRow::from_bytes(body).map_err(ErrorCode::from)?;
+            Ok((row.sidecar, Some(row.vector)))
+        }
         RowEngine::Document
         | RowEngine::Crdt
         | RowEngine::Kv
         | RowEngine::Columnar
-        | RowEngine::Timeseries => Ok(body.to_vec()),
+        | RowEngine::Timeseries => Ok((body.to_vec(), None)),
     }
 }
 
@@ -71,6 +83,7 @@ impl CoreLoop {
             database_id,
             tid,
             collection,
+            ..
         } = *at;
         match engine {
             RowEngine::Document | RowEngine::Crdt => {
@@ -152,13 +165,42 @@ impl CoreLoop {
                     .iter()
                     .map(|row| StorageKey::for_surrogate(row.surrogate))
                     .collect();
-                let stored: Vec<(&StorageKey, &[u8])> = keys
+                // The plan names its vector field. The collection config is
+                // not consulted: a Calvin install can precede the core's
+                // registration of the collection.
+                let field = at.vector_field.ok_or_else(|| ErrorCode::Internal {
+                    detail: format!(
+                        "calvin RETURNING: the vector-primary plan on '{}' names no vector field",
+                        at.collection
+                    ),
+                })?;
+                // A staged row carries its vector. A base row's is its node's.
+                let vectors: Vec<Vec<f32>> = rows
+                    .iter()
+                    .map(|row| match &row.vector {
+                        Some(vector) => Ok(vector.clone()),
+                        None => self.committed_primary_vector(
+                            at.database_id,
+                            at.tid,
+                            at.collection,
+                            field,
+                            row.surrogate,
+                        ),
+                    })
+                    .collect::<crate::Result<_>>()
+                    .map_err(ErrorCode::from)?;
+                let stored: Vec<(&StorageKey, &[u8], &[f32])> = keys
                     .iter()
                     .zip(rows)
-                    .map(|(key, row)| (key, row.bytes.as_slice()))
+                    .zip(vectors.iter())
+                    .map(|((key, row), vector)| (key, row.bytes.as_slice(), vector.as_slice()))
                     .collect();
                 let identity_column = self.identity_column(at.database_id, at.tid, at.collection);
-                vector_stored_rows_payload(spec, rls_filters, &identity_column, &stored)
+                let columns = VectorRowColumns {
+                    identity: &identity_column,
+                    vector: field,
+                };
+                vector_stored_rows_payload(spec, rls_filters, columns, &stored)
                     .map_err(ErrorCode::from)
             }
             RowEngine::Columnar | RowEngine::Timeseries => Err(ErrorCode::Internal {

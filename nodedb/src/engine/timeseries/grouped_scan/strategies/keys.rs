@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Integer group keys: packing a row's group columns into `u64` parts,
-//! hashing them, and resolving them back to the string key emission reads.
+//! hashing them, and resolving them back to the typed key emission reads.
 
 use super::super::super::columnar_memtable::{ColumnData, ColumnType};
+use super::super::group_key::{GroupCell, GroupKey, key_cell};
 use super::super::types::ResolvedSchema;
 
 /// Integer group key for local (per-source) grouping.
@@ -78,65 +79,42 @@ pub(super) fn build_generic_key(
         .collect()
 }
 
-/// Append the string form of one packed key part for a column of type `ty`.
+/// The key cells of packed GROUP BY `parts`, one per GROUP BY column.
 ///
-/// A symbol resolves through its dictionary and appends nothing when the id
-/// is unknown. Integers and time columns render as the signed integer packed,
-/// floats from their bit pattern.
-pub(super) fn push_key_part<'a>(
-    out: &mut String,
-    col_idx: usize,
-    ty: ColumnType,
-    part: u64,
+/// `columns` is the source's column data: a GROUP BY column the source holds
+/// no data for is NULL in every row. See [`key_cell`] for each cell.
+pub(super) fn key_cells<'a>(
+    parts: &[u64],
+    resolved: &ResolvedSchema,
+    columns: &[Option<&ColumnData>],
     sym_lookup: &dyn Fn(usize) -> Option<&'a nodedb_types::timeseries::SymbolDictionary>,
-) {
-    use std::fmt::Write;
-    match ty {
-        ColumnType::Symbol => {
-            if let Some(dict) = sym_lookup(col_idx)
-                && let Some(name) = dict.get(part as u32)
-            {
-                out.push_str(name);
-            }
-        }
-        ColumnType::Int64 | ColumnType::Timestamp(_) => {
-            let _ = write!(out, "{}", part as i64);
-        }
-        ColumnType::Float64 => {
-            let _ = write!(out, "{}", f64::from_bits(part));
-        }
-    }
+) -> Vec<GroupCell> {
+    resolved
+        .group_cols
+        .iter()
+        .zip(parts)
+        .map(|(&(col_idx, ty), &part)| {
+            let present = columns.get(col_idx).is_some_and(Option::is_some);
+            key_cell(ty, part, present, sym_lookup(col_idx))
+        })
+        .collect()
 }
 
+/// The typed group key of an integer key, with no time bucket.
 pub(super) fn resolve_group_key<'a>(
     key: &IntGroupKey,
     resolved: &ResolvedSchema,
+    columns: &[Option<&ColumnData>],
     sym_lookup: &dyn Fn(usize) -> Option<&'a nodedb_types::timeseries::SymbolDictionary>,
-) -> String {
-    match key {
-        IntGroupKey::None => String::new(),
-        IntGroupKey::SingleU32(id) => {
-            let col_idx = resolved.group_cols[0].0;
-            if resolved.group_cols[0].1 == ColumnType::Symbol {
-                sym_lookup(col_idx)
-                    .and_then(|d: &nodedb_types::timeseries::SymbolDictionary| d.get(*id))
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                id.to_string()
-            }
-        }
-        IntGroupKey::Multi(parts) => {
-            let mut s = String::with_capacity(parts.len() * 16);
-            for (i, &part) in parts.iter().enumerate() {
-                if i > 0 {
-                    s.push('\0');
-                }
-                let (col_idx, ty) = resolved.group_cols[i];
-                push_key_part(&mut s, col_idx, ty, part, sym_lookup);
-            }
-            s
-        }
+) -> GroupKey {
+    let cells = match key {
+        IntGroupKey::None => Vec::new(),
+        IntGroupKey::SingleU32(id) => key_cells(&[u64::from(*id)], resolved, columns, sym_lookup),
+        IntGroupKey::Multi(parts) => key_cells(parts, resolved, columns, sym_lookup),
+    };
+    GroupKey {
+        bucket: None,
+        cells,
     }
 }
 

@@ -243,6 +243,8 @@ fn purge_removes_all_tenant_data() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: vec![],
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(ts_resp.status, Status::Ok);

@@ -221,7 +221,8 @@ pub async fn crdt_apply(
         "sql".into(),
         &state.rls,
         &audit,
-    );
+    )
+    .with_type_guards_from(state.credentials.catalog(), database_id);
     crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted(
         state,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {

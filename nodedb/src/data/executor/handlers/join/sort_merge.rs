@@ -8,6 +8,8 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use nodedb_query::msgpack_scan;
 
+use super::side_rows::JoinSideSource;
+use super::support::row_qualifier;
 use super::{SortMergeJoinParams, compare_preextracted, merge_join_docs_binary};
 
 /// Collect consecutive index positions in `indices[start..]` sharing the same key as `indices[start]`.
@@ -51,6 +53,8 @@ impl CoreLoop {
             pre_sorted,
             left_rls_filters,
             right_rls_filters,
+            left_input,
+            right_input,
         } = p;
         debug!(
             core = self.core_id,
@@ -71,17 +75,18 @@ impl CoreLoop {
         let scan_limit =
             crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
-        let left_docs = match self.scan_collection_with_rls(
-            task.request.database_id.as_u64(),
+        let left_docs = match self.join_side_rows(
+            task,
             tid,
-            left_collection,
+            JoinSideSource {
+                collection: left_collection,
+                input: left_input,
+                rls_filters: left_rls_filters,
+            },
             scan_limit,
-            left_rls_filters,
         ) {
             Ok(d) => d,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+            Err(resp) => return *resp,
         };
 
         // Memory-budget guard on the left side. Checked immediately after
@@ -92,17 +97,18 @@ impl CoreLoop {
             return err;
         }
 
-        let right_docs = match self.scan_collection_with_rls(
-            task.request.database_id.as_u64(),
+        let right_docs = match self.join_side_rows(
+            task,
             tid,
-            right_collection,
+            JoinSideSource {
+                collection: right_collection,
+                input: right_input,
+                rls_filters: right_rls_filters,
+            },
             scan_limit,
-            right_rls_filters,
         ) {
             Ok(d) => d,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+            Err(resp) => return *resp,
         };
 
         // Memory-budget guard on the right side. Same convention as the
@@ -179,6 +185,12 @@ impl CoreLoop {
             )
         };
 
+        // Each side's columns are qualified with its bare collection name,
+        // the name SQL qualifies them with.
+        let database_id = task.request.database_id;
+        let left_qualifier = row_qualifier(left_collection, database_id);
+        let right_qualifier = row_qualifier(right_collection, database_id);
+
         let mut results: Vec<Vec<u8>> = Vec::new();
         let mut li = 0usize;
         let mut ri = 0usize;
@@ -201,8 +213,8 @@ impl CoreLoop {
                         results.push(merge_join_docs_binary(
                             &left_docs[left_idx].1,
                             None,
-                            left_collection,
-                            right_collection,
+                            left_qualifier,
+                            right_qualifier,
                         ));
                     }
                     li += 1;
@@ -214,7 +226,7 @@ impl CoreLoop {
                             &[],
                             Some(&right_docs[right_idx].1),
                             "",
-                            right_collection,
+                            right_qualifier,
                         ));
                     }
                     ri += 1;
@@ -242,8 +254,8 @@ impl CoreLoop {
                             results.push(merge_join_docs_binary(
                                 &left_docs[lj_idx].1,
                                 Some(&right_docs[rj_idx].1),
-                                left_collection,
-                                right_collection,
+                                left_qualifier,
+                                right_qualifier,
                             ));
                         }
                     }
@@ -260,8 +272,8 @@ impl CoreLoop {
                 results.push(merge_join_docs_binary(
                     &left_docs[left_idx].1,
                     None,
-                    left_collection,
-                    right_collection,
+                    left_qualifier,
+                    right_qualifier,
                 ));
                 li += 1;
             }
@@ -275,7 +287,7 @@ impl CoreLoop {
                         &[],
                         Some(&right_docs[right_idx].1),
                         "",
-                        right_collection,
+                        right_qualifier,
                     ));
                 }
                 ri += 1;

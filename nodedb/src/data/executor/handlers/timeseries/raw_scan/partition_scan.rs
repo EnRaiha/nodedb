@@ -2,6 +2,8 @@
 
 //! Parallel and sequential disk-partition scanning for raw mode.
 
+use nodedb_wal::crypto::WalEncryptionKey;
+
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::handlers::timeseries::partition_read::{
     TsPartitionColumns, read_ts_partition,
@@ -14,9 +16,9 @@ use super::row_emit::{emit_partition_row, extract_timestamp, row_admitted};
 /// Scan disk partitions in parallel, returning rmpv rows sorted by timestamp.
 ///
 /// `rls_predicates` is the caller's read policy: every row is checked
-/// against it before it counts toward `limit`. `Err` when a stored time
-/// cell cannot be read as its column's instant or a predicate expression
-/// divides by zero.
+/// against it before it counts toward `limit`. `kek` is the core's
+/// timeseries segment key. `Err` when a stored time cell cannot be read as
+/// its column's instant or a predicate expression divides by zero.
 pub(super) fn scan_partitions_parallel(
     partition_dirs: &[std::path::PathBuf],
     time_range: (i64, i64),
@@ -24,6 +26,7 @@ pub(super) fn scan_partitions_parallel(
     filter_predicates: &[ScanFilter],
     has_filters: bool,
     rls_predicates: &[ScanFilter],
+    kek: Option<&WalEncryptionKey>,
 ) -> crate::Result<Vec<rmpv::Value>> {
     if partition_dirs.len() <= 1 {
         return match partition_dirs.first() {
@@ -34,6 +37,7 @@ pub(super) fn scan_partitions_parallel(
                 filter_predicates,
                 has_filters,
                 rls_predicates,
+                kek,
             ),
             None => Ok(Vec::new()),
         };
@@ -54,6 +58,7 @@ pub(super) fn scan_partitions_parallel(
                 filter_predicates,
                 has_filters,
                 rls_predicates,
+                kek,
             );
         }
 
@@ -73,6 +78,7 @@ pub(super) fn scan_partitions_parallel(
                             filters_ref,
                             has_filters,
                             rls_ref,
+                            kek,
                         )
                     })
                 })
@@ -112,6 +118,7 @@ pub(super) fn scan_partitions_parallel(
             filter_predicates,
             has_filters,
             rls_predicates,
+            kek,
         )
     }
 }
@@ -123,6 +130,7 @@ pub(super) fn scan_partitions_sequential(
     filter_predicates: &[ScanFilter],
     has_filters: bool,
     rls_predicates: &[ScanFilter],
+    kek: Option<&WalEncryptionKey>,
 ) -> crate::Result<Vec<rmpv::Value>> {
     let mut results = Vec::new();
     for dir in partition_dirs {
@@ -137,6 +145,7 @@ pub(super) fn scan_partitions_sequential(
             filter_predicates,
             has_filters,
             rls_predicates,
+            kek,
         )?;
         results.extend(rows);
     }
@@ -158,6 +167,7 @@ pub(super) fn scan_one_partition(
     filter_predicates: &[ScanFilter],
     has_filters: bool,
     rls_predicates: &[ScanFilter],
+    kek: Option<&WalEncryptionKey>,
 ) -> crate::Result<Vec<rmpv::Value>> {
     // A partition that does not read refuses the scan. Skipping it would
     // answer without the partition's rows.
@@ -165,7 +175,7 @@ pub(super) fn scan_one_partition(
         schema,
         columns: col_data,
         sym_dicts,
-    } = read_ts_partition(part_dir, "timeseries_raw_scan")?;
+    } = read_ts_partition(part_dir, "timeseries_raw_scan", kek)?;
     let all_col_names: Vec<String> = schema.columns.iter().map(|(n, _)| n.clone()).collect();
 
     let Some(ts_col) = col_data.get(schema.timestamp_idx).and_then(|d| d.as_ref()) else {

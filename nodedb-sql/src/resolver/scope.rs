@@ -32,6 +32,29 @@ impl ColumnScope<'_> {
         }
     }
 
+    /// Check `column`, optionally qualified by `table_ref`, and return the
+    /// qualifier its converted reference carries.
+    ///
+    /// Outside a join's input clauses the qualifier is kept as written. In
+    /// them, an unqualified column gets its owning relation's qualifier, so
+    /// it reads the `qualifier.column` key of the merged row.
+    pub fn column_qualifier(
+        &self,
+        table_ref: Option<&str>,
+        column: &str,
+    ) -> Result<Option<String>> {
+        match self {
+            Self::Unchecked => Ok(table_ref.map(str::to_owned)),
+            Self::Relations(scope) => match table_ref {
+                None => scope.bare_column_qualifier(column),
+                Some(table) => {
+                    scope.check_name(Some(table), column)?;
+                    Ok(scope.qualified_column_qualifier(table))
+                }
+            },
+        }
+    }
+
     /// Whether an expression here is evaluated once per row of some relation.
     ///
     /// `Unchecked` stands behind stored DEFAULTs, index predicates, and the

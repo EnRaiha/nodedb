@@ -54,11 +54,14 @@ pub enum Expr {
     /// Parenthesized expression.
     Paren(Box<Expr>),
 
-    /// Subquery: `expr[range:step]`.
+    /// Subquery: `expr[range:step]` or `expr[range:]`, optionally followed
+    /// by `offset`.
     Subquery {
         expr: Box<Expr>,
         range: Duration,
+        /// `None` for `[range:]`: the default evaluation step.
         step: Option<Duration>,
+        offset: Option<Duration>,
     },
 }
 

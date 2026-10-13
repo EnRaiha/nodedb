@@ -420,6 +420,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::UndefinedFunction { .. }
             | Error::UndefinedObject { .. }
             | Error::ObjectNotInPrerequisiteState { .. }
+            | Error::WrongObjectType { .. }
             | Error::UndefinedColumn { .. }
             | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }

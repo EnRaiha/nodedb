@@ -88,3 +88,47 @@ impl Default for SegmentIndex {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nodedb_types::timeseries::SegmentKind;
+
+    use super::*;
+
+    #[test]
+    fn segment_index_basic() {
+        let mut idx = SegmentIndex::new();
+        idx.add(
+            1,
+            SegmentRef {
+                path: "seg1.bin".into(),
+                min_ts: 1000,
+                max_ts: 2000,
+                kind: SegmentKind::Metric,
+                size_bytes: 4096,
+                created_at_ms: 0,
+            },
+        );
+        idx.add(
+            1,
+            SegmentRef {
+                path: "seg2.bin".into(),
+                min_ts: 3000,
+                max_ts: 4000,
+                kind: SegmentKind::Metric,
+                size_bytes: 8192,
+                created_at_ms: 0,
+            },
+        );
+
+        let hits = idx.query(1, &TimeRange::new(1500, 2500));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "seg1.bin");
+
+        let all = idx.query(1, &TimeRange::new(0, 5000));
+        assert_eq!(all.len(), 2);
+
+        assert_eq!(idx.total_segments(), 2);
+        assert_eq!(idx.total_bytes(), 4096 + 8192);
+    }
+}

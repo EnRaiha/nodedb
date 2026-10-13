@@ -126,6 +126,7 @@ pub(super) fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
         | crate::Error::UndefinedFunction { .. }
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::WrongObjectType { .. }
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }
@@ -291,6 +292,7 @@ fn is_indeterminate(error: &crate::Error) -> bool {
         | crate::Error::UndefinedFunction { .. }
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::WrongObjectType { .. }
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }

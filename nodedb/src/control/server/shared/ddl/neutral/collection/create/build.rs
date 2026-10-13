@@ -39,7 +39,7 @@ use super::build_flags::{
     validate_name,
 };
 use super::build_post_create::{create_serial_sequences, log_vector_fields};
-use super::build_primary_engine::resolve_primary_engine;
+use super::build_primary_engine::{resolve_primary_engine, vector_engine_options};
 use crate::control::server::shared::ddl::neutral::column_default::validate_column_defaults;
 use crate::control::server::shared::ddl::neutral::declared_typmod::validate_declared_typmods;
 
@@ -131,6 +131,18 @@ pub async fn build_and_persist(
         ));
     }
 
+    // Collections and continuous aggregates share one relation namespace.
+    if catalog
+        .get_continuous_aggregate(database_id.as_u64(), tenant_id.as_u64(), name)
+        .map_err(|error| DdlError::from_error(&error))?
+        .is_some()
+    {
+        return Err(err(
+            "42P07",
+            format!("relation '{name}' already exists as a continuous aggregate"),
+        ));
+    }
+
     // Check if the object already exists. A catalog-read fault must abort the
     // CREATE — proceeding as if no row exists can build a fresh collection
     // over a soft-deleted incarnation's still-present storage.
@@ -184,6 +196,10 @@ pub async fn build_and_persist(
         .as_secs();
 
     let canonical_engine = validate_engine_name(engine, options)?;
+    // `engine='vector'` builds a vector-primary collection: its implied
+    // `primary='vector'` joins the options every later step reads.
+    let resolved_options = vector_engine_options(canonical_engine, options)?;
+    let options: &[(String, String)] = &resolved_options;
     let bitemporal_flag = flags.iter().any(|f| f == "BITEMPORAL");
 
     // Expand SERIAL / BIGSERIAL first, so every later reader of the column

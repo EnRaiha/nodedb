@@ -5,6 +5,7 @@
 mod insert;
 mod target;
 mod update_delete;
+mod update_from;
 mod upsert;
 
 pub use insert::plan_insert;

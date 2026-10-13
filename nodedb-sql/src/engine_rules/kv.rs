@@ -24,6 +24,16 @@ impl EngineRules for KvRules {
         })
     }
 
+    fn plan_insert_select(&self, p: InsertSelectParams) -> Result<Vec<SqlPlan>> {
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "INSERT ... SELECT into key-value collection '{}' is not supported; \
+                 the target must be a document collection",
+                p.collection
+            ),
+        })
+    }
+
     fn plan_upsert(&self, _p: UpsertParams) -> Result<Vec<SqlPlan>> {
         // KV upsert is handled via the KvInsert path (KV PUT is naturally an upsert).
         // Same as plan_insert — KV INSERT uses KvInsert which is already upsert semantics.
@@ -127,7 +137,7 @@ impl EngineRules for KvRules {
             aggregates: p.aggregates,
             having: p.having,
             limit: p.limit,
-            grouping_sets: None,
+            grouping_sets: p.grouping_sets,
             sort_keys: Vec::new(),
         })
     }

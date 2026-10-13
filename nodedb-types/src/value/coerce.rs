@@ -45,6 +45,58 @@ impl Value {
         }
     }
 
+    /// The text of a string that [`Value::eq_coerced`] can match only against
+    /// a string with identical text: one that reads as neither a number nor
+    /// an instant. `None` for any other value.
+    ///
+    /// An exact-bytes lookup (such as a secondary-index probe) on this text
+    /// finds every row the coerced equality accepts. For any other value it
+    /// can miss rows, such as `'5'` against a stored `5`.
+    pub fn eq_coerced_exact_text(&self) -> Option<&str> {
+        match self {
+            Value::String(s)
+                if parse_numeric_str(s).is_none() && crate::NdbDateTime::parse(s).is_none() =>
+            {
+                Some(s)
+            }
+            _ => None,
+        }
+    }
+
+    /// The hash bucket of this value under [`Value::eq_coerced`], for an
+    /// equi-join that must match exactly the pairs a WHERE `=` matches.
+    ///
+    /// Two values `eq_coerced` reports equal share a bucket. Two values in
+    /// one bucket need not be equal (`'1.0'` and `'1'` as text, or two
+    /// integers that round to one `f64`), so a join confirms each candidate
+    /// with `eq_coerced`. `None` for a value that equals nothing, NULL
+    /// included: it joins no row.
+    ///
+    /// A string reads first as a number, then as an instant, then as text.
+    /// A string with both a numeric and an instant reading buckets as a
+    /// number.
+    pub fn eq_coerced_bucket(&self) -> Option<EqCoercedBucket> {
+        match self {
+            Value::Null => None,
+            Value::Bool(b) => Some(EqCoercedBucket::Bool(*b)),
+            Value::ArrayCell(_) => Some(EqCoercedBucket::Cell),
+            other => {
+                if let Some(n) = numeric_reading(other) {
+                    return Some(EqCoercedBucket::Number(
+                        crate::numeric_cmp::numeric_bucket_bits(n),
+                    ));
+                }
+                if let Some(micros) = datetime_micros(other) {
+                    return Some(EqCoercedBucket::Instant(micros));
+                }
+                match other {
+                    Value::String(s) => Some(EqCoercedBucket::Text(s.clone())),
+                    _ => None,
+                }
+            }
+        }
+    }
+
     /// Coerced partial ordering for predicate evaluation.
     ///
     /// Two numbers (or numeric strings) order by [`cmp_numeric`]: exact for
@@ -98,6 +150,21 @@ impl Value {
     pub fn cmp_coerced(&self, other: &Value) -> Ordering {
         self.partial_cmp_coerced(other).unwrap_or(Ordering::Equal)
     }
+}
+
+/// A hash bucket of [`Value::eq_coerced`]. See [`Value::eq_coerced_bucket`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EqCoercedBucket {
+    Bool(bool),
+    /// The `f64` bits a number rounds to (see
+    /// [`crate::numeric_cmp::numeric_bucket_bits`]).
+    Number(u64),
+    /// Epoch microseconds of an instant.
+    Instant(i64),
+    /// Text that reads as neither a number nor an instant.
+    Text(String),
+    /// Every ND cell: cells compare structurally, so they share one bucket.
+    Cell,
 }
 
 /// The number a value denotes for coerced comparison: an integer, a float,
@@ -167,6 +234,60 @@ mod tests {
         assert!(!Value::Integer(5).eq_coerced(&Value::String("abc".into())));
     }
 
+    /// Every pair `eq_coerced` reports equal shares a bucket, so a join
+    /// that probes by bucket and confirms by `eq_coerced` finds every match
+    /// a WHERE `=` finds.
+    #[test]
+    fn equal_values_share_a_bucket() {
+        let dec = |s: &str| Value::Decimal(rust_decimal::Decimal::from_str_exact(s).expect("dec"));
+        let equal_pairs = [
+            (Value::Integer(1), Value::String("1".into())),
+            (Value::Integer(1), Value::String("1.0".into())),
+            (Value::Integer(1), Value::Float(1.0)),
+            (Value::Integer(1), dec("1.00")),
+            (dec("2.5"), Value::Float(2.5)),
+            (dec("2.50"), Value::String("2.5".into())),
+            (Value::Float(0.0), Value::Float(-0.0)),
+            (Value::Float(f64::NAN), Value::String("NaN".into())),
+            (Value::String("abc".into()), Value::String("abc".into())),
+            (Value::Bool(true), Value::Bool(true)),
+        ];
+        for (a, b) in equal_pairs {
+            assert!(a.eq_coerced(&b), "{a:?} = {b:?}");
+            assert_eq!(
+                a.eq_coerced_bucket(),
+                b.eq_coerced_bucket(),
+                "{a:?} vs {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unequal_values_are_told_apart() {
+        assert_ne!(
+            Value::Integer(1).eq_coerced_bucket(),
+            Value::Integer(2).eq_coerced_bucket()
+        );
+        assert_ne!(
+            Value::Bool(true).eq_coerced_bucket(),
+            Value::String("true".into()).eq_coerced_bucket()
+        );
+        // Same bucket, different text: the confirming `eq_coerced` refuses.
+        let a = Value::String("1.0".into());
+        let b = Value::String("1".into());
+        assert_eq!(a.eq_coerced_bucket(), b.eq_coerced_bucket());
+        assert!(!a.eq_coerced(&b));
+    }
+
+    #[test]
+    fn null_and_containers_join_nothing() {
+        assert_eq!(Value::Null.eq_coerced_bucket(), None);
+        assert_eq!(
+            Value::Array(vec![Value::Integer(1)]).eq_coerced_bucket(),
+            None
+        );
+    }
+
     #[test]
     fn eq_coerced_cross_type_false() {
         assert!(!Value::Bool(true).eq_coerced(&Value::Integer(1)));
@@ -193,6 +314,21 @@ mod tests {
             Value::Float(2.78).cmp_coerced(&Value::String("2.78".into())),
             Ordering::Equal
         );
+    }
+
+    #[test]
+    fn exact_text_only_for_strings_without_a_number_or_instant_reading() {
+        assert_eq!(
+            Value::String("us-east".into()).eq_coerced_exact_text(),
+            Some("us-east")
+        );
+        assert_eq!(Value::String("5".into()).eq_coerced_exact_text(), None);
+        assert_eq!(Value::String("2.5".into()).eq_coerced_exact_text(), None);
+        assert_eq!(
+            Value::String("2024-01-02T03:04:05Z".into()).eq_coerced_exact_text(),
+            None
+        );
+        assert_eq!(Value::Integer(5).eq_coerced_exact_text(), None);
     }
 
     #[test]

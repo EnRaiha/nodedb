@@ -14,7 +14,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 use super::super::body::convert_body_to_single_plan;
 use super::super::convert::ConvertContext;
 use super::super::filter::serialize_filters;
-use super::spec::{InputSourcedTaskParams, build_input_sourced_aggregate_task};
+use super::spec::{InputFieldNames, InputSourcedTaskParams, build_input_sourced_aggregate_task};
 
 pub(super) struct InputSourcedAggregateParams<'a> {
     pub input: &'a SqlPlan,
@@ -53,20 +53,18 @@ pub(super) fn convert_input_sourced_aggregate(
         ctx,
     } = p;
 
-    // The input-sourced aggregate executor does not expand ROLLUP / CUBE /
-    // GROUPING SETS. A typed error beats a silent base-grouping-only answer.
-    if grouping_sets.is_some_and(|sets| !sets.is_empty()) {
-        return Err(crate::Error::PlanError {
-            detail: "ROLLUP / CUBE / GROUPING SETS over a derived-table body is not supported"
-                .to_string(),
-        });
-    }
-
     // The body is ONE relation, already gathered when sharded, so the
-    // aggregate observes the full union exactly once.
+    // aggregate observes the full union exactly once. A body homed on one
+    // core (a timeseries or KV scan) is gathered from its owning vShard when
+    // the coordinator materializes the input.
     let child = convert_body_to_single_plan(input, tenant_id, ctx)?;
 
     let having_bytes = serialize_filters(having)?;
+    let grouping_sets = grouping_sets
+        .unwrap_or(&[])
+        .iter()
+        .map(|set| set.iter().map(|&i| i as u32).collect())
+        .collect();
 
     Ok(vec![build_input_sourced_aggregate_task(
         InputSourcedTaskParams {
@@ -78,7 +76,21 @@ pub(super) fn convert_input_sourced_aggregate(
             aggregates,
             having_bytes,
             limit,
+            grouping_sets,
             sort_keys,
+            names: input_field_names(input),
         },
-    )])
+    )?])
+}
+
+/// How the rows `input` produces key their fields.
+///
+/// A join with no projection emits its merged rows, which key every field
+/// `qualifier.column`. Every other body emits rows keyed by output column
+/// name.
+fn input_field_names(input: &SqlPlan) -> InputFieldNames {
+    match input {
+        SqlPlan::Join { projection, .. } if projection.is_empty() => InputFieldNames::Qualified,
+        _ => InputFieldNames::Bare,
+    }
 }

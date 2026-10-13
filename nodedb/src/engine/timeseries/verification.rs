@@ -110,13 +110,14 @@ mod tests {
         // Partition 1: 1-day width (rows 0-99, ts 1000-1099)
         let mut mt1 = ColumnarMemtable::new_metric(test_memtable_config());
         for i in 0..100 {
-            mt1.ingest_metric(
+            mt1.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1000 + i,
-                    value: i as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1000 + i),
+                    ColumnValue::Float64(i as f64),
+                ],
+            )
+            .unwrap();
         }
         let d1 = mt1.drain();
         writer
@@ -126,13 +127,14 @@ mod tests {
         // Partition 2: 3-day width (rows 100-199, ts 2000-2099)
         let mut mt2 = ColumnarMemtable::new_metric(test_memtable_config());
         for i in 0..100 {
-            mt2.ingest_metric(
+            mt2.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 2000 + i,
-                    value: (100 + i) as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(2000 + i),
+                    ColumnValue::Float64((100 + i) as f64),
+                ],
+            )
+            .unwrap();
         }
         let d2 = mt2.drain();
         writer
@@ -142,13 +144,14 @@ mod tests {
         // Partition 3: 1-week width (rows 200-299, ts 3000-3099)
         let mut mt3 = ColumnarMemtable::new_metric(test_memtable_config());
         for i in 0..100 {
-            mt3.ingest_metric(
+            mt3.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 3000 + i,
-                    value: (200 + i) as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(3000 + i),
+                    ColumnValue::Float64((200 + i) as f64),
+                ],
+            )
+            .unwrap();
         }
         let d3 = mt3.drain();
         writer
@@ -470,13 +473,14 @@ mod tests {
             // Write actual partition data.
             let mut mt = ColumnarMemtable::new_metric(test_memtable_config());
             for i in 0..50 {
-                mt.ingest_metric(
+                mt.ingest_row(
                     1,
-                    MetricSample {
-                        timestamp_ms: start + i,
-                        value: i as f64,
-                    },
-                );
+                    &[
+                        ColumnValue::Timestamp(start + i),
+                        ColumnValue::Float64(i as f64),
+                    ],
+                )
+                .unwrap();
             }
             let drain = mt.drain();
             writer
@@ -596,13 +600,14 @@ mod tests {
 
         let start = std::time::Instant::now();
         for i in 0..1_000_000u64 {
-            mt.ingest_metric(
+            mt.ingest_row(
                 i % 100,
-                MetricSample {
-                    timestamp_ms: i as i64,
-                    value: i as f64 * 0.001,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(i as i64),
+                    ColumnValue::Float64(i as f64 * 0.001),
+                ],
+            )
+            .unwrap();
         }
         let elapsed = start.elapsed();
         let rows_per_sec = 1_000_000.0 / elapsed.as_secs_f64();

@@ -2,6 +2,7 @@
 
 //! Parse users/roles/permissions/grants + audit/tenants/constraints/typeguards.
 
+use super::clause::{ClauseCursor, tokenize};
 use crate::ddl_ast::statement::{
     AlterRoleOp, AlterUserOp, AuthStmt, DatabaseStmt, MiscStmt, NodedbStatement, TenantSelector,
 };
@@ -9,139 +10,167 @@ use crate::error::SqlError;
 
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    try_parse_inner(upper, parts, trimmed)
-}
-
-fn try_parse_inner(
-    upper: &str,
-    parts: &[&str],
-    trimmed: &str,
-) -> Option<Result<NodedbStatement, SqlError>> {
-    if upper.starts_with("CREATE USER ") {
-        return Some(Ok(parse_create_user(parts, trimmed)));
-    }
-    if upper.starts_with("DROP USER ") {
-        let username = parts.get(2)?.to_string();
-        return Some(Ok(NodedbStatement::Auth(AuthStmt::DropUser { username })));
-    }
-    if upper.starts_with("ALTER USER ") {
-        return Some(parse_alter_user(parts, trimmed));
-    }
-    if upper.starts_with("SHOW USERS") {
+    let family = if upper.starts_with("CREATE USER ") {
+        Family::CreateUser
+    } else if upper.starts_with("DROP USER ") {
+        Family::DropUser
+    } else if upper.starts_with("ALTER USER ") {
+        Family::AlterUser
+    } else if upper.starts_with("SHOW USERS") {
         return Some(Ok(NodedbStatement::Auth(AuthStmt::ShowUsers)));
-    }
-    if upper.starts_with("ALTER ROLE ") {
-        return Some(parse_alter_role(parts, trimmed));
-    }
-    // `GRANT` / `REVOKE` (role-membership and object-permission) are parsed
-    // by the dedicated `grant` family, which runs before this one.
-    if upper.starts_with("SHOW PERMISSIONS") {
-        // SHOW PERMISSIONS [ON <collection>] [FOR <grantee>]
-        let on_collection = parts
-            .iter()
-            .position(|p| p.eq_ignore_ascii_case("ON"))
-            .and_then(|i| parts.get(i + 1))
-            .map(|s| s.to_string());
-        let for_grantee = parts
-            .iter()
-            .position(|p| p.eq_ignore_ascii_case("FOR"))
-            .and_then(|i| parts.get(i + 1))
-            .map(|s| s.to_string());
-        return Some(Ok(NodedbStatement::Auth(AuthStmt::ShowPermissions {
-            on_collection,
-            for_grantee,
-        })));
-    }
-    if upper.starts_with("SHOW GRANTS") {
-        let username = parts.get(2).map(|s| s.to_string());
-        return Some(Ok(NodedbStatement::Auth(AuthStmt::ShowGrants { username })));
-    }
-    // Only the bare `SHOW TENANTS` form lands here. `SHOW TENANTS WITH
-    // NAME <name>` and `SHOW TENANT <ident>` are parsed by `tenant.rs`
-    // into typed variants — matching them by prefix here would silently
-    // drop the filter / identifier and list every tenant.
-    if upper == "SHOW TENANTS" {
+    } else if upper.starts_with("ALTER ROLE ") {
+        Family::AlterRole
+    } else if upper.starts_with("SHOW PERMISSIONS") {
+        Family::ShowPermissions
+    } else if upper.starts_with("SHOW GRANTS") {
+        Family::ShowGrants
+    } else if upper == "SHOW TENANTS" {
+        // Only the bare form lands here. `SHOW TENANTS WITH NAME <name>` and
+        // `SHOW TENANT <ident>` are parsed by `tenant.rs` into typed variants.
         return Some(Ok(NodedbStatement::Database(DatabaseStmt::ShowTenants)));
-    }
-    if upper.starts_with("SHOW AUDIT") {
+    } else if upper.starts_with("SHOW AUDIT") {
+        // The audit router reads the filter clauses from the statement text.
         return Some(Ok(NodedbStatement::Misc(MiscStmt::ShowAuditLog)));
-    }
-    if upper.starts_with("SHOW CONSTRAINTS ") {
-        let collection = parts.get(2)?.to_string();
-        return Some(Ok(NodedbStatement::Misc(MiscStmt::ShowConstraints {
-            collection,
-        })));
-    }
-    if upper.starts_with("SHOW TYPEGUARD") {
-        let collection = parts.get(2)?.to_string();
-        return Some(Ok(NodedbStatement::Misc(MiscStmt::ShowTypeGuards {
-            collection,
-        })));
-    }
-    None
+    } else if upper.starts_with("SHOW CONSTRAINTS ") {
+        Family::ShowConstraints
+    } else if upper.starts_with("SHOW TYPEGUARD") {
+        Family::ShowTypeGuards
+    } else {
+        return None;
+    };
+    Some(parse(trimmed, family))
 }
 
-/// Parse `CREATE USER [IF NOT EXISTS] <name> WITH PASSWORD '<password>'
-/// [ROLE <role>] [TENANT <id>]`.
-///
-/// Extracts fields as primitive types; the handler converts role strings to
-/// the `Role` enum and tenant IDs to `TenantId`.
-fn parse_create_user(parts: &[&str], _trimmed: &str) -> NodedbStatement {
-    // parts[0] = CREATE, parts[1] = USER, then an optional `IF NOT EXISTS`
-    // clause, then parts[name_idx] = <name>.
-    let if_not_exists = parts.len() > 5
-        && parts[2].eq_ignore_ascii_case("IF")
-        && parts[3].eq_ignore_ascii_case("NOT")
-        && parts[4].eq_ignore_ascii_case("EXISTS");
-    let name_idx = if if_not_exists { 5 } else { 2 };
-    let username = parts
-        .get(name_idx)
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+#[derive(Clone, Copy)]
+enum Family {
+    CreateUser,
+    DropUser,
+    AlterUser,
+    AlterRole,
+    ShowPermissions,
+    ShowGrants,
+    ShowConstraints,
+    ShowTypeGuards,
+}
 
-    // Find PASSWORD token and extract the quoted string that follows.
-    let password = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("PASSWORD"))
-        .and_then(|pi| extract_quoted_string_from_parts(parts, pi + 1))
-        .unwrap_or_default();
-
-    // ROLE <role> — find after PASSWORD section.
-    let role = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("ROLE"))
-        .and_then(|ri| {
-            // Make sure this ROLE keyword isn't before WITH/PASSWORD
-            // (i.e., it appears after the password argument).
-            let pw_pos = parts
-                .iter()
-                .position(|p| p.eq_ignore_ascii_case("PASSWORD"))
-                .unwrap_or(0);
-            if ri > pw_pos {
-                parts.get(ri + 1).map(|s| s.to_lowercase())
+fn parse(sql: &str, family: Family) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let stmt = match family {
+        Family::CreateUser => {
+            let mut c = ClauseCursor::new(sql, &toks, "CREATE USER");
+            parse_create_user(&mut c)?
+        }
+        Family::DropUser => {
+            let mut c = ClauseCursor::new(sql, &toks, "DROP USER");
+            c.expect_keywords(&["DROP", "USER"])?;
+            let username = c.raw("user name")?.to_string();
+            c.finish()?;
+            NodedbStatement::Auth(AuthStmt::DropUser { username })
+        }
+        Family::AlterUser => {
+            let mut c = ClauseCursor::new(sql, &toks, "ALTER USER");
+            parse_alter_user(&mut c)?
+        }
+        Family::AlterRole => {
+            let mut c = ClauseCursor::new(sql, &toks, "ALTER ROLE");
+            parse_alter_role(&mut c)?
+        }
+        Family::ShowPermissions => {
+            // SHOW PERMISSIONS [ON <collection>] [FOR <grantee>]
+            let mut c = ClauseCursor::new(sql, &toks, "SHOW PERMISSIONS");
+            c.expect_keywords(&["SHOW", "PERMISSIONS"])?;
+            let on_collection = if c.eat_keyword("ON") {
+                Some(c.raw("collection")?.to_string())
             } else {
                 None
+            };
+            let for_grantee = if c.eat_keyword("FOR") {
+                Some(c.raw("grantee")?.to_string())
+            } else {
+                None
+            };
+            c.finish()?;
+            NodedbStatement::Auth(AuthStmt::ShowPermissions {
+                on_collection,
+                for_grantee,
+            })
+        }
+        Family::ShowGrants => {
+            let mut c = ClauseCursor::new(sql, &toks, "SHOW GRANTS");
+            c.expect_keywords(&["SHOW", "GRANTS"])?;
+            c.eat_keyword("FOR");
+            let username = if c.at_end() {
+                None
+            } else {
+                Some(c.raw("user name")?.to_string())
+            };
+            c.finish()?;
+            NodedbStatement::Auth(AuthStmt::ShowGrants { username })
+        }
+        Family::ShowConstraints => {
+            let mut c = ClauseCursor::new(sql, &toks, "SHOW CONSTRAINTS");
+            c.expect_keywords(&["SHOW", "CONSTRAINTS"])?;
+            c.eat_keyword("ON");
+            let collection = c.raw("collection")?.to_string();
+            c.finish()?;
+            NodedbStatement::Misc(MiscStmt::ShowConstraints { collection })
+        }
+        Family::ShowTypeGuards => {
+            let mut c = ClauseCursor::new(sql, &toks, "SHOW TYPEGUARDS");
+            c.expect_keyword("SHOW")?;
+            if !c.eat_keyword("TYPEGUARDS") {
+                c.expect_keyword("TYPEGUARD")?;
             }
-        });
+            c.eat_keyword("ON");
+            let collection = c.raw("collection")?.to_string();
+            c.finish()?;
+            NodedbStatement::Misc(MiscStmt::ShowTypeGuards { collection })
+        }
+    };
+    Ok(stmt)
+}
 
-    // TENANT <id> | TENANT '<name>' — numeric ids resolve directly, names
-    // are resolved against the catalog by the handler.
-    let tenant = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("TENANT"))
-        .and_then(|ti| parts.get(ti + 1))
-        .map(|s| parse_tenant_selector(s));
-
-    NodedbStatement::Auth(AuthStmt::CreateUser {
+/// Parse `CREATE USER [IF NOT EXISTS] <name> [WITH] PASSWORD '<password>'
+/// [ROLE <role>] [TENANT <id>|'<name>']`.
+///
+/// Extracts fields as primitive types; the handler converts role strings to
+/// the `Role` enum and tenant IDs to `TenantId`. A keyword inside the
+/// password string is part of the password, never a clause.
+fn parse_create_user(c: &mut ClauseCursor<'_, '_>) -> Result<NodedbStatement, SqlError> {
+    c.expect_keywords(&["CREATE", "USER"])?;
+    let if_not_exists = c.eat_keywords(&["IF", "NOT", "EXISTS"]);
+    let username = c.raw("user name")?.to_string();
+    let with = c.eat_keyword("WITH");
+    let password = if c.eat_keyword("PASSWORD") {
+        c.string("PASSWORD")?
+    } else if with {
+        return Err(c.error(format!("expected PASSWORD — found {}", c.describe_next())));
+    } else {
+        String::new()
+    };
+    let mut role = None;
+    let mut tenant = None;
+    while !c.at_end() {
+        if c.eat_keyword("ROLE") {
+            c.clause("ROLE")?;
+            role = Some(c.raw("ROLE")?.to_lowercase());
+        } else if c.eat_keyword("TENANT") {
+            c.clause("TENANT")?;
+            tenant = Some(parse_tenant_selector(c.raw("TENANT")?));
+        } else {
+            return Err(c.unknown_clause());
+        }
+    }
+    Ok(NodedbStatement::Auth(AuthStmt::CreateUser {
         username,
         password,
         role,
         tenant,
         if_not_exists,
-    })
+    }))
 }
 
 /// Parse a tenant reference: a bare integer is an id, anything else
@@ -153,154 +182,152 @@ fn parse_tenant_selector(token: &str) -> TenantSelector {
     }
 }
 
+/// The next word upper-cased, consumed; empty at the end of the statement.
+fn next_word_upper(c: &mut ClauseCursor<'_, '_>) -> String {
+    match c.peek_word_upper() {
+        Some(word) => {
+            // A peeked word is always readable.
+            if c.word("sub-command").is_ok() {
+                word
+            } else {
+                String::new()
+            }
+        }
+        None => String::new(),
+    }
+}
+
 /// Parse all `ALTER USER <name> ...` forms.
 ///
 /// Supported forms:
 /// - `ALTER USER <name> SET PASSWORD '<password>'`
 /// - `ALTER USER <name> SET ROLE <role>`
-/// - `ALTER USER <name> ROLE <role>` (alias for `SET ROLE`, matches the
-///   spelling many clients try by analogy with `CREATE USER ... ROLE ...`)
+/// - `ALTER USER <name> SET DEFAULT DATABASE <db>`
+/// - `ALTER USER <name> ROLE <role>` and `WITH ROLE <role>` (aliases for `SET ROLE`)
 /// - `ALTER USER <name> MUST CHANGE PASSWORD`
 /// - `ALTER USER <name> PASSWORD NEVER EXPIRES`
 /// - `ALTER USER <name> PASSWORD EXPIRES '<iso8601>'`
 /// - `ALTER USER <name> PASSWORD EXPIRES IN <N> DAYS`
 ///
-/// Unknown sub-commands return a parse error naming the offending token —
-/// they are never silently rewritten into a default `AlterUserOp` variant.
-fn parse_alter_user(parts: &[&str], _trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    // parts[0] = ALTER, parts[1] = USER, parts[2] = <name>, parts[3] = sub-cmd
-    let username = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
-    if username.is_empty() {
-        return Err(SqlError::Parse {
-            detail: alter_user_syntax_msg("missing user name"),
-        });
-    }
-    let Some(sub_owned) = parts.get(3).map(|s| s.to_uppercase()) else {
-        return Err(SqlError::Parse {
-            detail: alter_user_syntax_msg("ALTER USER requires a sub-command"),
-        });
+/// Unknown sub-commands and trailing tokens return a parse error naming the
+/// offending token — they are never rewritten into a default `AlterUserOp`.
+fn parse_alter_user(c: &mut ClauseCursor<'_, '_>) -> Result<NodedbStatement, SqlError> {
+    let syntax = |reason: &str| SqlError::Parse {
+        detail: alter_user_syntax_msg(reason),
     };
-    let sub = sub_owned.as_str();
+    c.expect_keywords(&["ALTER", "USER"])?;
+    if c.at_end() {
+        return Err(syntax("missing user name"));
+    }
+    let username = c.raw("user name")?.to_string();
+    if c.at_end() {
+        return Err(syntax("ALTER USER requires a sub-command"));
+    }
+    let sub = next_word_upper(c);
 
-    let op = match sub {
-        "SET" => {
-            // parts[4] = action
-            let action = parts.get(4).map(|s| s.to_uppercase()).unwrap_or_default();
-            match action.as_str() {
-                "PASSWORD" => {
-                    let password = extract_quoted_string_from_parts(parts, 5).unwrap_or_default();
-                    AlterUserOp::SetPassword { password }
+    let op = match sub.as_str() {
+        "SET" => match next_word_upper(c).as_str() {
+            "PASSWORD" => AlterUserOp::SetPassword {
+                password: c.string("SET PASSWORD")?,
+            },
+            "ROLE" => {
+                if c.at_end() {
+                    return Err(syntax("ALTER USER ... SET ROLE requires a role name"));
                 }
-                "ROLE" => {
-                    let role = parts.get(5).map(|s| s.to_string()).unwrap_or_default();
-                    AlterUserOp::SetRole { role }
-                }
-                "DEFAULT" => {
-                    // SET DEFAULT DATABASE <name>
-                    let db_name = parts.get(6).map(|s| s.to_string()).unwrap_or_default();
-                    AlterUserOp::SetDefaultDatabase { db_name }
-                }
-                "" => {
-                    return Err(SqlError::Parse {
-                        detail: alter_user_syntax_msg(
-                            "ALTER USER ... SET requires PASSWORD | ROLE | DEFAULT DATABASE",
-                        ),
-                    });
-                }
-                other => {
-                    return Err(SqlError::Parse {
-                        detail: alter_user_syntax_msg(&format!(
-                            "unknown ALTER USER ... SET action '{other}' \
-                             (expected PASSWORD | ROLE | DEFAULT DATABASE)"
-                        )),
-                    });
+                AlterUserOp::SetRole {
+                    role: c.raw("role")?.to_string(),
                 }
             }
-        }
+            "DEFAULT" => {
+                c.expect_keyword("DATABASE")?;
+                AlterUserOp::SetDefaultDatabase {
+                    db_name: c.raw("database name")?.to_string(),
+                }
+            }
+            "" => {
+                return Err(syntax(
+                    "ALTER USER ... SET requires PASSWORD | ROLE | DEFAULT DATABASE",
+                ));
+            }
+            other => {
+                return Err(syntax(&format!(
+                    "unknown ALTER USER ... SET action '{other}' \
+                     (expected PASSWORD | ROLE | DEFAULT DATABASE)"
+                )));
+            }
+        },
+        // PostgreSQL-compatible alias: `ALTER USER <name> ROLE <role>`, the
+        // parallel of `CREATE USER ... ROLE ...`.
         "ROLE" => {
-            // PostgreSQL-compatible alias: `ALTER USER <name> ROLE <role>` —
-            // accept it the same as `SET ROLE`, since `CREATE USER ... ROLE ...`
-            // uses the keyword without `SET` and clients reach for the
-            // parallel form. The empty-role case is enforced by the handler.
-            let role = parts.get(4).map(|s| s.to_string()).unwrap_or_default();
-            if role.is_empty() {
-                return Err(SqlError::Parse {
-                    detail: alter_user_syntax_msg("ALTER USER ... ROLE requires a role name"),
-                });
+            if c.at_end() {
+                return Err(syntax("ALTER USER ... ROLE requires a role name"));
             }
-            AlterUserOp::SetRole { role }
+            AlterUserOp::SetRole {
+                role: c.raw("role")?.to_string(),
+            }
         }
         "WITH" => {
-            // `ALTER USER <name> WITH ROLE <role>` — also seen in the wild.
-            // Recognise the `WITH ROLE` form; anything else under WITH is
-            // rejected with a clear message.
-            let next = parts.get(4).map(|s| s.to_uppercase()).unwrap_or_default();
-            if next == "ROLE" {
-                let role = parts.get(5).map(|s| s.to_string()).unwrap_or_default();
-                if role.is_empty() {
-                    return Err(SqlError::Parse {
-                        detail: alter_user_syntax_msg(
-                            "ALTER USER ... WITH ROLE requires a role name",
-                        ),
-                    });
-                }
-                AlterUserOp::SetRole { role }
-            } else {
-                return Err(SqlError::Parse {
-                    detail: alter_user_syntax_msg(&format!(
-                        "unknown ALTER USER ... WITH clause '{}' (expected WITH ROLE <role>)",
-                        parts.get(4).copied().unwrap_or("")
-                    )),
-                });
+            if !c.eat_keyword("ROLE") {
+                return Err(syntax(&format!(
+                    "unknown ALTER USER ... WITH clause {} (expected WITH ROLE <role>)",
+                    c.describe_next()
+                )));
+            }
+            if c.at_end() {
+                return Err(syntax("ALTER USER ... WITH ROLE requires a role name"));
+            }
+            AlterUserOp::SetRole {
+                role: c.raw("role")?.to_string(),
             }
         }
         "MUST" => {
-            // ALTER USER <name> MUST CHANGE PASSWORD
+            c.expect_keywords(&["CHANGE", "PASSWORD"])?;
             AlterUserOp::MustChangePassword
         }
-        "PASSWORD" => {
-            // parts[4] = NEVER | EXPIRES
-            let next_raw = parts.get(4).copied().unwrap_or("");
-            let next = next_raw.to_uppercase();
-            match next.as_str() {
-                "NEVER" => AlterUserOp::PasswordNeverExpires,
-                "EXPIRES" => {
-                    // parts[5] = '<iso8601>' or IN
-                    let part5 = parts.get(5).map(|s| s.to_uppercase()).unwrap_or_default();
-                    if part5 == "IN" {
-                        // PASSWORD EXPIRES IN <N> DAYS
-                        let days: u32 = parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        AlterUserOp::PasswordExpiresInDays { days }
-                    } else {
-                        // PASSWORD EXPIRES '<iso8601>'
-                        let iso8601 =
-                            extract_quoted_string_from_parts(parts, 5).unwrap_or_default();
-                        AlterUserOp::PasswordExpiresAt { iso8601 }
+        "PASSWORD" => match next_word_upper(c).as_str() {
+            "NEVER" => {
+                c.expect_keyword("EXPIRES")?;
+                AlterUserOp::PasswordNeverExpires
+            }
+            "EXPIRES" => {
+                if c.eat_keyword("IN") {
+                    let days = c.u64("EXPIRES IN")?;
+                    let days = u32::try_from(days)
+                        .map_err(|_| syntax(&format!("EXPIRES IN {days} DAYS is out of range")))?;
+                    c.expect_keyword("DAYS")?;
+                    AlterUserOp::PasswordExpiresInDays { days }
+                } else {
+                    AlterUserOp::PasswordExpiresAt {
+                        iso8601: c.string("PASSWORD EXPIRES")?,
                     }
                 }
-                "" => {
-                    return Err(SqlError::Parse {
-                        detail: alter_user_syntax_msg(
-                            "ALTER USER ... PASSWORD requires NEVER EXPIRES | EXPIRES ...",
-                        ),
-                    });
-                }
-                _ => {
-                    return Err(SqlError::Parse {
-                        detail: alter_user_syntax_msg(&format!(
-                            "unknown ALTER USER ... PASSWORD clause '{next_raw}' \
-                             (expected NEVER EXPIRES | EXPIRES '<iso8601>' | EXPIRES IN <N> DAYS)"
-                        )),
-                    });
-                }
             }
-        }
+            "" => {
+                return Err(syntax(
+                    "ALTER USER ... PASSWORD requires NEVER EXPIRES | EXPIRES ...",
+                ));
+            }
+            other => {
+                return Err(syntax(&format!(
+                    "unknown ALTER USER ... PASSWORD clause '{other}' \
+                     (expected NEVER EXPIRES | EXPIRES '<iso8601>' | EXPIRES IN <N> DAYS)"
+                )));
+            }
+        },
         other => {
-            return Err(SqlError::Parse {
-                detail: alter_user_syntax_msg(&format!("unknown ALTER USER sub-command '{other}'")),
-            });
+            return Err(syntax(&format!(
+                "unknown ALTER USER sub-command '{}'",
+                if other.is_empty() {
+                    c.describe_next()
+                } else {
+                    other.to_string()
+                }
+            )));
         }
     };
+    if !c.at_end() {
+        return Err(syntax(&format!("unexpected {}", c.describe_next())));
+    }
 
     Ok(NodedbStatement::Auth(AuthStmt::AlterUser { username, op }))
 }
@@ -327,75 +354,69 @@ fn alter_user_syntax_msg(reason: &str) -> String {
 /// - `ALTER ROLE <name> GRANT <perm> ON [<object-type>] <target>`
 /// - `ALTER ROLE <name> REVOKE <perm> ON [<object-type>] <target>`
 /// - `ALTER ROLE <name> SET INHERIT <parent>`
-fn parse_alter_role(parts: &[&str], _trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    // parts[0] = ALTER, parts[1] = ROLE, parts[2] = <name>, parts[3] = sub-command
-    let name = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
-    if name.is_empty() {
-        return Err(SqlError::Parse {
-            detail: alter_role_syntax_msg("missing role name"),
-        });
-    }
-    let Some(sub_cmd) = parts.get(3).map(|s| s.to_uppercase()) else {
-        return Err(SqlError::Parse {
-            detail: alter_role_syntax_msg("ALTER ROLE requires a sub-command"),
-        });
+fn parse_alter_role(c: &mut ClauseCursor<'_, '_>) -> Result<NodedbStatement, SqlError> {
+    let syntax = |reason: &str| SqlError::Parse {
+        detail: alter_role_syntax_msg(reason),
     };
+    c.expect_keywords(&["ALTER", "ROLE"])?;
+    if c.at_end() {
+        return Err(syntax("missing role name"));
+    }
+    let name = c.raw("role name")?.to_string();
+    if c.at_end() {
+        return Err(syntax("ALTER ROLE requires a sub-command"));
+    }
+    let sub_cmd = next_word_upper(c);
 
     let sub_op = match sub_cmd.as_str() {
-        "GRANT" => {
-            // ALTER ROLE <name> GRANT <perm> ON [object-type] <target>
-            let permission = parts.get(4).map(|s| s.to_string()).unwrap_or_default();
-            // ON is at index 5; the object clause begins at index 6.
-            let (target_type, target_name) = super::grant::classify_object_clause(
-                parts.get(6).copied().unwrap_or_default(),
-                parts.get(7).copied(),
-            );
-            AlterRoleOp::Grant {
-                permission,
-                target_type,
-                target_name,
-            }
-        }
-        "REVOKE" => {
-            // ALTER ROLE <name> REVOKE <perm> ON [object-type] <target>
-            let permission = parts.get(4).map(|s| s.to_string()).unwrap_or_default();
-            let (target_type, target_name) = super::grant::classify_object_clause(
-                parts.get(6).copied().unwrap_or_default(),
-                parts.get(7).copied(),
-            );
-            AlterRoleOp::Revoke {
-                permission,
-                target_type,
-                target_name,
+        "GRANT" | "REVOKE" => {
+            let permission = c.raw("permission")?.to_string();
+            c.expect_keyword("ON")?;
+            let (target_type, target_name) = super::grant::object_clause(c)?;
+            if sub_cmd == "GRANT" {
+                AlterRoleOp::Grant {
+                    permission,
+                    target_type,
+                    target_name,
+                }
+            } else {
+                AlterRoleOp::Revoke {
+                    permission,
+                    target_type,
+                    target_name,
+                }
             }
         }
         "SET" => {
-            // ALTER ROLE <name> SET INHERIT <parent>
-            let next = parts.get(4).map(|s| s.to_uppercase()).unwrap_or_default();
-            if next != "INHERIT" {
-                return Err(SqlError::Parse {
-                    detail: alter_role_syntax_msg(&format!(
-                        "unknown ALTER ROLE ... SET clause '{}' (expected SET INHERIT <parent>)",
-                        parts.get(4).copied().unwrap_or("")
-                    )),
-                });
+            if !c.eat_keyword("INHERIT") {
+                return Err(syntax(&format!(
+                    "unknown ALTER ROLE ... SET clause {} (expected SET INHERIT <parent>)",
+                    c.describe_next()
+                )));
             }
-            let parent = parts.get(5).map(|s| s.to_string()).unwrap_or_default();
-            if parent.is_empty() {
-                return Err(SqlError::Parse {
-                    detail: alter_role_syntax_msg(
-                        "ALTER ROLE ... SET INHERIT requires a parent role name",
-                    ),
-                });
+            if c.at_end() {
+                return Err(syntax(
+                    "ALTER ROLE ... SET INHERIT requires a parent role name",
+                ));
             }
-            AlterRoleOp::SetInherit { parent }
+            AlterRoleOp::SetInherit {
+                parent: c.raw("parent role")?.to_string(),
+            }
         }
         other => {
-            return Err(SqlError::Parse {
-                detail: alter_role_syntax_msg(&format!("unknown ALTER ROLE sub-command '{other}'")),
-            });
+            return Err(syntax(&format!(
+                "unknown ALTER ROLE sub-command '{}'",
+                if other.is_empty() {
+                    c.describe_next()
+                } else {
+                    other.to_string()
+                }
+            )));
         }
     };
+    if !c.at_end() {
+        return Err(syntax(&format!("unexpected {}", c.describe_next())));
+    }
 
     Ok(NodedbStatement::Auth(AuthStmt::AlterRole { name, sub_op }))
 }
@@ -409,40 +430,18 @@ fn alter_role_syntax_msg(reason: &str) -> String {
     )
 }
 
-/// Extract a single-quoted string from parts starting at `start`.
-/// Handles multi-token quoted strings like `'hello world'`.
-fn extract_quoted_string_from_parts(parts: &[&str], start: usize) -> Option<String> {
-    if start >= parts.len() {
-        return None;
-    }
-    let first = parts[start];
-    if !first.starts_with('\'') {
-        return None;
-    }
-    if first.ends_with('\'') && first.len() > 1 {
-        return Some(first[1..first.len() - 1].to_string());
-    }
-    // Multi-token: accumulate until closing quote.
-    let mut result = first[1..].to_string();
-    for &part in &parts[start + 1..] {
-        result.push(' ');
-        if let Some(stripped) = part.strip_suffix('\'') {
-            result.push_str(stripped);
-            return Some(result);
-        }
-        result.push_str(part);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(sql: &str) -> Option<NodedbStatement> {
+    fn try_sql(sql: &str) -> Option<Result<NodedbStatement, SqlError>> {
         let upper = sql.to_uppercase();
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        try_parse(&upper, &parts, sql).map(|r| r.unwrap())
+        try_parse(&upper, &parts, sql)
+    }
+
+    fn parse(sql: &str) -> Option<NodedbStatement> {
+        try_sql(sql).map(|r| r.expect("parses"))
     }
 
     #[test]
@@ -514,6 +513,32 @@ mod tests {
         } else {
             panic!("expected CreateUser");
         }
+    }
+
+    #[test]
+    fn clause_words_inside_the_password_are_password_text() {
+        let stmt = parse("CREATE USER bob WITH PASSWORD 'x tenant 7 role superuser y'").unwrap();
+        if let NodedbStatement::Auth(AuthStmt::CreateUser {
+            password,
+            role,
+            tenant,
+            ..
+        }) = stmt
+        {
+            assert_eq!(password, "x tenant 7 role superuser y");
+            assert!(role.is_none());
+            assert!(tenant.is_none());
+        } else {
+            panic!("expected CreateUser");
+        }
+    }
+
+    #[test]
+    fn create_user_trailing_tokens_are_refused() {
+        assert!(matches!(
+            try_sql("CREATE USER bob WITH PASSWORD 'pw' ROLE admin SUPERUSER"),
+            Some(Err(_))
+        ));
     }
 
     #[test]
@@ -592,6 +617,15 @@ mod tests {
                 op: AlterUserOp::PasswordExpiresInDays { days: 90 },
             })
         );
+    }
+
+    #[test]
+    fn alter_user_non_numeric_days_is_refused() {
+        // A bad day count is never read as 0.
+        assert!(matches!(
+            try_sql("ALTER USER alice PASSWORD EXPIRES IN ninety DAYS"),
+            Some(Err(_))
+        ));
     }
 
     // ── ALTER ROLE tests ─────────────────────────────────────────────
@@ -722,6 +756,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn alter_role_grant_without_on_is_refused() {
+        assert!(matches!(
+            try_sql("ALTER ROLE analyst GRANT READ my_collection"),
+            Some(Err(_))
+        ));
+    }
+
     // ── SHOW PERMISSIONS tests ────────────────────────────────────────
 
     #[test]
@@ -768,6 +810,17 @@ mod tests {
             NodedbStatement::Auth(AuthStmt::ShowPermissions {
                 on_collection: Some("orders".to_string()),
                 for_grantee: Some("alice".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn show_constraints_on_names_the_collection() {
+        let stmt = parse("SHOW CONSTRAINTS ON orders").unwrap();
+        assert_eq!(
+            stmt,
+            NodedbStatement::Misc(MiscStmt::ShowConstraints {
+                collection: "orders".to_string()
             })
         );
     }

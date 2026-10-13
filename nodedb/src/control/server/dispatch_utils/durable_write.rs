@@ -51,6 +51,7 @@ pub(crate) async fn dispatch_durable_autocommit_write(
                 tenant_id: write.tenant_id,
                 database_id: write.database_id,
                 vshard_id: write.vshard_id,
+                user_roles: write.user_roles.clone(),
             },
             &write.plan,
             write.event_source,
@@ -93,6 +94,7 @@ pub(crate) async fn dispatch_authorized_durable_write(
                 tenant_id: checked.tenant_id(),
                 database_id: checked.database_id(),
                 vshard_id: checked.vshard_id(),
+                user_roles: checked.user_roles(),
             },
             checked.plan(),
             crate::event::EventSource::User,
@@ -139,6 +141,7 @@ pub(crate) async fn dispatch_authorized_durable_write_with_source(
                 tenant_id: checked.tenant_id(),
                 database_id: checked.database_id(),
                 vshard_id: checked.vshard_id(),
+                user_roles: checked.user_roles(),
             },
             checked.plan(),
             event_source,
@@ -178,6 +181,9 @@ struct WriteTarget {
     tenant_id: TenantId,
     database_id: DatabaseId,
     vshard_id: VShardId,
+    /// The roles of the identity that wrote the write. The entry carries
+    /// them to every replica.
+    user_roles: Vec<String>,
 }
 
 /// Propose `plan` through Raft when the plan encodes to a replicated entry.
@@ -196,6 +202,7 @@ async fn propose_if_replicable(
         tenant_id,
         database_id,
         vshard_id,
+        user_roles,
     } = target;
     // The entry carries resolved rows: a timeseries ingest resolves here,
     // on the proposer, before the entry exists.
@@ -214,7 +221,9 @@ async fn propose_if_replicable(
     let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)? else {
         return Ok(None);
     };
-    let entry = entry.with_event_source(event_source);
+    let entry = entry
+        .with_event_source(event_source)
+        .with_user_roles(user_roles);
     let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(shared)
         .tokio_instant();
     let (payload, write_versions) =

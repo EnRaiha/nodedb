@@ -106,6 +106,9 @@ async fn dispatch_unlogged(
             trace_id,
             event_source: crate::event::EventSource::User,
             txn_id,
+            // A staged write is judged at COMMIT, against the roles its redo
+            // record carries.
+            user_roles: Vec::new(),
             // Staged in-transaction writes are not yet durably committed; the
             // committed write version is recorded at COMMIT via the batch funnel,
             // so durability is not the funnel's to append here.

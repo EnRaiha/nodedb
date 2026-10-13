@@ -36,6 +36,7 @@ fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
 pub async fn add_period_lock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -96,7 +97,7 @@ pub async fn add_period_lock(
     let catalog = state.credentials.catalog();
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
+        .get_collection(database_id, tenant_id, &name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
 
@@ -126,6 +127,7 @@ pub async fn add_period_lock(
 pub async fn drop_period_lock(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -138,7 +140,7 @@ pub async fn drop_period_lock(
     let catalog = state.credentials.catalog();
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &name)
+        .get_collection(database_id, tenant_id, &name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", format!("collection '{name}' not found")))?;
 

@@ -7,7 +7,7 @@ use nodedb_types::QualifiedCollection;
 use nodedb_types::protocol::TextFields;
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_physical::physical_plan::{DocumentOp, DocumentPageSource, RowSource};
 
 use super::super::DispatchCtx;
 use super::declared_primary_key;
@@ -120,16 +120,50 @@ pub(crate) async fn build_insert_select(
             detail: "missing 'source_collection'".to_string(),
         })?
         .clone();
-    let filters = fields.filters.clone().unwrap_or_default();
-    let limit = fields.limit.unwrap_or(10_000) as usize;
+    // The op reads its source page by page as stored documents, so only a
+    // document source has rows it can read. Any other engine is refused by
+    // name, never copied as zero rows.
+    let stored = ctx
+        .state
+        .credentials
+        .catalog()
+        .get_collection(ctx.database_id(), ctx.identity.tenant_id.as_u64(), &source)?
+        .ok_or_else(|| crate::Error::CollectionNotFound {
+            tenant_id: ctx.identity.tenant_id,
+            collection: source.clone(),
+        })?;
+    if !matches!(
+        stored.collection_type,
+        nodedb_types::CollectionType::Document(_)
+    ) {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "insert_select source '{source}' must be a document collection; use SQL \
+                 INSERT ... SELECT to copy from any other engine"
+            ),
+        });
+    }
+    // No limit reads every matching row: the page source has no row bound.
+    let limit = fields
+        .limit
+        .map(|limit| {
+            usize::try_from(limit).map_err(|_| crate::Error::BadRequest {
+                detail: format!("insert_select limit {limit} does not fit this platform"),
+            })
+        })
+        .transpose()?;
 
     Ok(PhysicalPlan::Document(DocumentOp::InsertSelect {
         target_collection: QualifiedCollection::new(ctx.database_id(), collection),
-        source_collection: QualifiedCollection::new(ctx.database_id(), &source),
-        source_filters: filters,
-        source_limit: limit,
         // The native text-field form names no projection, so every source row
         // copies unchanged.
-        column_map: Vec::new(),
+        source: RowSource::DocumentPages(DocumentPageSource {
+            collection: QualifiedCollection::new(ctx.database_id(), &source),
+            filters: fields.filters.clone().unwrap_or_default(),
+            system_as_of_ms: None,
+            offset: 0,
+            limit,
+            column_map: Vec::new(),
+        }),
     }))
 }

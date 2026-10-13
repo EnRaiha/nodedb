@@ -48,9 +48,13 @@ pub(super) fn resolver_for_timeseries_op(
         }
         // Read-only: the scan writes nothing, and `ResolveIngest` is the
         // resolve pass itself.
-        TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => return None,
+        TimeseriesOp::Scan { .. }
+        | TimeseriesOp::ResolveIngest(_)
+        | TimeseriesOp::ReadAggregate { .. } => return None,
         // Refused at injection under a write policy; carries no predicate.
         TimeseriesOp::Truncate { .. } => return None,
+        // Changes no row; carries no predicate.
+        TimeseriesOp::RefreshAggregate { .. } | TimeseriesOp::Partitions { .. } => return None,
     };
     Some(Box::new(TimeseriesWriteResolver {
         collection: collection.as_str().to_owned(),

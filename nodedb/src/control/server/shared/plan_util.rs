@@ -89,6 +89,9 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. })
         | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. })
         | PhysicalPlan::Timeseries(TimeseriesOp::Truncate { collection, .. })
+        | PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate { collection, .. })
+        | PhysicalPlan::Timeseries(TimeseriesOp::Partitions { collection, .. })
+        | PhysicalPlan::Timeseries(TimeseriesOp::ReadAggregate { collection, .. })
         | PhysicalPlan::Spatial(SpatialOp::Scan { collection, .. })
         | PhysicalPlan::Document(DocumentOp::Register { collection, .. })
         | PhysicalPlan::Document(DocumentOp::IndexLookup { collection, .. })
@@ -143,7 +146,10 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match &inner.ingest {
             TimeseriesOp::Scan { collection, .. }
             | TimeseriesOp::Ingest { collection, .. }
-            | TimeseriesOp::Truncate { collection, .. } => Some(collection.as_str()),
+            | TimeseriesOp::Truncate { collection, .. }
+            | TimeseriesOp::RefreshAggregate { collection, .. }
+            | TimeseriesOp::Partitions { collection, .. }
+            | TimeseriesOp::ReadAggregate { collection, .. } => Some(collection.as_str()),
             TimeseriesOp::ResolveIngest(_) => None,
         },
         // Remaining ops carry no extractable collection. Exhaustive so a new

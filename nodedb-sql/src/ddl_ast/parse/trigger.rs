@@ -2,114 +2,170 @@
 
 //! Parse CREATE/DROP/ALTER/SHOW TRIGGER.
 
-use super::helpers::{extract_after_keyword, extract_name_after_if_exists};
+use super::clause::{ClauseCursor, Tok, Token, tokenize};
+use super::helpers::if_exists_name;
 use crate::ddl_ast::statement::{AutomationStmt, NodedbStatement};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::{find_ascii_case_insensitive_from, find_ascii_keyword};
 
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    (|| -> Result<Option<NodedbStatement>, SqlError> {
-        if upper.starts_with("CREATE ") && upper.contains("TRIGGER ") {
-            return Ok(Some(parse_create_trigger(upper, trimmed)));
+    if !(upper.starts_with("CREATE ")
+        || upper.starts_with("DROP TRIGGER ")
+        || upper.starts_with("ALTER TRIGGER ")
+        || upper.starts_with("SHOW TRIGGERS"))
+    {
+        return None;
+    }
+    let toks = tokenize(trimmed);
+    if upper.starts_with("CREATE ") {
+        // Only `CREATE [OR REPLACE] [SYNC|DEFERRED] TRIGGER` is a trigger.
+        // The word TRIGGER anywhere else (a string, a body) is not.
+        let mut probe = ClauseCursor::new(trimmed, &toks, "CREATE TRIGGER");
+        probe.expect_keyword("CREATE").ok()?;
+        probe.eat_keywords(&["OR", "REPLACE"]);
+        if !probe.eat_keyword("SYNC") {
+            probe.eat_keyword("DEFERRED");
         }
-        if upper.starts_with("DROP TRIGGER ") {
-            let if_exists = upper.contains("IF EXISTS");
-            let name = match extract_name_after_if_exists(parts, "TRIGGER") {
-                None => return Ok(None),
-                Some(r) => r?,
-            };
-            let collection = extract_after_keyword(parts, "ON").unwrap_or_default();
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::DropTrigger {
-                    name,
-                    collection,
-                    if_exists,
-                },
-            )));
+        if !probe.peek_keyword("TRIGGER") {
+            return None;
         }
-        if upper.starts_with("ALTER TRIGGER ") {
-            // ALTER TRIGGER <name> ENABLE|DISABLE|OWNER TO <new_owner>
-            let name = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
-            let action = parts.get(3).map(|s| s.to_uppercase()).unwrap_or_default();
-            // When action is "OWNER", "TO" is at index 4 and new_owner at index 5.
-            let new_owner = if action == "OWNER" {
-                parts.get(5).map(|s| s.trim_end_matches(';').to_string())
-            } else {
-                None
-            };
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::AlterTrigger {
-                    name,
-                    action,
-                    new_owner,
-                },
-            )));
-        }
-        if upper.starts_with("SHOW TRIGGERS") {
-            let collection = if upper.starts_with("SHOW TRIGGERS ON ") {
-                parts.get(3).map(|s| s.to_string())
-            } else {
-                None
-            };
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::ShowTriggers { collection },
-            )));
-        }
-        Ok(None)
-    })()
-    .transpose()
+        return Some(parse_create_trigger(trimmed, &toks).map(NodedbStatement::Automation));
+    }
+    Some(parse_other(trimmed, &toks).map(NodedbStatement::Automation))
 }
 
-/// Structural extraction for `CREATE [OR REPLACE] [SYNC|DEFERRED] TRIGGER`.
-///
-/// Extracts all fields as primitive types. The handler converts timing/events/
-/// granularity strings to their respective enums.
-fn parse_create_trigger(upper: &str, trimmed: &str) -> NodedbStatement {
-    let (or_replace, execution_mode, rest_original) = strip_create_trigger_prefix(upper, trimmed);
-
-    let (header_original, body_sql) = split_header_and_body(rest_original);
-
-    let tokens_orig: Vec<&str> = header_original.split_whitespace().collect();
-    let tokens_upper: Vec<String> = tokens_orig.iter().map(|t| t.to_uppercase()).collect();
-
-    let name = tokens_orig
-        .first()
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
-
-    let mut i = 1usize;
-
-    let timing = parse_timing_token(&tokens_upper, &mut i);
-    let (events_insert, events_update, events_delete) = parse_event_tokens(&tokens_upper, &mut i);
-
-    if i < tokens_upper.len() && tokens_upper[i] == "ON" {
-        i += 1;
+fn parse_other<'a>(sql: &'a str, toks: &[Token<'a>]) -> Result<AutomationStmt, SqlError> {
+    let mut c = ClauseCursor::new(sql, toks, "TRIGGER");
+    if c.eat_keywords(&["DROP", "TRIGGER"]) {
+        let (if_exists, name) = if_exists_name(&mut c, "trigger name")?;
+        let collection = if c.eat_keyword("ON") {
+            c.raw("collection")?.to_string()
+        } else {
+            String::new()
+        };
+        c.finish()?;
+        return Ok(AutomationStmt::DropTrigger {
+            name,
+            collection,
+            if_exists,
+        });
     }
-    let collection = tokens_orig
-        .get(i)
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
-    i += 1;
+    if c.eat_keywords(&["ALTER", "TRIGGER"]) {
+        let name = c.name("trigger name")?;
+        let action = c.one_of("action", &["ENABLE", "DISABLE", "OWNER"])?;
+        let new_owner = if action == "OWNER" {
+            c.expect_keyword("TO")?;
+            Some(c.raw("new owner")?.to_string())
+        } else {
+            None
+        };
+        c.finish()?;
+        return Ok(AutomationStmt::AlterTrigger {
+            name,
+            action: action.to_string(),
+            new_owner,
+        });
+    }
+    c.expect_keywords(&["SHOW", "TRIGGERS"])?;
+    let collection = if c.eat_keyword("ON") {
+        Some(c.raw("collection")?.to_string())
+    } else {
+        None
+    };
+    c.finish()?;
+    Ok(AutomationStmt::ShowTriggers { collection })
+}
 
-    let granularity = parse_granularity_tokens(&tokens_upper, &mut i);
-    let when_condition = extract_when_condition(&header_original, &tokens_upper, &mut i);
-    let priority = parse_priority_token(&tokens_orig, &tokens_upper, &mut i);
-    let security = parse_security_token(&tokens_upper, &mut i);
+/// Read `CREATE [OR REPLACE] [SYNC|DEFERRED] TRIGGER <name> [timing] <events>
+/// ON <collection> [FOR EACH ROW|STATEMENT] [WHEN (<cond>)] [PRIORITY <n>]
+/// [SECURITY <mode>]` followed by a `BEGIN ... END` or `$$ ... $$` body.
+fn parse_create_trigger<'a>(sql: &'a str, toks: &[Token<'a>]) -> Result<AutomationStmt, SqlError> {
+    let (header_end, body_sql) = split_body(sql, toks)?;
+    let header_toks = &toks[..header_end];
+    let mut c = ClauseCursor::new(sql, header_toks, "CREATE TRIGGER");
+    c.expect_keyword("CREATE")?;
+    let or_replace = c.eat_keywords(&["OR", "REPLACE"]);
+    let execution_mode = if c.eat_keyword("SYNC") {
+        "SYNC"
+    } else if c.eat_keyword("DEFERRED") {
+        "DEFERRED"
+    } else {
+        "ASYNC"
+    };
+    c.expect_keyword("TRIGGER")?;
+    let name = c.name("trigger name")?;
 
-    NodedbStatement::Automation(AutomationStmt::CreateTrigger {
+    let timing = if c.eat_keyword("BEFORE") {
+        "BEFORE"
+    } else if c.eat_keywords(&["INSTEAD", "OF"]) || c.eat_keyword("INSTEAD") {
+        "INSTEAD OF"
+    } else {
+        c.eat_keyword("AFTER");
+        "AFTER"
+    };
+
+    let (mut events_insert, mut events_update, mut events_delete) = (false, false, false);
+    loop {
+        match c.one_of("trigger event", &["INSERT", "UPDATE", "DELETE"])? {
+            "INSERT" => events_insert = true,
+            "UPDATE" => events_update = true,
+            _ => events_delete = true,
+        }
+        if !c.eat_keyword("OR") {
+            break;
+        }
+    }
+
+    c.expect_keyword("ON")?;
+    let collection = c.name("collection")?;
+
+    let granularity = if c.eat_keywords(&["FOR", "EACH"]) {
+        c.one_of("FOR EACH", &["ROW", "STATEMENT"])?
+    } else {
+        "ROW"
+    };
+
+    let when_condition = if c.eat_keyword("WHEN") {
+        Some(c.raw_paren("WHEN")?.to_string())
+    } else {
+        None
+    };
+
+    let priority = if c.eat_keyword("PRIORITY") {
+        let value = c.i64("PRIORITY")?;
+        i32::try_from(value).map_err(|_| c.error(format!("PRIORITY {value} is out of range")))?
+    } else {
+        0
+    };
+
+    // A SECURITY keyword with no mode yields `Some("")`: the clause was
+    // written, so the DDL layer rejects it rather than the parser hiding it.
+    let security = if c.eat_keyword("SECURITY") {
+        match c.peek_word_upper() {
+            Some(mode) => {
+                c.word("SECURITY")?;
+                Some(mode)
+            }
+            None => Some(String::new()),
+        }
+    } else {
+        None
+    };
+    c.finish()?;
+
+    Ok(AutomationStmt::CreateTrigger {
         or_replace,
-        execution_mode,
+        execution_mode: execution_mode.to_string(),
         name,
-        timing,
+        timing: timing.to_string(),
         events_insert,
         events_update,
         events_delete,
         collection,
-        granularity,
+        granularity: granularity.to_string(),
         when_condition,
         priority,
         security,
@@ -117,317 +173,194 @@ fn parse_create_trigger(upper: &str, trimmed: &str) -> NodedbStatement {
     })
 }
 
-/// Strip `CREATE [OR REPLACE] [SYNC|DEFERRED] TRIGGER ` prefix.
-/// Returns `(or_replace, execution_mode, original_rest)`.
-fn strip_create_trigger_prefix<'a>(upper: &str, original: &'a str) -> (bool, String, &'a str) {
-    const PREFIXES: &[(&str, bool, &str)] = &[
-        ("CREATE OR REPLACE SYNC TRIGGER ", true, "SYNC"),
-        ("CREATE OR REPLACE DEFERRED TRIGGER ", true, "DEFERRED"),
-        ("CREATE OR REPLACE TRIGGER ", true, "ASYNC"),
-        ("CREATE SYNC TRIGGER ", false, "SYNC"),
-        ("CREATE DEFERRED TRIGGER ", false, "DEFERRED"),
-        ("CREATE TRIGGER ", false, "ASYNC"),
-    ];
-    for &(prefix, or_replace, mode) in PREFIXES {
-        if upper.starts_with(prefix) {
-            let rest = &original[prefix.len()..];
-            return (or_replace, mode.to_string(), rest);
-        }
-    }
-    (false, "ASYNC".to_string(), original)
-}
-
-/// Split trigger SQL into `(header_original, body_sql)`.
-/// Handles both `$$ ... $$` and `BEGIN ... END` body forms.
-fn split_header_and_body(rest: &str) -> (String, String) {
-    // Try $$ ... $$ first
-    if let Some(first) = rest.find("$$") {
-        let inner_start = first + 2;
-        if let Some(second) = rest[inner_start..].find("$$") {
-            let header = rest[..first].trim().to_string();
-            let body = rest[inner_start..inner_start + second].trim().to_string();
-            return (header, body);
-        }
-    }
-
-    // Find BEGIN keyword not inside quotes
-    let bytes = rest.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    i += 1;
-                    if i < bytes.len() && bytes[i] == b'\'' {
-                        i += 1;
-                    }
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if find_ascii_case_insensitive_from(rest, "BEGIN", i) == Some(i) {
-            let before_ok =
-                i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
-            let after_ok = i + 5 >= bytes.len()
-                || (!bytes[i + 5].is_ascii_alphanumeric() && bytes[i + 5] != b'_');
-            if before_ok && after_ok {
-                let header = rest[..i].trim().to_string();
-                let body = rest[i..].trim().to_string();
-                return (header, body);
-            }
-        }
-        i += 1;
-    }
-    (rest.to_string(), String::new())
-}
-
-fn parse_timing_token(tokens: &[String], i: &mut usize) -> String {
-    if *i >= tokens.len() {
-        return "AFTER".to_string();
-    }
-    match tokens[*i].as_str() {
-        "BEFORE" => {
-            *i += 1;
-            "BEFORE".to_string()
-        }
-        "AFTER" => {
-            *i += 1;
-            "AFTER".to_string()
-        }
-        "INSTEAD" => {
-            *i += 1;
-            if *i < tokens.len() && tokens[*i] == "OF" {
-                *i += 1;
-            }
-            "INSTEAD OF".to_string()
-        }
-        _ => "AFTER".to_string(),
-    }
-}
-
-fn parse_event_tokens(tokens: &[String], i: &mut usize) -> (bool, bool, bool) {
-    let (mut insert, mut update, mut delete) = (false, false, false);
-    loop {
-        if *i >= tokens.len() {
-            break;
-        }
-        match tokens[*i].as_str() {
-            "INSERT" => {
-                insert = true;
-                *i += 1;
-            }
-            "UPDATE" => {
-                update = true;
-                *i += 1;
-            }
-            "DELETE" => {
-                delete = true;
-                *i += 1;
-            }
-            "OR" => {
-                *i += 1;
-            }
-            _ => break,
-        }
-    }
-    (insert, update, delete)
-}
-
-fn parse_granularity_tokens(tokens: &[String], i: &mut usize) -> String {
-    if *i + 2 < tokens.len() && tokens[*i] == "FOR" && tokens[*i + 1] == "EACH" {
-        *i += 2;
-        let g = tokens[*i].clone();
-        *i += 1;
-        g
-    } else {
-        "ROW".to_string()
-    }
-}
-
-fn extract_when_condition(
-    header_original: &str,
-    tokens_upper: &[String],
-    i: &mut usize,
-) -> Option<String> {
-    if *i >= tokens_upper.len() || tokens_upper[*i] != "WHEN" {
-        return None;
-    }
-    *i += 1;
-
-    let when_pos = find_ascii_keyword(header_original, "WHEN")?;
-    let after_when = header_original[when_pos + 4..].trim_start();
-    if !after_when.starts_with('(') {
-        return None;
-    }
+/// Find where the trigger header ends and return `(header_token_count,
+/// body_sql)`. The body starts at the first `$$` or `BEGIN` token at
+/// parenthesis depth zero; a `$$` or `BEGIN` inside a string is not one.
+fn split_body<'a>(sql: &'a str, toks: &[Token<'a>]) -> Result<(usize, String), SqlError> {
     let mut depth = 0i32;
-    let mut end = 0usize;
-    for (j, ch) in after_when.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = j;
-                    break;
+    for (i, tok) in toks.iter().enumerate() {
+        match &tok.tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth -= 1,
+            Tok::Word(w) if depth == 0 && w.starts_with("$$") => {
+                let inner_start = tok.span.start + 2;
+                let close = sql[inner_start..]
+                    .find("$$")
+                    .ok_or_else(|| super::clause::parse_err("CREATE TRIGGER: unclosed $$ body"))?;
+                let after = sql[inner_start + close + 2..].trim();
+                let after = after.strip_suffix(';').unwrap_or(after).trim();
+                if !after.is_empty() {
+                    return Err(super::clause::parse_err(format!(
+                        "CREATE TRIGGER: unexpected text after the $$ body: '{after}'"
+                    )));
                 }
+                let body = sql[inner_start..inner_start + close].trim().to_string();
+                return Ok((i, body));
+            }
+            Tok::Word(w) if depth == 0 && w.eq_ignore_ascii_case("BEGIN") => {
+                return Ok((i, sql[tok.span.start..].trim().to_string()));
             }
             _ => {}
         }
     }
-    if depth != 0 {
-        return None;
-    }
-    let condition = after_when[1..end].trim().to_string();
-    while *i < tokens_upper.len() && tokens_upper[*i] != "PRIORITY" {
-        *i += 1;
-    }
-    Some(condition)
-}
-
-fn parse_priority_token(tokens_orig: &[&str], tokens_upper: &[String], i: &mut usize) -> i32 {
-    if *i >= tokens_upper.len() || tokens_upper[*i] != "PRIORITY" {
-        return 0;
-    }
-    *i += 1;
-    if let Some(val) = tokens_orig.get(*i).and_then(|s| s.parse::<i32>().ok()) {
-        *i += 1;
-        val
-    } else {
-        0
-    }
-}
-
-/// Capture the `SECURITY` clause verbatim, or `None` when it is absent.
-///
-/// A missing mode after the keyword yields `Some("")` rather than `None`: the
-/// clause was written, so it is the DDL layer's business to reject it, not the
-/// parser's to pretend it was never there.
-fn parse_security_token(tokens_upper: &[String], i: &mut usize) -> Option<String> {
-    if *i >= tokens_upper.len() || tokens_upper[*i] != "SECURITY" {
-        return None;
-    }
-    *i += 1;
-    let mode = tokens_upper.get(*i).cloned().unwrap_or_default();
-    if *i < tokens_upper.len() {
-        *i += 1;
-    }
-    Some(mode)
+    Ok((toks.len(), String::new()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn create(sql: &str) -> NodedbStatement {
-        let upper = sql.to_uppercase();
-        parse_create_trigger(&upper, sql)
+    fn create(sql: &str) -> Result<AutomationStmt, SqlError> {
+        let toks = tokenize(sql);
+        parse_create_trigger(sql, &toks)
     }
 
     #[test]
     fn unicode_trigger_name_before_when_preserves_original_offsets() {
         let sql = "CREATE TRIGGER tﬀﬀ AFTER INSERT ON orders FOR EACH ROW WHEN (NEW.status = 'active') BEGIN RETURN; END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateTrigger {
+        let AutomationStmt::CreateTrigger {
             name,
             when_condition,
+            body_sql,
             ..
-        }) = create(sql)
-        {
-            assert_eq!(name, "tﬀﬀ");
-            assert_eq!(when_condition.as_deref(), Some("NEW.status = 'active'"));
-        } else {
+        } = create(sql).expect("parses")
+        else {
             panic!("expected CreateTrigger");
-        }
+        };
+        assert_eq!(name, "tﬀﬀ");
+        assert_eq!(when_condition.as_deref(), Some("NEW.status = 'active'"));
+        assert_eq!(body_sql, "BEGIN RETURN; END");
     }
 
     #[test]
-    fn unicode_text_before_begin_preserves_body_boundary() {
-        let (header, body) = split_header_and_body(
-            "t AFTER INSERT ON orders WHEN (NEW.note = 'ﬀﬀ') BEGIN RETURN; END",
-        );
-        assert_eq!(header, "t AFTER INSERT ON orders WHEN (NEW.note = 'ﬀﬀ')");
-        assert_eq!(body, "BEGIN RETURN; END");
+    fn begin_inside_a_when_literal_is_not_the_body() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON orders WHEN (NEW.note = 'BEGIN $$') BEGIN RETURN; END";
+        let AutomationStmt::CreateTrigger {
+            when_condition,
+            body_sql,
+            ..
+        } = create(sql).expect("parses")
+        else {
+            panic!("expected CreateTrigger");
+        };
+        assert_eq!(when_condition.as_deref(), Some("NEW.note = 'BEGIN $$'"));
+        assert_eq!(body_sql, "BEGIN RETURN; END");
+    }
+
+    #[test]
+    fn dollar_body() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON c $$ BEGIN RETURN; END $$";
+        let AutomationStmt::CreateTrigger { body_sql, .. } = create(sql).expect("parses") else {
+            panic!("expected CreateTrigger");
+        };
+        assert_eq!(body_sql, "BEGIN RETURN; END");
     }
 
     #[test]
     fn basic_after_insert() {
         let sql = "CREATE TRIGGER audit AFTER INSERT ON orders FOR EACH ROW BEGIN RETURN; END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateTrigger {
+        let AutomationStmt::CreateTrigger {
             name,
             timing,
             events_insert,
             collection,
             granularity,
             ..
-        }) = create(sql)
-        {
-            assert_eq!(name, "audit");
-            assert_eq!(timing, "AFTER");
-            assert!(events_insert);
-            assert_eq!(collection, "orders");
-            assert_eq!(granularity, "ROW");
-        } else {
+        } = create(sql).expect("parses")
+        else {
             panic!("expected CreateTrigger");
-        }
+        };
+        assert_eq!(name, "audit");
+        assert_eq!(timing, "AFTER");
+        assert!(events_insert);
+        assert_eq!(collection, "orders");
+        assert_eq!(granularity, "ROW");
     }
 
     #[test]
     fn or_replace_sync() {
         let sql = "CREATE OR REPLACE SYNC TRIGGER t AFTER INSERT ON c FOR EACH ROW BEGIN END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateTrigger {
+        let AutomationStmt::CreateTrigger {
             or_replace,
             execution_mode,
             ..
-        }) = create(sql)
-        {
-            assert!(or_replace);
-            assert_eq!(execution_mode, "SYNC");
-        } else {
+        } = create(sql).expect("parses")
+        else {
             panic!("expected CreateTrigger");
-        }
+        };
+        assert!(or_replace);
+        assert_eq!(execution_mode, "SYNC");
     }
 
     #[test]
     fn multi_event() {
         let sql = "CREATE TRIGGER t AFTER INSERT OR UPDATE OR DELETE ON c FOR EACH ROW BEGIN END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateTrigger {
+        let AutomationStmt::CreateTrigger {
             events_insert,
             events_update,
             events_delete,
             ..
-        }) = create(sql)
-        {
-            assert!(events_insert);
-            assert!(events_update);
-            assert!(events_delete);
-        } else {
+        } = create(sql).expect("parses")
+        else {
             panic!("expected CreateTrigger");
-        }
+        };
+        assert!(events_insert && events_update && events_delete);
     }
 
     #[test]
     fn statement_granularity() {
         let sql = "CREATE TRIGGER t AFTER INSERT ON c FOR EACH STATEMENT BEGIN END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateTrigger { granularity, .. }) =
-            create(sql)
-        {
-            assert_eq!(granularity, "STATEMENT");
-        } else {
+        let AutomationStmt::CreateTrigger { granularity, .. } = create(sql).expect("parses") else {
             panic!("expected CreateTrigger");
-        }
+        };
+        assert_eq!(granularity, "STATEMENT");
     }
 
     #[test]
     fn with_priority() {
         let sql = "CREATE TRIGGER t AFTER INSERT ON c FOR EACH ROW PRIORITY 10 BEGIN END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateTrigger { priority, .. }) =
-            create(sql)
-        {
-            assert_eq!(priority, 10);
-        } else {
+        let AutomationStmt::CreateTrigger { priority, .. } = create(sql).expect("parses") else {
             panic!("expected CreateTrigger");
-        }
+        };
+        assert_eq!(priority, 10);
+    }
+
+    #[test]
+    fn security_without_mode_is_kept_as_written() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON c SECURITY BEGIN END";
+        let AutomationStmt::CreateTrigger { security, .. } = create(sql).expect("parses") else {
+            panic!("expected CreateTrigger");
+        };
+        assert_eq!(security.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn when_without_parentheses_is_refused() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON o FOR EACH ROW WHEN NEW.amount > 100 BEGIN RETURN; END";
+        assert!(create(sql).is_err());
+    }
+
+    #[test]
+    fn misspelled_timing_is_refused() {
+        let sql = "CREATE TRIGGER t BEFOR INSERT ON o FOR EACH ROW BEGIN RETURN; END";
+        assert!(create(sql).is_err());
+    }
+
+    #[test]
+    fn non_numeric_priority_is_refused() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON o PRIORITY high BEGIN RETURN; END";
+        assert!(create(sql).is_err());
+    }
+
+    #[test]
+    fn trigger_word_in_another_create_is_not_a_trigger() {
+        let sql = "CREATE SCHEDULE s CRON '* * * * *' AS INSERT INTO log VALUES ('TRIGGER fired')";
+        assert!(try_parse(&sql.to_uppercase(), &[], sql).is_none());
+    }
+
+    #[test]
+    fn drop_trigger_with_trailing_tokens_is_refused() {
+        let sql = "DROP TRIGGER t ON orders EXTRA";
+        assert!(try_parse(&sql.to_uppercase(), &[], sql).is_some_and(|r| r.is_err()));
     }
 }

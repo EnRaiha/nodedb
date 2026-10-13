@@ -70,6 +70,12 @@ pub struct RedoRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[msgpack(default)]
     pub row_changes: Vec<super::row_changes::RedoRowChange>,
+    /// The roles of the identity that committed the transaction. Every
+    /// replica judges a role-guarded state transition against this set, so
+    /// each reaches the same verdict. Empty for a record no user committed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[msgpack(default)]
+    pub user_roles: Vec<String>,
 }
 
 /// One `PUBLISH TO` message a committed transaction owes its topic.
@@ -397,6 +403,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let bytes = record.to_bytes().expect("encode");
         let decoded = RedoRecord::from_bytes(&bytes).expect("decode");
@@ -426,6 +433,7 @@ mod tests {
                 }),
             }],
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let bytes = record.to_bytes().expect("encode");
         assert_eq!(RedoRecord::from_bytes(&bytes).expect("decode"), record);
@@ -460,6 +468,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let bytes = record.to_bytes().expect("encode");
         let decoded = RedoRecord::from_bytes(&bytes).expect("decode");
@@ -495,6 +504,25 @@ mod tests {
         assert!(decoded.row_sources.is_empty());
         assert!(decoded.publishes.is_empty());
         assert!(decoded.row_changes.is_empty());
+        assert!(decoded.user_roles.is_empty());
+    }
+
+    /// The committing identity's roles survive the encoding every replica
+    /// decodes.
+    #[test]
+    fn roundtrip_with_user_roles() {
+        let record = RedoRecord {
+            version: 1,
+            ops: sample_ops(),
+            calvin_stamp: None,
+            cross_shard_applied: None,
+            row_sources: Vec::new(),
+            publishes: Vec::new(),
+            row_changes: Vec::new(),
+            user_roles: vec!["approver".into(), "readwrite".into()],
+        };
+        let bytes = record.to_bytes().expect("encode");
+        assert_eq!(RedoRecord::from_bytes(&bytes).expect("decode"), record);
     }
 
     #[test]
@@ -511,6 +539,7 @@ mod tests {
             }],
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let bytes = record.to_bytes().expect("encode");
         assert_eq!(RedoRecord::from_bytes(&bytes).expect("decode"), record);
@@ -531,6 +560,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let bytes = record.to_bytes().expect("encode");
         assert_eq!(RedoRecord::from_bytes(&bytes).expect("decode"), record);

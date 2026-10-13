@@ -49,6 +49,7 @@ pub mod security;
 pub mod sequence;
 pub mod server;
 pub mod shutdown;
+pub(crate) mod source_read;
 pub mod sql_dispatch;
 pub mod startup;
 pub mod state;

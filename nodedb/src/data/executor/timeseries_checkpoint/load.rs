@@ -97,6 +97,14 @@ impl CoreLoop {
             return Ok(());
         }
 
+        // A rewrite a crash interrupted leaves its staged or replaced copy.
+        // Settle it before the registry lists the partitions.
+        super::rewrite_recovery::recover_interrupted_rewrites(&ts_dir)?;
+        // A multi-partition flush a crash interrupted is installed whole if it
+        // committed, and removed if it did not.
+        crate::data::executor::handlers::timeseries::flush_commit::recover_interrupted_flushes(
+            &ts_dir,
+        )?;
         let registry = read_registry(&ts_dir, self.segment_keks.ts_segment_kek.as_ref())?;
         let stamp = super::stamp::read_collection_ts_stamp(&ts_dir, &registry)?;
         let merged = match self.ts_replay_stamps.get(&key) {

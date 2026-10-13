@@ -9,5 +9,5 @@ pub use memtable::ColumnarMemtable;
 pub use snapshot::{ColumnSnapshot, MemtableSnapshot};
 pub use types::{
     ColumnData, ColumnType, ColumnValue, ColumnarDrainResult, ColumnarFlushView,
-    ColumnarMemtableConfig, ColumnarSchema, TimeKind,
+    ColumnarMemtableConfig, ColumnarSchema, NULL_SYMBOL_ID, TimeKind,
 };

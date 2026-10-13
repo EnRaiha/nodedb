@@ -92,7 +92,9 @@ impl Scheduler {
 
         // A stage writes no WAL record, so no committed LSN rides on it.
         let database_id = txn.tx_class.database_id;
-        let request = self.build_exempt_request(request_id, tenant_id, database_id, plan);
+        let mut request = self.build_exempt_request(request_id, tenant_id, database_id, plan);
+        // The stage judges a role-guarded transition against the writer's roles.
+        request.user_roles = txn.tx_class.user_roles.clone();
 
         // The txn enters `pending` before the dispatch, so a stage refused at
         // capacity stays in flight with its locks until the re-send.

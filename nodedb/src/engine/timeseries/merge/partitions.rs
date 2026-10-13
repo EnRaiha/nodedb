@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use nodedb_types::timeseries::{PartitionMeta, SymbolDictionary};
+use nodedb_wal::crypto::WalEncryptionKey;
 
 use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
 use crate::engine::timeseries::columnar_segment::{
@@ -14,18 +15,21 @@ use crate::engine::timeseries::columnar_segment::{
 /// Merge multiple source partitions into one output partition.
 ///
 /// Reads all columns from each source, concatenates them (sorted by timestamp),
-/// unifies symbol dictionaries, and writes the result.
+/// unifies symbol dictionaries, and writes the result. `kek` is the
+/// timeseries segment key: the sources are read with it and the output is
+/// written with it. `None` reads and writes plaintext.
 pub fn merge_partitions(
     base_dir: &Path,
     source_dirs: &[PathBuf],
     output_name: &str,
+    kek: Option<&WalEncryptionKey>,
 ) -> Result<MergeResult, SegmentError> {
     if source_dirs.is_empty() {
         return Err(SegmentError::Io("no source partitions to merge".into()));
     }
 
     // Read schemas — use the first partition's schema as the reference.
-    let ref_schema = ColumnarSegmentReader::read_schema(&source_dirs[0], None)?;
+    let ref_schema = ColumnarSegmentReader::read_schema(&source_dirs[0], kek)?;
 
     // Read and concatenate columns from all sources.
     let mut merged_columns: Vec<ColumnData> = ref_schema
@@ -49,7 +53,7 @@ pub fn merge_partitions(
     }
 
     for source_dir in source_dirs {
-        let meta = ColumnarSegmentReader::read_meta(source_dir, None)?;
+        let meta = ColumnarSegmentReader::read_meta(source_dir, kek)?;
         total_rows += meta.row_count;
         if meta.min_ts < global_min_ts {
             global_min_ts = meta.min_ts;
@@ -60,7 +64,7 @@ pub fn merge_partitions(
         total_size += meta.size_bytes;
 
         // Read partition schema for column mapping (handles schema evolution).
-        let part_schema = ColumnarSegmentReader::read_schema(source_dir, None)?;
+        let part_schema = ColumnarSegmentReader::read_schema(source_dir, kek)?;
 
         for (i, (col_name, col_type)) in ref_schema.columns.iter().enumerate() {
             // Check if this column exists in the source partition.
@@ -69,12 +73,12 @@ pub fn merge_partitions(
             match source_idx {
                 Some(_src_i) => {
                     let col =
-                        ColumnarSegmentReader::read_column(source_dir, col_name, *col_type, None)?;
+                        ColumnarSegmentReader::read_column(source_dir, col_name, *col_type, kek)?;
 
                     if *col_type == ColumnType::Symbol {
                         // Remap symbol IDs through merged dictionary.
                         let source_dict =
-                            ColumnarSegmentReader::read_symbol_dict(source_dir, col_name, None)?;
+                            ColumnarSegmentReader::read_symbol_dict(source_dir, col_name, kek)?;
                         let merged_dict =
                             merged_dicts
                                 .get_mut(&i)
@@ -142,7 +146,7 @@ pub fn merge_partitions(
         "merge partition written"
     );
 
-    let meta = writer.write_partition(output_name, &drain.view(), interval_ms, 0, None)?;
+    let meta = writer.write_partition(output_name, &drain.view(), interval_ms, 0, kek)?;
 
     Ok(MergeResult {
         meta,
@@ -254,7 +258,6 @@ fn permute_vec<T: Clone>(v: &mut Vec<T>, indices: &[usize]) {
 mod tests {
     use std::path::PathBuf;
 
-    use nodedb_types::timeseries::MetricSample;
     use tempfile::TempDir;
 
     use crate::engine::timeseries::columnar_memtable::{
@@ -277,13 +280,14 @@ mod tests {
         let writer = ColumnarSegmentWriter::new(base_dir);
         let mut mt = ColumnarMemtable::new_metric(test_config());
         for i in 0..count {
-            mt.ingest_metric(
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: start_ts + i as i64,
-                    value: (start_ts + i as i64) as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(start_ts + i as i64),
+                    ColumnValue::Float64((start_ts + i as i64) as f64),
+                ],
+            )
+            .unwrap();
         }
         let drain = mt.drain();
         writer
@@ -298,7 +302,7 @@ mod tests {
         let dir1 = write_test_partition(tmp.path(), "ts-part1", 1000, 50);
         let dir2 = write_test_partition(tmp.path(), "ts-part2", 2000, 50);
 
-        let result = merge_partitions(tmp.path(), &[dir1, dir2], "ts-merged").unwrap();
+        let result = merge_partitions(tmp.path(), &[dir1, dir2], "ts-merged", None).unwrap();
 
         assert_eq!(result.meta.row_count, 100);
         assert_eq!(result.meta.min_ts, 1000);
@@ -355,6 +359,7 @@ mod tests {
             tmp.path(),
             &[tmp.path().join("ts-p1"), tmp.path().join("ts-p2")],
             "ts-merged-tags",
+            None,
         )
         .unwrap();
         assert_eq!(result.meta.row_count, 20);
@@ -374,7 +379,7 @@ mod tests {
         let dir1 = write_test_partition(tmp.path(), "ts-later", 5000, 20);
         let dir2 = write_test_partition(tmp.path(), "ts-earlier", 1000, 20);
 
-        let merged = merge_partitions(tmp.path(), &[dir1, dir2], "ts-sorted").unwrap();
+        let merged = merge_partitions(tmp.path(), &[dir1, dir2], "ts-sorted", None).unwrap();
         assert_eq!(
             merged.meta.row_count, 40,
             "merged partition should have all rows"
@@ -388,5 +393,41 @@ mod tests {
         assert_eq!(timestamps[0], 1000);
         assert_eq!(timestamps[19], 1019);
         assert_eq!(timestamps[20], 5000);
+    }
+
+    /// Encrypted sources merge with the segment key, and the merged
+    /// partition is written with it.
+    #[test]
+    fn merge_reads_and_writes_with_the_segment_key() {
+        let kek = WalEncryptionKey::from_bytes(&[0x42u8; 32]).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let mut dirs = Vec::new();
+        for (name, start) in [("ts-enc1", 1000i64), ("ts-enc2", 2000)] {
+            let mut mt = ColumnarMemtable::new_metric(test_config());
+            for i in 0..10 {
+                mt.ingest_row(
+                    1,
+                    &[
+                        ColumnValue::Timestamp(start + i),
+                        ColumnValue::Float64(i as f64),
+                    ],
+                )
+                .unwrap();
+            }
+            let drain = mt.drain();
+            ColumnarSegmentWriter::new(tmp.path())
+                .write_partition(name, &drain.view(), 86_400_000, 0, Some(&kek))
+                .unwrap();
+            dirs.push(tmp.path().join(name));
+        }
+
+        assert!(merge_partitions(tmp.path(), &dirs, "ts-plain-try", None).is_err());
+        let merged = merge_partitions(tmp.path(), &dirs, "ts-enc-merged", Some(&kek)).unwrap();
+        assert_eq!(merged.meta.row_count, 20);
+        let merged_dir = tmp.path().join("ts-enc-merged");
+        let ts_col =
+            ColumnarSegmentReader::read_column(&merged_dir, "timestamp", MILLIS, Some(&kek))
+                .unwrap();
+        assert_eq!(ts_col.as_timestamps().len(), 20);
     }
 }

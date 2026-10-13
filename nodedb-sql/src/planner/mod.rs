@@ -3,6 +3,7 @@
 pub mod agg_bind;
 pub mod agg_naming;
 pub mod aggregate;
+pub mod aggregate_clauses;
 pub mod aggregate_cp_wrap;
 pub mod aggregate_order;
 pub mod array_ddl;

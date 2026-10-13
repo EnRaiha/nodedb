@@ -2,42 +2,32 @@
 
 //! `DROP DATABASE [IF EXISTS] <name> [CASCADE | FORCE]`.
 
+use crate::ddl_ast::parse::clause::ClauseCursor;
 use crate::ddl_ast::statement::{DatabaseStmt, NodedbStatement};
 use crate::error::SqlError;
 
-pub(super) fn parse_drop_database(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
+use super::dispatch::db_name;
+
+/// Read `[IF EXISTS] <name> [CASCADE | FORCE]` after `DROP DATABASE`.
+pub(super) fn parse_drop_database(
+    c: &mut ClauseCursor<'_, '_>,
+) -> Result<NodedbStatement, SqlError> {
     // FORCE is accepted as a synonym for CASCADE: both set `cascade = true`.
     // Any token after the name that is not CASCADE/FORCE is a parse error —
     // silently ignoring trailing garbage masks typos in user SQL.
-    let mut idx = 2usize;
-    let if_exists = if parts.get(idx).map(|w| w.to_uppercase()).as_deref() == Some("IF")
-        && parts.get(idx + 1).map(|w| w.to_uppercase()).as_deref() == Some("EXISTS")
-    {
-        idx += 2;
-        true
-    } else {
-        false
-    };
-
-    let name = parts
-        .get(idx)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "DROP DATABASE requires a name".into(),
-        })?
-        .to_string();
-    let name = name.trim_matches('"').to_string();
-    idx += 1;
+    let if_exists = c.eat_keywords(&["IF", "EXISTS"]);
+    if c.at_end() {
+        return Err(c.error("DROP DATABASE requires a name"));
+    }
+    let name = db_name(c, "database name")?;
 
     let mut cascade = false;
-    for w in &parts[idx..] {
-        match w.to_uppercase().as_str() {
-            "CASCADE" | "FORCE" => cascade = true,
-            other => {
-                return Err(SqlError::Parse {
-                    detail: format!("DROP DATABASE: unexpected token '{other}'"),
-                });
-            }
+    while !c.at_end() {
+        if c.eat_keyword("CASCADE") || c.eat_keyword("FORCE") {
+            cascade = true;
+        } else {
+            let word = c.peek_word_upper().unwrap_or_else(|| c.describe_next());
+            return Err(c.error(format!("unexpected token '{word}'")));
         }
     }
 

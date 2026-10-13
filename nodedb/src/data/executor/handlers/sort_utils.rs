@@ -15,27 +15,24 @@ use nodedb_query::{EvalError, compare_json, eval_expr_on_json};
 /// projection. Returning the rows unsorted instead would answer a different
 /// query than the client asked for.
 ///
-/// Decode failures for individual rows are logged at debug level and treated
-/// as `null` for comparison purposes, so they sort to the start rather than
-/// failing the entire scan.
+/// A row that does not decode is an error. Sorting it as `null` would place
+/// it by a value it does not hold.
 pub(in crate::data::executor) fn sort_msgpack_rows(
     rows: &mut [Vec<u8>],
     sort_keys: &[SortKeySpec],
-) -> Result<(), EvalError> {
+) -> crate::Result<()> {
     if sort_keys.is_empty() {
         return Ok(());
     }
 
     let decoded: Vec<serde_json::Value> = rows
         .iter()
-        .map(|r| match nodedb_types::json_from_msgpack(r) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(err = %e, "msgpack decode failed during sort; treating row as null");
-                serde_json::Value::Null
-            }
+        .map(|r| {
+            nodedb_types::json_from_msgpack(r).map_err(|e| crate::Error::Codec {
+                detail: format!("ORDER BY row decode: {e}"),
+            })
         })
-        .collect();
+        .collect::<crate::Result<_>>()?;
 
     let keyed = sort_key_values(&decoded, sort_keys)?;
 

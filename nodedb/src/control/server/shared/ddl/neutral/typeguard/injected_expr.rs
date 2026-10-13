@@ -32,7 +32,21 @@ pub(super) fn validate_injected_expr(
     clause: &str,
     expr: &str,
 ) -> Result<(), DdlError> {
-    validate_clause_expr(clause, field, expr)?;
+    let compiled = validate_clause_expr(clause, field, expr)?;
+    // The classifier reads a bare `UUID_V7`, `ULID` or `current_timestamp` as
+    // a generator or a volatile call, while the write path reads the same
+    // spelling as a field reference and stores that field's value. A guard
+    // clause evaluates on every write, so a volatile classification is
+    // refused.
+    if compiled.is_volatile() {
+        return Err(err(
+            "42601",
+            &format!(
+                "field '{field}': {clause} expression '{expr}' is non-deterministic; a \
+                 typeguard {clause} is evaluated on every write"
+            ),
+        ));
+    }
     nodedb_query::expr_parse::parse_generated_expr(expr).map_err(|error| {
         err(
             "42601",
@@ -97,6 +111,21 @@ mod tests {
             let error = validate_injected_expr("at", "DEFAULT", expr)
                 .expect_err("a non-deterministic function must refuse");
             assert_eq!(error.sqlstate, "42601", "on {expr}");
+        }
+    }
+
+    /// A bare generator keyword or a niladic volatile call reads as a field on
+    /// the write path, so it is refused at declaration.
+    #[test]
+    fn a_bare_generator_keyword_is_refused() {
+        for (clause, expr) in [
+            ("DEFAULT", "UUID_V7"),
+            ("DEFAULT", "ulid"),
+            ("VALUE", "current_timestamp"),
+        ] {
+            let error = validate_injected_expr("f", clause, expr)
+                .expect_err("a volatile classification must refuse");
+            assert_eq!(error.sqlstate, "42601", "on {clause} {expr}");
         }
     }
 

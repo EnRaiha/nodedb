@@ -114,6 +114,9 @@ impl CoreLoop {
                     unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                     wal_lsn: task.wal_lsn(),
                     resolved_targets: resolved_sum_targets,
+                    guards: crate::data::executor::enforcement::typeguard::GuardScope::Assigned(
+                        &upd.assigned,
+                    ),
                 },
             ) {
                 Ok(mut outcome) => {

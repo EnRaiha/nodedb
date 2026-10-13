@@ -26,6 +26,14 @@ use crate::engine::graph::edge_store::Direction;
 use crate::query::fusion::{RankedResult, reciprocal_rank_fusion_weighted};
 use crate::types::TenantId;
 
+/// The BM25 leg of a three-source fusion: the query and the field whose
+/// index it searches.
+#[derive(Clone, Copy)]
+pub(in crate::data::executor) struct Bm25Leg<'a> {
+    pub query: &'a str,
+    pub field: &'a str,
+}
+
 /// Bundled arguments for [`CoreLoop::execute_graph_rag_fusion_triple`].
 pub(in crate::data::executor) struct GraphRagFusionTripleParams<'a> {
     pub tenant_id: u64,
@@ -62,7 +70,7 @@ impl CoreLoop {
             vector_field,
             max_visited,
             bm25_query,
-            bm25_field: _bm25_field,
+            bm25_field,
         } = params;
         debug!(
             core = self.core_id,
@@ -71,6 +79,7 @@ impl CoreLoop {
             expansion_depth,
             final_top_k,
             %bm25_query,
+            %bm25_field,
             "graph rag fusion triple"
         );
 
@@ -88,11 +97,15 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let text_results =
-            match self.bm25_leg_hits(task, tid_typed, collection, bm25_query, final_top_k) {
-                Ok(results) => results,
-                Err(resp) => return resp,
-            };
+        let bm25 = Bm25Leg {
+            query: bm25_query,
+            field: bm25_field,
+        };
+        let text_results = match self.bm25_leg_hits(task, tid_typed, collection, bm25, final_top_k)
+        {
+            Ok(results) => results,
+            Err(resp) => return resp,
+        };
 
         // Graph expansion seeded directly by the vector hits' surrogates.
         let expansion = self.expand_graph(GraphExpansionParams {
@@ -142,23 +155,31 @@ impl CoreLoop {
     }
 
     /// Run the BM25 leg of a three-source fusion: `(surrogate, score)` per
-    /// hit, in rank order. It fetches three times `final_top_k`, at least 20,
-    /// so fusion has candidates past the final cut.
+    /// hit, in rank order. The leg searches the index of `bm25.field`. It
+    /// fetches three times `final_top_k`, at least 20, so fusion has
+    /// candidates past the final cut. A collection with no text at all gives
+    /// no hits. A field that holds no text while other text exists is a
+    /// `TextColumn` error.
     pub(in crate::data::executor) fn bm25_leg_hits(
         &self,
         task: &ExecutionTask,
         tenant_id: TenantId,
         collection: &str,
-        bm25_query: &str,
+        bm25: Bm25Leg<'_>,
         final_top_k: usize,
     ) -> Result<Vec<(Surrogate, f32)>, Response> {
+        let index = match self.text_index(task, tenant_id.as_u64(), collection, Some(bm25.field)) {
+            Ok(Some(index)) => index,
+            Ok(None) => return Ok(Vec::new()),
+            Err(e) => return Err(self.response_error(task, e)),
+        };
         let fetch_k = final_top_k.saturating_mul(3).max(20);
         match self.inverted.search(
             task.request.database_id.as_u64(),
             tenant_id,
-            collection,
+            index,
             FtsSearchParams {
-                query: bm25_query,
+                query: bm25.query,
                 top_k: fetch_k,
                 fuzzy_enabled: true,
                 mode: QueryMode::And,

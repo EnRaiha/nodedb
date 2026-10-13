@@ -326,6 +326,13 @@ pub enum Error {
     #[error("{detail}")]
     ObjectNotInPrerequisiteState { object: String, detail: String },
 
+    /// A statement the named object's kind does not take, such as a write to
+    /// a read-only continuous aggregate. Propagated from
+    /// `SqlError::WrongObjectType`; the pgwire layer renders this as SQLSTATE
+    /// `42809` (wrong_object_type).
+    #[error("{detail}")]
+    WrongObjectType { detail: String },
+
     /// A column reference resolved against no relation, output alias, or
     /// synthetic column in scope. Propagated from `SqlError::UnknownColumn`;
     /// the pgwire layer renders it as SQLSTATE `42703` (undefined_column).

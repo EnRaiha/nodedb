@@ -15,7 +15,7 @@ pub(crate) async fn build_recursive_scan(
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
     let base_filters = fields.filters.clone().unwrap_or_default();
-    let limit = fields.limit.unwrap_or(10_000) as usize;
+    let limit = super::requested_limit(fields)?;
 
     Ok(PhysicalPlan::Query(QueryOp::RecursiveScan {
         collection: QualifiedCollection::new(ctx.database_id(), collection),

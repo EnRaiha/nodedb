@@ -24,15 +24,13 @@ use super::parse::{find_matching_paren, parse_parameters, validate_identifier};
 pub async fn create_wasm_aggregate(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create WASM aggregate functions")?;
 
     let parsed = parse_aggregate_create(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 

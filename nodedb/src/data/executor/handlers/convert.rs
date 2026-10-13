@@ -132,8 +132,15 @@ impl CoreLoop {
             .iter()
             .find(|c| c.primary_key)
             .map(|c| c.name.as_str());
-        let identity_column = nodedb_types::declared_key(declared_primary_key)
-            .unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN);
+        // A system row id keys a schema with no declared key: it is an integer
+        // the write path fills from the surrogate. Every other key column holds
+        // the client-visible identity text.
+        let identity_column = match declared_primary_key {
+            Some(key) if key == nodedb_types::ROWID_COLUMN => nodedb_types::ROWID_COLUMN,
+            other => {
+                nodedb_types::declared_key(other).unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN)
+            }
+        };
 
         // Scan all existing documents.
         let database_id = task.request.database_id.as_u64();
@@ -155,8 +162,26 @@ impl CoreLoop {
             // identity yet: inject the surrogate's decimal string there so the
             // target schema's NOT NULL key column has something to validate.
             let synth_id = doc_id.to_identity();
-            let with_id =
-                msgpack_scan::inject_str_field(&normalized, identity_column, synth_id.as_str());
+            let with_id = if identity_column == nodedb_types::ROWID_COLUMN {
+                // A row that carries its system row id keeps it. One that
+                // lacks it takes the surrogate, as a write fills it.
+                if msgpack_scan::extract_field(&normalized, 0, nodedb_types::ROWID_COLUMN).is_some()
+                {
+                    normalized.to_vec()
+                } else {
+                    let mut cell = Vec::with_capacity(9);
+                    msgpack_scan::writer::write_i64(
+                        &mut cell,
+                        i64::from(doc_id.surrogate().as_u32()),
+                    );
+                    msgpack_scan::merge_fields(
+                        &normalized,
+                        &[(nodedb_types::ROWID_COLUMN, cell.as_slice())],
+                    )
+                }
+            } else {
+                msgpack_scan::inject_str_field(&normalized, identity_column, synth_id.as_str())
+            };
             // The identity a user recognizes: the declared primary key's value,
             // or `id`, read from the row itself — never the internal surrogate.
             let identity = RowIdentity::of_stored_row(&normalized, declared_primary_key, *doc_id);

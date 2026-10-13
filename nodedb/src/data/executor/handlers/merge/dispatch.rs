@@ -18,7 +18,8 @@ use nodedb_physical::physical_plan::document::merge_types::MergeClauseOp;
 /// Parameters for `execute_merge`.
 pub(in crate::data::executor) struct MergeParams<'a> {
     pub target_collection: &'a str,
-    pub source_collection: &'a str,
+    /// The source relation's label, for logs and errors.
+    pub source_label: &'a str,
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
@@ -27,20 +28,16 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// and return the NOT-MATCHED insert rows.
     pub resolve_only: bool,
     /// Control-Plane-pre-assigned surrogates for the NOT-MATCHED insert rows,
-    /// keyed by source join value (orchestrator phase 3). `Some` selects the
+    /// keyed by source row id (orchestrator phase 3). `Some` selects the
     /// atomic verify-and-apply path; `None` (with `resolve_only == false`)
     /// selects the legacy per-row apply, retained only as a fallback — the
     /// in-transaction MERGE that once used it is now resolved + staged at
     /// statement time into concrete point ops
     /// (`control::server::shared::session::expander_stage`).
     pub resolved_inserts: Option<&'a [(String, u32)]>,
-    /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`, the
-    /// source join-map is built from these pre-scanned
-    /// `(source_doc_id, raw_stored_source_bytes)` rows instead of a local read
-    /// of the source collection (whose vShard may live on a different core).
-    /// `None` selects the legacy local-storage read (co-resident / in-txn
-    /// buffered replay).
-    pub source_rows: Option<&'a [(String, Vec<u8>)]>,
+    /// The source rows the Control Plane read, each a standard msgpack map.
+    /// The join map is built from these alone.
+    pub source_rows: &'a [Vec<u8>],
     /// Projection for a `MERGE ... RETURNING`. Honoured only by the orchestrated
     /// apply pass — the only pass that walks every arm's row bodies. `None`
     /// selects the affected-count payload.

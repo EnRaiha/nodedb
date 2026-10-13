@@ -10,7 +10,9 @@ use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::table_name_from_factor;
 use crate::temporal::TemporalScope;
-use crate::types::{CollectionInfo, ColumnInfo, SqlCatalog};
+use crate::types::{CollectionInfo, ColumnInfo, EngineType, SqlCatalog};
+
+pub use super::column_naming::{BareColumn, ColumnNaming};
 
 /// Synthetic temporal columns an audit read injects into every version row.
 /// They are not declared columns, so a bitemporal relation resolves them by
@@ -29,6 +31,24 @@ impl ResolvedTable {
     /// The name to use for qualified column references.
     pub fn ref_name(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The qualifier a join's merged row gives this relation's columns.
+    ///
+    /// A collection or catalog relation's columns are keyed
+    /// `ref_name.column`. An `ARRAY_*` table function's rows keep bare
+    /// column names, so it has none.
+    pub fn row_qualifier(&self) -> Option<&str> {
+        match self.info.engine {
+            EngineType::Array => None,
+            EngineType::DocumentSchemaless
+            | EngineType::DocumentStrict
+            | EngineType::KeyValue
+            | EngineType::Columnar
+            | EngineType::Timeseries
+            | EngineType::Spatial
+            | EngineType::ContinuousAggregate => Some(self.ref_name()),
+        }
     }
 }
 
@@ -66,6 +86,9 @@ pub struct TableScope {
     /// keeps the default and refuses the call. A scope nested inside this one
     /// never inherits the flag.
     cp_functions: bool,
+    /// How a column reference to one of this scope's relations names its
+    /// field. A scope nested inside this one never inherits it.
+    column_naming: ColumnNaming,
 }
 
 impl TableScope {
@@ -154,6 +177,7 @@ impl TableScope {
         self.outer = Some(Box::new(outer));
         self.statement_output = false;
         self.cp_functions = false;
+        self.column_naming = ColumnNaming::AsWritten;
         self
     }
 
@@ -219,32 +243,52 @@ impl TableScope {
             };
         }
 
-        if self.output_names.iter().any(|n| n == &col) {
-            return Ok(());
-        }
+        self.resolve_bare(&col).map(|_| ())
+    }
 
-        // A relation that declares the column wins over one that merely
-        // accepts any name. An open-schema relation alongside a closed one
-        // that declares the column is not an ambiguity.
+    /// Where an unqualified column reference resolves.
+    ///
+    /// A SELECT output name wins. Otherwise the relations a bare name reaches
+    /// are tried:
+    /// - One relation declares the column: it resolves there, even beside an
+    ///   open-schema relation.
+    /// - Two or more declare it: refused as ambiguous.
+    /// - None declares it and exactly one accepts any name (an open schema,
+    ///   an implicit column): it resolves there.
+    /// - None declares it and two or more accept any name: refused as
+    ///   ambiguous. Picking one would read NULL for a field the other holds.
+    /// - None accepts it: the enclosing query's scope is tried, else the
+    ///   column is unknown.
+    pub fn resolve_bare(&self, column: &str) -> Result<BareColumn<'_>> {
+        let col = column.to_lowercase();
+        if self.output_names.iter().any(|n| n == &col) {
+            return Ok(BareColumn::Output);
+        }
         let bare: Vec<&ResolvedTable> = self
             .order
             .iter()
             .filter(|key| !self.qualified_only.contains(*key))
             .map(|key| &self.tables[key])
             .collect();
-        let declared = bare
+        let declared: Vec<&ResolvedTable> = bare
             .iter()
+            .copied()
             .filter(|table| table.info.columns.iter().any(|c| c.name == col))
-            .count();
-        // An open-schema relation contributes a maybe, never a yes. With no
-        // relation declaring the column, one that accepts any name resolves
-        // it: neither ambiguity nor absence is provable.
-        if declared == 0 && bare.iter().any(|table| self.column_exists(table, &col)) {
-            return Ok(());
+            .collect();
+        match declared.as_slice() {
+            &[table] => return Ok(BareColumn::Relation(table)),
+            [] => {}
+            _ => return Err(SqlError::AmbiguousColumn { column: col }),
         }
-        match declared {
-            0 => match &self.outer {
-                Some(outer) => outer.check_name(None, &col),
+        let accepting: Vec<&ResolvedTable> = bare
+            .iter()
+            .copied()
+            .filter(|table| self.column_exists(table, &col))
+            .collect();
+        match accepting.as_slice() {
+            &[table] => Ok(BareColumn::Relation(table)),
+            [] => match &self.outer {
+                Some(outer) => outer.resolve_bare(&col).map(|_| BareColumn::Outer),
                 None => Err(SqlError::UnknownColumn {
                     table: self
                         .order
@@ -254,8 +298,45 @@ impl TableScope {
                     column: col,
                 }),
             },
-            1 => Ok(()),
             _ => Err(SqlError::AmbiguousColumn { column: col }),
+        }
+    }
+
+    /// This scope with column references named for `naming`'s rows.
+    pub fn with_column_naming(mut self, naming: ColumnNaming) -> Self {
+        self.column_naming = naming;
+        self
+    }
+
+    /// How this scope's column references name their fields.
+    pub fn column_naming(&self) -> ColumnNaming {
+        self.column_naming
+    }
+
+    /// Reject a `USING (column)` key that `right_ref`'s relation or every
+    /// other relation lacks. Both sides of the join must carry it.
+    pub fn check_using_column(&self, right_ref: Option<&str>, column: &str) -> Result<()> {
+        let col = column.to_lowercase();
+        let right_key = right_ref.map(str::to_lowercase);
+        let right = right_key.as_deref().and_then(|key| self.tables.get(key));
+        let carriers = self
+            .order
+            .iter()
+            .filter(|key| !self.qualified_only.contains(*key))
+            .filter(|key| self.column_exists(&self.tables[*key], &col));
+        let has_both = match (right, right_key.as_deref()) {
+            (Some(right), Some(key)) => {
+                self.column_exists(right, &col) && carriers.into_iter().any(|k| k != key)
+            }
+            _ => carriers.count() >= 2,
+        };
+        if has_both {
+            Ok(())
+        } else {
+            Err(SqlError::UnknownColumn {
+                table: right_key.unwrap_or_else(|| "<unknown>".into()),
+                column: col,
+            })
         }
     }
 
@@ -446,6 +527,226 @@ mod tests {
             })
             .expect("add failed");
         scope
+    }
+
+    fn open_collection(name: &str) -> CollectionInfo {
+        CollectionInfo {
+            engine: EngineType::DocumentSchemaless,
+            open_schema: CollectionInfo::open_schema_for(EngineType::DocumentSchemaless),
+            ..strict_collection(name, Vec::new())
+        }
+    }
+
+    fn array_relation(name: &str, columns: Vec<&str>) -> CollectionInfo {
+        CollectionInfo {
+            engine: EngineType::Array,
+            open_schema: false,
+            ..strict_collection(name, columns)
+        }
+    }
+
+    /// A join scope over `(alias, info)` relations, in FROM order.
+    fn join_scope(relations: Vec<(&str, CollectionInfo)>) -> TableScope {
+        let mut scope = TableScope::new();
+        for (alias, info) in relations {
+            scope
+                .add(ResolvedTable {
+                    name: info.name.clone(),
+                    alias: Some(alias.into()),
+                    info,
+                })
+                .expect("add failed");
+        }
+        scope.with_column_naming(ColumnNaming::JoinRow)
+    }
+
+    fn owner<'a>(scope: &'a TableScope, column: &str) -> Option<&'a str> {
+        match scope.resolve_bare(column).expect("resolves") {
+            BareColumn::Relation(table) => Some(table.ref_name()),
+            BareColumn::Output | BareColumn::Outer => None,
+        }
+    }
+
+    #[test]
+    fn column_declared_by_one_relation_resolves_there() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("o", strict_collection("orders", vec!["id", "amount"])),
+        ]);
+        assert_eq!(owner(&scope, "title"), Some("a"));
+        assert_eq!(owner(&scope, "amount"), Some("o"));
+    }
+
+    #[test]
+    fn declared_relation_wins_over_a_schemaless_one() {
+        let scope = join_scope(vec![
+            ("e", open_collection("events")),
+            ("a", strict_collection("articles", vec!["id", "title"])),
+        ]);
+        assert_eq!(owner(&scope, "title"), Some("a"));
+    }
+
+    #[test]
+    fn column_declared_by_two_relations_is_ambiguous() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("b", strict_collection("blogs", vec!["id", "title"])),
+        ]);
+        let err = scope.resolve_bare("title").expect_err("ambiguous");
+        assert!(
+            matches!(err, SqlError::AmbiguousColumn { ref column } if column == "title"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn undeclared_column_resolves_to_the_only_schemaless_relation() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("e", open_collection("events")),
+        ]);
+        assert_eq!(owner(&scope, "payload"), Some("e"));
+    }
+
+    #[test]
+    fn undeclared_column_over_two_schemaless_relations_is_ambiguous() {
+        let scope = join_scope(vec![
+            ("e", open_collection("events")),
+            ("d", open_collection("devices")),
+        ]);
+        let err = scope.resolve_bare("region").expect_err("ambiguous");
+        assert!(
+            matches!(err, SqlError::AmbiguousColumn { ref column } if column == "region"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn column_no_relation_accepts_is_unknown() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("o", strict_collection("orders", vec!["id", "amount"])),
+        ]);
+        let err = scope.resolve_bare("ghost").expect_err("unknown");
+        assert!(matches!(err, SqlError::UnknownColumn { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn output_name_resolves_before_relations() {
+        let scope = join_scope(vec![
+            ("e", open_collection("events")),
+            ("d", open_collection("devices")),
+        ])
+        .with_output_names(["total".to_string()]);
+        assert!(matches!(
+            scope.resolve_bare("total").expect("resolves"),
+            BareColumn::Output
+        ));
+        assert_eq!(
+            scope.bare_column_qualifier("total").expect("resolves"),
+            None
+        );
+    }
+
+    #[test]
+    fn join_row_naming_qualifies_a_bare_column_with_its_owner() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("e", open_collection("events")),
+        ]);
+        assert_eq!(
+            scope.bare_column_qualifier("title").expect("resolves"),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            scope.bare_column_qualifier("payload").expect("resolves"),
+            Some("e".to_string())
+        );
+    }
+
+    #[test]
+    fn as_written_naming_checks_but_keeps_a_bare_column_bare() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("o", strict_collection("orders", vec!["id", "amount"])),
+        ])
+        .with_column_naming(ColumnNaming::AsWritten);
+        assert_eq!(
+            scope.bare_column_qualifier("title").expect("resolves"),
+            None
+        );
+        assert!(
+            scope.bare_column_qualifier("id").is_err(),
+            "still ambiguous"
+        );
+    }
+
+    #[test]
+    fn array_relation_columns_carry_no_qualifier() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("g", array_relation("genome", vec!["chrom", "qual"])),
+        ]);
+        assert_eq!(scope.bare_column_qualifier("qual").expect("resolves"), None);
+        assert_eq!(scope.qualified_column_qualifier("g"), None);
+        assert_eq!(scope.qualified_column_qualifier("a"), Some("a".to_string()));
+    }
+
+    #[test]
+    fn output_row_naming_drops_relation_qualifiers() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("o", strict_collection("orders", vec!["id", "amount"])),
+        ])
+        .with_column_naming(ColumnNaming::OutputRow);
+        assert_eq!(scope.qualified_column_qualifier("a"), None);
+        assert_eq!(
+            scope.bare_column_qualifier("title").expect("resolves"),
+            None
+        );
+        assert_eq!(
+            scope.qualified_column_qualifier("outer_ref"),
+            Some("outer_ref".to_string()),
+            "a qualifier naming no relation here is kept"
+        );
+    }
+
+    #[test]
+    fn nested_scope_does_not_inherit_join_row_naming() {
+        let outer = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("o", strict_collection("orders", vec!["id", "amount"])),
+        ]);
+        let inner = scope_with(strict_collection("tags", vec!["tag"])).nested_in(outer);
+        assert_eq!(inner.column_naming(), ColumnNaming::AsWritten);
+        assert!(matches!(
+            inner.resolve_bare("amount").expect("resolves"),
+            BareColumn::Outer
+        ));
+    }
+
+    #[test]
+    fn using_column_must_exist_on_both_sides() {
+        let scope = join_scope(vec![
+            ("a", strict_collection("articles", vec!["id", "title"])),
+            ("o", strict_collection("orders", vec!["id", "amount"])),
+        ]);
+        scope
+            .check_using_column(Some("o"), "id")
+            .expect("both sides carry id");
+        assert!(scope.check_using_column(Some("o"), "title").is_err());
+        assert!(scope.check_using_column(Some("o"), "amount").is_err());
+    }
+
+    #[test]
+    fn using_column_over_two_schemaless_relations_is_not_ambiguous() {
+        let scope = join_scope(vec![
+            ("e", open_collection("events")),
+            ("d", open_collection("devices")),
+        ]);
+        scope
+            .check_using_column(Some("d"), "device_id")
+            .expect("USING names the column on both sides");
     }
 
     /// A double-quoted identifier resolves as a column name.

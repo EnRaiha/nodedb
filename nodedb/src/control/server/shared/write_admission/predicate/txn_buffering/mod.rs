@@ -20,7 +20,7 @@
 //! fixing those is a separate, later change.
 //!
 //! One documented set of arms is the exception:
-//! `DocumentOp::{Merge, UpdateFromJoin}` and `CrdtOp::RestoreToVersion`
+//! `DocumentOp::{Merge, UpdateFromJoin, InsertSelect}` and `CrdtOp::RestoreToVersion`
 //! classify `true` here even though `to_replicated_entry` has no encoder arm
 //! for any of them — a deliberate divergence from the oracle (see the
 //! equivalence test below, which pins the divergence explicitly rather than

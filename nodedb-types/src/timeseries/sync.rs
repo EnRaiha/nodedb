@@ -25,20 +25,6 @@ pub struct TimeseriesDelta {
     pub sample_count: u64,
 }
 
-/// WAL record payload for a timeseries metric batch.
-#[derive(
-    Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
-)]
-pub struct TimeseriesWalBatch {
-    /// Collection name.
-    pub collection: String,
-    /// Batch of metric samples: (series_id, timestamp_ms, value).
-    pub samples: Vec<(SeriesId, i64, f64)>,
-    /// Sync provenance for idempotent WAL replay across replicas.
-    #[serde(default)]
-    pub provenance: Option<crate::sync::wire::SyncProvenance>,
-}
-
 /// WAL record payload for a timeseries log batch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogWalBatch {

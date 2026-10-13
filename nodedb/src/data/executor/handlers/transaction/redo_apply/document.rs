@@ -145,6 +145,9 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                 resolved_targets: &resolved,
                 wal_lsn,
+                // A committed transaction's redo: the guards inject again, and
+                // the commit already judged them.
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::InjectOnly,
             },
         ) {
             Ok(outcome) => outcome,

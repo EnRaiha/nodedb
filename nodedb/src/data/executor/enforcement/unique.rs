@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::handlers::generated;
+use crate::data::executor::enforcement::typeguard::GuardScope;
+use crate::data::executor::handlers::write_body;
 use crate::engine::document::store::{
     CollectionConfig, DocumentEngine, IndexPath, extract_index_values,
 };
@@ -251,8 +252,9 @@ impl CoreLoop {
         Ok(())
     }
 
-    /// The document a submitted body is indexed as: generated columns
-    /// evaluated, as the put stores it. A body that does not decode is an
+    /// The document a submitted body is indexed as: typeguards injected and
+    /// generated columns evaluated, as the put stores it. A body that does
+    /// not decode is an
     /// error: its UNIQUE claims cannot be judged, so the unit is refused
     /// rather than let it take a value unseen.
     pub(in crate::data::executor) fn unique_image(
@@ -266,18 +268,17 @@ impl CoreLoop {
     }
 }
 
-/// Evaluate `config`'s generated columns into `doc`, with the error the put
-/// path reports for them.
+/// Derive `doc` as the put stores it: typeguards injected, then `config`'s
+/// generated columns evaluated.
+///
+/// The guards only inject here: the write that stores the body judges them.
+/// An error keeps its own code, as the put path reports it.
 pub(in crate::data::executor) fn evaluate_generated(
     config: &CollectionConfig,
     doc: &mut serde_json::Value,
 ) -> crate::Result<()> {
-    generated::evaluate_generated_columns(doc, &config.enforcement.generated_columns).map_err(|e| {
-        crate::Error::Storage {
-            engine: "generated".into(),
-            detail: format!("generated column evaluation failed: {e:?}"),
-        }
-    })
+    write_body::materialize_write_body(config, doc, GuardScope::InjectOnly)
+        .map_err(crate::Error::DataPlane)
 }
 
 #[cfg(test)]

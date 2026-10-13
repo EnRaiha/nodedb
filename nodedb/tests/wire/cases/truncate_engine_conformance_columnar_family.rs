@@ -205,6 +205,13 @@ async fn truncate_timeseries_resets_continuous_aggregate() {
         ("0".to_string(), "0".to_string(), "false".to_string()),
         "a truncated source resets its aggregate and keeps it live"
     );
+    assert!(
+        srv.query_rows("SELECT * FROM trunc_cagg_view")
+            .await
+            .unwrap_or_else(|e| panic!("read the aggregate: {e}"))
+            .is_empty(),
+        "the aggregate's relation reads no row after the truncate"
+    );
 
     srv.exec("INSERT INTO trunc_cagg_src (id, ts, value) VALUES ('z', 4000, 9.5)")
         .await

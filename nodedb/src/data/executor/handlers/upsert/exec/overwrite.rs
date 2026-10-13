@@ -121,6 +121,18 @@ impl CoreLoop {
             }
         };
 
+        // The fields this merge writes: the `ON CONFLICT DO UPDATE SET`
+        // targets, else every field of the incoming body. Typeguards judge
+        // them, and the fields a guard injects.
+        let assigned: Vec<String> = if on_conflict_updates.is_empty() {
+            match &new_val {
+                nodedb_types::Value::Object(fields) => fields.keys().cloned().collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            crate::data::executor::handlers::write_body::assigned_names(on_conflict_updates)
+        };
+
         // Conflict branch: if `ON CONFLICT DO UPDATE SET` assignments
         // are present, evaluate each against the *existing* row and
         // apply only those fields. Otherwise fall back to the plain
@@ -213,6 +225,9 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: hook_ctx.resolved_targets,
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::Assigned(
+                    &assigned,
+                ),
             },
         ) {
             Ok(o) => o,

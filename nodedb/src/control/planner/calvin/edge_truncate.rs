@@ -197,6 +197,8 @@ async fn dispatch_rows_plan(state: &SharedState, task: &PhysicalTask) -> crate::
             trace_id: TraceId::ZERO,
             event_source: crate::event::EventSource::User,
             txn_id: None,
+            // A truncate rewrites no row for a transition to judge.
+            user_roles: Vec::new(),
         },
     )
     .await

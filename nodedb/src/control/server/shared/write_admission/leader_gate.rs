@@ -260,7 +260,6 @@ fn entry_scope(write: &ReplicatedWrite, database_id: crate::types::DatabaseId) -
         | ReplicatedWrite::KvTransferItem { .. }
         | ReplicatedWrite::BulkDml { .. }
         | ReplicatedWrite::ColumnarBulkDml { .. }
-        | ReplicatedWrite::InsertSelect { .. }
         | ReplicatedWrite::CrdtImportCollection { .. }
         | ReplicatedWrite::CrdtListInsert { .. }
         | ReplicatedWrite::CrdtListDelete { .. }
@@ -279,6 +278,7 @@ fn entry_scope(write: &ReplicatedWrite, database_id: crate::types::DatabaseId) -
         | ReplicatedWrite::ColumnarBulkDmlResolved { .. }
         | ReplicatedWrite::ColumnarTruncate { .. }
         | ReplicatedWrite::TimeseriesTruncate { .. }
+        | ReplicatedWrite::TimeseriesAggregateRefresh { .. }
         | ReplicatedWrite::KvResolvedWrite { .. }
         | ReplicatedWrite::DocumentResolvedWrite { .. }
         | ReplicatedWrite::VectorDirectDelete { .. }

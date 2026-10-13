@@ -2,8 +2,11 @@
 
 //! Engine surface tests for the Vector engine.
 //!
-//! The vector engine is accessed via `WITH (engine='vector')` which maps to
-//! the document_schemaless storage path with an HNSW index overlay.
+//! These tests cover vector search over a document collection: a
+//! `document_schemaless` collection with an HNSW index on a field. The
+//! vector engine itself, `WITH (engine='vector')`, is a vector-primary
+//! collection; `sql_create_collection_type_clause` and the `vector_primary_*`
+//! cases cover it.
 //! Covers: index creation, ANN search via vector_distance, quantization option.
 
 use crate::harness::TestServer;
@@ -11,7 +14,7 @@ use crate::harness::TestServer;
 #[tokio::test]
 async fn create_vector_collection_and_insert() {
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION vec_basic WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION vec_basic WITH (engine='document_schemaless')")
         .await
         .unwrap();
 
@@ -32,7 +35,7 @@ async fn create_vector_collection_and_insert() {
 #[tokio::test]
 async fn create_vector_index_and_ann_search() {
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION vec_ann WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION vec_ann WITH (engine='document_schemaless')")
         .await
         .unwrap();
     srv.exec("CREATE INDEX ON vec_ann (embedding)")
@@ -70,7 +73,7 @@ async fn create_vector_index_and_ann_search() {
 #[tokio::test]
 async fn vector_distance_with_quantization_option() {
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION vec_quant WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION vec_quant WITH (engine='document_schemaless')")
         .await
         .unwrap();
     srv.exec("CREATE INDEX ON vec_quant (vec)").await.unwrap();
@@ -97,7 +100,7 @@ async fn vector_distance_with_quantization_option() {
 #[tokio::test]
 async fn wal_restart_durability() {
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION vec_wal WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION vec_wal WITH (engine='document_schemaless')")
         .await
         .unwrap();
     srv.exec("INSERT INTO vec_wal { id: 'w1', label: 'persisted' }")
@@ -122,7 +125,7 @@ async fn search_using_vector_dsl_lowers_to_canonical_form() {
     // must lower to `ORDER BY vector_distance(...) LIMIT k` so users can pick
     // either surface.
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION vec_search_dsl WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION vec_search_dsl WITH (engine='document_schemaless')")
         .await
         .unwrap();
     srv.exec("CREATE INDEX ON vec_search_dsl (embedding)")

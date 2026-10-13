@@ -2,108 +2,78 @@
 
 //! Parse CREATE INDEX / DROP INDEX / SHOW INDEX / REINDEX.
 
-use super::helpers::extract_name_after_if_exists;
+use super::clause::{ClauseCursor, Token, tokenize};
+use super::helpers::if_exists_name;
 use crate::ddl_ast::statement::{CollectionStmt, NodedbStatement};
 use crate::error::SqlError;
-use crate::reserved::check_identifier;
 
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    (|| -> Result<Option<NodedbStatement>, SqlError> {
-        if upper.starts_with("CREATE UNIQUE INDEX ") || upper.starts_with("CREATE UNIQUE IND") {
-            return Ok(Some(parse_create_index(true, upper, parts, trimmed)?));
-        }
-        if upper.starts_with("CREATE INDEX ") {
-            return Ok(Some(parse_create_index(false, upper, parts, trimmed)?));
-        }
-        if upper.starts_with("DROP INDEX ") {
-            let if_exists = upper.contains("IF EXISTS");
-            let name = match extract_name_after_if_exists(parts, "INDEX") {
-                None => return Ok(None),
-                Some(r) => r?,
-            };
-            return Ok(Some(NodedbStatement::Collection(
-                CollectionStmt::DropIndex {
-                    name,
-                    collection: None,
-                    if_exists,
-                },
-            )));
-        }
-        if upper.starts_with("SHOW INDEX") {
-            let collection = parts.get(2).map(|s| s.to_string());
-            return Ok(Some(NodedbStatement::Collection(
-                CollectionStmt::ShowIndexes { collection },
-            )));
-        }
-        if upper.starts_with("REINDEX ") {
-            // Grammar: REINDEX [INDEX <name>] [CONCURRENTLY] <collection>
-            //
-            // Parsing strategy: walk parts starting at index 1.
-            // Optional INDEX <name> occupies positions 1-2; optional CONCURRENTLY
-            // is anywhere before the final token; the last token is the collection.
-            let mut offset = 1usize;
-            let mut index_name: Option<String> = None;
-            let mut concurrent = false;
+    if !(upper.starts_with("CREATE UNIQUE INDEX ")
+        || upper.starts_with("CREATE INDEX ")
+        || upper.starts_with("DROP INDEX ")
+        || upper.starts_with("SHOW INDEX")
+        || upper.starts_with("REINDEX "))
+    {
+        return None;
+    }
+    let toks = tokenize(trimmed);
+    Some(parse(trimmed, &toks).map(NodedbStatement::Collection))
+}
 
-            // Skip optional TABLE keyword for backwards compat (REINDEX TABLE <coll>)
-            if parts
-                .get(offset)
-                .map(|p| p.eq_ignore_ascii_case("TABLE"))
-                .unwrap_or(false)
-            {
-                offset += 1;
-            }
-
-            // Consume optional INDEX <name>. The name is required when INDEX is
-            // present and must not be the CONCURRENTLY keyword.
-            if parts
-                .get(offset)
-                .map(|p| p.eq_ignore_ascii_case("INDEX"))
-                .unwrap_or(false)
-            {
-                offset += 1;
-                let name = parts.get(offset).ok_or_else(|| SqlError::Parse {
-                    detail: "REINDEX INDEX requires an index name".to_string(),
-                })?;
-                if name.eq_ignore_ascii_case("CONCURRENTLY") {
-                    return Err(SqlError::Parse {
-                        detail: "REINDEX INDEX requires an index name before CONCURRENTLY"
-                            .to_string(),
-                    });
-                }
-                index_name = Some(check_identifier(name)?);
-                offset += 1;
-            }
-
-            // Consume optional CONCURRENTLY
-            if parts
-                .get(offset)
-                .map(|p| p.eq_ignore_ascii_case("CONCURRENTLY"))
-                .unwrap_or(false)
-            {
-                concurrent = true;
-                offset += 1;
-            }
-
-            // Remaining token is the collection name
-            let collection = match parts.get(offset) {
-                None => return Ok(None),
-                Some(s) => check_identifier(s)?,
-            };
-
-            return Ok(Some(NodedbStatement::Collection(CollectionStmt::Reindex {
-                collection,
-                index_name,
-                concurrent,
-            })));
+fn parse<'a>(sql: &'a str, toks: &[Token<'a>]) -> Result<CollectionStmt, SqlError> {
+    let mut c = ClauseCursor::new(sql, toks, "INDEX");
+    if c.peek_keyword("CREATE") {
+        return parse_create_index(sql, toks);
+    }
+    if c.eat_keywords(&["DROP", "INDEX"]) {
+        let (if_exists, name) = if_exists_name(&mut c, "index name")?;
+        c.finish()?;
+        return Ok(CollectionStmt::DropIndex {
+            name,
+            collection: None,
+            if_exists,
+        });
+    }
+    if c.eat_keyword("SHOW") {
+        if !c.eat_keyword("INDEXES") {
+            c.expect_keyword("INDEX")?;
         }
-        Ok(None)
-    })()
-    .transpose()
+        c.eat_keyword("ON");
+        let collection = if c.at_end() {
+            None
+        } else {
+            Some(c.raw("collection")?.to_string())
+        };
+        c.finish()?;
+        return Ok(CollectionStmt::ShowIndexes { collection });
+    }
+    parse_reindex(&mut c)
+}
+
+/// `REINDEX [TABLE] [INDEX <name>] [CONCURRENTLY] <collection>`.
+fn parse_reindex(c: &mut ClauseCursor<'_, '_>) -> Result<CollectionStmt, SqlError> {
+    c.expect_keyword("REINDEX")?;
+    c.eat_keyword("TABLE");
+    let index_name = if c.eat_keyword("INDEX") {
+        if c.peek_keyword("CONCURRENTLY") || c.at_end() {
+            return Err(c.error("REINDEX INDEX requires an index name before CONCURRENTLY"));
+        }
+        Some(c.ident("index name")?)
+    } else {
+        None
+    };
+    let concurrent = c.eat_keyword("CONCURRENTLY");
+    let collection = c.ident("collection")?;
+    c.finish()?;
+    Ok(CollectionStmt::Reindex {
+        collection,
+        index_name,
+        concurrent,
+    })
 }
 
 /// Keywords that belong to the `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`
@@ -113,109 +83,63 @@ pub(super) fn try_parse(
 const INDEX_CLAUSE_KEYWORDS: [&str; 5] = ["IF", "NOT", "EXISTS", "ON", "UNIQUE"];
 
 /// Parse `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON collection (field)
-///         [WHERE cond] [COLLATE NOCASE]` into a typed `CreateIndex` variant.
+///         [COLLATE NOCASE|CI] [WHERE cond]` into a typed `CreateIndex`
+/// variant. `ON collection FIELDS field` is the same as `(field)`.
 ///
 /// `IF NOT EXISTS` is also accepted with the anonymous form
 /// (`CREATE INDEX IF NOT EXISTS ON users (email)`): the flag then applies to
 /// the name the executor derives from the collection and field, which is
 /// deterministic, so a repeated statement is still a no-op.
-fn parse_create_index(
-    unique: bool,
-    upper: &str,
-    parts: &[&str],
-    _trimmed: &str,
-) -> Result<NodedbStatement, SqlError> {
-    // Skip "CREATE [UNIQUE] INDEX" prefix.
-    let mut idx_offset: usize = if unique { 3 } else { 2 };
+fn parse_create_index<'a>(sql: &'a str, toks: &[Token<'a>]) -> Result<CollectionStmt, SqlError> {
+    let mut c = ClauseCursor::new(sql, toks, "CREATE INDEX");
+    c.expect_keyword("CREATE")?;
+    let unique = c.eat_keyword("UNIQUE");
+    c.expect_keyword("INDEX")?;
+    let if_not_exists = c.eat_keywords(&["IF", "NOT", "EXISTS"]);
 
-    // Optional `IF NOT EXISTS`, matched token-wise so any amount of internal
-    // whitespace and any casing works (`parts` is whitespace-split).
-    let if_not_exists = parts.len() > idx_offset + 2
-        && parts[idx_offset].eq_ignore_ascii_case("IF")
-        && parts[idx_offset + 1].eq_ignore_ascii_case("NOT")
-        && parts[idx_offset + 2].eq_ignore_ascii_case("EXISTS");
-    if if_not_exists {
-        idx_offset += 3;
+    let index_name = if c.peek_keyword("ON") {
+        None
+    } else {
+        if INDEX_CLAUSE_KEYWORDS.iter().any(|kw| c.peek_keyword(kw)) {
+            return Err(c.error(format!(
+                "{} is a keyword of this clause and cannot be an index name; expected \
+                 CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON <collection> (<field>)",
+                c.describe_next()
+            )));
+        }
+        Some(c.ident("index name")?)
+    };
+    c.expect_keyword("ON")?;
+    let collection = c.ident("collection")?;
+    let field = if c.eat_keyword("FIELDS") {
+        c.ident("indexed field")?
+    } else {
+        let mut fields = c.paren_list("indexed field", |c| c.ident("indexed field"))?;
+        if fields.len() != 1 {
+            return Err(c.error(format!(
+                "a secondary index covers one field; found {}",
+                fields.len()
+            )));
+        }
+        fields.remove(0)
+    };
+
+    let mut case_insensitive = false;
+    let mut where_condition = None;
+    while !c.at_end() {
+        if c.eat_keyword("COLLATE") {
+            c.clause("COLLATE")?;
+            c.one_of("COLLATE", &["NOCASE", "CI"])?;
+            case_insensitive = true;
+        } else if c.eat_keyword("WHERE") {
+            c.clause("WHERE")?;
+            where_condition = Some(c.raw_until("WHERE", &[&["COLLATE"]])?.to_string());
+        } else {
+            return Err(c.unknown_clause());
+        }
     }
 
-    // Detect whether an explicit name is present: if parts[idx_offset] is "ON",
-    // the name was omitted; otherwise it is the index name.
-    let (index_name, on_offset) = if parts
-        .get(idx_offset)
-        .map(|p| p.eq_ignore_ascii_case("ON"))
-        .unwrap_or(false)
-    {
-        (None, idx_offset)
-    } else {
-        match parts.get(idx_offset) {
-            None => (None, idx_offset + 1),
-            Some(token) => {
-                if INDEX_CLAUSE_KEYWORDS
-                    .iter()
-                    .any(|kw| token.eq_ignore_ascii_case(kw))
-                {
-                    return Err(SqlError::Parse {
-                        detail: format!(
-                            "CREATE INDEX: '{token}' is a keyword of this clause and cannot be \
-                             an index name; expected \
-                             CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON <collection> (<field>)"
-                        ),
-                    });
-                }
-                (Some(check_identifier(token)?), idx_offset + 1)
-            }
-        }
-    };
-
-    // parts[on_offset] should be "ON"; collection follows.
-    let raw_collection_token = parts.get(on_offset + 1).copied().unwrap_or("");
-
-    // The collection and the field are both identifiers: a quoted token keeps
-    // its case, a bare one lowercases.
-    let (collection, field) = if let Some(paren_pos) = raw_collection_token.find('(') {
-        // Inline form: `collection(field)`.
-        let coll = check_identifier(&raw_collection_token[..paren_pos])?;
-        let fld = check_identifier(
-            raw_collection_token[paren_pos..].trim_matches(|c| c == '(' || c == ')'),
-        )?;
-        (coll, fld)
-    } else if parts
-        .get(on_offset + 2)
-        .map(|p| p.eq_ignore_ascii_case("FIELDS"))
-        .unwrap_or(false)
-    {
-        // FIELDS keyword form: ON collection FIELDS field
-        let coll = check_identifier(raw_collection_token)?;
-        let fld = check_identifier(parts.get(on_offset + 3).copied().unwrap_or(""))?;
-        (coll, fld)
-    } else {
-        // Standard form: ON collection (field)
-        let coll = check_identifier(raw_collection_token)?;
-        let fld = check_identifier(
-            parts
-                .get(on_offset + 2)
-                .copied()
-                .unwrap_or("")
-                .trim_matches(|c| c == '(' || c == ')'),
-        )?;
-        (coll, fld)
-    };
-
-    // WHERE condition.
-    let where_condition = if let Some(_pos) = upper.find(" WHERE ") {
-        // Recompute position in original-case `_trimmed` ... but we have `upper` only.
-        // Use byte offset from upper — safe because the WHERE keyword itself is ASCII.
-        // The value after WHERE is the original-case remainder.
-        // We need the original text; use `parts` to reconstruct.
-        let where_tok_idx = parts.iter().position(|p| p.eq_ignore_ascii_case("WHERE"));
-        where_tok_idx.map(|i| parts[i + 1..].join(" ").trim_end_matches(';').to_string())
-    } else {
-        None
-    };
-
-    let case_insensitive = upper.contains("COLLATE NOCASE") || upper.contains("COLLATE CI");
-
-    Ok(NodedbStatement::Collection(CollectionStmt::CreateIndex {
+    Ok(CollectionStmt::CreateIndex {
         unique,
         index_name,
         collection,
@@ -223,7 +147,7 @@ fn parse_create_index(
         case_insensitive,
         where_condition,
         if_not_exists,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -378,5 +302,64 @@ mod tests {
             assert_eq!(parsed.collection, "users", "{sql}");
             assert_eq!(parsed.field, "email", "{sql}");
         }
+    }
+
+    #[test]
+    fn misspelled_collate_is_refused() {
+        assert!(parse("CREATE INDEX i ON t (email) COLATE NOCASE").is_err());
+    }
+
+    #[test]
+    fn collate_inside_a_where_literal_does_not_set_case_insensitive() {
+        let stmt =
+            parse("CREATE INDEX i ON t (email) WHERE note = 'COLLATE NOCASE'").expect("parses");
+        let NodedbStatement::Collection(CollectionStmt::CreateIndex {
+            case_insensitive,
+            where_condition,
+            ..
+        }) = stmt
+        else {
+            panic!("expected CreateIndex");
+        };
+        assert!(!case_insensitive);
+        assert_eq!(where_condition.as_deref(), Some("note = 'COLLATE NOCASE'"));
+    }
+
+    #[test]
+    fn collate_then_where_parse_together() {
+        let stmt = parse("CREATE UNIQUE INDEX i ON t (email) COLLATE NOCASE WHERE active = true")
+            .expect("parses");
+        let NodedbStatement::Collection(CollectionStmt::CreateIndex {
+            case_insensitive,
+            where_condition,
+            ..
+        }) = stmt
+        else {
+            panic!("expected CreateIndex");
+        };
+        assert!(case_insensitive);
+        assert_eq!(where_condition.as_deref(), Some("active = true"));
+    }
+
+    #[test]
+    fn multi_field_list_is_refused() {
+        assert!(parse("CREATE INDEX i ON t (a, b)").is_err());
+    }
+
+    #[test]
+    fn reindex_forms() {
+        let NodedbStatement::Collection(CollectionStmt::Reindex {
+            collection,
+            index_name,
+            concurrent,
+        }) = parse("REINDEX INDEX i CONCURRENTLY docs").expect("parses")
+        else {
+            panic!("expected Reindex");
+        };
+        assert_eq!(collection, "docs");
+        assert_eq!(index_name.as_deref(), Some("i"));
+        assert!(concurrent);
+        assert!(parse("REINDEX INDEX CONCURRENTLY docs").is_err());
+        assert!(parse("REINDEX docs extra").is_err());
     }
 }

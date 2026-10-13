@@ -5,6 +5,7 @@
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::scan_filter::{FilterOp, ScanFilter, decode_scan_filters};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::scan_budget;
 use crate::data::executor::task::ExecutionTask;
@@ -72,8 +73,16 @@ impl CoreLoop {
             count
         };
 
-        // Try to extract a single equality filter for index pushdown.
-        let (filter_field, filter_value) = extract_eq_filter(filters);
+        // A malformed filter payload is an error. Reading it as "no filter"
+        // would return every row of the collection.
+        let filter_predicates = match decode_scan_filters(filters, "kv scan filter") {
+            Ok(predicates) => predicates,
+            Err(e) => return self.response_error(task, e),
+        };
+
+        // Index pushdown for one equality conjunct. The post-scan filter
+        // below still checks every predicate on every row.
+        let probe = eq_index_probe(&filter_predicates);
         let (mut entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
             database_id: did,
             tenant_id: tid,
@@ -82,8 +91,8 @@ impl CoreLoop {
             count: fetch_count,
             now_ms,
             match_pattern,
-            filter_field: filter_field.as_deref(),
-            filter_value: filter_value.as_deref(),
+            filter_field: probe.map(|(field, _)| field),
+            filter_value: probe.map(|(_, value)| value),
             surrogate_ceiling,
         });
 
@@ -119,16 +128,6 @@ impl CoreLoop {
                 return self.response_error(task, ErrorCode::ResourcesExhausted);
             }
         }
-
-        // Parse filter predicates for post-scan evaluation.
-        // Index pushdown handles eq filters on indexed fields, but general
-        // predicates (gt, lt, in, etc.) need post-scan evaluation.
-        let filter_predicates: Vec<crate::bridge::scan_filter::ScanFilter> = if !filters.is_empty()
-        {
-            zerompk::from_msgpack(filters).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
 
         // Build results as raw msgpack — no serde_json::Value intermediary.
         let mut result_entries: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
@@ -171,7 +170,7 @@ impl CoreLoop {
             && let Err(e) =
                 super::super::sort_utils::sort_msgpack_rows(&mut result_entries, sort_keys)
         {
-            return self.response_error(task, crate::Error::from(e));
+            return self.response_error(task, e);
         }
 
         // Build response as flat msgpack array — same format as document/columnar scan.
@@ -247,61 +246,74 @@ impl CoreLoop {
     }
 }
 
-/// Extract a single equality filter from serialized ScanFilter bytes.
+/// The secondary-index probe for a decoded filter set: the field and value
+/// bytes of the first top-level `field = '<text>'` conjunct.
 ///
-/// Looks for the first `{"field": "x", "op": "eq", "value": "y"}` filter.
-/// Returns `(Some(field), Some(value_bytes))` if found, `(None, None)` otherwise.
-pub(in crate::data::executor) fn extract_eq_filter(
-    filters: &[u8],
-) -> (Option<String>, Option<Vec<u8>>) {
-    if filters.is_empty() {
-        return (None, None);
-    }
-
-    // Filters are MessagePack-encoded Vec<ScanFilter>.
-    let Ok(parsed) = zerompk::from_msgpack::<Vec<nodedb_types::json_msgpack::JsonValue>>(filters)
-        .map(|v| {
-            v.into_iter()
-                .map(|jv| jv.0)
-                .collect::<Vec<serde_json::Value>>()
-        })
-    else {
-        tracing::trace!(
-            len = filters.len(),
-            "filter deserialization failed, falling back to full scan"
-        );
-        return (None, None);
-    };
-
-    for filter in &parsed {
-        let Some(field) = filter.get("field").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(op) = filter.get("op").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if op != "eq" {
-            continue;
+/// The probe narrows the scan to the index entries holding those bytes, so
+/// it must find every row the post-scan filter accepts. A KV index stores a
+/// string as its UTF-8 bytes and a number in the sorted number encoding. A
+/// literal that coerced equality can match against other stored bytes, such
+/// as `'5'` against a stored `5`, a timestamp string, or a non-string
+/// literal, gives no probe, and the scan reads every row.
+pub(in crate::data::executor) fn eq_index_probe(filters: &[ScanFilter]) -> Option<(&str, &[u8])> {
+    filters.iter().find_map(|f| {
+        let plain_eq = matches!(f.op, FilterOp::Eq)
+            && !f.field.is_empty()
+            && f.clauses.is_empty()
+            && f.expr.is_none();
+        if !plain_eq {
+            return None;
         }
-        let Some(value) = filter.get("value") else {
-            continue;
-        };
+        f.value
+            .eq_coerced_exact_text()
+            .map(|text| (f.field.as_str(), text.as_bytes()))
+    })
+}
 
-        let value_bytes = match value {
-            serde_json::Value::String(s) => s.as_bytes().to_vec(),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    let sortable = (i as u64) ^ (1u64 << 63);
-                    sortable.to_be_bytes().to_vec()
-                } else {
-                    n.to_string().into_bytes()
-                }
-            }
-            other => other.to_string().into_bytes(),
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_types::Value;
 
-        return (Some(field.to_string()), Some(value_bytes));
+    fn eq(field: &str, value: Value) -> ScanFilter {
+        ScanFilter {
+            field: field.into(),
+            op: FilterOp::Eq,
+            value,
+            clauses: Vec::new(),
+            expr: None,
+        }
     }
 
-    (None, None)
+    #[test]
+    fn probe_uses_a_plain_text_equality() {
+        let filters = [
+            eq("age", Value::Integer(5)),
+            eq("region", Value::String("us-east".into())),
+        ];
+        assert_eq!(
+            eq_index_probe(&filters),
+            Some(("region", b"us-east".as_slice()))
+        );
+    }
+
+    #[test]
+    fn literal_with_a_coerced_reading_gives_no_probe() {
+        // `'5'` equals a stored integer 5, whose index bytes differ.
+        assert_eq!(eq_index_probe(&[eq("n", Value::String("5".into()))]), None);
+        assert_eq!(
+            eq_index_probe(&[eq("t", Value::String("2024-01-02".into()))]),
+            None
+        );
+        assert_eq!(eq_index_probe(&[eq("n", Value::Integer(5))]), None);
+    }
+
+    #[test]
+    fn non_equality_or_grouped_filter_gives_no_probe() {
+        let mut ne = eq("region", Value::String("us".into()));
+        ne.op = FilterOp::Ne;
+        let mut or = eq("region", Value::String("us".into()));
+        or.clauses = vec![vec![eq("region", Value::String("eu".into()))]];
+        assert_eq!(eq_index_probe(&[ne, or]), None);
+    }
 }

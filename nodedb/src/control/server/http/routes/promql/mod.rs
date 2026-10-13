@@ -7,12 +7,16 @@
 pub mod buildinfo;
 pub mod handlers;
 pub(crate) mod helpers;
+mod metric_registration;
+pub mod params;
 mod remote;
-pub mod types;
+mod remote_read;
+pub(crate) mod source;
 
 pub use buildinfo::buildinfo;
 pub use handlers::{
     annotations, instant_query, label_names, label_values, metadata, range_query, series_query,
 };
-pub use remote::{remote_read, remote_write};
-pub use types::{InstantQueryParams, LabelsParams, RangeQueryParams, SeriesParams};
+pub use params::PromParams;
+pub use remote::remote_write;
+pub use remote_read::remote_read;

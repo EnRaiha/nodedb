@@ -4,7 +4,7 @@
 
 use nodedb_types::timeseries::SymbolDictionary;
 
-use super::super::types::{ColumnData, ColumnType};
+use super::super::types::{ColumnData, ColumnType, NULL_SYMBOL_ID};
 use super::table::ColumnarMemtable;
 
 impl ColumnarMemtable {
@@ -22,7 +22,7 @@ impl ColumnarMemtable {
         let col = match col_type {
             ColumnType::Float64 => ColumnData::Float64(vec![f64::NAN; existing_rows]),
             ColumnType::Int64 => ColumnData::Int64(vec![0; existing_rows]),
-            ColumnType::Symbol => ColumnData::Symbol(vec![u32::MAX; existing_rows]),
+            ColumnType::Symbol => ColumnData::Symbol(vec![NULL_SYMBOL_ID; existing_rows]),
             ColumnType::Timestamp(_) => return, // never add a second timestamp
         };
         let idx = self.columns.len();

@@ -221,6 +221,17 @@ pub(super) async fn try_string(
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(explain_ddl::explain_scope(state, identity, &parts));
     }
+    // RLS visibility probe. `SELECT NODEDB_ASSERT_VISIBLE(...)` is recognized by
+    // its statement prefix, so a collection name in another statement never
+    // reaches it.
+    if upper.starts_with("SELECT NODEDB_ASSERT_VISIBLE(") {
+        return Some(explain_ddl::assert_visible(
+            state,
+            identity,
+            database_id,
+            sql,
+        ));
+    }
 
     // Usage metering: DEFINE METERING DIMENSION, SHOW USAGE FOR TENANT, EXPORT
     // USAGE, SHOW USAGE, SHOW QUOTA. None of these parse into a typed DDL AST

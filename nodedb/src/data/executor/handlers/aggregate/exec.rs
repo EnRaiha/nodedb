@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Aggregate dispatch: input-sourced (catalog) routing, grouping-set expansion,
-//! and the per-shard fast paths (result cache, index-backed COUNT, native
-//! columnar aggregation) before falling back to streaming aggregation.
+//! Aggregate dispatch: input-sourced routing, grouping-set expansion, and the
+//! per-shard fast paths (result cache, index-backed COUNT) before falling
+//! back to streaming aggregation over a collection scan.
 
 use tracing::debug;
 
-use super::cache_entry::AggregateCacheEntry;
-use super::cache_key::{AggregateCacheKeyInputs, aggregate_cache_key, legacy_aggregate_pairs};
-use super::rows::{apply_user_aliases_to_rows, retain_having, sort_aggregated_rows};
-use crate::bridge::envelope::{ErrorCode, Response, Status};
-use crate::bridge::scan_filter::ScanFilter;
+use super::cache_key::{AggregateCacheKeyInputs, aggregate_cache_key};
+use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
@@ -60,40 +57,31 @@ impl CoreLoop {
         debug!(core = self.core_id, %collection, has_input = input.is_some(), group_fields = group_by.len(), aggs = aggregates.len(), "aggregate");
 
         // Input-sourced aggregate: the rows come from executing the sub-plan
-        // (a coordinator-materialized `ProviderScan` over catalog rows or a
-        // derived-table body), not from a per-shard collection scan. Decode
-        // the sub-plan rows and aggregate over them using the same streaming
-        // logic, then short-circuit before the per-shard fast paths (cache /
-        // index-backed / columnar memtable), none of which apply to
-        // coordinator-local rows.
+        // (a coordinator-materialized `ProviderScan` over catalog rows, a
+        // derived-table body, a join, or a transaction's full engine scan),
+        // not from a per-shard collection scan. The per-shard fast paths
+        // (cache, index-backed COUNT) do not apply to those rows.
         if let Some(sub_plan) = input {
-            let sub_response = self.execute_plan(task, sub_plan);
-            // A child error (22012 from a computed column, a resolver refusal)
-            // fails the statement.
-            if sub_response.status == Status::Error {
-                return sub_response;
-            }
-            // An empty payload is zero rows. A non-empty payload that is not
-            // a MessagePack row array is an internal error, never an empty
-            // aggregate.
-            let docs = if sub_response.payload.is_empty() {
-                Vec::new()
-            } else {
-                match crate::data::executor::response_codec::decode_response_to_docs(&sub_response)
-                {
-                    Some(docs) => docs,
-                    None => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: "aggregate input rows failed to decode: payload is not \
-                                         a MessagePack row array"
-                                    .to_string(),
-                            },
-                        );
-                    }
-                }
+            let docs = match self.input_docs(task, sub_plan) {
+                Ok(docs) => docs,
+                Err(resp) => return *resp,
             };
+            if !grouping_sets.is_empty() {
+                return super::super::grouping_sets_exec::execute_grouping_sets(
+                    self,
+                    super::super::grouping_sets_exec::GroupingSetsParams {
+                        task,
+                        docs,
+                        group_by,
+                        aggregates,
+                        filters,
+                        having,
+                        limit,
+                        grouping_sets,
+                        sort_keys,
+                    },
+                );
+            }
             return self.aggregate_over_docs(
                 super::streaming::over_docs::AggregateOverDocsParams {
                     task,
@@ -112,27 +100,24 @@ impl CoreLoop {
             );
         }
 
-        // ROLLUP / CUBE / GROUPING SETS path: union results from each set.
+        // ROLLUP / CUBE / GROUPING SETS: one scan, one pass per set.
         if !grouping_sets.is_empty() {
-            // Physical column names for the group-key fields, used by the
-            // paths that key on raw column names (grouping-set expansion,
-            // native columnar aggregation). For a bare column this is the
-            // same string the spec emits under, so those paths behave
-            // identically.
-            let group_fields: Vec<String> =
-                group_by.iter().filter_map(|s| s.field.clone()).collect();
+            let docs = match self.scan_for_aggregate(task, tid, collection) {
+                Ok(docs) => docs,
+                Err(resp) => return *resp,
+            };
             return super::super::grouping_sets_exec::execute_grouping_sets(
                 self,
                 super::super::grouping_sets_exec::GroupingSetsParams {
                     task,
-                    tid,
-                    collection,
-                    group_by: &group_fields,
+                    docs,
+                    group_by,
                     aggregates,
                     filters,
                     having,
                     limit,
                     grouping_sets,
+                    sort_keys,
                 },
             );
         }
@@ -202,175 +187,14 @@ impl CoreLoop {
                     msgpack_scan::write_kv_str(&mut payload_buf, out_name, &value);
                     msgpack_scan::write_kv_i64(&mut payload_buf, &count_key, count as i64);
                 }
-                return match Ok::<Vec<u8>, crate::Error>(payload_buf) {
-                    Ok(payload) => self.response_with_payload(task, payload),
-                    Err(e) => self.response_error(task, ErrorCode::from(e)),
-                };
+                return self.response_with_payload(task, payload_buf);
             }
         }
 
-        let scan_limit = self.query_tuning.aggregate_scan_cap;
-
-        let mt_key = (
-            task.request.database_id,
-            crate::types::TenantId::new(tid),
-            collection.to_string(),
-        );
-        let columnar_mt = self
-            .columnar_memtables
-            .get(&mt_key)
-            .filter(|mt| !mt.is_empty());
-
-        // Fast path: native columnar aggregation. This path keys on physical
-        // column names and has no expression-evaluation capability, so a
-        // computed group key (`field: None`) diverts it to the streaming path
-        // below rather than silently mis-grouping on the dropped key.
-        if let Some(mt) = columnar_mt.filter(|_| {
-            sub_group_by.is_empty()
-                && sub_aggregates.is_empty()
-                && group_by.iter().all(|s| s.field.is_some())
-        }) {
-            let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
-                Vec::new()
-            } else {
-                match zerompk::from_msgpack(filters) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(core = self.core_id, error = %e, "filter predicate deserialization failed");
-                        Vec::new()
-                    }
-                }
-            };
-
-            // Physical column names for the group-key fields, used by the
-            // paths that key on raw column names (grouping-set expansion,
-            // native columnar aggregation). For a bare column this is the
-            // same string the spec emits under, so those paths behave
-            // identically.
-            let group_fields: Vec<String> =
-                group_by.iter().filter_map(|s| s.field.clone()).collect();
-            let legacy_aggs = legacy_aggregate_pairs(aggregates);
-            let columnar_spill_dir = self
-                .data_dir
-                .join("groupby-spill")
-                .join(format!("core-{}-columnar", self.core_id));
-            let columnar_spill_cap = self.query_tuning.groupby_max_groups_in_mem;
-            let columnar = legacy_aggs
-                .map(|pairs| {
-                    super::super::columnar_agg::try_columnar_aggregate(
-                        &super::super::columnar_agg::ColumnarAggParams {
-                            mt,
-                            group_by: &group_fields,
-                            aggregates: &pairs,
-                            filters: &filter_predicates,
-                            limit,
-                            scan_limit,
-                            spill_dir: &columnar_spill_dir,
-                            spill_cap: columnar_spill_cap,
-                            governor: self.governor.clone(),
-                            db: task.request.database_id,
-                            tenant: task.request.tenant_id,
-                        },
-                    )
-                })
-                .transpose();
-            let columnar = match columnar {
-                Ok(result) => result.flatten(),
-                Err(e) => return self.response_error(task, ErrorCode::from(e)),
-            };
-            if let Some(mut agg_result) = columnar {
-                if !having.is_empty() {
-                    let having_predicates: Vec<ScanFilter> = match zerompk::from_msgpack(having) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::warn!(core = self.core_id, error = %e, "having predicate deserialization failed");
-                            Vec::new()
-                        }
-                    };
-                    // HAVING is WHERE-shaped, so an evaluation error in a
-                    // predicate fails the statement.
-                    if let Err(e) = retain_having(&mut agg_result.rows, &having_predicates) {
-                        return self.response_error(task, ErrorCode::from(e));
-                    }
-                }
-
-                apply_user_aliases_to_rows(&mut agg_result.rows, aggregates);
-                // Post-aggregate ORDER BY: sort the finalised group rows
-                // before truncating to LIMIT so the visible top-N
-                // reflects the requested sort, not hash-map iteration
-                // order.
-                if let Err(e) = sort_aggregated_rows(&mut agg_result.rows, sort_keys) {
-                    return self.response_error(task, e);
-                }
-                agg_result.rows.truncate(limit);
-
-                return match crate::data::executor::response_codec::encode_value_vec(
-                    &agg_result.rows,
-                ) {
-                    Ok(payload) => {
-                        if filters.is_empty() && having.is_empty() {
-                            let cache_key = aggregate_cache_key(AggregateCacheKeyInputs {
-                                database_id: task.request.database_id.as_u64(),
-                                tid,
-                                collection,
-                                group_by,
-                                aggregates,
-                                sub_group_by,
-                                sub_aggregates,
-                                limit,
-                                sort_keys,
-                            });
-                            if self.aggregate_cache.len() < 256 {
-                                let kv_epoch = self.kv_engine.write_epoch(
-                                    task.request.database_id.as_u64(),
-                                    tid,
-                                    collection,
-                                );
-                                self.aggregate_cache.insert(
-                                    cache_key,
-                                    AggregateCacheEntry {
-                                        kv_epoch,
-                                        payload: payload.clone(),
-                                    },
-                                );
-                            }
-                        }
-                        self.response_with_payload(task, payload)
-                    }
-                    Err(e) => self.response_error(task, ErrorCode::from(e)),
-                };
-            }
-        }
-
-        // ── Streaming aggregation (per-shard collection scan) ──────────────
-        // Bitemporal collections keep every write on the versioned sparse
-        // table; the plain `scan_collection` reads the non-versioned namespace
-        // and would return zero rows (making COUNT/SUM/etc. see nothing). Route
-        // the current-state scan to the versioned table for those collections.
-        // Both paths return the same normalized `(doc_id, msgpack)` shape, so
-        // the downstream aggregation is identical. Non-bitemporal collections
-        // keep the exact `scan_collection` path unchanged.
-        let scan_result = if self.is_bitemporal(task.request.database_id.as_u64(), tid, collection)
-        {
-            self.scan_collection_versioned_current(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                scan_limit,
-            )
-        } else {
-            self.scan_collection(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                scan_limit,
-            )
-        };
-        let docs = match scan_result {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+        // Streaming aggregation over a per-shard collection scan.
+        let docs = match self.scan_for_aggregate(task, tid, collection) {
+            Ok(docs) => docs,
+            Err(resp) => return *resp,
         };
         self.aggregate_over_docs(super::streaming::over_docs::AggregateOverDocsParams {
             task,
@@ -397,7 +221,9 @@ mod tests {
     use nodedb_physical::physical_plan::VectorOp;
 
     use super::*;
-    use crate::bridge::envelope::{Admission, ExemptReason, PhysicalPlan, Priority, Request};
+    use crate::bridge::envelope::{
+        Admission, ExemptReason, PhysicalPlan, Priority, Request, Status,
+    };
     use crate::data::executor::core_loop::CoreLoop;
     use crate::engine::kv::KvPutParams;
     use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
@@ -468,6 +294,7 @@ mod tests {
             user_alias: None,
             field: "*".to_string(),
             expr: None,
+            param: None,
         }
     }
 
@@ -545,5 +372,61 @@ mod tests {
             refreshed_epoch, epoch_at_insert,
             "serving the stale entry unchanged would reproduce the bug"
         );
+    }
+
+    /// HAVING bytes that do not decode fail the aggregate. Dropping the
+    /// predicate would return every group.
+    #[test]
+    fn undecodable_having_errors() {
+        let (mut core, _dir) = open_core();
+        let task = make_task();
+        put_kv_row(&mut core, b"k1");
+
+        let aggregates = vec![count_star()];
+        let garbage = [0xc1u8, 0xff, 0x00];
+        let mut inputs = count_star_inputs(&task, &aggregates);
+        inputs.having = &garbage;
+
+        let response = core.execute_aggregate(inputs);
+        assert_eq!(response.status, Status::Error);
+        assert!(
+            core.aggregate_cache.is_empty(),
+            "a refused aggregate is never cached"
+        );
+    }
+
+    /// WHERE bytes that do not decode fail the aggregate. Dropping the
+    /// predicate would aggregate every row.
+    #[test]
+    fn undecodable_filter_errors() {
+        let (mut core, _dir) = open_core();
+        let task = make_task();
+        put_kv_row(&mut core, b"k1");
+
+        let aggregates = vec![count_star()];
+        let garbage = [0xc1u8, 0xff, 0x00];
+        let mut inputs = count_star_inputs(&task, &aggregates);
+        inputs.filters = &garbage;
+
+        let response = core.execute_aggregate(inputs);
+        assert_eq!(response.status, Status::Error);
+    }
+
+    /// A grouping-set aggregate with undecodable HAVING bytes fails.
+    #[test]
+    fn undecodable_grouping_set_having_errors() {
+        let (mut core, _dir) = open_core();
+        let task = make_task();
+        put_kv_row(&mut core, b"k1");
+
+        let aggregates = vec![count_star()];
+        let garbage = [0xc1u8, 0xff, 0x00];
+        let sets = vec![Vec::<u32>::new()];
+        let mut inputs = count_star_inputs(&task, &aggregates);
+        inputs.having = &garbage;
+        inputs.grouping_sets = &sets;
+
+        let response = core.execute_aggregate(inputs);
+        assert_eq!(response.status, Status::Error);
     }
 }

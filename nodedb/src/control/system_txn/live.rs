@@ -196,9 +196,14 @@ impl<'s> OpenSystemTxn<'s> {
         let session_id = scope.session_id();
         let buffered_before = sessions.buffered_task_count(session_id);
 
-        let routed = match route_in_tx_expander(state, sessions, session_id, task, |staged| {
-            dispatch_staged(state, staged, event_source)
-        })
+        let routed = match route_in_tx_expander(
+            state,
+            &self.identity,
+            sessions,
+            session_id,
+            task,
+            |staged| dispatch_staged(state, staged, event_source),
+        )
         .await
         {
             Ok(ExpanderOutcome::Handled(route)) => Ok(route),

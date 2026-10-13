@@ -33,7 +33,7 @@ use crate::parser::normalize::normalize_ident;
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
-use crate::types::{AggregateExpr, SqlExpr};
+use crate::types::{AggregateExpr, SqlExpr, SqlValue};
 
 /// Return `true` if any aggregate function call appears anywhere inside
 /// `expr` — at any nesting depth, inside any expression position.
@@ -147,12 +147,36 @@ impl Visitor for AggregateExtractor<'_> {
                     return ControlFlow::Break(());
                 }
             };
+            let filter = match aggregate_filter(f, self.scope) {
+                Ok(filter) => filter,
+                Err(e) => {
+                    self.error = Some(e);
+                    return ControlFlow::Break(());
+                }
+            };
+            let mut arg_text = computed_arg_text(f, &args);
+            let (args, filter_text) = match filter {
+                Some((predicate, text)) => {
+                    // The folded argument is a CASE; the key keeps naming
+                    // the argument as written.
+                    if arg_text.is_none() {
+                        arg_text = Some(match args.first() {
+                            Some(SqlExpr::Column { name, .. }) => name.clone(),
+                            _ => "*".to_string(),
+                        });
+                    }
+                    (filtered_args(args, predicate), Some(text))
+                }
+                None => (args, None),
+            };
             self.out.push(AggregateExpr {
                 function: function_name(f),
                 args,
                 alias: self.alias.into(),
                 distinct,
                 grouping_col_index: None,
+                filter_text,
+                arg_text,
             });
             self.inside_aggregate += 1;
         }
@@ -237,6 +261,67 @@ fn function_args_and_distinct(
         Some(ast::DuplicateTreatment::Distinct)
     );
     Ok((parsed, distinct))
+}
+
+/// Convert an aggregate call's `FILTER (WHERE ...)` clause against `scope`:
+/// the predicate and its lowercase source text.
+///
+/// An aggregate inside the predicate is rejected by the extractor's nested
+/// aggregate check, because the visitor descends into the clause while the
+/// enclosing aggregate is open.
+fn aggregate_filter(f: &ast::Function, scope: &TableScope) -> Result<Option<(SqlExpr, String)>> {
+    let Some(predicate) = f.filter.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        convert_expr(predicate, &ColumnScope::Relations(scope))?,
+        format!("{predicate}").to_lowercase(),
+    )))
+}
+
+/// Fold a `FILTER` predicate into the aggregate's arguments.
+///
+/// Each argument becomes `CASE WHEN <predicate> THEN <arg> END`, NULL for
+/// a row the predicate does not admit. Every aggregate skips a NULL input,
+/// so the result equals PostgreSQL's FILTER semantics. `COUNT(*)` counts
+/// rows, so its wildcard becomes the constant 1.
+fn filtered_args(args: Vec<SqlExpr>, predicate: SqlExpr) -> Vec<SqlExpr> {
+    let args = if args.is_empty() {
+        vec![SqlExpr::Wildcard]
+    } else {
+        args
+    };
+    args.into_iter()
+        .map(|arg| {
+            let value = match arg {
+                SqlExpr::Wildcard => SqlExpr::Literal(SqlValue::Int(1)),
+                other => other,
+            };
+            SqlExpr::Case {
+                operand: None,
+                when_then: vec![(predicate.clone(), value)],
+                else_expr: None,
+            }
+        })
+        .collect()
+}
+
+/// Lowercase source text of the first argument when it is computed. A
+/// column or wildcard argument is named by the column itself.
+fn computed_arg_text(f: &ast::Function, args: &[SqlExpr]) -> Option<String> {
+    match args.first() {
+        None | Some(SqlExpr::Column { .. }) | Some(SqlExpr::Wildcard) => return None,
+        Some(_) => {}
+    }
+    let ast::FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    list.args.iter().find_map(|a| match a {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+            Some(format!("{e}").to_lowercase())
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]

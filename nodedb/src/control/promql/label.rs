@@ -26,21 +26,32 @@ pub struct LabelMatcher {
 }
 
 impl LabelMatcher {
-    pub fn new(name: String, op: LabelMatchOp, value: String) -> Self {
+    /// Build a matcher. A regex that does not compile is an error, so `=~`
+    /// never matches nothing and `!~` never matches everything by accident.
+    pub fn new(
+        name: String,
+        op: LabelMatchOp,
+        value: String,
+    ) -> Result<Self, super::error::PromqlError> {
         let regex = match &op {
             LabelMatchOp::RegexMatch | LabelMatchOp::RegexNotMatch => {
                 // Prometheus anchors regexes implicitly: ^value$
                 let pattern = format!("^(?:{value})$");
-                regex::Regex::new(&pattern).ok()
+                Some(regex::Regex::new(&pattern).map_err(|e| {
+                    super::error::PromqlError::InvalidRegex {
+                        name: name.clone(),
+                        detail: e.to_string(),
+                    }
+                })?)
             }
-            _ => None,
+            LabelMatchOp::Equal | LabelMatchOp::NotEqual => None,
         };
-        Self {
+        Ok(Self {
             name,
             op,
             value,
             regex,
-        }
+        })
     }
 
     /// Test whether a label value matches this matcher.
@@ -79,23 +90,27 @@ mod tests {
             .collect()
     }
 
+    fn matcher(name: &str, op: LabelMatchOp, value: &str) -> LabelMatcher {
+        LabelMatcher::new(name.into(), op, value.into()).unwrap()
+    }
+
     #[test]
     fn equal() {
-        let m = LabelMatcher::new("job".into(), LabelMatchOp::Equal, "api".into());
+        let m = matcher("job", LabelMatchOp::Equal, "api");
         assert!(m.matches("api"));
         assert!(!m.matches("web"));
     }
 
     #[test]
     fn not_equal() {
-        let m = LabelMatcher::new("job".into(), LabelMatchOp::NotEqual, "api".into());
+        let m = matcher("job", LabelMatchOp::NotEqual, "api");
         assert!(!m.matches("api"));
         assert!(m.matches("web"));
     }
 
     #[test]
     fn regex_match() {
-        let m = LabelMatcher::new("job".into(), LabelMatchOp::RegexMatch, "api.*".into());
+        let m = matcher("job", LabelMatchOp::RegexMatch, "api.*");
         assert!(m.matches("api-server"));
         assert!(m.matches("api"));
         assert!(!m.matches("web"));
@@ -103,14 +118,25 @@ mod tests {
 
     #[test]
     fn regex_not_match() {
-        let m = LabelMatcher::new("job".into(), LabelMatchOp::RegexNotMatch, "api.*".into());
+        let m = matcher("job", LabelMatchOp::RegexNotMatch, "api.*");
         assert!(!m.matches("api-server"));
         assert!(m.matches("web"));
     }
 
     #[test]
+    fn invalid_regex_is_an_error() {
+        for op in [LabelMatchOp::RegexMatch, LabelMatchOp::RegexNotMatch] {
+            let err = LabelMatcher::new("job".into(), op, "(".into()).unwrap_err();
+            assert!(matches!(
+                err,
+                crate::control::promql::PromqlError::InvalidRegex { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn absent_label_is_empty() {
-        let m = LabelMatcher::new("env".into(), LabelMatchOp::Equal, "".into());
+        let m = matcher("env", LabelMatchOp::Equal, "");
         let l = labels(&[("job", "api")]);
         assert!(m.matches_labels(&l)); // absent = ""
     }
@@ -118,8 +144,8 @@ mod tests {
     #[test]
     fn matches_all_fn() {
         let matchers = vec![
-            LabelMatcher::new("job".into(), LabelMatchOp::Equal, "api".into()),
-            LabelMatcher::new("env".into(), LabelMatchOp::NotEqual, "test".into()),
+            matcher("job", LabelMatchOp::Equal, "api"),
+            matcher("env", LabelMatchOp::NotEqual, "test"),
         ];
         let l = labels(&[("job", "api"), ("env", "prod")]);
         assert!(matches_all(&matchers, &l));

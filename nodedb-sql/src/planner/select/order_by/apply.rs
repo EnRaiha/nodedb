@@ -15,7 +15,7 @@ use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
 use crate::planner::select::post_process::post_process;
 use crate::resolver::ColumnScope;
-use crate::resolver::columns::TableScope;
+use crate::resolver::columns::{ColumnNaming, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -103,6 +103,13 @@ pub(in crate::planner::select) fn apply_order_by(
     let mut bound_aggregates: Option<Vec<AggregateExpr>> = None;
     let sort_keys: Vec<SortKey> = if let SqlPlan::Aggregate { aggregates, .. } = plan {
         let mut extended = aggregates.clone();
+        // A sort-only aggregate reads the aggregate's input rows. Over a
+        // join those are the merged rows, keyed `qualifier.column`, while the
+        // sort keys read the group rows, keyed by bare column name.
+        let input_scope = match scope.column_naming() {
+            ColumnNaming::OutputRow => scope.clone().with_column_naming(ColumnNaming::JoinRow),
+            ColumnNaming::AsWritten | ColumnNaming::JoinRow => scope.clone(),
+        };
         // ORDER BY sorts after aggregates are renamed to their user aliases,
         // so each key must address the output name. Binding runs to
         // completion first: a sort-only aggregate appends to `extended`, and
@@ -116,7 +123,7 @@ pub(in crate::planner::select) fn apply_order_by(
                     &mut extended,
                     functions,
                     BindName::Output,
-                    scope,
+                    &input_scope,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -142,6 +149,20 @@ pub(in crate::planner::select) fn apply_order_by(
             .collect::<Result<Vec<_>>>()?;
         bound_aggregates = Some(extended);
         keys
+    } else if let SqlPlan::TimeseriesScan(TimeseriesScanPlan {
+        aggregates,
+        bucket_interval_ms,
+        ..
+    }) = plan
+        && (!aggregates.is_empty() || *bucket_interval_ms > 0)
+    {
+        super::timeseries_native::native_timeseries_sort_keys(
+            exprs,
+            aggregates,
+            select_items,
+            functions,
+            scope,
+        )?
     } else {
         let sort_scope = scope.with_output_names(select_output_aliases(select_items));
         exprs
@@ -223,6 +244,7 @@ pub(in crate::planner::select) fn apply_order_by(
             group_by,
             aggregates,
             filters,
+            having,
             projection,
             gap_fill,
             limit,
@@ -236,6 +258,7 @@ pub(in crate::planner::select) fn apply_order_by(
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
             filters: filters.clone(),
+            having: having.clone(),
             projection: projection.clone(),
             gap_fill: gap_fill.clone(),
             limit: *limit,

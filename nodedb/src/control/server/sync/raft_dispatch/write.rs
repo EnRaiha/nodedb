@@ -65,6 +65,7 @@ pub(crate) async fn dispatch_write_replicated(
     deadline: StatementDeadline,
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
+    let user_roles = authorized.identity().role_names();
     let task = authorized.into_physical_task();
     let tenant_id = task.tenant_id;
     let database_id = task.database_id;
@@ -91,7 +92,7 @@ pub(crate) async fn dispatch_write_replicated(
     )
     .await?;
     // The apply's write funnel records the write's mark on every replica.
-    propose_sync_plan(state, owner, &plan, event_source, deadline).await
+    propose_sync_plan(state, owner, &plan, event_source, deadline, user_roles).await
 }
 
 #[cfg(test)]

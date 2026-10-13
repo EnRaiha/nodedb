@@ -18,7 +18,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::MetaOp;
+use nodedb_physical::physical_plan::{AggregateIncarnation, MetaOp};
 
 impl CoreLoop {
     /// Shared entry point for every `MetaOp::TemporalPurge*` variant.
@@ -56,11 +56,13 @@ impl CoreLoop {
                 tenant_id,
                 collection,
                 cutoff_system_ms,
+                aggregates,
             } => self.meta_temporal_purge_columnar(
                 task,
                 *tenant_id,
                 collection.as_str(),
                 *cutoff_system_ms,
+                aggregates,
             ),
             MetaOp::TemporalPurgeCrdt {
                 tenant_id,
@@ -105,7 +107,11 @@ impl CoreLoop {
     ) -> Response {
         let wm = self
             .continuous_agg_mgr
-            .get_watermark(task.request.database_id.as_u64(), aggregate_name)
+            .get_watermark(
+                task.request.database_id.as_u64(),
+                task.request.tenant_id.as_u64(),
+                aggregate_name,
+            )
             .cloned()
             .unwrap_or_default();
         match response_codec::encode_serde(&wm) {
@@ -321,12 +327,17 @@ impl CoreLoop {
     /// consults `max_system_ts` for bitemporal. A collection present in
     /// `columnar_engines` is a plain-profile collection and runs the
     /// segment-scanning row-version purge below.
+    ///
+    /// `aggregates` lists the continuous aggregates the catalog roots at
+    /// `collection`. The timeseries path removes nothing while one of them
+    /// is not registered on this core.
     pub(in crate::data::executor::dispatch) fn meta_temporal_purge_columnar(
         &mut self,
         task: &ExecutionTask,
         tenant_id: u64,
         collection: &str,
         cutoff_system_ms: i64,
+        aggregates: &[AggregateIncarnation],
     ) -> Response {
         let tid = TenantId::new(tenant_id);
         let key = (task.request.database_id, tid, collection.to_string());
@@ -336,7 +347,8 @@ impl CoreLoop {
         if self.ts_registries.contains_key(&key) {
             let now = now_ms();
             let max_age_ms = (now - cutoff_system_ms).max(0);
-            return self.meta_enforce_timeseries_retention(task, collection, max_age_ms);
+            return self
+                .meta_enforce_timeseries_retention(task, collection, max_age_ms, aggregates);
         }
 
         // Plain columnar profile: row-level purge via delete bitmaps.
@@ -368,4 +380,26 @@ pub(super) fn now_ms() -> i64 {
             std::time::Duration::ZERO
         })
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data::executor::response_codec;
+    use crate::engine::timeseries::continuous_agg::WatermarkState;
+
+    /// The watermark the retention gate reads decodes from the payload this
+    /// handler writes.
+    #[test]
+    fn watermark_payload_decodes() {
+        let wm = WatermarkState {
+            watermark_ts: 42,
+            rows_aggregated: 3,
+            last_refresh_ms: 9,
+        };
+        let payload = response_codec::encode_serde(&wm).expect("encode");
+        let back: WatermarkState = response_codec::decode_payload(&payload).expect("decode");
+        assert_eq!(back.watermark_ts, 42);
+        assert_eq!(back.rows_aggregated, 3);
+        assert_eq!(back.last_refresh_ms, 9);
+    }
 }

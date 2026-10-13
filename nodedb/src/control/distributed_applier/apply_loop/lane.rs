@@ -720,6 +720,7 @@ mod tests {
                 row_sources: Vec::new(),
                 publishes: Vec::new(),
                 row_changes: Vec::new(),
+                user_roles: Vec::new(),
             },
             collections: vec!["orders".into()],
             sum_targets: Vec::new(),

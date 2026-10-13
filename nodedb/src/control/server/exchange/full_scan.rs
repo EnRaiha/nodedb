@@ -172,8 +172,8 @@ pub fn full_scan_plan_for_collection(
         CollectionType::Columnar(ColumnarProfile::Timeseries { .. }) => {
             PhysicalPlan::Timeseries(TimeseriesOp::Scan {
                 collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
-                // (0, i64::MAX) = no time filter — scan all rows.
-                time_range: (0, i64::MAX),
+                // No time filter: every row, pre-epoch ones included.
+                time_range: nodedb_physical::physical_plan::UNBOUNDED_TIME_RANGE,
                 projection: Vec::new(),
                 limit: COMPLETE_SCAN,
                 filters: Vec::new(),
@@ -186,6 +186,8 @@ pub fn full_scan_plan_for_collection(
                 rls_filters: side_filters,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
+                having: Vec::new(),
+                tiering: None,
             })
         }
     };

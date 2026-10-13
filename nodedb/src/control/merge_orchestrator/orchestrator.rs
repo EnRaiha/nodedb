@@ -4,8 +4,8 @@
 //!
 //! A NOT-MATCHED insert row needs its OWN registered surrogate, and surrogate
 //! registration is Control-Plane-only, so autocommit MERGE runs as a
-//! TOCTOU-safe round trip: (0) ship the source rows (scanned on its own
-//! core, since it can differ from the target's) into `source_rows`; (1)
+//! TOCTOU-safe round trip: (0) read the source relation like a SELECT
+//! (`control::source_read`) and ship its rows into `source_rows`; (1)
 //! resolve — the Data Plane classifies the merge read-only and returns
 //! NOT-MATCHED rows; (2) assign a fresh registered surrogate per insert row
 //! and decide the target's write policy over every resolved arm; (3) apply —
@@ -22,13 +22,15 @@
 use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
+use crate::control::maintenance::clone_materializer::dispatch_local;
 use crate::control::orchestrated_write::{
     apply_orchestrated_write, decide_write_policy_over_images,
 };
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::source_read::{SourceReadContext, read_source_rows};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::document::merge_types::MergeClauseOp;
-use nodedb_physical::physical_plan::{DocumentOp, ReturningSpec};
+use nodedb_physical::physical_plan::{DocumentOp, ReturningSpec, RowSource};
 
 use super::resolve_arms::decode_resolve;
 use crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies;
@@ -45,10 +47,12 @@ const MAX_MERGE_RETRIES: u32 = 10;
 /// Bundled arguments for [`run_merge`], mirroring the fields of the intercepted
 /// `DocumentOp::Merge` plan.
 pub struct MergeArgs<'a> {
+    /// The statement's identity, which reads the source relation.
+    pub identity: &'a AuthenticatedIdentity,
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
     pub target_collection: &'a str,
-    pub source_collection: &'a str,
+    pub source: &'a RowSource,
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
@@ -72,10 +76,11 @@ pub async fn run_authorized_merge(
     state: &SharedState,
     authorized: crate::control::server::shared::authorization::AuthorizedTask,
 ) -> crate::Result<Response> {
+    let identity = authorized.identity().clone();
     let task = authorized.into_physical_task();
     let PhysicalPlan::Document(DocumentOp::Merge {
         target_collection,
-        source_collection,
+        source,
         source_alias,
         target_join_col,
         source_join_col,
@@ -99,10 +104,11 @@ pub async fn run_authorized_merge(
     run_merge(
         state,
         MergeArgs {
+            identity: &identity,
             tenant_id: task.tenant_id,
             database_id: task.database_id,
             target_collection: target_collection.as_str(),
-            source_collection: source_collection.as_str(),
+            source: &source,
             source_alias: &source_alias,
             target_join_col: &target_join_col,
             source_join_col: &source_join_col,
@@ -133,15 +139,18 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
 
     let mut attempt: u32 = 0;
     loop {
-        // Phase 0: read SOURCE on its own core (can differ from target's)
-        // and ship raw rows into the plan. A fresh read per attempt keeps
-        // resolve/apply on one consistent snapshot.
-        let source_rows = read_all_source_rows(
-            state,
-            args.tenant_id,
-            args.database_id,
-            args.source_collection,
-            None,
+        // Phase 0: read the source relation and ship its rows into the plan.
+        // A fresh read per attempt keeps resolve/apply on one consistent
+        // snapshot.
+        let source_rows = read_source_rows(
+            &SourceReadContext {
+                state,
+                identity: args.identity,
+                tenant_id: args.tenant_id,
+                database_id: args.database_id,
+                txn_id: None,
+            },
+            args.source,
         )
         .await?;
 
@@ -266,6 +275,7 @@ pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate
             args.database_id,
             args.target_collection,
             apply_plan,
+            args.identity.role_names(),
         )
         .await?;
 
@@ -304,13 +314,12 @@ enum MergePass {
 
 /// Build a `DocumentOp::Merge` physical plan for one orchestrator pass.
 ///
-/// `source_rows` carries the RAW stored source rows scanned on the source's own
-/// core (phase 0) so the Data Plane builds the join-map from the shipped bytes
-/// rather than reading the source from the target core's local store.
+/// `source_rows` carries the source rows read in phase 0, each a msgpack map.
+/// The Data Plane builds the join map from them alone.
 fn merge_plan(
     args: &MergeArgs<'_>,
     pass: MergePass,
-    source_rows: Option<Vec<(String, Vec<u8>)>>,
+    source_rows: Option<Vec<Vec<u8>>>,
     resolved_sum_targets: Vec<nodedb_physical::physical_plan::ResolvedSumTarget>,
 ) -> PhysicalPlan {
     // Only APPLY can project rows; RESOLVE's payload is the fixed
@@ -331,9 +340,7 @@ fn merge_plan(
         target_collection: nodedb_types::QualifiedCollection::from_stored(
             args.target_collection.to_string(),
         ),
-        source_collection: nodedb_types::QualifiedCollection::from_stored(
-            args.source_collection.to_string(),
-        ),
+        source: args.source.clone(),
         source_alias: args.source_alias.to_string(),
         target_join_col: args.target_join_col.to_string(),
         source_join_col: args.source_join_col.to_string(),

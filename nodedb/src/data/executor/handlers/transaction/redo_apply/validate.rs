@@ -44,7 +44,8 @@ use super::sub_ops::RedoDocOp;
 
 impl CoreLoop {
     /// Refuse `ops` when applying them would break a constraint the
-    /// transaction batch checks at commit. Reads only.
+    /// transaction batch checks at commit. A role-guarded transition is
+    /// judged against `user_roles`, the roles the record carries. Reads only.
     pub(super) fn validate_redo_document_ops(
         &self,
         database_id: u64,
@@ -52,6 +53,7 @@ impl CoreLoop {
         ops: &[RedoDocOp],
         apply_scope: &super::state::RedoApplyScope,
         origin: RedoOrigin,
+        user_roles: &[String],
     ) -> crate::Result<()> {
         let mut by_collection: BTreeMap<&str, Vec<&RedoDocOp>> = BTreeMap::new();
         for op in ops {
@@ -77,6 +79,7 @@ impl CoreLoop {
                 config,
                 bitemporal,
                 resolved: &resolved,
+                user_roles,
             };
             if origin == RedoOrigin::Commit {
                 self.check_collection_ops(&scope, &collection_ops)?;
@@ -121,7 +124,7 @@ impl CoreLoop {
                             collection: scope.collection,
                             value,
                             old_value: &prior,
-                            user_roles: &[],
+                            user_roles: scope.user_roles,
                             resolved_targets: scope.resolved,
                         },
                     )?;
@@ -243,4 +246,6 @@ struct CollectionScope<'a> {
     config: &'a CollectionConfig,
     bitemporal: bool,
     resolved: &'a [nodedb_physical::physical_plan::ResolvedSumTarget],
+    /// Roles of the identity that committed the record.
+    user_roles: &'a [String],
 }

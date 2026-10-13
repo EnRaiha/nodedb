@@ -95,7 +95,11 @@ impl NodeDbPgHandler {
             auth,
         } = params;
         // Resolved once for the whole forwarded task set, before the loop.
-        let redaction = QueryRedaction::for_plans(tenant_id, auth, tasks.iter().map(|t| &t.plan));
+        let redaction = QueryRedaction::for_plans(
+            tenant_id,
+            auth,
+            tasks.iter().map(|t| (&t.plan, t.database_id)),
+        );
         let shaping = GatewayShaping {
             tenant_id,
             database_id,

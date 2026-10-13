@@ -3,7 +3,7 @@
 //! Permission-tree resolution for the three peer engines sharing the columnar
 //! storage core: plain columnar, timeseries, and spatial.
 
-use nodedb_physical::physical_plan::{ColumnarOp, SpatialOp, TimeseriesOp};
+use nodedb_physical::physical_plan::{ColumnarOp, PartitionsAction, SpatialOp, TimeseriesOp};
 
 use super::context::{PermCtx, PermTreeLevel};
 
@@ -95,6 +95,24 @@ pub(super) fn apply_timeseries(ctx: &PermCtx<'_>, op: &mut TimeseriesOp) -> crat
         TimeseriesOp::Truncate { collection, .. } => {
             ctx.authorize(collection, PermTreeLevel::Delete)
         }
+
+        // Read level, blanket: a refresh folds every row of the collection
+        // into an aggregate, so there is no predicate to narrow.
+        TimeseriesOp::RefreshAggregate { collection, .. } => {
+            ctx.authorize(collection, PermTreeLevel::Read)
+        }
+
+        // Read level, blanket: a partition listing reports over every row. A
+        // rewrite stores every row again, so it needs the write level.
+        TimeseriesOp::Partitions { collection, action } => match action {
+            PartitionsAction::List => ctx.authorize(collection, PermTreeLevel::Read),
+            PartitionsAction::Rewrite => ctx.authorize(collection, PermTreeLevel::Write),
+        },
+
+        // No subtree: the coordinator issues this read for a continuous
+        // aggregate relation, whose read grant was checked on the aggregate's
+        // own name.
+        TimeseriesOp::ReadAggregate { .. } => Ok(()),
     }
 }
 
@@ -148,6 +166,8 @@ mod tests {
             rls_filters: Vec::new(),
             system_time: Default::default(),
             valid_at_ms: None,
+            having: Vec::new(),
+            tiering: None,
         });
         assert!(apply(&mut plan, &cache).is_ok());
         match &plan {

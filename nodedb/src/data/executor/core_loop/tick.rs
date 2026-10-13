@@ -59,7 +59,11 @@ impl CoreLoop {
         self.io_metrics.record_wait(tier, wait_ns);
 
         // A plain REINDEX starts its rebuilds and waits for their cutovers.
-        if let Some(task) = self.hold_plain_reindex(qt.task) {
+        // A refresh wait waits for its cut to fold.
+        if let Some(task) = self.hold_plain_reindex(qt.task)
+            && let Some(task) = self.hold_cagg_refresh_await(task)
+            && let Some(task) = self.hold_cagg_read(task)
+        {
             self.run_task(task);
         }
         true
@@ -183,6 +187,8 @@ impl CoreLoop {
         self.poll_build_completions();
         self.poll_pending_reindex();
         self.answer_reindex_waiters();
+        self.answer_cagg_refresh_waiters();
+        self.answer_cagg_read_waiters();
         // Adjust SPSC read depth based on current memory pressure.
         self.apply_spsc_pressure();
         self.drain_requests();

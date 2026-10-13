@@ -45,6 +45,8 @@ pub(in super::super::super) fn convert_insert(
         tenant_id,
         ctx,
     } = args;
+    // The name the user wrote, for refusal messages.
+    let user_collection = collection;
     let key = ctx.collection_key(collection);
     let coll_qualified = super::super::super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
@@ -59,6 +61,9 @@ pub(in super::super::super) fn convert_insert(
     // `IF NOT EXISTS` (ON CONFLICT DO NOTHING → `if_absent`) cannot be honored by
     // `CrdtOp::DocUpsert`, which is an unconditional LWW full-replace: reject.
     let gates = super::super::balanced_gate::document_collection_write_gates(ctx, collection)?;
+    // A row that supplies a generated column is refused: the engine computes
+    // it on every write.
+    super::super::write_checks::refuse_generated_cells(user_collection, &gates.generated, rows)?;
     let is_crdt = gates.crdt;
     if is_crdt && if_absent {
         return Err(crate::Error::BadRequest {
@@ -70,13 +75,13 @@ pub(in super::super::super) fn convert_insert(
     }
 
     // A balanced collection's rows are judged as a set, so the statement lowers
-    // to ONE page rather than one task per row — see `balanced_gate`.
+    // to ONE page whatever its row count — see `balanced_gate`.
     let is_balanced = gates.balanced && !is_crdt;
     // `ON CONFLICT DO NOTHING` skips rows whose key already exists, and which
     // rows those are is decided per row at apply time. A journal that silently
     // loses one leg that way is exactly the unbalanced state the constraint
-    // exists to refuse, and the page shape cannot express the per-row skip, so
-    // the combination is rejected rather than half-honored.
+    // exists to refuse, so the combination is rejected rather than
+    // half-honored.
     if is_balanced && if_absent {
         return Err(crate::Error::BadRequest {
             detail: format!(
@@ -85,10 +90,18 @@ pub(in super::super::super) fn convert_insert(
             ),
         });
     }
-    // Rows of a balanced INSERT, accumulated across the loop below and emitted
+    // A multi-row document INSERT lowers to ONE `BatchInsert` page: one
+    // Data-Plane request and one commit for the statement, its rows judged
+    // as `PointInsert` judges each (a duplicate key refused, or skipped under
+    // `ON CONFLICT DO NOTHING`). One task per row costs a round trip and a
+    // commit per row. A single-row INSERT stays a `PointInsert`. A CRDT
+    // collection converges row by row through `DocUpsert`.
+    let paged =
+        is_balanced || (!is_crdt && rows.len() > 1 && matches!(route, WriteRoute::Document));
+    // Rows of a paged INSERT, accumulated across the loop below and emitted
     // as one `BatchInsert` task after it.
-    let mut balanced_documents: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut balanced_surrogates: Vec<Surrogate> = Vec::new();
+    let mut page_documents: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut page_surrogates: Vec<Surrogate> = Vec::new();
 
     // One catalog read for the whole statement. `_rowid` carries no
     // declaration, so it skips the read.
@@ -112,12 +125,12 @@ pub(in super::super::super) fn convert_insert(
                     declared_pk.as_deref(),
                     row,
                 )?;
-                // One page for the whole statement: the rows of a balanced
+                // One page for the whole statement. The rows of a balanced
                 // INSERT are judged together, so they must not be split across
                 // one task — one boundary — per row.
-                if is_balanced {
-                    balanced_documents.push((doc_id, value_bytes));
-                    balanced_surrogates.push(surrogate);
+                if paged {
+                    page_documents.push((doc_id, value_bytes));
+                    page_surrogates.push(surrogate);
                     continue;
                 }
                 let plan = if is_crdt {
@@ -162,14 +175,17 @@ pub(in super::super::super) fn convert_insert(
         }
     }
 
-    if !balanced_documents.is_empty() {
+    if !page_documents.is_empty() {
         tasks.push(super::super::balanced_gate::balanced_batch_task(
             super::super::balanced_gate::BalancedBatch {
-                collection,
+                // The already-qualified target: qualifying the qualified name
+                // a second time names no collection outside `default`.
+                collection: &qualified_collection,
                 tenant_id,
                 vshard,
-                documents: balanced_documents,
-                surrogates: balanced_surrogates,
+                documents: page_documents,
+                surrogates: page_surrogates,
+                if_absent,
             },
             ctx.database_id,
         ));
@@ -349,5 +365,84 @@ mod tests {
             ),
             "non-crdt INSERT must remain a PointInsert"
         );
+    }
+
+    /// A multi-row document INSERT lowers to one page that keeps the
+    /// statement's conflict behaviour; a CRDT collection stays row by row.
+    #[test]
+    fn a_multi_row_insert_lowers_to_one_page() {
+        let (ctx, _dir) = ctx_with_catalog();
+        let rows = vec![crdt_row("k1"), crdt_row("k2"), crdt_row("k3")];
+        for if_absent in [false, true] {
+            let tasks = convert_insert(ConvertInsertArgs {
+                collection: "plain",
+                route: WriteRoute::Document,
+                rows: &rows,
+                column_schema: &[],
+                if_absent,
+                primary_key: "id",
+                tenant_id: TenantId::new(0),
+                ctx: &ctx,
+            })
+            .expect("convert_insert");
+            assert_eq!(tasks.len(), 1, "one task for the statement");
+            match &tasks[0].plan {
+                PhysicalPlan::Document(DocumentOp::BatchInsert {
+                    documents,
+                    surrogates,
+                    if_absent: page_if_absent,
+                    ..
+                }) => {
+                    assert_eq!(documents.len(), 3);
+                    assert_eq!(surrogates.len(), 3);
+                    assert_eq!(*page_if_absent, if_absent);
+                }
+                other => panic!("expected one BatchInsert page, got {other:?}"),
+            }
+        }
+
+        let crdt = convert_insert(ConvertInsertArgs {
+            collection: "crdt_coll",
+            route: WriteRoute::Document,
+            rows: &rows,
+            column_schema: &[],
+            if_absent: false,
+            primary_key: "id",
+            tenant_id: TenantId::new(0),
+            ctx: &ctx,
+        })
+        .expect("convert_insert");
+        assert_eq!(crdt.len(), 3, "a CRDT collection converges row by row");
+    }
+
+    /// A page outside `default` names its target qualified once, as a
+    /// `PointInsert` does. Qualifying the qualified name again named no
+    /// collection, so the rows landed nowhere the collection reads.
+    #[test]
+    fn a_page_outside_default_names_its_target_qualified_once() {
+        let (mut ctx, _dir) = ctx_with_catalog();
+        let db = crate::types::DatabaseId::new(5);
+        ctx.database_id = db;
+        let rows = vec![crdt_row("k1"), crdt_row("k2")];
+        let tasks = convert_insert(ConvertInsertArgs {
+            collection: "plain",
+            route: WriteRoute::Document,
+            rows: &rows,
+            column_schema: &[],
+            if_absent: false,
+            primary_key: "id",
+            tenant_id: TenantId::new(0),
+            ctx: &ctx,
+        })
+        .expect("convert_insert");
+        match &tasks[0].plan {
+            PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. }) => {
+                assert_eq!(
+                    collection,
+                    &nodedb_types::QualifiedCollection::new(db, "plain")
+                );
+            }
+            other => panic!("expected one BatchInsert page, got {other:?}"),
+        }
     }
 }

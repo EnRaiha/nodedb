@@ -29,7 +29,9 @@ pub use ast_extract::extract_point_keys;
 pub(super) use ast_extract::extract_table_name_from_table_with_joins;
 pub(super) use declared_defaults::materialize_defaults_in_rows;
 pub(super) use insert_columns::resolve_insert_columns;
-pub(super) use insert_select_bind::bind_insert_select_columns;
+pub(super) use insert_select_bind::{
+    bind_insert_select_columns, insert_select_targets, name_insert_select_outputs,
+};
 pub use kv_counter::{KvCounterFreshRow, KvCounterKind, plan_kv_counter_fresh_row};
 pub(super) use kv_insert::build_kv_insert_plan;
 pub(super) use params::KvInsertParams;

@@ -117,6 +117,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
                 collection,
                 engine: _engine,
                 source,
+                source_alias,
                 target_join_col,
                 source_join_col,
                 assignments,
@@ -126,6 +127,7 @@ macro_rules! impl_dml_arms_for_convert_visitor {
             super::super::dml::convert_update_from(super::super::dml::UpdateFromParams {
                 collection,
                 source,
+                source_alias,
                 target_join_col,
                 source_join_col,
                 assignments,

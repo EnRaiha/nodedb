@@ -13,7 +13,7 @@ use crate::planner::lateral::plan::{LateralJoinArgs, plan_lateral_join};
 use crate::planner::lateral::subquery::{
     is_lateral_derived, lateral_alias_from_factor, subquery_from_factor,
 };
-use crate::resolver::columns::TableScope;
+use crate::resolver::columns::{ColumnNaming, TableScope};
 use crate::types::*;
 
 pub fn plan_join_from_select(
@@ -25,12 +25,28 @@ pub fn plan_join_from_select(
 ) -> Result<Option<SqlPlan>> {
     let from = &select.from[0];
 
+    // Every clause below reads the join's merged rows, which key each field
+    // `qualifier.column`, so a column reference names its owning relation's
+    // qualifier. A LATERAL body reads its outer row through its own
+    // correlation, so a join with a LATERAL item keeps references as written.
+    let has_lateral = from
+        .joins
+        .iter()
+        .any(|join_item| is_lateral_derived(&join_item.relation));
+    let join_row_scope;
+    let scope = if has_lateral {
+        scope
+    } else {
+        join_row_scope = scope.clone().with_column_naming(ColumnNaming::JoinRow);
+        &join_row_scope
+    };
+
     // Left side: either an ARRAY_* TVF or a named table.
     let left_plan =
         if let Some(plan) = array_arm::try_plan_relation(&from.relation, catalog, temporal)? {
             plan
         } else {
-            scan_for_relation(&from.relation, scope)?
+            scan_for_relation(&from.relation, scope, temporal)?
         };
 
     let outer_alias = scan_alias_from_relation(&from.relation)?;
@@ -71,18 +87,21 @@ pub fn plan_join_from_select(
         {
             plan
         } else {
-            scan_for_relation(&join_item.relation, scope)?
+            scan_for_relation(&join_item.relation, scope, temporal)?
         };
 
-        let (join_type, mut on_keys, condition) =
-            extract_join_spec(&join_item.join_operator, scope)?;
+        let right_ids = right_side_identifiers(&join_item.relation)?;
+        let (join_type, mut on_keys, condition) = extract_join_spec(
+            &join_item.join_operator,
+            scope,
+            right_ids.first().map(String::as_str),
+        )?;
 
         // Orient equi-keys to FROM order: `on.0` must reference the left input
         // and `on.1` the right input. The ON clause may write the operands in
         // either order (`ON right.k = left.k`); the physical join builds the
         // hash index on the right key, so a reversed pair would index the wrong
         // side and match zero rows.
-        let right_ids = right_side_identifiers(&join_item.relation)?;
         super::constraint::orient_keys_to_sides(&mut on_keys, &right_ids);
 
         current_plan = SqlPlan::Join {
@@ -124,46 +143,33 @@ pub fn plan_join_from_select(
         };
     }
 
-    let group_by_non_empty = match &select.group_by {
-        ast::GroupByExpr::All(_) => true,
-        ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-    };
-    if group_by_non_empty {
-        let aggregates = super::super::aggregate::extract_aggregates_from_projection(
-            &select.projection,
-            functions,
+    if super::super::select::has_aggregation(select, functions) {
+        // The WHERE predicates filter the joined rows before grouping.
+        if let SqlPlan::Join {
+            filters: ref mut filt,
+            ..
+        } = current_plan
+        {
+            *filt = filters;
+        }
+        // A join aggregate is always the generic aggregate, so ORDER BY
+        // need not be inspected for aggregates of its own.
+        let clauses = super::super::aggregate_clauses::plan_aggregate_clauses(
+            select,
+            None,
+            &[],
             scope,
-        )?;
-        let group_by = super::super::group_by::convert_group_by(&select.group_by, scope)?;
-        let group_by_aliases =
-            super::super::group_by::group_by_output_aliases(&select.projection, &group_by);
-        let output_order = super::super::aggregate_order::compute_output_order(
-            &select.projection,
-            &group_by,
             functions,
-            scope,
         )?;
-        let having = match &select.having {
-            Some(expr) => {
-                // A HAVING term addresses a computed group column, so the
-                // aggregate output names join the input columns here.
-                let having_scope =
-                    scope.with_output_names(aggregates.iter().map(|a| a.alias.clone()).chain(
-                        super::super::select::select_output_aliases(&select.projection),
-                    ));
-                super::super::select::convert_where_to_filters(expr, &having_scope)?
-            }
-            None => Vec::new(),
-        };
         return Ok(Some(SqlPlan::Aggregate {
             input: Box::new(current_plan),
-            group_by,
-            group_by_aliases,
-            output_order,
-            aggregates,
-            having,
-            limit: 10000,
-            grouping_sets: None,
+            group_by: clauses.group_by,
+            group_by_aliases: clauses.group_by_aliases,
+            output_order: clauses.output_order,
+            aggregates: clauses.aggregates,
+            having: clauses.having,
+            limit: super::super::aggregate::AGGREGATE_NO_LIMIT,
+            grouping_sets: clauses.grouping_sets,
             sort_keys: Vec::new(),
         }));
     }
@@ -209,7 +215,14 @@ fn is_left_join_operator(op: &ast::JoinOperator) -> bool {
 }
 
 /// Build a `SqlPlan::Scan` for a named-table TableFactor.
-fn scan_for_relation(rel: &ast::TableFactor, scope: &TableScope) -> Result<SqlPlan> {
+///
+/// The statement's `FOR SYSTEM_TIME` / `FOR VALID_TIME` scope applies to
+/// every joined relation, so each side must be bitemporal.
+fn scan_for_relation(
+    rel: &ast::TableFactor,
+    scope: &TableScope,
+    temporal: crate::TemporalScope,
+) -> Result<SqlPlan> {
     let (rel_name, rel_alias) =
         crate::parser::normalize::table_name_from_factor(rel)?.ok_or_else(|| {
             SqlError::Unsupported {
@@ -223,6 +236,7 @@ fn scan_for_relation(rel: &ast::TableFactor, scope: &TableScope) -> Result<SqlPl
         .ok_or_else(|| SqlError::UnknownTable {
             name: rel_name.clone(),
         })?;
+    temporal.require_bitemporal(&table.name, table.info.bitemporal)?;
     Ok(SqlPlan::Scan {
         collection: table.name.clone(),
         alias: rel_alias.or_else(|| table.alias.clone()),
@@ -234,6 +248,6 @@ fn scan_for_relation(rel: &ast::TableFactor, scope: &TableScope) -> Result<SqlPl
         offset: 0,
         distinct: false,
         window_functions: Vec::new(),
-        temporal: crate::temporal::TemporalScope::default(),
+        temporal,
     })
 }

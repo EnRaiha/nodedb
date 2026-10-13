@@ -57,6 +57,7 @@ pub(super) async fn dispatch_remote_stream(
         txn_id,
         linearizable,
         read_groups,
+        user_roles,
     } = args;
     // The statement's deadline, fixed before any wait of this attempt.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
@@ -133,6 +134,7 @@ pub(super) async fn dispatch_remote_stream(
         txn_id,
         vshard_id: scoped_vshard,
         read_groups,
+        user_roles,
     });
 
     debug!(

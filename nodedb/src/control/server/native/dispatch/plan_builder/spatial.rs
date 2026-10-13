@@ -48,7 +48,7 @@ pub(crate) async fn build_scan(
 
     let distance_meters = fields.distance_meters.unwrap_or(0.0);
     let field = fields.field.clone().unwrap_or_else(|| "geom".to_string());
-    let limit = fields.limit.unwrap_or(1000) as usize;
+    let limit = super::requested_limit(fields)?;
 
     Ok(PhysicalPlan::Spatial(SpatialOp::Scan {
         collection: QualifiedCollection::new(ctx.database_id(), collection),

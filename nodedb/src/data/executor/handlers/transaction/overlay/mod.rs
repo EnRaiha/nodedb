@@ -31,6 +31,6 @@ pub(in crate::data::executor) use spatial_merge::SpatialOverlayMergeParams;
 pub use staged::{CollectionOverlay, MAX_TXN_OVERLAY_BYTES, Staged, TouchedSlot, TxnOverlay};
 pub use staged_sidecar::{BitemporalStamp, StagedTtl};
 pub use staged_vector::StagedVectorRow;
-pub(in crate::data::executor) use timeseries_merge::TimeseriesOverlayMergeParams;
+pub(in crate::data::executor) use timeseries_merge::{StagedTsRows, TimeseriesOverlayMergeParams};
 pub(in crate::data::executor) use vector_merge::VectorMergeParams;
 pub(in crate::data::executor) use vector_primary_merge::{SidecarRowShape, staged_vector_sidecar};

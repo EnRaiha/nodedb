@@ -38,19 +38,38 @@ pub(super) fn aggregate_direct_index(
     let mut table: Vec<Vec<AggAccum>> = (0..card)
         .map(|_| (0..num_aggs).map(|_| AggAccum::default()).collect())
         .collect();
+    let mut seen = vec![false; card];
+    // An id outside the dictionary — the NULL symbol id among them — keeps
+    // its own group, so its rows are never dropped.
+    let mut outside: FxHashMap<u32, Vec<AggAccum>> = FxHashMap::default();
 
     for_each_set_bit(mask, row_count, |row_idx| {
-        let id = sym_ids[row_idx] as usize;
-        if id < card {
-            accumulate_row(&mut table[id], resolved, columns, row_idx);
+        let id = sym_ids[row_idx];
+        match table.get_mut(id as usize) {
+            Some(accums) => {
+                seen[id as usize] = true;
+                accumulate_row(accums, resolved, columns, row_idx);
+            }
+            None => {
+                let accums = outside
+                    .entry(id)
+                    .or_insert_with(|| (0..num_aggs).map(|_| AggAccum::default()).collect());
+                accumulate_row(accums, resolved, columns, row_idx);
+            }
         }
     });
 
     table
         .into_iter()
+        .zip(seen)
         .enumerate()
-        .filter(|(_, accums)| accums.iter().any(|a| a.count > 0))
-        .map(|(id, accums)| (IntGroupKey::SingleU32(id as u32), accums))
+        .filter(|(_, (_, seen))| *seen)
+        .map(|(id, (accums, _))| (IntGroupKey::SingleU32(id as u32), accums))
+        .chain(
+            outside
+                .into_iter()
+                .map(|(id, accums)| (IntGroupKey::SingleU32(id), accums)),
+        )
         .collect()
 }
 

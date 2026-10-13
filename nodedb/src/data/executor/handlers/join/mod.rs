@@ -15,6 +15,7 @@ pub mod nested_loop;
 pub mod params;
 mod row_source;
 mod shuffle_join;
+mod side_rows;
 pub mod sort_merge;
 mod spill;
 mod support;

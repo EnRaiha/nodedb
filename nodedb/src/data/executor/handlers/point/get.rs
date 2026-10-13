@@ -165,6 +165,28 @@ impl CoreLoop {
             }
         };
 
-        self.response_with_payload(task, transcoded.unwrap_or(data))
+        let body = transcoded.unwrap_or(data);
+        // A vector-primary row reads with its vector, as a scan of it does.
+        if matches!(
+            body_format,
+            crate::data::executor::sparse_body_format::SparseBodyFormat::VectorSidecar
+        ) && let Some(field) = self.vector_primary_field(database_id, tid, collection)
+        {
+            let coll_key = (
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection.to_string(),
+            );
+            let with_vector = self
+                .current_primary_vector(task.request.txn_id, &coll_key, &field, surrogate)
+                .and_then(|vector| {
+                    super::super::vector_row_column::with_vector_column(&body, &field, &vector)
+                });
+            return match with_vector {
+                Ok(row) => self.response_with_payload(task, row),
+                Err(e) => self.response_error(task, e),
+            };
+        }
+        self.response_with_payload(task, body)
     }
 }

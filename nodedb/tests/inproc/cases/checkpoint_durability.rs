@@ -267,12 +267,19 @@ fn timeseries_merge_directory_swap_is_durable() {
 
 #[test]
 fn timeseries_ddl_partition_swap_is_durable() {
-    let src = read("nodedb/src/control/server/shared/ddl/neutral/timeseries/rewrite.rs");
-    assert!(
-        src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
-        "timeseries DDL partition rewrite directory swap must fsync the \
-         parent directory after renames."
-    );
+    // The owning Data Plane core performs the `REWRITE PARTITIONS` swap, and
+    // boot recovery renames an interrupted swap's backup back into place.
+    for rel in [
+        "nodedb/src/data/executor/handlers/timeseries/partition_rewrite.rs",
+        "nodedb/src/data/executor/timeseries_checkpoint/rewrite_recovery.rs",
+    ] {
+        let src = read(rel);
+        assert!(
+            src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
+            "{rel}: a timeseries partition rewrite directory swap must fsync \
+             the parent directory after renames."
+        );
+    }
 }
 
 /// Checkpoint reads are consumed once and then superseded by the in-memory

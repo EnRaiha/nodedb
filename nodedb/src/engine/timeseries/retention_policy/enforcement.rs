@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
 use crate::engine::timeseries::retention_policy::RetentionPolicyRegistry;
+use crate::engine::timeseries::retention_policy::rooted_aggregates::aggregates_rooted_at;
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::MetaOp;
 
@@ -87,13 +88,37 @@ async fn enforcement_loop(
                     true // No downsample tiers — safe to drop raw unconditionally.
                 };
 
-                if safe_to_drop {
+                let aggregates = if safe_to_drop {
+                    match aggregates_rooted_at(
+                        &state,
+                        &registry,
+                        policy.database_id,
+                        policy.tenant_id,
+                        &policy.collection,
+                    ) {
+                        Ok(aggregates) => Some(aggregates),
+                        Err(e) => {
+                            warn!(
+                                policy = policy.name,
+                                collection = policy.collection,
+                                error = %e,
+                                "skipping raw retention: the aggregates rooted at the \
+                                 collection could not be read; the next pass retries"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(aggregates) = aggregates {
                     let plan = PhysicalPlan::Meta(MetaOp::EnforceTimeseriesRetention {
                         collection: nodedb_types::QualifiedCollection::new(
                             DatabaseId::new(policy.database_id),
                             &policy.collection,
                         ),
                         max_age_ms: raw_tier.retain_ms as i64,
+                        aggregates,
                     });
 
                     if let Err(e) =
@@ -116,7 +141,7 @@ async fn enforcement_loop(
                             "failed to enforce raw tier retention"
                         );
                     }
-                } else {
+                } else if !safe_to_drop {
                     warn!(
                         policy = policy.name,
                         collection = policy.collection,
@@ -201,17 +226,30 @@ async fn check_watermark_coverage(
     )
     .await
     {
-        Ok(payload) => {
-            if let Ok(wm) = sonic_rs::from_slice::<
-                crate::engine::timeseries::continuous_agg::WatermarkState,
-            >(&payload)
-            {
-                // Safe if tier1 has aggregated data beyond the cutoff.
-                wm.watermark_ts >= cutoff
-            } else {
-                false // Can't parse watermark — not safe.
+        // The core answers with `encode_serde`, which is MessagePack.
+        Ok(payload) => match crate::data::executor::response_codec::decode_payload::<
+            crate::engine::timeseries::continuous_agg::WatermarkState,
+        >(&payload)
+        {
+            // Safe if tier1 has aggregated data beyond the cutoff.
+            Ok(wm) => wm.watermark_ts >= cutoff,
+            Err(e) => {
+                tracing::warn!(
+                    policy = policy.name,
+                    tier1 = tier1_name,
+                    error = %e,
+                    "tier1 watermark payload does not decode; raw partitions are kept"
+                );
+                crate::diag::continuous_aggregate_state_fault(
+                    &e,
+                    "watermark_decode",
+                    policy.database_id,
+                    tenant_id.as_u64(),
+                    &tier1_name,
+                );
+                false
             }
-        }
+        },
         Err(e) => {
             tracing::warn!(
                 policy = policy.name,

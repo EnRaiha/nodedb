@@ -67,7 +67,7 @@ fn has_point_lookup(engine: &EngineType) -> bool {
         | EngineType::KeyValue
         | EngineType::Columnar
         | EngineType::Spatial => true,
-        EngineType::Timeseries | EngineType::Array => false,
+        EngineType::Timeseries | EngineType::Array | EngineType::ContinuousAggregate => false,
     }
 }
 

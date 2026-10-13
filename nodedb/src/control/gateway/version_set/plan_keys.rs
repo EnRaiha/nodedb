@@ -103,23 +103,31 @@ fn document_touched_collections(
         // source row rides a separate task on its own vShard.
         | ApplyBalanceDelta { collection, .. } => out.push(collection.as_str().to_owned()),
 
+        // The target, plus every collection the source relation reads.
         InsertSelect {
             target_collection,
-            source_collection,
+            source,
             ..
         }
         | UpdateFromJoin {
             target_collection,
-            source_collection,
+            source,
             ..
         }
         | Merge {
             target_collection,
-            source_collection,
+            source,
             ..
         } => {
             out.push(target_collection.as_str().to_owned());
-            out.push(source_collection.as_str().to_owned());
+            match source {
+                nodedb_physical::physical_plan::RowSource::DocumentPages(page) => {
+                    out.push(page.collection.as_str().to_owned());
+                }
+                nodedb_physical::physical_plan::RowSource::Query(query) => {
+                    out.extend(touched_collections(&query.plan));
+                }
+            }
         }
 
         // The wrapped op is the intercepted write verbatim, so it reads
@@ -268,7 +276,10 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
             match op {
                 Scan { collection, .. }
                 | Ingest { collection, .. }
-                | Truncate { collection, .. } => out.push(collection.as_str().to_owned()),
+                | Truncate { collection, .. }
+                | RefreshAggregate { collection, .. }
+                | Partitions { collection, .. }
+                | ReadAggregate { collection, .. } => out.push(collection.as_str().to_owned()),
 
                 // The wrapped ingest is the intercepted write verbatim.
                 ResolveIngest(inner) => {

@@ -9,7 +9,6 @@ use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
-use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::{DmlTxnCtx, PendingFieldInference};
 use crate::control::state::SharedState;
 
@@ -141,24 +140,13 @@ async fn insert_parsed(
         }
     }
 
-    // Enforce type guards and CHECK constraints (after BEFORE trigger + sequence injection).
+    // Enforce CHECK constraints (after BEFORE trigger + sequence injection).
+    // Typeguards are enforced on the Data Plane, on the body every write form
+    // stores.
     let catalog = state.credentials.catalog();
     if let Ok(Some(coll_def)) =
         catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
-        // Inject DEFAULT/VALUE + validate type guards (combined).
-        if !coll_def.type_guards.is_empty()
-            && let Err(violation) =
-                crate::data::executor::enforcement::typeguard::inject_and_validate(
-                    &parsed.coll_name,
-                    &coll_def.type_guards,
-                    &mut fields,
-                )
-        {
-            let (_severity, code, message) = error_code_to_sqlstate(&violation);
-            return Err(DdlError::new(code, message));
-        }
-
         // General CHECK constraints (Control Plane enforcement, can have subqueries).
         if !coll_def.check_constraints.is_empty()
             && let Err(e) =

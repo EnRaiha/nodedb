@@ -41,7 +41,7 @@ pub(super) fn snapshot_redaction(
     plan: &PhysicalPlan,
 ) -> QueryRedaction {
     let scope = RequestAuthScope::for_database(identity, shared.auth_stores(), database_id);
-    QueryRedaction::for_plan(identity.tenant_id, scope.auth(), plan)
+    QueryRedaction::for_plan(identity.tenant_id, database_id, scope.auth(), plan)
 }
 
 /// The first shape-predicate field a redaction rule covers, if any.

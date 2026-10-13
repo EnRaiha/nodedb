@@ -158,6 +158,19 @@ pub async fn create_alert(
     Ok(status("CREATE ALERT"))
 }
 
+/// The aggregates a grouped timeseries scan computes, the only source an
+/// alert condition reads.
+const ALERT_AGGREGATES: &[&str] = &[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "first",
+    "last",
+    "ts_stddev",
+];
+
 /// Parse `agg_func(column) op threshold` from raw condition string.
 fn parse_condition_raw(raw: &str) -> Result<AlertCondition, DdlError> {
     let s = raw.trim();
@@ -172,6 +185,15 @@ fn parse_condition_raw(raw: &str) -> Result<AlertCondition, DdlError> {
         .ok_or_else(|| err("42601", "missing ')' in CONDITION".to_string()))?;
 
     let agg_func = s[..open].trim().to_lowercase();
+    if !ALERT_AGGREGATES.contains(&agg_func.as_str()) {
+        return Err(err(
+            "42883",
+            format!(
+                "alert aggregate '{agg_func}' is not supported; expected one of: {}",
+                ALERT_AGGREGATES.join(", ")
+            ),
+        ));
+    }
     let column = s[open + 1..close].trim().to_lowercase();
     let remainder = s[close + 1..].trim();
 
@@ -314,7 +336,17 @@ fn parse_insert_target(s: &str) -> Result<(String, Vec<String>), DdlError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_insert_target;
+    use super::{parse_condition_raw, parse_insert_target};
+
+    #[test]
+    fn a_condition_names_a_computed_aggregate() {
+        assert!(parse_condition_raw("avg(temperature) > 90").is_ok());
+        assert!(parse_condition_raw("TS_STDDEV(v) >= 1.5").is_ok());
+        match parse_condition_raw("median(temperature) > 90") {
+            Err(e) => assert!(format!("{e:?}").contains("'median'"), "{e:?}"),
+            Ok(c) => panic!("expected a refusal, got {c:?}"),
+        }
+    }
 
     #[test]
     fn insert_target_requires_exact_alert_history_arity() {

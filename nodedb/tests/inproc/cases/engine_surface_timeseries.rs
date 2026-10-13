@@ -417,13 +417,10 @@ async fn continuous_aggregate_survives_restart() {
     );
 }
 
-/// The aggregate name must resolve as a queryable relation — `SELECT
-/// … FROM <ca_name>` must not error with "unknown table". The bench's
-/// reported symptom is precisely that: queries against the
-/// materialized name return `42P01` because no target collection ever
-/// existed. Data correctness of the rolled-up rows is a separate
-/// spec (it depends on a refresh path that doesn't ship yet); this
-/// test only pins the "name resolves" half of the bug.
+/// The aggregate name resolves as a queryable relation: `SELECT … FROM
+/// <ca_name>` reads the aggregate's buckets and never errors with "unknown
+/// table". The rows themselves are pinned by the wire serving tests, which
+/// flush the source.
 #[tokio::test]
 async fn continuous_aggregate_name_is_queryable_after_create() {
     let srv = TestServer::start().await;
@@ -443,17 +440,14 @@ async fn continuous_aggregate_name_is_queryable_after_create() {
     .await
     .unwrap();
 
-    let _rows = srv
+    let rows = srv
         .query_rows("SELECT * FROM ts_cagg_query_view")
         .await
         .unwrap_or_else(|e| {
-            panic!(
-                "SELECT against the CA name must succeed once the aggregate \
-                 is registered (rolled-up data may be empty until a refresh \
-                 path is wired, but the name must resolve to a real relation); \
-                 got error: {e}. \"unknown table\" here is the bench's \
-                 reported symptom — no target collection was ever \
-                 materialized for the aggregate name."
-            )
+            panic!("SELECT against the aggregate's name must resolve to its relation; got {e}")
         });
+    assert!(
+        rows.is_empty(),
+        "no row was flushed into the aggregate: {rows:?}"
+    );
 }

@@ -143,7 +143,10 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
         field: String::new(),
         lower: None,
         upper: None,
-        limit: 10_000,
+        // The replica's initial dataset is every row: a cut would leave the
+        // client missing rows with nothing saying so. The Data Plane bounds
+        // the read by its scan byte budget and fails loudly past it.
+        limit: usize::MAX,
         rls_filters: Vec::new(),
     });
 

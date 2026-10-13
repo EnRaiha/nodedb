@@ -48,8 +48,6 @@ pub struct QueryTuning {
     pub sort_run_size: usize,
     #[serde(default = "default_stream_chunk_size")]
     pub stream_chunk_size: usize,
-    #[serde(default = "default_aggregate_scan_cap")]
-    pub aggregate_scan_cap: usize,
     #[serde(default = "default_arrow_batch_max_rows")]
     pub arrow_batch_max_rows: usize,
     #[serde(default = "default_arrow_batch_max_bytes")]
@@ -106,7 +104,6 @@ impl Default for QueryTuning {
         Self {
             sort_run_size: default_sort_run_size(),
             stream_chunk_size: default_stream_chunk_size(),
-            aggregate_scan_cap: default_aggregate_scan_cap(),
             arrow_batch_max_rows: default_arrow_batch_max_rows(),
             arrow_batch_max_bytes: default_arrow_batch_max_bytes(),
             bitmap_over_fetch_factor: default_bitmap_over_fetch_factor(),
@@ -127,9 +124,6 @@ fn default_sort_run_size() -> usize {
 }
 fn default_stream_chunk_size() -> usize {
     1_000
-}
-fn default_aggregate_scan_cap() -> usize {
-    10_000_000
 }
 fn default_arrow_batch_max_rows() -> usize {
     65_536

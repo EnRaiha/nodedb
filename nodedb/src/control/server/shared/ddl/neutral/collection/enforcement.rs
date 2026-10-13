@@ -405,16 +405,18 @@ pub fn find_materialized_sum_bindings<S: CollectionSource + ?Sized>(
 }
 
 /// Build generated column specs from the stored collection's
-/// schema. Checks both strict-schema `ColumnDef` entries (via
-/// `timeseries_config`, reused for schema storage) and schemaless
-/// `FieldDefinition` entries (via `field_defs`).
+/// schema. Checks both strict-schema `ColumnDef` entries (from the
+/// collection type, the schema's source of truth) and schemaless
+/// `FieldDefinition` entries (via `field_defs`), the same columns
+/// `StoredCollection::generated_columns` reports.
 pub fn build_generated_column_specs(
     coll: &StoredCollection,
 ) -> Vec<nodedb_physical::physical_plan::GeneratedColumnSpec> {
     let mut specs = Vec::new();
 
-    let schema_json = coll.timeseries_config.as_deref().unwrap_or("");
-    if let Ok(schema) = sonic_rs::from_str::<nodedb_types::columnar::StrictSchema>(schema_json) {
+    if let nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Strict(schema)) =
+        &coll.collection_type
+    {
         for col in &schema.columns {
             if let Some(ref expr_json) = col.generated_expr
                 && let Ok(expr) = sonic_rs::from_str::<crate::bridge::expr_eval::SqlExpr>(expr_json)

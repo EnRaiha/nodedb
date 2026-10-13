@@ -26,15 +26,16 @@ async fn vector_search_with_metadata_filter_round_trips_through_pgwire() {
         .await
         .expect("pgwire connect to harness must succeed");
 
-    // Provision a vector collection with an explicit `category`
-    // metadata column so the WHERE predicate has a real column to bind
-    // against. Vector engine requires the engine='vector' option plus
-    // explicit FIELDS; the planner does not auto-promote.
+    // Provision a document collection with a vector column and an
+    // explicit `category` metadata column, so the WHERE predicate has a
+    // real column to bind against. Vector search over a document
+    // collection uses engine='document_schemaless'; engine='vector' is a
+    // vector-primary collection.
     remote
         .execute_sql(
             "CREATE COLLECTION embeddings \
              FIELDS (id TEXT, embedding VECTOR(3), category TEXT) \
-             WITH (engine='vector', m=8, ef_construction=50)",
+             WITH (engine='document_schemaless', m=8, ef_construction=50)",
             &[],
         )
         .await

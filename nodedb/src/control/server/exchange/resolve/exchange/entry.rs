@@ -64,7 +64,7 @@ pub async fn resolve_and_materialize(
     scope: ReadScope,
 ) -> crate::Result<Resolved> {
     // Pass 1: fill empty ProviderScan rows (identity-scoped, per-request).
-    let plan = materialize_providers(state, identity, plan).await?;
+    let plan = materialize_providers(state, identity, scope.database_id, plan).await?;
 
     // Pass 2: resolve Exchange nodes. The captures accumulator is filled at every
     // base-collection gather point beneath the plan root and consumed (taken)

@@ -105,6 +105,8 @@ pub(crate) async fn enqueue_transaction_redo(
             txn_id: None,
             // The proposer authorized every write before it resolved them.
             user_id: None,
+            // The record carries the committing identity's roles itself.
+            user_roles: Vec::new(),
             // Every replica appends the record to its own WAL, in apply order.
             durability: WalDurability::AppendHere {
                 now_override: None,

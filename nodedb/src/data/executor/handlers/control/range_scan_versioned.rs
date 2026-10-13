@@ -130,8 +130,9 @@ impl CoreLoop {
                     return false;
                 }
                 // Row-level security decides on the same decoded body. A filter
-                // that errors excludes the row: this predicate cannot surface an
-                // error, and admitting the row would leak it.
+                // that errors excludes the row and fails the scan through the
+                // same side-channel: admitting the row would leak it, and
+                // dropping it quietly would shrink the answer.
                 match &rls {
                     None => true,
                     // The filters evaluate against the normalized msgpack form,
@@ -148,21 +149,34 @@ impl CoreLoop {
                                 doc_id,
                                 &identity_column,
                             );
-                            crate::bridge::scan_filter::ScanFilter::all_match_binary(filters, &mp)
-                                .unwrap_or(false)
+                            match crate::bridge::scan_filter::ScanFilter::all_match_binary(
+                                filters, &mp,
+                            ) {
+                                Ok(admitted) => admitted,
+                                Err(e) => {
+                                    decode_err.set(Some(e.into()));
+                                    false
+                                }
+                            }
                         }
-                        Err(_) => false,
+                        Err(e) => {
+                            decode_err.set(Some(crate::Error::Serialization {
+                                format: "msgpack".into(),
+                                detail: format!("range scan row for RLS: {e}"),
+                            }));
+                            false
+                        }
                     },
                 }
             }
         };
 
-        // Over-fetch so the sort produces a correct top-`limit`, matching the
-        // non-bitemporal fallback's `limit.max(1000)` scan ceiling. The
-        // versioned scan applies `limit` only to surviving (live + matching)
-        // rows, so the predicate has already excluded out-of-range and
-        // tombstoned rows before this bound is counted.
-        let scan_limit = limit.max(1000);
+        // The rows come back in storage-key order and are sorted by `field`
+        // below, so the scan must return every matching row: a read cut at a
+        // row count would sort a prefix and return the wrong top-`limit`. The
+        // read is bounded by the scan byte budget alone, checked after it.
+        let budget = self.query_tuning.max_scan_result_bytes;
+        let scan_limit = super::super::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
         // Safe point: the versioned scan consults this once per scanned
         // version. A statement that goes over its deadline mid-scan stops here
         // and the check below turns the short result into an error.
@@ -224,11 +238,26 @@ impl CoreLoop {
             let mp = match &strict_schema {
                 Some(schema) => match strict_format::binary_tuple_to_msgpack(&body, schema) {
                     Some(mp) => mp,
-                    None => continue,
+                    // An unreadable row fails the scan; dropping it would
+                    // shrink the answer with nothing saying a row is missing.
+                    None => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!(
+                                    "range scan of '{collection}': row {id} is not a Binary \
+                                     Tuple readable under the collection's strict schema"
+                                ),
+                            },
+                        );
+                    }
                 },
                 None => body,
             };
             rows.push((id.to_string(), mp));
+        }
+        if super::super::scan_budget::scan_bytes_exceeded(&rows, budget) {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
         }
 
         // Sort ascending by `field` and cap at `limit` — the same ordering the

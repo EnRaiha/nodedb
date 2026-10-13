@@ -113,6 +113,9 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             collection,
             restart_identity,
         } => Ok(columnar::timeseries_truncate(collection, *restart_identity)),
+        ReplicatedWrite::TimeseriesAggregateRefresh { collection, cut } => Ok(
+            columnar::timeseries_aggregate_refresh(collection, cut.clone()),
+        ),
         _ => Err(crate::Error::Internal {
             detail: "entry_columnar_family::decode_arm called with a non-columnar-family \
                 ReplicatedWrite variant (dispatch bug in decode/entry.rs's grouped \

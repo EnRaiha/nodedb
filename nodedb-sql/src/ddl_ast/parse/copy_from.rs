@@ -4,21 +4,85 @@
 //!
 //! Only the server-side file-path form is handled here. The STDIN streaming
 //! shape (`COPY ... FROM STDIN`) is handled elsewhere (backup/restore);
-//! returning `None` lets dispatch fall through to that handler.
-//! `COPY ... TO` and `COPY (SELECT ...) TO` are rejected with typed errors.
+//! returning `None` lets dispatch fall through to that handler. `COPY ... TO`
+//! and `COPY (SELECT ...) TO` belong to the `copy_to` family.
+//!
+//! The direction is the keyword right after the copied relation, never a
+//! `FROM` or `TO` inside a path, a name, or a query.
 
-use nodedb_types::strip_prefix_ascii_case_insensitive;
-
+use super::clause::{ClauseCursor, Tok, Token, tokenize};
 use crate::ddl_ast::statement::{CopyFormat, MiscStmt, NodedbStatement};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::find_ascii_case_insensitive;
+
+/// Which way a `COPY` statement moves rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CopyDirection {
+    /// `COPY <relation> FROM '<path>'`.
+    FromFile,
+    /// `COPY <relation> FROM STDIN`.
+    FromStdin,
+    /// `COPY <relation> TO ...`.
+    To,
+}
+
+/// The direction of a `COPY` statement, read from the keyword that follows
+/// the copied relation: a name (`users`, `"Users"`, `tenant_restore(1)`) or a
+/// parenthesized query. `None` when the statement is not a `COPY` or names
+/// no direction there.
+pub(super) fn copy_direction(sql: &str) -> Option<CopyDirection> {
+    let toks = tokenize(sql);
+    let end = relation_end(&toks)?;
+    let mut c = ClauseCursor::new(sql, &toks[end..], "COPY");
+    if c.eat_keyword("TO") {
+        return Some(CopyDirection::To);
+    }
+    if c.eat_keyword("FROM") {
+        return Some(if c.peek_keyword("STDIN") {
+            CopyDirection::FromStdin
+        } else {
+            CopyDirection::FromFile
+        });
+    }
+    None
+}
+
+/// Index of the first token after the copied relation, or `None` when the
+/// statement does not start with `COPY`.
+fn relation_end(toks: &[Token<'_>]) -> Option<usize> {
+    if !matches!(toks.first().map(|t| &t.tok), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("COPY"))
+    {
+        return None;
+    }
+    let mut i = 1;
+    let mut depth = 0i32;
+    while let Some(tok) = toks.get(i) {
+        match &tok.tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => {
+                depth -= 1;
+                if depth == 0 && i > 1 && toks[1].tok == Tok::Punct('(') {
+                    // A parenthesized query ends at its matching `)`.
+                    return Some(i + 1);
+                }
+            }
+            Tok::Word(w)
+                if depth == 0
+                    && i > 1
+                    && (w.eq_ignore_ascii_case("FROM") || w.eq_ignore_ascii_case("TO")) =>
+            {
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
 
 /// Try to parse a COPY statement.
 ///
-/// Returns `None` if the SQL does not start with `COPY `, so dispatch is
-/// unaffected. Returns `Some(Err)` for malformed COPY statements that this
-/// parser claims (i.e. `COPY ... TO`, query form, or parse errors).
-/// Returns `Some(Ok(CopyFromFile {...}))` on success.
+/// Returns `None` unless the statement is `COPY <collection> FROM '<path>'`.
+/// Returns `Some(Err)` for a malformed statement of that shape.
 pub(super) fn try_parse(
     upper: &str,
     _parts: &[&str],
@@ -27,74 +91,27 @@ pub(super) fn try_parse(
     if !upper.starts_with("COPY ") {
         return None;
     }
-
-    // COPY (SELECT ...) is the query-form TO path — handled by copy_to parser.
-    let after_copy_check = trimmed["COPY ".len()..].trim_start();
-    if after_copy_check.starts_with('(') {
+    if copy_direction(trimmed) != Some(CopyDirection::FromFile) {
         return None;
     }
-
-    // Fall through for COPY ... TO — handled by copy_to parser.
-    let has_from = upper.contains(" FROM ");
-    let has_to = upper.contains(" TO ");
-    if has_to
-        && (!has_from
-            || find_ascii_case_insensitive(trimmed, " TO ")
-                < find_ascii_case_insensitive(trimmed, " FROM "))
-    {
-        return None;
-    }
-
-    // If it has FROM STDIN, return None — let backup/restore intercept it.
-    if upper.contains(" FROM STDIN") {
-        return None;
-    }
-
-    if !has_from {
-        return None;
-    }
-
     Some(parse_copy_from(trimmed))
 }
 
-fn parse_copy_from(trimmed: &str) -> Result<NodedbStatement, SqlError> {
+fn parse_copy_from(sql: &str) -> Result<NodedbStatement, SqlError> {
     // Grammar: COPY <name> FROM '<path>' [WITH (...)]
-
-    // Extract collection name (first word before FROM).
-    let from_pos =
-        find_ascii_case_insensitive(trimmed, " FROM ").ok_or_else(|| SqlError::Parse {
-            detail: "COPY: missing FROM keyword".to_string(),
-        })?;
-
-    // The collection name is between "COPY " and " FROM ".
-    let coll_raw = trimmed["COPY ".len()..from_pos].trim();
-    if coll_raw.is_empty() {
-        return Err(SqlError::Parse {
-            detail: "COPY: missing collection name".to_string(),
-        });
-    }
-    // Strip optional quotes.
-    let collection = strip_quotes(coll_raw).to_lowercase();
-
-    let after_from = trimmed[from_pos + " FROM ".len()..].trim_start();
-
-    // Extract the path (must be a single-quoted string).
-    let (path, rest) = extract_quoted_string(after_from)?;
-
-    // Parse optional WITH clause.
-    let rest = rest.trim();
-    let (format, delimiter, header) = if rest.is_empty() {
-        (None, None, true)
-    } else {
-        parse_with_clause(rest)?
-    };
-
-    // Auto-detect format from extension if not explicitly specified.
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "COPY");
+    c.expect_keyword("COPY")?;
+    let collection = copy_collection_name(&mut c)?;
+    c.expect_keyword("FROM")?;
+    let path = c
+        .string("FROM")
+        .map_err(|_| c.error("expected single-quoted path after FROM"))?;
+    let (format, delimiter, header) = parse_copy_options(&mut c)?;
     let format = match format {
         Some(f) => Some(f),
         None => detect_format_from_path(&path)?,
     };
-
     Ok(NodedbStatement::Misc(MiscStmt::CopyFromFile {
         collection,
         path,
@@ -104,160 +121,57 @@ fn parse_copy_from(trimmed: &str) -> Result<NodedbStatement, SqlError> {
     }))
 }
 
-/// Strip surrounding double or single quotes from an identifier or path.
-pub(super) fn strip_quotes(s: &str) -> &str {
-    if let Some(inner) = s
+/// The copied collection: one bare or quoted name, quotes removed and
+/// lower-cased.
+pub(super) fn copy_collection_name(c: &mut ClauseCursor<'_, '_>) -> Result<String, SqlError> {
+    let raw = c.raw_run("collection name")?;
+    let unquoted = raw
         .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        inner
-    } else if let Some(inner) = s
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-    {
-        inner
-    } else {
-        s
-    }
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(raw);
+    Ok(unquoted.to_lowercase())
 }
 
-/// Extract the leading single-quoted string from `s`.
-/// Returns `(content, remainder_after_closing_quote)`.
-pub(super) fn extract_quoted_string(s: &str) -> Result<(String, &str), SqlError> {
-    if !s.starts_with('\'') {
-        return Err(SqlError::Parse {
-            detail: format!(
-                "COPY: expected single-quoted path after FROM, got: {}",
-                &s[..s.len().min(32)]
-            ),
-        });
-    }
-    let inner = s.strip_prefix('\'').unwrap_or("");
-    // Find the closing quote (handle escaped '' as a literal quote).
-    let mut result = String::new();
-    let mut chars = inner.char_indices();
-    loop {
-        match chars.next() {
-            None => {
-                return Err(SqlError::Parse {
-                    detail: "COPY: unterminated path string".to_string(),
-                });
-            }
-            Some((_, '\'')) => {
-                // Peek: if next char is also ', it's an escaped quote.
-                let remainder = chars.as_str();
-                if remainder.starts_with('\'') {
-                    result.push('\'');
-                    chars.next(); // consume second '
-                } else {
-                    return Ok((result, remainder));
-                }
-            }
-            Some((_, ch)) => result.push(ch),
-        }
-    }
-}
-
-/// Parse `WITH (key value, ...)` or `WITH (key = value, ...)`.
-pub(super) fn parse_with_clause(
-    s: &str,
+/// Read an optional `WITH (key [=] value, ...)` and require the end of the
+/// statement. Returns `(format, delimiter, header)`; `header` defaults to
+/// true.
+pub(super) fn parse_copy_options(
+    c: &mut ClauseCursor<'_, '_>,
 ) -> Result<(Option<CopyFormat>, Option<char>, bool), SqlError> {
-    if !nodedb_types::starts_with_ascii_case_insensitive(s, "WITH") {
-        return Err(SqlError::Parse {
-            detail: format!(
-                "COPY: unexpected trailing content: {}",
-                &s[..s.len().min(32)]
-            ),
-        });
-    }
-    let after_with = strip_prefix_ascii_case_insensitive(s, "WITH")
-        .unwrap_or("")
-        .trim_start();
-    if !after_with.starts_with('(') {
-        return Err(SqlError::Parse {
-            detail: "COPY: WITH clause must be enclosed in parentheses".to_string(),
-        });
-    }
-    let close = after_with.rfind(')').ok_or_else(|| SqlError::Parse {
-        detail: "COPY: unclosed WITH clause parenthesis".to_string(),
-    })?;
-    let inner = &after_with[1..close];
-
-    let mut format: Option<CopyFormat> = None;
-    let mut delimiter: Option<char> = None;
+    let mut format = None;
+    let mut delimiter = None;
     let mut header = true;
-
-    // Split on commas; each token is "KEY value" or "KEY = value".
-    for token in split_with_tokens(inner) {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
-        }
-        // Remove optional '=' separator.
-        let (key, val_raw) = if let Some(pos) = token.find('=') {
-            let k = token[..pos].trim().to_uppercase();
-            let v = token[pos + 1..].trim().to_string();
-            (k, v)
-        } else {
-            // Space-separated: KEY VALUE or just KEY.
-            let mut words = token.splitn(2, char::is_whitespace);
-            let k = words.next().unwrap_or("").to_uppercase();
-            let v = words.next().unwrap_or("").trim().to_string();
-            (k, v)
-        };
-
-        match key.as_str() {
-            "FORMAT" => {
-                format = Some(parse_format_value(&val_raw)?);
-            }
-            "DELIMITER" => {
-                delimiter = Some(parse_delimiter_value(&val_raw)?);
-            }
-            "HEADER" => {
-                header = parse_bool_value(&val_raw).unwrap_or(true);
-            }
-            other => {
-                return Err(SqlError::Parse {
-                    detail: format!("COPY WITH: unknown option '{other}'"),
-                });
+    if c.eat_keyword("WITH") {
+        let options = c.paren_list("WITH options", |c| {
+            let key = c.word("option name")?.to_ascii_uppercase();
+            c.eat_punct('=');
+            let value = match c.string(&key) {
+                Ok(value) => value,
+                Err(_) => c.word(&key)?.to_string(),
+            };
+            Ok((key, value))
+        })?;
+        for (key, value) in options {
+            match key.as_str() {
+                "FORMAT" => format = Some(parse_format_value(&value)?),
+                "DELIMITER" => delimiter = Some(parse_delimiter_value(&value)?),
+                "HEADER" => {
+                    header = parse_bool_value(&value).ok_or_else(|| {
+                        c.error(format!("HEADER must be true or false — found '{value}'"))
+                    })?;
+                }
+                other => return Err(c.error(format!("WITH: unknown option '{other}'"))),
             }
         }
     }
-
+    if !c.at_end() {
+        return Err(c.error(format!("unexpected trailing content {}", c.describe_next())));
+    }
     Ok((format, delimiter, header))
 }
 
-/// Split WITH clause inner content on commas, respecting single-quoted strings.
-fn split_with_tokens(s: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    for ch in s.chars() {
-        match ch {
-            '\'' if !in_quote => {
-                in_quote = true;
-                current.push(ch);
-            }
-            '\'' if in_quote => {
-                in_quote = false;
-                current.push(ch);
-            }
-            ',' if !in_quote => {
-                tokens.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        tokens.push(current.trim().to_string());
-    }
-    tokens
-}
-
 fn parse_format_value(s: &str) -> Result<CopyFormat, SqlError> {
-    let stripped = strip_quotes(s.trim());
-    match stripped.to_lowercase().as_str() {
+    match s.trim().to_lowercase().as_str() {
         "ndjson" | "jsonl" => Ok(CopyFormat::Ndjson),
         "json" => Ok(CopyFormat::JsonArray),
         "csv" => Ok(CopyFormat::Csv),
@@ -268,8 +182,7 @@ fn parse_format_value(s: &str) -> Result<CopyFormat, SqlError> {
 }
 
 fn parse_delimiter_value(s: &str) -> Result<char, SqlError> {
-    let stripped = strip_quotes(s.trim());
-    let mut chars = stripped.chars();
+    let mut chars = s.chars();
     let ch = chars.next().ok_or_else(|| SqlError::Parse {
         detail: "COPY: DELIMITER must be a single character".to_string(),
     })?;
@@ -282,7 +195,7 @@ fn parse_delimiter_value(s: &str) -> Result<char, SqlError> {
 }
 
 fn parse_bool_value(s: &str) -> Option<bool> {
-    match strip_quotes(s.trim()).to_lowercase().as_str() {
+    match s.trim().to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
@@ -291,8 +204,8 @@ fn parse_bool_value(s: &str) -> Option<bool> {
 
 /// Detect the copy format from the file path extension.
 ///
-/// Returns `Err` if the extension is unrecognised (suggests explicit WITH clause).
-/// Returns `Ok(None)` only if there is no extension at all (also suggests explicit WITH).
+/// Returns `Err` if the extension is unrecognised or absent (suggests an
+/// explicit WITH clause).
 pub(super) fn detect_format_from_path(path: &str) -> Result<Option<CopyFormat>, SqlError> {
     let lower = path.to_lowercase();
     if lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
@@ -304,7 +217,6 @@ pub(super) fn detect_format_from_path(path: &str) -> Result<Option<CopyFormat>, 
     if lower.ends_with(".csv") {
         return Ok(Some(CopyFormat::Csv));
     }
-    // Unknown or absent extension.
     Err(SqlError::Parse {
         detail: format!(
             "COPY: cannot infer format from path '{path}'; \
@@ -422,6 +334,27 @@ mod tests {
     }
 
     #[test]
+    fn non_boolean_header_is_refused() {
+        let e = err("COPY users FROM '/tmp/data.csv' WITH (HEADER maybe)");
+        assert!(matches!(e, SqlError::Parse { .. }));
+    }
+
+    #[test]
+    fn trailing_content_after_with_is_refused() {
+        let e = err("COPY users FROM '/tmp/data.csv' WITH (FORMAT csv) EXTRA");
+        assert!(matches!(e, SqlError::Parse { .. }));
+    }
+
+    #[test]
+    fn to_inside_the_path_does_not_change_the_direction() {
+        let stmt = ok("COPY users FROM '/tmp/copy to mars.csv'");
+        assert!(matches!(
+            stmt,
+            NodedbStatement::Misc(MiscStmt::CopyFromFile { .. })
+        ));
+    }
+
+    #[test]
     fn unknown_extension_is_err() {
         let e = err("COPY users FROM '/tmp/data.parquet'");
         assert!(matches!(e, SqlError::Parse { .. }));
@@ -430,16 +363,11 @@ mod tests {
 
     #[test]
     fn copy_to_handled_by_copy_to_parser() {
-        // COPY ... TO is handled by copy_to.rs — copy_from returns None.
-        // The dispatch layer routes it to copy_to::try_parse instead.
-        // Here we verify copy_from::try_parse does not claim this statement.
         use super::super::copy_to::try_parse as copy_to_try_parse;
         let sql = "COPY users TO '/tmp/out.csv'";
         let upper = sql.to_uppercase();
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        // copy_from should return None.
         assert!(try_parse(&upper, &parts, sql).is_none());
-        // copy_to should claim it.
         assert!(copy_to_try_parse(&upper, sql).is_some());
     }
 

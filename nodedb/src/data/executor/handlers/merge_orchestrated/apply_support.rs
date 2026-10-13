@@ -54,8 +54,7 @@ pub(super) fn gate_merge_arms(
         return Ok(());
     }
     // Updates and deletes name their row by its storage key; inserts name
-    // theirs by the source join value, an engine-native key that is never a
-    // document storage key.
+    // theirs by the source row's id, which is never a document storage key.
     let doc_arms = plan
         .updates
         .iter()

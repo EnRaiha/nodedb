@@ -48,6 +48,7 @@ fn attach_wasm_payload_for_reproposal(
 pub async fn alter_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "alter functions")?;
@@ -64,7 +65,7 @@ pub async fn alter_function(
 
     // ALTER FUNCTION <name> SET (FUEL = N, MEMORY = N)
     if action == "SET" {
-        return alter_function_limits(state, identity, &name, parts).await;
+        return alter_function_limits(state, identity, database_id, &name, parts).await;
     }
 
     // ALTER FUNCTION <name> OWNER TO <new_owner>
@@ -78,9 +79,6 @@ pub async fn alter_function(
     let new_owner = parts[5].trim_end_matches(';').to_string();
 
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     let catalog = state.credentials.catalog();
 
     let mut func = catalog
@@ -116,13 +114,11 @@ pub async fn alter_function(
 async fn alter_function_limits(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     name: &str,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     let catalog = state.credentials.catalog();
 
     let mut func = catalog

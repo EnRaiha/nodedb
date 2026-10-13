@@ -86,6 +86,9 @@ impl CoreLoop {
                 sys_from_ms: 0,
                 valid_from_ms: i64::MIN,
                 valid_until_ms: i64::MAX,
+                // The contents a write stores, derived the same way; the write
+                // itself judged the guards.
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::InjectOnly,
             })?
             .stored;
         let config =

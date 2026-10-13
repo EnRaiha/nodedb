@@ -212,7 +212,12 @@ pub async fn query_ndjson(
                         projection: Some(output_schema.clone()),
                         // `try_open_stream` returns `Some` only for a single-task plan.
                         redaction: tasks.first().map(|task| {
-                            QueryRedaction::for_plan(tenant_id, scope.auth(), &task.plan)
+                            QueryRedaction::for_plan(
+                                tenant_id,
+                                task.database_id,
+                                scope.auth(),
+                                &task.plan,
+                            )
                         }),
                         state: Arc::clone(&state.shared),
                         lease_scope,
@@ -263,7 +268,8 @@ pub async fn query_ndjson(
         let plan_kind = describe_plan(&task.plan);
         let plan_for_shape = task.plan.clone();
         // Resolved once per task, reused for every payload it produced.
-        let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
+        let redaction =
+            QueryRedaction::for_plan(tenant_id, task.database_id, scope.auth(), &plan_for_shape);
 
         // A read is cancelled mid-flight once this node loses a lease it
         // holds. A write is not: its outcome will be unknown to the client.

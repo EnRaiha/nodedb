@@ -84,6 +84,9 @@ pub fn calvin_route_keeps(plan: &PhysicalPlan, event_source: EventSource, restor
 /// gate routes a predicate write only when it is a client's (see
 /// [`calvin_route_keeps`]).
 ///
+/// The transaction carries `user_roles`, the roles of the identity that wrote
+/// the write, so every replica judges a role-guarded state transition alike.
+///
 /// Returns a boxed future (rather than an `async fn`) to break the async
 /// recursion cycle described in the module docs.
 pub fn route_write_to_calvin<'a>(
@@ -93,6 +96,7 @@ pub fn route_write_to_calvin<'a>(
     vshard_id: VShardId,
     plan: PhysicalPlan,
     event_source: EventSource,
+    user_roles: Vec<String>,
 ) -> Pin<Box<dyn Future<Output = crate::Result<Option<Response>>> + Send + 'a>> {
     Box::pin(async move {
         let task = PhysicalTask {
@@ -112,8 +116,14 @@ pub fn route_write_to_calvin<'a>(
         // single-collection predicate targets a single vshard, which the recon
         // dispatch's dependent builder accepts.
         if is_dependent_predicate(&task.plan) {
-            let recon =
-                dispatch_dependent_edge_recon(shared, vec![task], tenant_id, database_id).await?;
+            let recon = dispatch_dependent_edge_recon(
+                shared,
+                vec![task],
+                tenant_id,
+                database_id,
+                user_roles,
+            )
+            .await?;
             return Ok(recon.apply_result);
         }
 
@@ -130,6 +140,7 @@ pub fn route_write_to_calvin<'a>(
         let mut tx_class =
             build_single_vshard_tx_class(std::slice::from_ref(&task), tenant_id, &[])?;
         tx_class.set_event_source(event_source.wal_code());
+        tx_class.set_user_roles(user_roles);
         submit_calvin_routed(shared, tx_class).await
     })
 }

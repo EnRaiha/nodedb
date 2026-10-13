@@ -20,7 +20,7 @@ use crate::types::DatabaseId;
 /// rebuildable control-plane projection of the authoritative timeseries-engine
 /// schema.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct IlpMeasurementBatch {
+pub(crate) struct IlpMeasurementBatch {
     pub(super) measurement: String,
     pub(super) raw_lines: Vec<String>,
     /// The column inference names for the line timestamp. The catalog merge
@@ -28,6 +28,36 @@ pub(super) struct IlpMeasurementBatch {
     pub(super) catalog_time_column: Option<(String, String)>,
     /// The inferred tag and field columns, in inference order.
     pub(super) catalog_fields: Vec<(String, String)>,
+}
+
+impl IlpMeasurementBatch {
+    /// The batch of `raw_lines`, all of `measurement`, with the catalog
+    /// projection inferred from them. Authorizes nothing: the caller has
+    /// already authorized the write to `measurement`.
+    pub(crate) fn from_lines(
+        measurement: String,
+        raw_lines: Vec<String>,
+    ) -> Result<Self, crate::engine::timeseries::ilp::IlpError> {
+        let grouped_source = raw_lines.join("\n");
+        let parsed_group = crate::engine::timeseries::ilp::parse_batch(&grouped_source)?;
+        let schema = crate::engine::timeseries::ilp_ingest::infer_schema(parsed_group.lines());
+        let mut catalog_time_column = None;
+        let mut catalog_fields = Vec::with_capacity(schema.columns.len());
+        for (index, (name, ty)) in schema.columns.iter().enumerate() {
+            let projected = (name.clone(), ty.ddl_type_name().to_owned());
+            if index == schema.timestamp_idx {
+                catalog_time_column = Some(projected);
+            } else {
+                catalog_fields.push(projected);
+            }
+        }
+        Ok(Self {
+            measurement,
+            raw_lines,
+            catalog_time_column,
+            catalog_fields,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,26 +106,10 @@ pub(super) fn preflight_ilp_batch(
             audit,
         )
         .map_err(|_| IlpPreflightFailure::PermissionDenied)?;
-        let grouped_source = raw_lines.join("\n");
-        let parsed_group = crate::engine::timeseries::ilp::parse_batch(&grouped_source)
-            .map_err(|_| IlpPreflightFailure::Parse)?;
-        let schema = crate::engine::timeseries::ilp_ingest::infer_schema(parsed_group.lines());
-        let mut catalog_time_column = None;
-        let mut catalog_fields = Vec::with_capacity(schema.columns.len());
-        for (index, (name, ty)) in schema.columns.iter().enumerate() {
-            let projected = (name.clone(), ty.ddl_type_name().to_owned());
-            if index == schema.timestamp_idx {
-                catalog_time_column = Some(projected);
-            } else {
-                catalog_fields.push(projected);
-            }
-        }
-        groups.push(IlpMeasurementBatch {
-            measurement,
-            raw_lines,
-            catalog_time_column,
-            catalog_fields,
-        });
+        groups.push(
+            IlpMeasurementBatch::from_lines(measurement, raw_lines)
+                .map_err(|_| IlpPreflightFailure::Parse)?,
+        );
     }
     Ok(groups)
 }

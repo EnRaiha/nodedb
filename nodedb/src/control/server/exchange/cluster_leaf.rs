@@ -23,6 +23,7 @@ use nodedb_physical::physical_plan::{ClusterArrayOp, ExchangeOp, PhysicalPlan, Q
 
 use crate::control::cluster::ClusterArrayExecutor;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
+use crate::control::server::shared::authorization::gathered_sources;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{ArraySliceResponse, flatten_to_relational_rows};
 use crate::types::{Lsn, TxnId};
@@ -43,7 +44,7 @@ pub(super) async fn gather_cluster_partitioned(
         return Ok(outcome_of(flatten_to_relational_rows(&rows)));
     }
     let mut local = plan;
-    inline_cluster_arrays(state, &mut local, scope.txn_id).await?;
+    inline_cluster_arrays(state, &mut local, scope).await?;
     if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&local) {
         return Err(crate::Error::Internal {
             detail: "a graph or local array plan reached a cross-node gather; graph reads \
@@ -131,17 +132,18 @@ fn cluster_array_rows(op: &ClusterArrayOp, payload: Vec<u8>) -> crate::Result<Ve
 fn inline_cluster_arrays<'a>(
     state: &'a SharedState,
     plan: &'a mut PhysicalPlan,
-    txn_id: Option<TxnId>,
+    scope: ReadScope,
 ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         match plan {
             PhysicalPlan::ClusterArray(op) => {
-                let rows = read_cluster_array(state, op, txn_id).await?;
-                *plan = provider_scan_of_rows(flatten_to_relational_rows(&rows));
+                let rows = read_cluster_array(state, op, scope.txn_id).await?;
+                let sources = gathered_sources(plan, scope.database_id)?;
+                *plan = provider_scan_of_rows(flatten_to_relational_rows(&rows), sources);
             }
             PhysicalPlan::Query(QueryOp::Aggregate { input, .. }) => {
                 if let Some(child) = input.as_deref_mut() {
-                    inline_cluster_arrays(state, child, txn_id).await?;
+                    inline_cluster_arrays(state, child, scope).await?;
                 }
             }
             PhysicalPlan::Query(QueryOp::HashJoin {
@@ -153,7 +155,7 @@ fn inline_cluster_arrays<'a>(
             }) => {
                 for side in [left_input, right_input, left_bitmap, right_bitmap] {
                     if let Some(child) = side.as_deref_mut() {
-                        inline_cluster_arrays(state, child, txn_id).await?;
+                        inline_cluster_arrays(state, child, scope).await?;
                     }
                 }
             }
@@ -165,11 +167,11 @@ fn inline_cluster_arrays<'a>(
             | PhysicalPlan::Query(QueryOp::LateralLoop {
                 outer_plan: child, ..
             }) => {
-                inline_cluster_arrays(state, child, txn_id).await?;
+                inline_cluster_arrays(state, child, scope).await?;
             }
             PhysicalPlan::Query(QueryOp::SetOp { inputs, .. }) => {
                 for child in inputs.iter_mut() {
-                    inline_cluster_arrays(state, child, txn_id).await?;
+                    inline_cluster_arrays(state, child, scope).await?;
                 }
             }
             _ => {}

@@ -104,6 +104,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             detail.clone(),
         ),
+        crate::Error::WrongObjectType { detail } => {
+            ("ERROR", sqlstate::WRONG_OBJECT_TYPE, detail.clone())
+        }
         crate::Error::UndefinedColumn { column } => (
             "ERROR",
             sqlstate::UNDEFINED_COLUMN,

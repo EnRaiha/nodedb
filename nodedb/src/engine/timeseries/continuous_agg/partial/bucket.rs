@@ -14,14 +14,15 @@ use nodedb_types::Value;
 
 use super::super::definition::{AggFunction, AggregateExpr};
 use super::column::ColumnPartial;
+use super::group::GroupCell;
 use super::layout::ColumnLayout;
 
 /// Partial aggregate state for a single `(bucket, group_key)` combination.
-#[derive(Debug)]
+#[derive(Debug, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct PartialAggregate {
     pub bucket_ts: i64,
-    /// Symbol IDs for GROUP BY columns.
-    pub group_key: Vec<u32>,
+    /// GROUP BY cells, one per GROUP BY column.
+    pub group_key: Vec<GroupCell>,
     /// Rows aggregated into this bucket.
     pub count: u64,
     /// One state per column slot of the aggregate's layout.
@@ -30,7 +31,7 @@ pub struct PartialAggregate {
 
 impl PartialAggregate {
     /// An empty bucket shaped by `layout`.
-    pub fn new(bucket_ts: i64, group_key: Vec<u32>, layout: &ColumnLayout) -> Self {
+    pub fn new(bucket_ts: i64, group_key: Vec<GroupCell>, layout: &ColumnLayout) -> Self {
         Self {
             bucket_ts,
             group_key,
@@ -138,6 +139,7 @@ mod tests {
             refresh_policy: RefreshPolicy::OnFlush,
             retention_period_ms: 0,
             stale: false,
+            incarnation: Default::default(),
         })
     }
 

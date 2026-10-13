@@ -4,6 +4,8 @@
 
 #[cfg(test)]
 mod fixtures;
+#[cfg(test)]
+mod join_columns;
 mod payload;
 mod pk_prefilter;
 mod query;

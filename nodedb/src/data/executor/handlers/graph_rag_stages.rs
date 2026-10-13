@@ -17,6 +17,7 @@ use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::graph_rag_triple::Bm25Leg;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 
@@ -28,8 +29,8 @@ pub(in crate::data::executor) struct RagExportParams<'a> {
     pub vector_top_k: usize,
     pub vector_field: &'a str,
     pub final_top_k: usize,
-    /// The BM25 query of a three-source fusion; `None` for two sources.
-    pub bm25_query: Option<&'a str>,
+    /// The BM25 leg of a three-source fusion. `None` for two sources.
+    pub bm25: Option<Bm25Leg<'a>>,
 }
 
 /// Bundled arguments for [`CoreLoop::execute_rag_bindings`].
@@ -56,7 +57,7 @@ impl CoreLoop {
             vector_top_k,
             vector_field,
             final_top_k,
-            bm25_query,
+            bm25,
         } = params;
         let hits = match self.vector_leg_hits(
             task,
@@ -69,12 +70,12 @@ impl CoreLoop {
             Ok(hits) => hits,
             Err(response) => return response,
         };
-        let text = match bm25_query {
-            Some(query) => match self.bm25_leg_hits(
+        let text = match bm25 {
+            Some(leg) => match self.bm25_leg_hits(
                 task,
                 TenantId::new(tenant_id),
                 collection,
-                query,
+                leg,
                 final_top_k,
             ) {
                 Ok(text) => text,

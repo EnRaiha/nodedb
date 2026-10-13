@@ -9,7 +9,7 @@ use nodedb::types::*;
 use nodedb::wal::manager::{NO_APPLY_KEY, WalManager};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 
-use super::stack::ilp_payload;
+use super::stack::{ilp_payload, ilp_wal_payload};
 
 /// Simulates server restart: WAL has many batches, startup replay must
 /// recover all rows even if total data exceeds memtable capacity (64MB).
@@ -33,7 +33,7 @@ fn startup_replay_recovers_all_wal_data() {
         let start_ts =
             1_700_000_000_000_000_000i64 + batch as i64 * rows_per_batch as i64 * 1_000_000;
         let payload = ilp_payload(collection, rows_per_batch, start_ts);
-        let wal_payload = zerompk::to_msgpack_vec(&(collection.to_string(), payload)).unwrap();
+        let wal_payload = ilp_wal_payload(collection, payload);
         wal.appender(NO_APPLY_KEY)
             .with_event_source(nodedb::event::EventSource::User)
             .append_timeseries_batch(
@@ -89,6 +89,8 @@ fn startup_replay_recovers_all_wal_data() {
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         computed_columns: Vec::new(),
+        having: Vec::new(),
+        tiering: None,
     });
 
     use nodedb::bridge::dispatch::BridgeRequest;

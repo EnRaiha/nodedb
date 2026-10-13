@@ -2,9 +2,10 @@
 
 //! Control-Plane orchestrator for autocommit `UPDATE ... FROM <source>`.
 //!
-//! A remote source silently updates nothing unless shipped into `source_rows`
-//! on the target's core. Never inserts. In-transaction resolves at statement
-//! time instead — see `expand_staged_update_from_join`.
+//! The source relation is read like a SELECT (`control::source_read`) and
+//! shipped into `source_rows`; the Data Plane builds the join map from those
+//! rows alone. Never inserts. In-transaction resolves at statement time
+//! instead — see `expand_staged_update_from_join`.
 //!
 //! The resolved apply plan lands on the target vShard's owner and every
 //! replica through `orchestrated_write`; a target write policy is decided
@@ -12,17 +13,22 @@
 
 use nodedb_types::{DatabaseId, TenantId};
 
-use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
-use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
+use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
+use crate::control::maintenance::clone_materializer::dispatch_local;
 use crate::control::orchestrated_write::{
     apply_orchestrated_write, decide_write_policy_over_images,
 };
 use crate::control::planner::materialized_sum::{
     resolve_sum_targets_for_bodies, source_drives_bindings,
 };
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::response_payload::payload_or_typed_error;
+use crate::control::source_read::{SourceReadContext, read_source_rows};
 use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::expand_staged_update_from_join::decode_resolved_update_rows;
-use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{
+    DocumentOp, ResolvedSumTarget, ReturningSpec, RowSource, UpdateValue,
+};
 
 /// Attempts before a drifting materialized-sum resolution is reported rather
 /// than retried forever. Mirrors the MERGE orchestrator's bound.
@@ -31,10 +37,12 @@ const MAX_UPDATE_FROM_JOIN_RETRIES: u32 = 8;
 /// Bundled arguments for [`run_update_from_join`], mirroring the fields of the
 /// intercepted `DocumentOp::UpdateFromJoin` plan.
 pub struct UpdateFromJoinArgs<'a> {
+    /// The statement's identity, which reads the source relation.
+    pub identity: &'a AuthenticatedIdentity,
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
     pub target_collection: &'a str,
-    pub source_collection: &'a str,
+    pub source: &'a RowSource,
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
@@ -56,10 +64,11 @@ pub async fn run_authorized_update_from_join(
     state: &SharedState,
     authorized: crate::control::server::shared::authorization::AuthorizedTask,
 ) -> crate::Result<Response> {
+    let identity = authorized.identity().clone();
     let task = authorized.into_physical_task();
     let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
         target_collection,
-        source_collection,
+        source,
         source_alias,
         target_join_col,
         source_join_col,
@@ -81,10 +90,11 @@ pub async fn run_authorized_update_from_join(
     run_update_from_join(
         state,
         UpdateFromJoinArgs {
+            identity: &identity,
             tenant_id: task.tenant_id,
             database_id: task.database_id,
             target_collection: target_collection.as_str(),
-            source_collection: source_collection.as_str(),
+            source: &source,
             source_alias: &source_alias,
             target_join_col: &target_join_col,
             source_join_col: &source_join_col,
@@ -126,27 +136,23 @@ pub(crate) async fn run_update_from_join(
 
     let mut attempt: u32 = 0;
     loop {
-        // Source vShard can map to a different core than the target's, so the
-        // target-core dispatch below can't read it locally — scan and ship it.
-        let source_rows = read_all_source_rows(
-            state,
-            args.tenant_id,
-            args.database_id,
-            args.source_collection,
-            None,
+        // Read the source relation and ship its rows: the Data Plane holds no
+        // read path for it. A fresh read per attempt keeps resolve and apply
+        // on one snapshot.
+        let source_rows = read_source_rows(
+            &SourceReadContext {
+                state,
+                identity: args.identity,
+                tenant_id: args.tenant_id,
+                database_id: args.database_id,
+                txn_id: None,
+            },
+            args.source,
         )
         .await?;
 
         let resolved_sum_targets = if needs_resolve {
-            match resolve_matched_rows(state, &args, source_rows.clone()).await? {
-                Some(resolved) => resolved,
-                // RESOLVE pass failed on the Data Plane; its response is the answer.
-                None => {
-                    return Err(crate::Error::Dispatch {
-                        detail: "UPDATE ... FROM target-row resolve pass failed".into(),
-                    });
-                }
-            }
+            resolve_matched_rows(state, &args, source_rows.clone()).await?
         } else {
             // No policy to decide: the gate admits every row, or refuses an
             // un-injected plan before it proposes.
@@ -163,9 +169,7 @@ pub(crate) async fn run_update_from_join(
             target_collection: nodedb_types::QualifiedCollection::from_stored(
                 args.target_collection.to_string(),
             ),
-            source_collection: nodedb_types::QualifiedCollection::from_stored(
-                args.source_collection.to_string(),
-            ),
+            source: args.source.clone(),
             source_alias: args.source_alias.to_string(),
             target_join_col: args.target_join_col.to_string(),
             source_join_col: args.source_join_col.to_string(),
@@ -189,6 +193,7 @@ pub(crate) async fn run_update_from_join(
             args.database_id,
             args.target_collection,
             plan,
+            args.identity.role_names(),
         )
         .await?;
 
@@ -213,20 +218,19 @@ pub(crate) async fn run_update_from_join(
 /// target's write policy decided over every post-image, and the
 /// materialized-sum AND period-lock targets (both images of every matched
 /// row — a join-column rewrite debits one target and credits another; a
-/// period-lock check may read either image). `None` means RESOLVE failed.
+/// period-lock check may read either image). A refused RESOLVE pass keeps its
+/// Data-Plane code.
 async fn resolve_matched_rows(
     state: &SharedState,
     args: &UpdateFromJoinArgs<'_>,
-    source_rows: Vec<(String, Vec<u8>)>,
-) -> crate::Result<Option<Vec<ResolvedSumTarget>>> {
+    source_rows: Vec<Vec<u8>>,
+) -> crate::Result<Vec<ResolvedSumTarget>> {
     let resolve_plan = PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(
         DocumentOp::UpdateFromJoin {
             target_collection: nodedb_types::QualifiedCollection::from_stored(
                 args.target_collection.to_string(),
             ),
-            source_collection: nodedb_types::QualifiedCollection::from_stored(
-                args.source_collection.to_string(),
-            ),
+            source: args.source.clone(),
             source_alias: args.source_alias.to_string(),
             target_join_col: args.target_join_col.to_string(),
             source_join_col: args.source_join_col.to_string(),
@@ -252,11 +256,9 @@ async fn resolve_matched_rows(
         None,
     )
     .await?;
-    if resp.status != Status::Ok {
-        return Ok(None);
-    }
+    let payload = payload_or_typed_error(resp)?;
 
-    let arms = decode_resolved_update_rows(&resp.payload)?;
+    let arms = decode_resolved_update_rows(&payload)?;
     decide_write_policy_over_images(
         args.rls_write_check,
         arms.iter().map(|(_, _, body, _)| body.as_slice()),
@@ -287,5 +289,5 @@ async fn resolve_matched_rows(
         )
         .await?,
     );
-    Ok(Some(resolved))
+    Ok(resolved)
 }

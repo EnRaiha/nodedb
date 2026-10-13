@@ -89,8 +89,13 @@ impl NodeDbPgHandler {
         // A set-op merge blends rows from every branch into one result, so the
         // union of the branches' sources governs redaction. Resolved before the
         // loop consumes `tasks`.
-        let set_op_redaction = needs_set_op
-            .then(|| QueryRedaction::for_plans(tenant_id, auth_ctx, tasks.iter().map(|t| &t.plan)));
+        let set_op_redaction = needs_set_op.then(|| {
+            QueryRedaction::for_plans(
+                tenant_id,
+                auth_ctx,
+                tasks.iter().map(|t| (&t.plan, t.database_id)),
+            )
+        });
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
         let mut dedup_set_op = PostSetOp::None;
         // A statement's RETURNING rows are ONE result set, however many tasks
@@ -159,6 +164,7 @@ impl NodeDbPgHandler {
                     identity,
                     auth: auth_ctx,
                     tenant_id,
+                    database_id: task_database_id,
                     session_id,
                     plan_kind: describe_plan(&plan),
                     projection,
@@ -311,6 +317,7 @@ impl NodeDbPgHandler {
                         identity,
                         auth: auth_ctx,
                         tenant_id,
+                        database_id: task.database_id,
                         session_id,
                         plan_kind,
                         projection,

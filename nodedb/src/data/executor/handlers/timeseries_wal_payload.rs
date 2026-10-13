@@ -6,34 +6,27 @@
 use crate::bridge::envelope::PhysicalPlan;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::timeseries::{TimeseriesApplyMode, TimeseriesIngestExec};
-use crate::data::executor::handlers::transaction::undo::UndoEntry;
-use crate::engine::timeseries::columnar_memtable::{
-    ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema,
-};
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp};
-use nodedb_types::timeseries::MetricSample;
 
 use super::timeseries_wal_decode::{ColumnarReplayArgs, TimeseriesReplayArgs};
 
-impl CoreLoop {
-    /// Ensure a timeseries memtable exists for the given collection, creating if needed.
-    ///
-    /// Uses the same operator tuning the live ingest path does. A memtable keeps
-    /// the limits it was built with for its whole life, so seeding replay with
-    /// hardcoded defaults would leave a restarted node running budgets the
-    /// operator did not configure until every collection happened to flush.
-    fn ensure_columnar_memtable(
-        &mut self,
-        key: (DatabaseId, crate::types::TenantId, String),
-        schema: ColumnarSchema,
-    ) {
-        let config = ColumnarMemtableConfig::from_tuning(&self.ts_tuning);
-        self.columnar_memtables
-            .entry(key)
-            .or_insert_with(|| ColumnarMemtable::new(schema, config));
-    }
+/// The payload formats the timeseries ingest handler accepts.
+const INGEST_FORMATS: [&str; 5] = [
+    crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT,
+    "ilp",
+    "ilp-msgpack",
+    "json",
+    "msgpack",
+];
 
+impl CoreLoop {
+    /// Replay one timeseries ingest record through the live ingest handler.
+    ///
+    /// Every timeseries ingest record names its payload format. A record
+    /// that names no format, or one the handler does not accept, is not a
+    /// record shape any writer produces. Restart replay halts on it, and a
+    /// committed-redo apply fails.
     pub(super) fn replay_timeseries_payload(
         &mut self,
         tid: crate::types::TenantId,
@@ -48,53 +41,18 @@ impl CoreLoop {
             format,
             default_timestamp_ms,
         } = args;
-        let resolved =
-            format == Some(crate::engine::timeseries::resolved_ingest::RESOLVED_INGEST_FORMAT);
-        if !resolved
-            && let Ok(batch) =
-                zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
-        {
-            let key = (db_id, tid, collection.to_string());
-            if self.recording_redo_undo() {
-                let undo = UndoEntry::TimeseriesIngest(self.capture_timeseries_ingest_undo(&key));
-                self.record_redo_undo([undo]);
-            }
-            self.ensure_columnar_memtable(key.clone(), ColumnarSchema::metric_default());
-
-            let Some(mt) = self.columnar_memtables.get_mut(&key) else {
-                return 0;
-            };
-            for (series_id, timestamp_ms, value) in &batch.samples {
-                mt.ingest_metric(
-                    *series_id,
-                    MetricSample {
-                        timestamp_ms: *timestamp_ms,
-                        value: *value,
-                    },
-                );
-            }
-            let sample_count = batch.samples.len();
-            if self.recording_redo_undo() {
-                // The install settles the budget once the whole record landed.
-                self.note_redo_timeseries_written(key);
-            } else {
-                // Re-charge the engine memory budget to the memtable's
-                // resident footprint after replaying these samples. The
-                // reservation is held until the memtable is drained on flush,
-                // so a replay-driven flush balances its release instead of
-                // over-releasing.
-                self.recharge_ts_memtable_budget(tid, db_id, collection);
-            }
-            return sample_count;
-        }
-
-        let format = format.unwrap_or_else(|| {
-            if std::str::from_utf8(payload).is_ok() {
-                "ilp"
-            } else {
-                "msgpack"
-            }
-        });
+        let Some(format) = format.filter(|format| INGEST_FORMATS.contains(format)) else {
+            self.replay_record_unapplied(
+                "timeseries",
+                "format",
+                record_lsn,
+                &format!(
+                    "timeseries record for '{collection}' names no known ingest format \
+                     ({format:?})"
+                ),
+            );
+            return 0;
+        };
         let Some(vshard) = self.replay_vshard("timeseries", record_lsn, db_id, collection) else {
             return 0;
         };

@@ -143,9 +143,26 @@ impl CoreLoop {
                 collection,
                 restart_identity: _,
             } => self.stage_collection_truncate(task, tid, txn_id, collection.as_str()),
-            TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => {
-                self.stage_not_point_write(task)
-            }
+            TimeseriesOp::Scan { .. }
+            | TimeseriesOp::ResolveIngest(_)
+            | TimeseriesOp::ReadAggregate { .. } => self.stage_not_point_write(task),
+            // A refresh cut flushes the collection at its log position, which
+            // a transaction's staged rows have no place in.
+            TimeseriesOp::RefreshAggregate { .. } => self.response_error(
+                task,
+                crate::bridge::envelope::ErrorCode::Unsupported {
+                    detail: "REFRESH CONTINUOUS AGGREGATE runs outside a transaction".into(),
+                },
+            ),
+            // Partition maintenance changes no row, so a transaction stages
+            // nothing for it.
+            TimeseriesOp::Partitions { .. } => self.response_error(
+                task,
+                crate::bridge::envelope::ErrorCode::Unsupported {
+                    detail: "SHOW PARTITIONS and REWRITE PARTITIONS run outside a transaction"
+                        .into(),
+                },
+            ),
         }
     }
 }

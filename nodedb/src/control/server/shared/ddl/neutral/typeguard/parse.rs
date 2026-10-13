@@ -178,6 +178,17 @@ pub(super) fn parse_single_field(s: &str) -> Result<TypeGuardFieldDef, DdlError>
     // rejects fails here instead of failing each later write.
     parse_type_expr(&type_expr).map_err(|e| err("42601", &format!("field '{field}': {e}")))?;
 
+    // The write path enforces the CHECK with this parser, so a CHECK it cannot
+    // parse fails here instead of failing each later write.
+    if let Some(expr) = check_expr.as_deref() {
+        nodedb_query::expr_parse::parse_generated_expr(expr).map_err(|e| {
+            err(
+                "42601",
+                &format!("field '{field}': CHECK expression '{expr}' is invalid: {e}"),
+            )
+        })?;
+    }
+
     // Extract DEFAULT expression if present.
     let default_expr = if let Some(def_pos) = find_word_boundary(rest, "DEFAULT") {
         let after_default = rest[def_pos + 7..].trim_start();
@@ -325,5 +336,27 @@ mod tests {
         assert_eq!(field.default_expr.as_deref(), Some("'ﬀﬀ'"));
         assert_eq!(field.check_expr.as_deref(), Some("label <> ''"));
         assert!(field.required);
+    }
+
+    /// Every predicate form the write path enforces is accepted in a CHECK.
+    #[test]
+    fn check_predicates_are_accepted() {
+        for declaration in [
+            "email STRING CHECK (email LIKE '%@%')",
+            "email STRING CHECK (email NOT ILIKE '%@spam.%')",
+            "role STRING CHECK (role IN ('admin', 'user'))",
+            "age INT CHECK (age BETWEEN 0 AND 150)",
+            "code STRING CHECK (legacy IS NULL OR code IS NOT NULL)",
+        ] {
+            parse_single_field(declaration)
+                .unwrap_or_else(|e| panic!("{declaration} must parse: {}", e.message));
+        }
+    }
+
+    /// A CHECK the write path cannot parse is refused at declaration.
+    #[test]
+    fn an_unparsable_check_is_refused() {
+        let error = parse_single_field("x INT CHECK (x >)").expect_err("refused");
+        assert!(error.message.contains("CHECK"), "{}", error.message);
     }
 }

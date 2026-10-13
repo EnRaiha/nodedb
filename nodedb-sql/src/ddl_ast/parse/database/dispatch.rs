@@ -4,6 +4,7 @@
 //! the per-operation parser. Keep this file thin — the actual parsing logic
 //! belongs in the sibling modules.
 
+use crate::ddl_ast::parse::clause::{ClauseCursor, tokenize};
 use crate::ddl_ast::statement::{DatabaseStmt, NodedbStatement};
 use crate::error::SqlError;
 
@@ -21,59 +22,61 @@ use super::use_db::parse_use_database;
 ///
 /// Returns `None` for SQL that does not match any database-DDL prefix.
 /// Returns `Some(Err(...))` for structurally valid database DDL that contains a
-/// parse error (e.g. missing required name token).
+/// parse error (e.g. missing required name token). Each parser reads its
+/// statement left to right and refuses any token it does not consume.
 pub fn try_parse(
     _upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     original: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    let first = parts.first().copied().unwrap_or("");
-    let second = parts.get(1).copied().unwrap_or("").to_uppercase();
+    let toks = tokenize(original);
+    let mut c = ClauseCursor::new(original, &toks, "DATABASE");
+    let result = if c.eat_keywords(&["CREATE", "DATABASE"]) {
+        parse_create_database(&mut c)
+    } else if c.eat_keywords(&["DROP", "DATABASE"]) {
+        parse_drop_database(&mut c)
+    } else if c.eat_keywords(&["ALTER", "DATABASE"]) {
+        parse_alter_database(&mut c)
+    } else if c.eat_keywords(&["USE", "DATABASE"]) {
+        parse_use_database(&mut c)
+    } else if c.eat_keywords(&["CLONE", "DATABASE"]) {
+        parse_clone_database(&mut c)
+    } else if c.eat_keywords(&["MIRROR", "DATABASE"]) {
+        parse_mirror_database(&mut c)
+    } else if c.eat_keywords(&["MOVE", "TENANT"]) {
+        parse_move_tenant(&mut c)
+    } else if c.eat_keywords(&["BACKUP", "DATABASE"]) {
+        parse_backup_database(&mut c)
+    } else if c.eat_keywords(&["RESTORE", "DATABASE"]) {
+        parse_restore_database(&mut c)
+    } else if c.peek_keywords(&["SHOW", "DATABASES"]) {
+        c.eat_keywords(&["SHOW", "DATABASES"]);
+        if !c.at_end() {
+            return None;
+        }
+        Ok(NodedbStatement::Database(DatabaseStmt::ShowDatabases))
+    } else if c.eat_keywords(&["SHOW", "DATABASE", "QUOTA"]) {
+        parse_show_database_quota_or_usage(&mut c, false)
+    } else if c.eat_keywords(&["SHOW", "DATABASE", "USAGE"]) {
+        parse_show_database_quota_or_usage(&mut c, true)
+    } else if c.eat_keywords(&["SHOW", "DATABASE", "LINEAGE"]) {
+        parse_show_database_lineage(&mut c)
+    } else if c.eat_keywords(&["SHOW", "DATABASE", "MIRROR", "STATUS"]) {
+        parse_show_database_mirror_status(&mut c)
+    } else {
+        return None;
+    };
+    Some(result)
+}
 
-    match first.to_uppercase().as_str() {
-        "CREATE" if second == "DATABASE" => Some(parse_create_database(parts, original)),
-        "DROP" if second == "DATABASE" => Some(parse_drop_database(parts)),
-        "ALTER" if second == "DATABASE" => Some(parse_alter_database(parts, original)),
-        "USE" if second == "DATABASE" => Some(parse_use_database(parts)),
-        "CLONE" if second == "DATABASE" => Some(parse_clone_database(parts, original)),
-        "MIRROR" if second == "DATABASE" => Some(parse_mirror_database(parts)),
-        "MOVE" if second == "TENANT" => Some(parse_move_tenant(parts)),
-        "BACKUP" if second == "DATABASE" => Some(parse_backup_database(parts)),
-        "RESTORE" if second == "DATABASE" => Some(parse_restore_database(parts)),
-        "SHOW" if second == "DATABASES" && parts.len() == 2 => {
-            Some(Ok(NodedbStatement::Database(DatabaseStmt::ShowDatabases)))
-        }
-        // SHOW DATABASE QUOTA FOR <name>
-        "SHOW"
-            if second == "DATABASE"
-                && parts.get(2).map(|w| w.to_uppercase()).as_deref() == Some("QUOTA") =>
-        {
-            Some(parse_show_database_quota_or_usage(parts, false))
-        }
-        // SHOW DATABASE USAGE FOR <name>
-        "SHOW"
-            if second == "DATABASE"
-                && parts.get(2).map(|w| w.to_uppercase()).as_deref() == Some("USAGE") =>
-        {
-            Some(parse_show_database_quota_or_usage(parts, true))
-        }
-        // SHOW DATABASE LINEAGE FOR <name>
-        "SHOW"
-            if second == "DATABASE"
-                && parts.get(2).map(|w| w.to_uppercase()).as_deref() == Some("LINEAGE") =>
-        {
-            Some(parse_show_database_lineage(parts))
-        }
-        // SHOW DATABASE MIRROR STATUS [FOR <name>]
-        "SHOW"
-            if second == "DATABASE"
-                && parts.get(2).map(|w| w.to_uppercase()).as_deref() == Some("MIRROR")
-                && parts.get(3).map(|w| w.to_uppercase()).as_deref() == Some("STATUS") =>
-        {
-            Some(parse_show_database_mirror_status(parts))
-        }
-        _ => None,
-    }
+/// A database or tenant name: a bare word as written, or a quoted
+/// identifier's content.
+pub(super) fn db_name(c: &mut ClauseCursor<'_, '_>, what: &str) -> Result<String, SqlError> {
+    let raw = c.raw(what)?;
+    Ok(raw
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .map_or_else(|| raw.to_string(), |inner| inner.replace("\"\"", "\"")))
 }
 
 #[cfg(test)]

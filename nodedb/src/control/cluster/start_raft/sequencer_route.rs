@@ -47,6 +47,7 @@ pub(super) fn routed_write(state: &Weak<SharedState>, data: Vec<u8>) -> Proposed
             vshard_id,
             plan,
             event_source,
+            entry.user_roles.clone(),
         )
         .await?
         .unwrap_or_else(|| bare_ok_response(RequestId::new(0)));

@@ -94,8 +94,8 @@ async fn extended_query_vector_id_filter() {
     let srv = TestServer::start().await;
     srv.exec(
         "CREATE COLLECTION vecs \
-         FIELDS (id TEXT, emb VECTOR(3)) \
-         WITH (engine='vector', m=8, ef_construction=50)",
+         (id STRING PRIMARY KEY, emb VECTOR(3)) \
+         WITH (engine='vector', vector_field='emb', dim=3, m=8, ef_construction=50)",
     )
     .await
     .expect("CREATE vecs");
@@ -137,8 +137,8 @@ async fn extended_query_vector_search_dsl_oid_check() {
     let srv = TestServer::start().await;
     srv.exec(
         "CREATE COLLECTION vecs_oid \
-         FIELDS (id TEXT, emb VECTOR(3)) \
-         WITH (engine='vector', m=8, ef_construction=50)",
+         (id STRING PRIMARY KEY, emb VECTOR(3)) \
+         WITH (engine='vector', vector_field='emb', dim=3, m=8, ef_construction=50)",
     )
     .await
     .expect("CREATE vecs_oid");

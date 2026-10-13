@@ -123,6 +123,8 @@ pub(super) fn agg_expr(
         alias: alias.to_string(),
         distinct: false,
         grouping_col_index: None,
+        filter_text: None,
+        arg_text: None,
     }
 }
 

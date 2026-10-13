@@ -180,7 +180,7 @@ mod tests {
     fn an_absent_column_takes_the_live_empty_value() {
         let values = values_by_name(&live(), &batch_columns(), &row("", vec![2]))
             .expect("an absent column never conflicts");
-        assert!(matches!(values.get(2), Some(ColumnValue::Float64(v)) if v.is_nan()));
+        assert_eq!(values.get(2), Some(&ColumnValue::Null));
         assert_eq!(values.get(1), Some(&ColumnValue::Float64(1.0)));
     }
 }

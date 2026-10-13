@@ -63,6 +63,12 @@ pub enum SqlError {
     #[error("{detail}")]
     ObjectNotInPrerequisiteState { object: String, detail: String },
 
+    /// A statement the named object's kind does not take, such as a write to
+    /// a read-only continuous aggregate. PostgreSQL rejects the same input
+    /// with SQLSTATE `42809` (`wrong_object_type`).
+    #[error("{detail}")]
+    WrongObjectType { detail: String },
+
     #[error("unknown column '{column}' in table '{table}'")]
     UnknownColumn { table: String, column: String },
 
@@ -349,6 +355,12 @@ impl From<crate::catalog::SqlCatalogError> for SqlError {
                     name,
                     retention_expires_at_ns,
                     undrop_hint,
+                }
+            }
+            crate::catalog::SqlCatalogError::Unreadable { relation, detail } => {
+                Self::ObjectNotInPrerequisiteState {
+                    object: format!("relation '{relation}'"),
+                    detail: format!("relation '{relation}' could not be read: {detail}"),
                 }
             }
         }

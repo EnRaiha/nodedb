@@ -78,6 +78,9 @@ pub static SUM_ARGS: &[ArgTypeSpec] = &[typed("expr", NUMERIC)];
 
 pub static AVG_ARGS: &[ArgTypeSpec] = &[typed("expr", NUMERIC)];
 
+/// `stddev` / `variance` and their `_samp` / `_pop` forms.
+pub static DISPERSION_ARGS: &[ArgTypeSpec] = &[typed("expr", NUMERIC)];
+
 pub static MIN_ARGS: &[ArgTypeSpec] = &[any("expr")];
 
 pub static MAX_ARGS: &[ArgTypeSpec] = &[any("expr")];

@@ -9,6 +9,8 @@
 
 pub mod column_defs;
 pub mod driver;
+mod fields;
+mod source_key;
 mod support;
 pub mod type_map;
 pub mod typeguard_columns;

@@ -167,6 +167,7 @@ mod tests {
             txn_id: None,
             vshard_id: None,
             read_groups: Vec::new(),
+            user_roles: Vec::new(),
         };
         let decoded = roundtrip_req(req.clone());
         assert_eq!(decoded.plan_bytes, req.plan_bytes);
@@ -193,6 +194,7 @@ mod tests {
             txn_id: None,
             vshard_id: None,
             read_groups: Vec::new(),
+            user_roles: Vec::new(),
         };
         let decoded = roundtrip_req(req);
         assert!(decoded.descriptor_versions.is_empty());
@@ -210,6 +212,7 @@ mod tests {
             txn_id: Some(nodedb_types::id::TxnId::new(9)),
             vshard_id: Some(nodedb_types::id::VShardId::new(513)),
             read_groups: vec![7, 9],
+            user_roles: vec!["approver".into()],
         };
         let decoded = roundtrip_req(req);
         assert_eq!(
@@ -218,6 +221,7 @@ mod tests {
         );
         assert_eq!(decoded.txn_id, Some(nodedb_types::id::TxnId::new(9)));
         assert_eq!(decoded.read_groups, vec![7, 9]);
+        assert_eq!(decoded.user_roles, vec!["approver".to_string()]);
     }
 
     #[test]
@@ -434,6 +438,7 @@ mod tests {
             txn_id: None,
             vshard_id: None,
             read_groups: Vec::new(),
+            user_roles: Vec::new(),
         };
         let rpc = RaftRpc::ExecuteStreamRequest(req.clone());
         let encoded =

@@ -739,6 +739,7 @@ mod tests {
                     ("e1".to_string(), body("acc-1")),
                     ("e2".to_string(), body("acc-1")),
                 ],
+                if_absent: false,
                 surrogates: vec![Surrogate::new(901), Surrogate::new(902)],
                 returning: None,
                 rls_filters: Vec::new(),

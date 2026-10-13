@@ -7,6 +7,8 @@
 //! authorizes the call and shapes the verdict as
 //! `{valid, entries, last_hash, broken_at, document_id, expected, found}`.
 
+use nodedb_sql::parser::query_function::VerifyHashChainArgs;
+
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils;
@@ -16,20 +18,19 @@ use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
-use super::helpers::{clean_arg, err, extract_function_args, single_result};
+use super::helpers::{err, single_result};
 
 pub async fn verify_hash_chain(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    sql: &str,
+    args: &VerifyHashChainArgs,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = extract_function_args(sql, "VERIFY_HASH_CHAIN")?;
-    let collection = args.first().map(|arg| clean_arg(arg).to_lowercase());
-    let Some(collection) = collection.filter(|name| !name.is_empty()) else {
+    let collection = args.collection.to_lowercase();
+    if collection.is_empty() {
         return Err(err("42601", "VERIFY_HASH_CHAIN requires (collection)"));
-    };
+    }
 
     // Each link covers its whole stored row, so a caller that cannot read
     // every row of the collection is refused rather than handed a verdict

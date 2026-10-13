@@ -12,220 +12,193 @@
 //! `SCOPE` / `DELEGATION` / `API KEY` grants belong to the admin router —
 //! this family returns `None` for them so they fall through.
 
+use super::clause::{ClauseCursor, tokenize};
 use crate::ddl_ast::statement::{AuthStmt, NodedbStatement};
 use crate::error::SqlError;
 
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
-    _trimmed: &str,
+    _parts: &[&str],
+    trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
     if upper.starts_with("GRANT ") {
         if upper.starts_with("GRANT SCOPE ") {
             return None;
         }
-        return Some(parse_grant_revoke(parts, true));
+        return Some(parse_grant_revoke(trimmed, true));
     }
     if upper.starts_with("REVOKE ")
         && !upper.starts_with("REVOKE SCOPE ")
         && !upper.starts_with("REVOKE DELEGATION ")
         && !upper.starts_with("REVOKE API KEY ")
     {
-        return Some(parse_grant_revoke(parts, false));
+        return Some(parse_grant_revoke(trimmed, false));
     }
     None
 }
 
-/// Classify the object clause of a `GRANT/REVOKE ... ON ...` statement.
+/// Read the object clause after `ON`: `FUNCTION <name>`, `PROCEDURE <name>`,
+/// `COLLECTION <name>`, `TABLE <name>`, or a bare collection name. Returns
+/// `(target_type, target_name)`.
 ///
-/// `after` is the token immediately following `ON`; `name_after` is the
-/// token after that (consulted only when `after` is an explicit
-/// object-type keyword). Returns `(target_type, target_name)`.
-///
-/// Object-type keywords (`FUNCTION`, `PROCEDURE`, `COLLECTION`, `TABLE`)
-/// are matched explicitly so they can never be silently consumed as the
-/// object name. `COLLECTION` and `TABLE` are accepted as the explicit
-/// spelling of the default (collection) object type; a bare token with
-/// no keyword is still treated as a collection name directly.
+/// Object-type keywords are matched explicitly so they are never consumed as
+/// the object name. Every name stays a raw token; the handler decodes it
+/// once, so a quoted target keeps its case.
 ///
 /// `DATABASE` and `TENANT` are not handled here — the caller intercepts
 /// them first because they need different statement shapes.
-pub(super) fn classify_object_clause(after: &str, name_after: Option<&str>) -> (String, String) {
-    // Every name stays a raw token. The handler decodes it once, so a quoted
-    // target keeps its case.
-    if after.eq_ignore_ascii_case("FUNCTION") {
-        (
-            "FUNCTION".to_string(),
-            name_after.map(|s| s.to_string()).unwrap_or_default(),
-        )
-    } else if after.eq_ignore_ascii_case("PROCEDURE") {
-        (
-            "PROCEDURE".to_string(),
-            name_after.map(|s| s.to_string()).unwrap_or_default(),
-        )
-    } else if after.eq_ignore_ascii_case("COLLECTION") || after.eq_ignore_ascii_case("TABLE") {
-        (
-            "COLLECTION".to_string(),
-            name_after.map(|s| s.to_string()).unwrap_or_default(),
-        )
+pub(super) fn object_clause(c: &mut ClauseCursor<'_, '_>) -> Result<(String, String), SqlError> {
+    let target_type = if c.eat_keyword("FUNCTION") {
+        "FUNCTION"
+    } else if c.eat_keyword("PROCEDURE") {
+        "PROCEDURE"
     } else {
-        ("COLLECTION".to_string(), after.to_string())
+        // `COLLECTION` and `TABLE` spell the default object type.
+        if !c.eat_keyword("COLLECTION") {
+            c.eat_keyword("TABLE");
+        }
+        "COLLECTION"
+    };
+    // A dotted name (`_system.audit_log`, `db.coll`) is one object: its
+    // tokens are written with no whitespace between them.
+    let target_name = c.raw_run("object name")?.to_string();
+    Ok((target_type.to_string(), target_name))
+}
+
+/// Read a comma-separated list of items. Each item is one or more words,
+/// joined by one space (`CREATE COLLECTION`). The list ends before any of
+/// `stops`.
+fn item_list(c: &mut ClauseCursor<'_, '_>, stops: &[&str]) -> Result<Vec<String>, SqlError> {
+    let mut items = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    while !c.at_end() && !stops.iter().any(|s| c.peek_keyword(s)) {
+        if c.eat_punct(',') {
+            if current.is_empty() {
+                return Err(c.error("empty item in list"));
+            }
+            items.push(current.join(" "));
+            current.clear();
+            continue;
+        }
+        current.push(c.raw("list item")?);
     }
+    if !current.is_empty() {
+        items.push(current.join(" "));
+    } else if !items.is_empty() {
+        return Err(c.error("trailing ',' in list"));
+    }
+    Ok(items)
 }
 
-/// Split a run of whitespace-separated tokens into a comma-separated list,
-/// trimming each item. `["READ,", "WRITE"]` → `["READ", "WRITE"]`,
-/// `["CREATE", "COLLECTION"]` → `["CREATE COLLECTION"]`.
-fn split_list(tokens: &[&str]) -> Vec<String> {
-    tokens
-        .join(" ")
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
+fn parse_grant_revoke(sql: &str, is_grant: bool) -> Result<NodedbStatement, SqlError> {
+    let (kw, pivot) = if is_grant {
+        ("GRANT", "TO")
+    } else {
+        ("REVOKE", "FROM")
+    };
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, if is_grant { "GRANT" } else { "REVOKE" });
+    c.expect_keyword(kw)?;
+    let role_keyword = c.eat_keyword("ROLE");
+    let items = item_list(&mut c, &["ON", pivot])?;
 
-fn parse_grant_revoke(parts: &[&str], is_grant: bool) -> Result<NodedbStatement, SqlError> {
-    let pivot = if is_grant { "TO" } else { "FROM" };
-    let kw = if is_grant { "GRANT" } else { "REVOKE" };
-
-    let pivot_pos = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case(pivot))
-        .ok_or_else(|| SqlError::Parse {
-            detail: format!(
-                "syntax: {kw} <role>[, ...] {pivot} <grantee> | \
-                 {kw} <perm>[, ...] ON <object> {pivot} <grantee>"
-            ),
-        })?;
-
-    let grantee = parts
-        .get(pivot_pos + 1)
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| SqlError::Parse {
-            detail: format!("{kw}: missing grantee after {pivot}"),
-        })?;
-
-    let on_pos = parts.iter().position(|p| p.eq_ignore_ascii_case("ON"));
-
-    match on_pos {
-        // Object-permission grant: an `ON` clause sits before the pivot.
-        Some(on) if on < pivot_pos => {
-            let permissions = split_list(&parts[1..on]);
-            if permissions.is_empty() {
-                return Err(SqlError::Parse {
-                    detail: format!("{kw}: missing permission before ON"),
-                });
-            }
-            let after = parts.get(on + 1).copied().unwrap_or_default();
-
-            if after.eq_ignore_ascii_case("DATABASE") {
-                // Database grants carry a single (possibly multi-word) privilege.
-                let permission = parts[1..on].join(" ");
-                let db_name = parts.get(on + 2).map(|s| s.to_string()).unwrap_or_default();
-                return Ok(NodedbStatement::Auth(if is_grant {
-                    AuthStmt::GrantDatabasePermission {
-                        permission,
-                        db_name,
-                        grantee,
-                    }
-                } else {
-                    AuthStmt::RevokeDatabasePermission {
-                        permission,
-                        db_name,
-                        grantee,
-                    }
-                }));
-            }
-
-            if after.eq_ignore_ascii_case("TENANT") {
-                // Tenant-scoped grant: the permission applies to every
-                // collection in the named tenant. The handler resolves the
-                // tenant name to its id.
-                let tenant_name = parts
-                    .get(on + 2)
-                    .filter(|_| on + 2 < pivot_pos)
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| SqlError::Parse {
-                        detail: format!("{kw}: missing tenant name after ON TENANT"),
-                    })?;
-                return Ok(NodedbStatement::Auth(if is_grant {
-                    AuthStmt::GrantPermission {
-                        permissions,
-                        target_type: "TENANT".to_string(),
-                        target_name: tenant_name,
-                        grantee,
-                    }
-                } else {
-                    AuthStmt::RevokePermission {
-                        permissions,
-                        target_type: "TENANT".to_string(),
-                        target_name: tenant_name,
-                        grantee,
-                    }
-                }));
-            }
-
-            let (target_type, target_name) =
-                classify_object_clause(after, parts.get(on + 2).copied());
-
-            Ok(NodedbStatement::Auth(if is_grant {
-                AuthStmt::GrantPermission {
-                    permissions,
-                    target_type,
-                    target_name,
+    if !role_keyword && c.eat_keyword("ON") {
+        if items.is_empty() {
+            return Err(c.error("missing permission before ON"));
+        }
+        if c.eat_keyword("DATABASE") {
+            // Database grants carry a single (possibly multi-word) privilege.
+            let permission = items.join(", ");
+            let db_name = c.raw("database name")?.to_string();
+            let grantee = read_grantee(&mut c, pivot)?;
+            return Ok(NodedbStatement::Auth(if is_grant {
+                AuthStmt::GrantDatabasePermission {
+                    permission,
+                    db_name,
                     grantee,
                 }
             } else {
-                AuthStmt::RevokePermission {
-                    permissions,
-                    target_type,
-                    target_name,
+                AuthStmt::RevokeDatabasePermission {
+                    permission,
+                    db_name,
                     grantee,
                 }
-            }))
+            }));
         }
-
-        // Role-membership grant: no `ON` clause.
-        _ => {
-            // Accept a leading `ROLE` keyword as an optional alias.
-            let start = if parts
-                .get(1)
-                .map(|s| s.eq_ignore_ascii_case("ROLE"))
-                .unwrap_or(false)
-            {
-                2
-            } else {
-                1
-            };
-            let roles = split_list(&parts[start.min(pivot_pos)..pivot_pos]);
-            if roles.is_empty() {
-                return Err(SqlError::Parse {
-                    detail: format!("{kw}: missing role name before {pivot}"),
-                });
+        let (target_type, target_name) = if c.eat_keyword("TENANT") {
+            // The permission applies to every collection in the named
+            // tenant. The handler resolves the tenant name to its id.
+            if c.peek_keyword(pivot) {
+                return Err(c.error("missing tenant name after ON TENANT"));
             }
-            Ok(NodedbStatement::Auth(if is_grant {
-                AuthStmt::GrantRole { roles, grantee }
-            } else {
-                AuthStmt::RevokeRole { roles, grantee }
-            }))
-        }
+            ("TENANT".to_string(), c.raw("tenant name")?.to_string())
+        } else {
+            object_clause(&mut c)?
+        };
+        let grantee = read_grantee(&mut c, pivot)?;
+        return Ok(NodedbStatement::Auth(if is_grant {
+            AuthStmt::GrantPermission {
+                permissions: items,
+                target_type,
+                target_name,
+                grantee,
+            }
+        } else {
+            AuthStmt::RevokePermission {
+                permissions: items,
+                target_type,
+                target_name,
+                grantee,
+            }
+        }));
     }
+
+    // Role-membership grant: no `ON` clause.
+    if items.is_empty() {
+        return Err(c.error(format!("missing role name before {pivot}")));
+    }
+    let grantee = read_grantee(&mut c, pivot)?;
+    Ok(NodedbStatement::Auth(if is_grant {
+        AuthStmt::GrantRole {
+            roles: items,
+            grantee,
+        }
+    } else {
+        AuthStmt::RevokeRole {
+            roles: items,
+            grantee,
+        }
+    }))
+}
+
+/// Read `TO|FROM <grantee>` and require the end of the statement. One
+/// grantee per statement: a list or trailing words are refused, never
+/// silently dropped.
+fn read_grantee(c: &mut ClauseCursor<'_, '_>, pivot: &str) -> Result<String, SqlError> {
+    if !c.eat_keyword(pivot) {
+        return Err(c.error(format!(
+            "syntax: <role>[, ...] {pivot} <grantee> | <perm>[, ...] ON <object> {pivot} \
+             <grantee> — found {}",
+            c.describe_next()
+        )));
+    }
+    let grantee = c.raw("grantee")?.to_string();
+    c.finish()?;
+    Ok(grantee)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(sql: &str) -> NodedbStatement {
+    fn try_sql(sql: &str) -> Option<Result<NodedbStatement, SqlError>> {
         let upper = sql.to_uppercase();
         let parts: Vec<&str> = sql.split_whitespace().collect();
         try_parse(&upper, &parts, sql)
-            .expect("expected Some")
-            .expect("expected Ok")
+    }
+
+    fn parse(sql: &str) -> NodedbStatement {
+        try_sql(sql).expect("expected Some").expect("expected Ok")
     }
 
     #[test]
@@ -294,6 +267,23 @@ mod tests {
     }
 
     #[test]
+    fn grant_on_a_dotted_object_reads_the_whole_name() {
+        match parse("GRANT SELECT ON _system.audit_log TO auditor") {
+            NodedbStatement::Auth(AuthStmt::GrantPermission {
+                target_type,
+                target_name,
+                grantee,
+                ..
+            }) => {
+                assert_eq!(target_type, "COLLECTION");
+                assert_eq!(target_name, "_system.audit_log");
+                assert_eq!(grantee, "auditor");
+            }
+            other => panic!("expected GrantPermission, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn grant_on_function() {
         match parse("GRANT EXECUTE ON FUNCTION full_name TO analyst") {
             NodedbStatement::Auth(AuthStmt::GrantPermission { target_type, .. }) => {
@@ -347,11 +337,7 @@ mod tests {
 
     #[test]
     fn grant_scope_falls_through() {
-        let upper = "GRANT SCOPE 'pro:all' TO ORG 'acme'".to_uppercase();
-        let parts: Vec<&str> = "GRANT SCOPE 'pro:all' TO ORG 'acme'"
-            .split_whitespace()
-            .collect();
-        assert!(try_parse(&upper, &parts, "").is_none());
+        assert!(try_sql("GRANT SCOPE 'pro:all' TO ORG 'acme'").is_none());
     }
 
     #[test]
@@ -367,7 +353,6 @@ mod tests {
                 assert_eq!(target_type, "COLLECTION");
                 // The explicit `COLLECTION` object-type keyword must be
                 // recognized, not consumed as the collection name itself.
-                assert_ne!(target_name, "COLLECTION");
                 assert_eq!(target_name, "chunks");
                 assert_eq!(grantee, "some_role");
             }
@@ -384,7 +369,6 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(target_type, "COLLECTION");
-                assert_ne!(target_name, "TABLE");
                 assert_eq!(target_name, "orders");
             }
             other => panic!("expected GrantPermission, got {other:?}"),
@@ -400,7 +384,6 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(target_type, "COLLECTION");
-                assert_ne!(target_name, "COLLECTION");
                 assert_eq!(target_name, "orders");
             }
             other => panic!("expected RevokePermission, got {other:?}"),
@@ -445,22 +428,37 @@ mod tests {
 
     #[test]
     fn grant_on_tenant_missing_name_is_error() {
-        let sql = "GRANT BACKUP ON TENANT TO ops_user";
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        // `TO` is the token after `TENANT`; with no name the pivot still
-        // parses, so the tenant name resolves empty → explicit error.
         assert!(matches!(
-            try_parse(&sql.to_uppercase(), &parts, sql),
+            try_sql("GRANT BACKUP ON TENANT TO ops_user"),
             Some(Err(SqlError::Parse { .. }))
         ));
     }
 
     #[test]
     fn grant_missing_pivot_is_error() {
-        let upper = "GRANT readonly".to_uppercase();
-        let parts: Vec<&str> = "GRANT readonly".split_whitespace().collect();
         assert!(matches!(
-            try_parse(&upper, &parts, ""),
+            try_sql("GRANT readonly"),
+            Some(Err(SqlError::Parse { .. }))
+        ));
+    }
+
+    #[test]
+    fn trailing_grantee_tokens_are_refused() {
+        // `bob` is not silently dropped: the statement names one grantee.
+        assert!(matches!(
+            try_sql("GRANT READ ON orders TO alice bob"),
+            Some(Err(SqlError::Parse { .. }))
+        ));
+        assert!(matches!(
+            try_sql("REVOKE WRITE ON orders FROM alice CASCADE"),
+            Some(Err(SqlError::Parse { .. }))
+        ));
+    }
+
+    #[test]
+    fn extra_object_tokens_are_refused() {
+        assert!(matches!(
+            try_sql("GRANT READ ON orders extra TO alice"),
             Some(Err(SqlError::Parse { .. }))
         ));
     }

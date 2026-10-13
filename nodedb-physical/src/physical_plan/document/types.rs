@@ -81,6 +81,11 @@ pub struct EnforcementOptions {
     /// On UPDATE: re-evaluate if any `depends_on` column changed.
     #[serde(default)]
     pub generated_columns: Vec<GeneratedColumnSpec>,
+    /// The collection's typeguards. Schemaless collections only; empty
+    /// otherwise. Every write injects their DEFAULT / VALUE into the stored
+    /// body and validates REQUIRED, type and CHECK.
+    #[serde(default)]
+    pub type_guards: Vec<nodedb_types::TypeGuardFieldDef>,
 }
 
 impl EnforcementOptions {

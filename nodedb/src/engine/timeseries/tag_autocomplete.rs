@@ -17,12 +17,15 @@ use super::columnar_segment::ColumnarSegmentReader;
 
 /// Get all distinct tag values for a column from a partition on disk.
 ///
-/// Reads the `.sym` file only — no column data decompression.
+/// Reads the `.sym` file only — no column data decompression. `kek` is the
+/// timeseries segment key the partition was written with, or `None` for a
+/// plaintext partition.
 pub fn tag_values_from_partition(
     partition_dir: &Path,
     tag_column: &str,
+    kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
 ) -> Result<Vec<String>, TagAutoError> {
-    let dict = ColumnarSegmentReader::read_symbol_dict(partition_dir, tag_column, None)
+    let dict = ColumnarSegmentReader::read_symbol_dict(partition_dir, tag_column, kek)
         .map_err(|e| TagAutoError::Io(format!("read symbol dict: {e}")))?;
 
     let mut values = Vec::with_capacity(dict.len());
@@ -182,11 +185,27 @@ mod tests {
             .unwrap();
 
         let part_dir = tmp.path().join("ts-tags");
-        let hosts = tag_values_from_partition(&part_dir, "host").unwrap();
+        let hosts = tag_values_from_partition(&part_dir, "host", None).unwrap();
         assert_eq!(hosts.len(), 4);
 
-        let regions = tag_values_from_partition(&part_dir, "region").unwrap();
+        let regions = tag_values_from_partition(&part_dir, "region", None).unwrap();
         assert_eq!(regions.len(), 3);
+    }
+
+    #[test]
+    fn tag_values_from_an_encrypted_partition() {
+        let kek = nodedb_wal::crypto::WalEncryptionKey::from_bytes(&[0x42u8; 32]).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let mut mt = make_tagged_memtable();
+        let drain = mt.drain();
+        ColumnarSegmentWriter::new(tmp.path())
+            .write_partition("ts-tags", &drain.view(), 86_400_000, 0, Some(&kek))
+            .unwrap();
+
+        let part_dir = tmp.path().join("ts-tags");
+        let hosts = tag_values_from_partition(&part_dir, "host", Some(&kek)).unwrap();
+        assert_eq!(hosts.len(), 4);
+        assert!(tag_values_from_partition(&part_dir, "host", None).is_err());
     }
 
     #[test]

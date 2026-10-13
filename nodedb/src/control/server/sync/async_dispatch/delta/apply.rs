@@ -146,15 +146,17 @@ pub(crate) async fn apply_delta_and_finalize(
         database_id,
         &delta_msg.collection,
     );
-    let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
-        tenant_id,
-        database_id,
-        &qualified_collection,
-        identity,
-        "sync".into(),
-        &shared.rls,
-        &audit,
-    );
+    let policy =
+        crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
+            tenant_id,
+            database_id,
+            &qualified_collection,
+            identity,
+            "sync".into(),
+            &shared.rls,
+            &audit,
+        )
+        .with_type_guards_from(shared.credentials.catalog(), database_id);
 
     let (constraint_version_required, signing_required) = match shared
         .credentials

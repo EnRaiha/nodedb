@@ -172,7 +172,11 @@ impl CoreLoop {
                     schema,
                     columns: col_data,
                     sym_dicts,
-                } = match read_ts_partition(part_dir, SITE) {
+                } = match read_ts_partition(
+                    part_dir,
+                    SITE,
+                    self.segment_keks.ts_segment_kek.as_ref(),
+                ) {
                     Ok(partition) => partition,
                     Err(e) => return self.response_error(task, e),
                 };

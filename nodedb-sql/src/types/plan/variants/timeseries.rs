@@ -16,6 +16,8 @@ pub struct TimeseriesScanPlan {
     pub group_by: Vec<String>,
     pub aggregates: Vec<AggregateExpr>,
     pub filters: Vec<Filter>,
+    /// HAVING predicates over the finalized group rows. Empty on a raw scan.
+    pub having: Vec<Filter>,
     pub projection: Vec<Projection>,
     pub gap_fill: String,
     pub limit: usize,

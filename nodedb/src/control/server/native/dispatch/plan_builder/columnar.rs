@@ -16,7 +16,7 @@ pub(crate) async fn build_scan(
     fields: &TextFields,
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
-    let limit = fields.limit.unwrap_or(10_000) as usize;
+    let limit = super::requested_limit(fields)?;
     let filters = fields.filters.clone().unwrap_or_default();
 
     Ok(PhysicalPlan::Columnar(ColumnarOp::Scan {

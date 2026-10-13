@@ -3,9 +3,9 @@
 //! Aggregate plan conversion and projection/window helpers.
 //!
 //! Split by concern so each file stays under the project's hard size limit:
-//! `plan` (the `convert_aggregate` entry point and its join / catalog /
-//! timeseries lowering), `input_sourced` (aggregate over a materialized
-//! derived-table body), `spec` (aggregate-spec + collection/alias helpers and
+//! `plan` (the `convert_aggregate` entry point and its catalog and per-shard
+//! lowering), `input_sourced` (aggregate over a materialized input: a join,
+//! a derived table, a raw timeseries scan, a temporal scan), `spec` (aggregate-spec + collection/alias helpers and
 //! join-side embedding), and `projection` (projection / computed-column /
 //! window-function serialization).
 

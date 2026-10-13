@@ -120,7 +120,7 @@ static SCHEMA_PROJECTION_SLOT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore:
 /// measurement's full field set, so a merge skipped because the slot was busy
 /// is re-attempted by the next batch. Failures stay loud in the log, exactly as
 /// they were when this ran inline.
-fn spawn_schema_projection_merge(
+pub(crate) fn spawn_schema_projection_merge(
     state: &Arc<SharedState>,
     database_id: DatabaseId,
     tenant_id: TenantId,
@@ -250,7 +250,7 @@ async fn flush_ilp_batch_inner(
         TxnDispatchPosition::Autocommit,
         &[],
         None,
-        TxnProvenance::client(),
+        TxnProvenance::client(identity.role_names()),
     )
     .await?;
     let rejected = rejected_lines_of(&submitted, applied.as_ref())?;

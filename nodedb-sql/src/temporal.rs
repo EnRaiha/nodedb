@@ -47,4 +47,17 @@ impl TemporalScope {
     pub fn is_temporal(&self) -> bool {
         self.system_time.is_temporal() || !matches!(self.valid_time, ValidTime::Any)
     }
+
+    /// Refuse a temporal scope on `collection` unless it is bitemporal.
+    pub fn require_bitemporal(&self, collection: &str, bitemporal: bool) -> crate::Result<()> {
+        if self.is_temporal() && !bitemporal {
+            return Err(crate::SqlError::Unsupported {
+                detail: format!(
+                    "FOR SYSTEM_TIME / FOR VALID_TIME requires a bitemporal collection; \
+                     '{collection}' was not created WITH bitemporal = true"
+                ),
+            });
+        }
+        Ok(())
+    }
 }

@@ -22,6 +22,15 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
 
+/// The op that [`dispatch_and_respond`] routes: its target shard, plan,
+/// function name, and the collections it touches.
+pub(crate) struct KvAtomicDispatch<'a> {
+    pub vshard: VShardId,
+    pub plan: PhysicalPlan,
+    pub func_name: &'a str,
+    pub collections: &'a [&'a str],
+}
+
 /// Dispatch a KvOp through the protocol-neutral in-transaction staging gate
 /// and return the JSON response as a single text-column row keyed by the
 /// lower-cased function name.
@@ -48,18 +57,22 @@ use super::super::read_gate::CollectionReadGate;
 pub(crate) async fn dispatch_and_respond(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    vshard: VShardId,
-    mut plan: PhysicalPlan,
-    func_name: &str,
-    collections: &[&str],
+    database_id: DatabaseId,
+    op: KvAtomicDispatch<'_>,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     use crate::control::server::shared::session::staging_gate::{
         InTxnRoute, StagingGateError, route_in_tx_write,
     };
 
+    let KvAtomicDispatch {
+        vshard,
+        mut plan,
+        func_name,
+        collections,
+    } = op;
+
     let tenant_id = identity.tenant_id;
-    let database_id = DatabaseId::DEFAULT;
 
     // Every caller here names its collections in the SQL text and reaches the
     // Data Plane through a hand-built `KvOp`. The op reports the value it

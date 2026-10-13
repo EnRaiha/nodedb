@@ -8,6 +8,7 @@ mod engines;
 mod maintenance;
 mod memory;
 mod network;
+mod promql;
 mod scheduler;
 mod shutdown;
 
@@ -23,5 +24,6 @@ pub use engines::{
 pub use maintenance::MaintenanceTuning;
 pub use memory::MemoryTuning;
 pub use network::{BridgeTuning, ClusterTransportTuning, NetworkTuning, WalTuning};
+pub use promql::PromqlTuning;
 pub use scheduler::SchedulerTuning;
 pub use shutdown::ShutdownTuning;

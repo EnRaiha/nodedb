@@ -27,6 +27,7 @@ use super::support::err;
 pub fn show_constraints(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_after_on(sql)?;
@@ -35,7 +36,7 @@ pub fn show_constraints(
 
     let tenant_id = identity.tenant_id.as_u64();
     let coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
+        .get_collection(database_id, tenant_id, &coll_name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 

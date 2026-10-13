@@ -5,7 +5,10 @@
 use crate::types::EngineType;
 
 use super::rules::EngineRules;
-use super::{array, columnar, document_schemaless, document_strict, kv, spatial, timeseries};
+use super::{
+    array, columnar, continuous_aggregate, document_schemaless, document_strict, kv, spatial,
+    timeseries,
+};
 
 /// Resolve the engine rules for a given engine type.
 ///
@@ -19,5 +22,6 @@ pub fn resolve_engine_rules(engine: EngineType) -> &'static dyn EngineRules {
         EngineType::Timeseries => &timeseries::TimeseriesRules,
         EngineType::Spatial => &spatial::SpatialRules,
         EngineType::Array => &array::ArrayRules,
+        EngineType::ContinuousAggregate => &continuous_aggregate::ContinuousAggregateRules,
     }
 }

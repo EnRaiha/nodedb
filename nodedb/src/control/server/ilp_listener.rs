@@ -32,7 +32,9 @@ mod ilp_connection;
 mod ilp_drop;
 #[path = "ilp_line_read.rs"]
 mod ilp_line_read;
-pub(crate) use ilp_batch::flush_authenticated_ilp_batch;
+pub(crate) use ilp_batch::{
+    IlpMeasurementBatch, flush_authenticated_ilp_batch, spawn_schema_projection_merge,
+};
 use ilp_connection::handle_ilp_connection;
 
 /// ILP TCP listener.

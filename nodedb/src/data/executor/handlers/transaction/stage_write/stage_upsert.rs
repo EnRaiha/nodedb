@@ -18,7 +18,9 @@ use nodedb_types::columnar::StrictSchema;
 use super::context::StageCtx;
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::typeguard::GuardScope;
 use crate::data::executor::handlers::upsert::{apply_on_conflict_updates, merge_values};
+use crate::data::executor::handlers::write_body;
 use crate::data::executor::strict_format;
 use crate::types::TenantId;
 
@@ -117,10 +119,37 @@ impl CoreLoop {
                 detail: format!("staged upsert value: {e}"),
             })?;
 
+        // The fields this merge writes: the `ON CONFLICT DO UPDATE SET`
+        // targets, else every field of the incoming body.
+        let assigned: Vec<String> = if on_conflict_updates.is_empty() {
+            match &new_val {
+                nodedb_types::Value::Object(fields) => fields.keys().cloned().collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            write_body::assigned_names(on_conflict_updates)
+        };
+
         let merged = if on_conflict_updates.is_empty() {
             merge_values(existing_val, new_val)
         } else {
             apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates)?
+        };
+
+        // Apply typeguards and generated columns to the merged row, as the
+        // durable merge does, judging the assigned and injected fields.
+        let merged = match self.doc_configs.get(&config_key) {
+            Some(config) if write_body::rewrites_body(config) => {
+                let mut doc = serde_json::Value::from(merged);
+                write_body::materialize_write_body(
+                    config,
+                    &mut doc,
+                    GuardScope::Assigned(&assigned),
+                )
+                .map_err(crate::Error::DataPlane)?;
+                nodedb_types::Value::from(doc)
+            }
+            _ => merged,
         };
 
         let bitemporal = self.is_bitemporal(ctx.database_id, ctx.tid, ctx.collection);

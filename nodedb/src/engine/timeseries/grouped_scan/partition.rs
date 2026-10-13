@@ -118,6 +118,9 @@ pub struct PartitionAggParams<'a> {
     pub io_priority: Option<Priority>,
     /// IO metrics sink.  `None` when `uring_reader` is `None`.
     pub io_metrics: Option<&'a IoMetrics>,
+    /// The core's timeseries segment key, the key every partition write
+    /// uses. `None` reads plaintext partitions.
+    pub kek: Option<&'a nodedb_wal::crypto::WalEncryptionKey>,
 }
 
 /// Aggregate from a sealed disk partition with GROUP BY + optional time_bucket.
@@ -136,9 +139,10 @@ pub fn aggregate_partition(p: PartitionAggParams<'_>) -> crate::Result<Option<Gr
     let dir = p.partition_dir;
 
     require_partition_dir(dir, SITE)?;
-    let schema = ColumnarSegmentReader::read_schema(dir, None)
+    let kek = p.kek;
+    let schema = ColumnarSegmentReader::read_schema(dir, kek)
         .map_err(|e| partition_corrupt(dir, "schema", SITE, e))?;
-    let meta = ColumnarSegmentReader::read_meta(dir, None)
+    let meta = ColumnarSegmentReader::read_meta(dir, kek)
         .map_err(|e| partition_corrupt(dir, "meta", SITE, e))?;
     let row_count = meta.row_count as usize;
     if row_count == 0 {
@@ -156,7 +160,7 @@ pub fn aggregate_partition(p: PartitionAggParams<'_>) -> crate::Result<Option<Gr
 
     // Load sparse index for block-level skip. A partition written without
     // one has no index file.
-    let sparse_idx = ColumnarSegmentReader::read_sparse_index(dir, None)
+    let sparse_idx = ColumnarSegmentReader::read_sparse_index(dir, kek)
         .map_err(|e| partition_corrupt(dir, "sparse_index", SITE, e))?;
 
     // Determine surviving blocks (if sparse index available).
@@ -190,6 +194,7 @@ pub fn aggregate_partition(p: PartitionAggParams<'_>) -> crate::Result<Option<Gr
         uring_reader: p.uring_reader,
         io_priority: p.io_priority,
         io_metrics: p.io_metrics,
+        kek,
     })?;
 
     // When block-level read was used, row_count is the number of
@@ -220,7 +225,7 @@ pub fn aggregate_partition(p: PartitionAggParams<'_>) -> crate::Result<Option<Gr
         if *ty != ColumnType::Symbol || !needed || !dir.join(format!("{name}.sym")).exists() {
             continue;
         }
-        let dict = ColumnarSegmentReader::read_symbol_dict(dir, name, None)
+        let dict = ColumnarSegmentReader::read_symbol_dict(dir, name, kek)
             .map_err(|e| partition_corrupt(dir, "symbol_dict", SITE, e))?;
         sym_dicts.insert(i, dict);
     }
@@ -351,6 +356,7 @@ struct ReadPartitionColumnsParams<'a> {
     uring_reader: Option<&'a mut crate::data::io::uring_reader::UringReader>,
     io_priority: Option<Priority>,
     io_metrics: Option<&'a IoMetrics>,
+    kek: Option<&'a nodedb_wal::crypto::WalEncryptionKey>,
 }
 
 /// Read column data for a partition, using io_uring when available.
@@ -374,6 +380,7 @@ fn read_partition_columns(
         uring_reader,
         io_priority,
         io_metrics,
+        kek,
     } = p;
     // Determine which schema columns are actually needed.
     let needed_indices: Vec<usize> = schema_columns
@@ -398,11 +405,11 @@ fn read_partition_columns(
                 *ty,
                 codec,
                 surviving_blocks.unwrap_or(&[]),
-                None,
+                kek,
             )
             .map(|(data, _)| data)
         } else {
-            ColumnarSegmentReader::read_column_with_codec(partition_dir, name, *ty, codec, None)
+            ColumnarSegmentReader::read_column_with_codec(partition_dir, name, *ty, codec, kek)
         };
         read.map_err(|e| partition_corrupt(partition_dir, "column", SITE, e))
     };
@@ -455,7 +462,7 @@ fn read_partition_columns(
                 *ty,
                 codec,
                 raw,
-                None,
+                kek,
             )
             .map_err(|e| partition_corrupt(partition_dir, "column", SITE, e))?
         };
@@ -480,6 +487,7 @@ mod tests {
             uring_reader: None,
             io_priority: None,
             io_metrics: None,
+            kek: None,
         })
     }
 

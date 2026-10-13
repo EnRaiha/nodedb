@@ -17,6 +17,7 @@ use crate::control::state::SharedState;
 use crate::types::TenantId;
 use nodedb_types::Value;
 
+use super::group_key::AlertGroupKey;
 use super::hysteresis::HysteresisTransition;
 use super::types::{AlertDef, AlertEvent, NotifyTarget};
 
@@ -27,7 +28,7 @@ use super::types::{AlertDef, AlertEvent, NotifyTarget};
 pub async fn dispatch_notifications(
     state: &Arc<SharedState>,
     alert: &AlertDef,
-    group_key: &str,
+    group_key: &AlertGroupKey,
     value: f64,
     transition: HysteresisTransition,
     now_ms: u64,

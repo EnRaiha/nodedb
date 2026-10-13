@@ -85,7 +85,7 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
     let group_by = extract_group_by(sql, sql)?;
 
     // Extract WITH options (optional).
-    let (refresh_policy, retention_period_ms) = extract_with_options(sql, sql);
+    let (refresh_policy, retention_period_ms) = extract_with_options(sql, sql)?;
 
     Ok(ContinuousAggregateDef {
         // Placeholder: the caller (`create_continuous_aggregate`) rebuilds
@@ -101,6 +101,8 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
         refresh_policy,
         retention_period_ms,
         stale: false,
+        // The caller stamps the CREATE's incarnation.
+        incarnation: nodedb_types::Hlc::ZERO,
     })
 }
 
@@ -136,7 +138,7 @@ fn extract_aggregates(_upper: &str, sql: &str) -> Result<Vec<AggregateExpr>, Ddl
     let agg_str = sql[after_agg_start..end_pos].trim().trim_end_matches(',');
     let mut exprs = Vec::new();
 
-    for part in agg_str.split(',') {
+    for part in split_top_level(agg_str) {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -146,6 +148,27 @@ fn extract_aggregates(_upper: &str, sql: &str) -> Result<Vec<AggregateExpr>, Ddl
     }
 
     Ok(exprs)
+}
+
+/// Split `s` on the commas outside parentheses, so a two-argument function
+/// such as `percentile(v, 0.99)` stays one expression.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// Parse a single aggregate expression: `func(col) [AS alias]`.
@@ -170,19 +193,79 @@ fn parse_single_aggregate(s: &str) -> Result<AggregateExpr, DdlError> {
         .ok_or_else(|| err("42601", format!("missing closing parenthesis: {s}")))?;
 
     // The function word is matched against a fixed set, so it lowercases as a
-    // keyword. The argument names a column, or `*` for `count(*)`.
+    // keyword. The first argument names a column, or `*` for `count(*)`. The
+    // sketch functions take a second, numeric argument.
     let func_name = func_part[..open].trim().to_lowercase();
-    let col_name = parse_ident_or_wildcard_token(func_part[open + 1..close].trim())?;
+    let args: Vec<&str> = func_part[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .collect();
+    let col_name = parse_ident_or_wildcard_token(args.first().copied().unwrap_or_default())?;
+    let arity = |expected: usize| {
+        if args.len() == expected {
+            Ok(())
+        } else {
+            Err(err(
+                "42601",
+                format!(
+                    "{func_name} takes {expected} argument(s), got {}: {s}",
+                    args.len()
+                ),
+            ))
+        }
+    };
 
     let function = match func_name.as_str() {
-        "sum" => AggFunction::Sum,
-        "count" => AggFunction::Count,
-        "min" => AggFunction::Min,
-        "max" => AggFunction::Max,
-        "avg" => AggFunction::Avg,
-        "first" => AggFunction::First,
-        "last" => AggFunction::Last,
-        "count_distinct" => AggFunction::CountDistinct,
+        "sum"
+        | "count"
+        | "min"
+        | "max"
+        | "avg"
+        | "first"
+        | "last"
+        | "count_distinct"
+        | "approx_count_distinct" => {
+            arity(1)?;
+            match func_name.as_str() {
+                "sum" => AggFunction::Sum,
+                "count" => AggFunction::Count,
+                "min" => AggFunction::Min,
+                "max" => AggFunction::Max,
+                "avg" => AggFunction::Avg,
+                "first" => AggFunction::First,
+                "last" => AggFunction::Last,
+                _ => AggFunction::CountDistinct,
+            }
+        }
+        "percentile" | "ts_percentile" | "approx_percentile" => {
+            arity(2)?;
+            let q: f64 = args[1].parse().map_err(|_| {
+                err(
+                    "22023",
+                    format!("{func_name} quantile '{}' is not a number", args[1]),
+                )
+            })?;
+            if !(0.0..=1.0).contains(&q) {
+                return Err(err(
+                    "22023",
+                    format!("{func_name} quantile {q} is outside [0, 1]"),
+                ));
+            }
+            AggFunction::Percentile(q)
+        }
+        "topk" | "approx_topk" => {
+            arity(2)?;
+            let k: usize = args[1].parse().map_err(|_| {
+                err(
+                    "22023",
+                    format!("{func_name} k '{}' is not a count", args[1]),
+                )
+            })?;
+            if k == 0 {
+                return Err(err("22023", format!("{func_name} k must be at least 1")));
+            }
+            AggFunction::TopK(k)
+        }
         other => {
             return Err(err("42601", format!("unknown aggregate function: {other}")));
         }
@@ -228,60 +311,76 @@ fn extract_group_by(_upper: &str, sql: &str) -> Result<Vec<String>, DdlError> {
         .collect()
 }
 
-/// Extract WITH options: refresh_policy and retention.
-pub(super) fn extract_with_options(_upper: &str, sql: &str) -> (RefreshPolicy, u64) {
+/// Parse the trailing `WITH (...)` options into the refresh policy and the
+/// aggregate's retention period in milliseconds.
+///
+/// - `refresh_policy` / `refresh`: `on_flush`, `on_seal`, `manual`, or an
+///   interval (`'5m'`), which means `Periodic`.
+/// - `refresh_interval`: an interval, which means `Periodic`.
+/// - `retention` / `retention_period`: an interval.
+///
+/// An unknown option, or a value that does not parse, is an error: a
+/// misspelled option never falls back to a default silently.
+pub(super) fn extract_with_options(
+    _upper: &str,
+    sql: &str,
+) -> Result<(RefreshPolicy, u64), DdlError> {
     let mut refresh = RefreshPolicy::OnFlush;
     let mut retention_ms = 0u64;
 
-    let with_pos = match rfind_ascii_case_insensitive(sql, "WITH") {
-        Some(p) => p,
-        None => return (refresh, retention_ms),
+    let Some(with_pos) = rfind_ascii_case_insensitive(sql, "WITH") else {
+        return Ok((refresh, retention_ms));
     };
     let after_with = sql[with_pos + 4..].trim_start();
-    let open = match after_with.find('(') {
-        Some(p) => p,
-        None => return (refresh, retention_ms),
-    };
-    let close = match after_with.rfind(')') {
-        Some(p) => p,
-        None => return (refresh, retention_ms),
+    let (Some(open), Some(close)) = (after_with.find('('), after_with.rfind(')')) else {
+        return Ok((refresh, retention_ms));
     };
     if close <= open {
-        return (refresh, retention_ms);
+        return Ok((refresh, retention_ms));
     }
 
+    let interval = |key: &str, val: &str| {
+        nodedb_types::kv_parsing::parse_interval_to_ms(val).map_err(|_| {
+            DdlError::new(
+                "22023",
+                format!("continuous aggregate option {key} = '{val}' is not an interval"),
+            )
+        })
+    };
     let inner = &after_with[open + 1..close];
-    for pair in inner.split(',') {
-        let pair = pair.trim();
-        if let Some(eq) = pair.find('=') {
-            let key = pair[..eq].trim().to_lowercase();
-            let val = pair[eq + 1..].trim().trim_matches('\'').trim_matches('"');
-            match key.as_str() {
-                "refresh_policy" | "refresh" => {
-                    refresh = match val.to_lowercase().as_str() {
-                        "on_flush" | "onflush" => RefreshPolicy::OnFlush,
-                        "on_seal" | "onseal" => RefreshPolicy::OnSeal,
-                        "manual" => RefreshPolicy::Manual,
-                        other => {
-                            if let Ok(ms) = nodedb_types::kv_parsing::parse_interval_to_ms(other) {
-                                RefreshPolicy::Periodic(ms)
-                            } else {
-                                RefreshPolicy::OnFlush
-                            }
-                        }
-                    };
-                }
-                "retention" | "retention_period" => {
-                    if let Ok(ms) = nodedb_types::kv_parsing::parse_interval_to_ms(val) {
-                        retention_ms = ms;
-                    }
-                }
-                _ => {}
+    for pair in inner.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let Some(eq) = pair.find('=') else {
+            return Err(DdlError::new(
+                "42601",
+                format!("continuous aggregate option '{pair}' needs '= <value>'"),
+            ));
+        };
+        let key = pair[..eq].trim().to_lowercase();
+        let val = pair[eq + 1..].trim().trim_matches('\'').trim_matches('"');
+        match key.as_str() {
+            "refresh_policy" | "refresh" => {
+                refresh = match val.to_lowercase().as_str() {
+                    "on_flush" | "onflush" => RefreshPolicy::OnFlush,
+                    "on_seal" | "onseal" => RefreshPolicy::OnSeal,
+                    "manual" => RefreshPolicy::Manual,
+                    other => RefreshPolicy::Periodic(interval(&key, other)?),
+                };
+            }
+            "refresh_interval" => refresh = RefreshPolicy::Periodic(interval(&key, val)?),
+            "retention" | "retention_period" => retention_ms = interval(&key, val)?,
+            other => {
+                return Err(DdlError::new(
+                    "42601",
+                    format!(
+                        "unknown continuous aggregate option '{other}'; expected refresh_policy, \
+                         refresh, refresh_interval, retention, or retention_period"
+                    ),
+                ));
             }
         }
     }
 
-    (refresh, retention_ms)
+    Ok((refresh, retention_ms))
 }
 
 #[cfg(test)]

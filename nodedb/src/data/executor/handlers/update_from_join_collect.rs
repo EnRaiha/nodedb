@@ -12,7 +12,6 @@
 //! `collect_merge_plan` is shared between the MERGE resolve and apply passes).
 
 use redb::{ReadableDatabase, ReadableTable};
-use std::collections::HashMap;
 
 use nodedb_types::StorageKey;
 use nodedb_types::columnar::StrictSchema;
@@ -21,7 +20,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
 use crate::data::executor::doc_format;
-use crate::data::executor::handlers::update_from_join_source_map::json_value_to_string;
+use crate::data::executor::handlers::join_source_map::JoinSource;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::sparse::btree::{KeyedTable, invalid_storage_key_err};
 use crate::types::{DatabaseId, TenantId, TxnId};
@@ -38,7 +37,7 @@ pub(in crate::data::executor) struct CollectUpdateRows<'a> {
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub updates: &'a [(String, UpdateValue)],
-    pub source_map: &'a HashMap<String, serde_json::Value>,
+    pub source_map: &'a JoinSource,
     pub target_filters: &'a [ScanFilter],
     pub strict_schema: Option<&'a StrictSchema>,
     pub config_key: &'a (DatabaseId, TenantId, String),
@@ -137,15 +136,11 @@ impl CoreLoop {
             };
 
             // Extract the join key from the target document.
-            let join_val = target_doc
-                .get(target_join_col)
-                .map(json_value_to_string)
-                .unwrap_or_default();
-
-            // Look up the matching source row.
-            let source_doc = match source_map.get(&join_val) {
-                Some(s) => s,
-                None => continue, // No matching source row — skip this target row.
+            // The source row whose join key a WHERE `=` would match. A
+            // target row with no such row is not updated.
+            let source_doc = match source_map.probe(target_doc.get(target_join_col)) {
+                Some(row) => &row.doc,
+                None => continue,
             };
 
             // Build a merged document for expression evaluation:
@@ -199,20 +194,34 @@ impl CoreLoop {
             }
             identity.check_unchanged(target_collection, &target_doc)?;
 
-            // Recompute generated columns if any dependency changed. A column
-            // the engine cannot recompute fails the statement.
-            if let Some(config) = self.doc_configs.get(config_key)
-                && !config.enforcement.generated_columns.is_empty()
-                && super::generated::needs_recomputation(
-                    updates,
-                    &config.enforcement.generated_columns,
-                )
-            {
-                super::generated::evaluate_generated_columns(
-                    &mut target_doc,
-                    &config.enforcement.generated_columns,
-                )
-                .map_err(crate::Error::DataPlane)?;
+            // Apply typeguards to the post-image, judging the assigned and
+            // injected fields. Then recompute generated columns if any
+            // dependency changed. A column the engine cannot recompute fails
+            // the statement.
+            if let Some(config) = self.doc_configs.get(config_key) {
+                if !config.crdt_enabled && !config.type_guards.is_empty() {
+                    let assigned = super::write_body::assigned_names(updates);
+                    crate::data::executor::enforcement::typeguard::enforce_type_guards(
+                        &config.type_guards,
+                        &mut target_doc,
+                        crate::data::executor::enforcement::typeguard::GuardScope::Assigned(
+                            &assigned,
+                        ),
+                    )
+                    .map_err(crate::Error::DataPlane)?;
+                }
+                if !config.enforcement.generated_columns.is_empty()
+                    && super::generated::needs_recomputation(
+                        updates,
+                        &config.enforcement.generated_columns,
+                    )
+                {
+                    super::generated::evaluate_generated_columns(
+                        &mut target_doc,
+                        &config.enforcement.generated_columns,
+                    )
+                    .map_err(crate::Error::DataPlane)?;
+                }
             }
 
             // A declared numeric column holds the value its type stores,

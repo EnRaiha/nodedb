@@ -21,6 +21,7 @@ use super::super::graph_ops;
 use super::super::match_ops;
 use super::super::query_functions;
 
+use super::route_tokens::RouteTokens;
 use super::{
     string_admin, string_engine_ops, string_introspection, string_schema, string_streaming,
     string_versioning, typed_auth, typed_automation, typed_collection, typed_database, typed_misc,
@@ -78,23 +79,15 @@ pub async fn try_dispatch(
     // GRAPH / MATCH / SHOW GRAPH STATS prefixed inputs reach their parse
     // error through this arm.
     //
-    // Non-DDL statements (`None`) include the temporal / audit query functions —
-    // `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST. They are
-    // recognized by substring after the typed-AST parse gate and the auth
-    // family, in the `None` branch (any typed DDL whose body contains one of
-    // the substrings is handled by the typed match above first). A non-match
-    // returns `None` so the caller falls through to the SQL planner.
+    // Non-DDL statements (`None`) include the temporal / audit query functions:
+    // `SELECT <FUNC>(...)` calls that never parse into a typed DDL AST. The
+    // `None` branch recognizes them from the parsed SQL statement. A
+    // non-match returns `None`, so the caller falls through to the SQL planner.
     let stmt = match nodedb_sql::ddl_ast::parse(sql) {
         Some(Ok(stmt)) => stmt,
-        Some(Err(e)) => {
-            // The SQLSTATE the planner path renders for the same error, so a
-            // parse refusal answers one class wherever it is raised.
-            let message = e.to_string();
-            let (_, sqlstate, _) = crate::control::server::pgwire::types::error_to_sqlstate(
-                &crate::control::planner::plan_error_map::map_plan_error(e, identity.tenant_id),
-            );
-            return Some(Err(DdlError::new(sqlstate, message)));
-        }
+        // The SQLSTATE the planner path renders for the same error, so a
+        // parse refusal answers one class wherever it is raised.
+        Some(Err(e)) => return Some(Err(DdlError::from_sql_error(e, identity.tenant_id))),
         None => {
             // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The
             // file-path form (`COPY … FROM '<path>'`) parses into a typed
@@ -104,7 +97,8 @@ pub async fn try_dispatch(
             // ran after the typed-AST parse gate. Recognizing it here in the
             // `None` branch preserves that ordering exactly — the file form never
             // reaches this arm, so it is not diverted from the typed handler.
-            if upper.starts_with("COPY ") && upper.contains(" FROM ") {
+            let tokens = RouteTokens::new(sql);
+            if is_copy_from(&tokens) {
                 let parts: Vec<&str> = sql.split_whitespace().collect();
                 return Some(bulk::copy_from(state, identity, &parts).await);
             }
@@ -112,50 +106,17 @@ pub async fn try_dispatch(
             // INSERT INTO x { } — object literal syntax; intercept for
             // trigger/sequence handling. It runs after the typed-AST parse
             // gate, in the `None` branch.
-            if sql
-                .get(.."INSERT INTO ".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("INSERT INTO "))
+            if is_object_literal_write(&tokens, "INSERT")
+                && let Some(result) =
+                    collection::insert_document(state, identity, database_id, sql, txn_ctx).await
             {
-                let after_into = sql
-                    .get("INSERT INTO ".len()..)
-                    .unwrap_or_default()
-                    .trim_start();
-                let coll_end = after_into
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(after_into.len());
-                if after_into
-                    .get(coll_end..)
-                    .unwrap_or_default()
-                    .trim_start()
-                    .starts_with('{')
-                    && let Some(result) =
-                        collection::insert_document(state, identity, database_id, sql, txn_ctx)
-                            .await
-                {
-                    return Some(result);
-                }
+                return Some(result);
             }
 
             // UPSERT INTO — same as INSERT but merges into existing document
             // if it exists. Handles both (cols) VALUES (vals) and { } object
             // literal forms.
-            if sql
-                .get(.."UPSERT INTO ".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UPSERT INTO "))
-                && (upper.contains("VALUES") || {
-                    let after_into = sql
-                        .get("UPSERT INTO ".len()..)
-                        .unwrap_or_default()
-                        .trim_start();
-                    let coll_end = after_into
-                        .find(|c: char| c.is_whitespace())
-                        .unwrap_or(after_into.len());
-                    after_into
-                        .get(coll_end..)
-                        .unwrap_or_default()
-                        .trim_start()
-                        .starts_with('{')
-                })
+            if (is_upsert_values(&tokens) || is_object_literal_write(&tokens, "UPSERT"))
                 && let Some(result) =
                     collection::upsert_document(state, identity, database_id, sql, txn_ctx).await
             {
@@ -222,4 +183,59 @@ pub async fn try_dispatch(
     }
 
     None
+}
+
+/// `COPY <collection> FROM ...`: the clause follows the collection name.
+fn is_copy_from(tokens: &RouteTokens) -> bool {
+    tokens.leads_with(&["COPY"]) && tokens.phrase_at(tokens.skip_name(1), &["FROM"])
+}
+
+/// `<verb> INTO <collection> { ... }`, the object-literal write form.
+fn is_object_literal_write(tokens: &RouteTokens, verb: &str) -> bool {
+    tokens.leads_with(&[verb, "INTO"]) && tokens.phrase_at(tokens.skip_name(2), &["{"])
+}
+
+/// `UPSERT INTO <collection> [(columns)] VALUES (...)`.
+fn is_upsert_values(tokens: &RouteTokens) -> bool {
+    tokens.leads_with(&["UPSERT", "INTO"]) && tokens.has_word_from(tokens.skip_name(2), "VALUES")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_from_is_routed_on_the_clause_after_the_collection() {
+        assert!(is_copy_from(&RouteTokens::new("COPY orders FROM STDIN")));
+        assert!(!is_copy_from(&RouteTokens::new(
+            "COPY (SELECT 'x FROM y') TO STDOUT"
+        )));
+    }
+
+    #[test]
+    fn object_literal_writes_are_routed_on_the_brace_after_the_collection() {
+        let insert = RouteTokens::new("INSERT INTO docs { id: 'a' }");
+        assert!(is_object_literal_write(&insert, "INSERT"));
+        assert!(!is_object_literal_write(&insert, "UPSERT"));
+        // A brace inside a literal is data.
+        assert!(!is_object_literal_write(
+            &RouteTokens::new("INSERT INTO docs (body) VALUES ('{ }')"),
+            "INSERT"
+        ));
+        assert!(is_object_literal_write(
+            &RouteTokens::new("upsert into docs {id: 'a'}"),
+            "UPSERT"
+        ));
+    }
+
+    #[test]
+    fn upsert_values_is_routed_on_a_top_level_values_clause() {
+        assert!(is_upsert_values(&RouteTokens::new(
+            "UPSERT INTO docs (id, n) VALUES ('a', 1)"
+        )));
+        // `VALUES` inside a string literal is data.
+        assert!(!is_upsert_values(&RouteTokens::new(
+            "UPSERT INTO docs SELECT 'VALUES' AS id"
+        )));
+    }
 }

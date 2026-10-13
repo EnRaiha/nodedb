@@ -5,6 +5,7 @@
 //! Returns `current_balance - SUM(value_expr over source rows WHERE created_at > timestamp)`.
 //! Fast: only scans recent rows, not full history.
 
+use nodedb_sql::parser::query_function::BalanceAsOfArgs;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -15,30 +16,19 @@ use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
-use super::helpers::{
-    clean_arg, err, extract_function_args, json_to_decimal, parse_timestamp_secs, single_result,
-    unwrap_scan_docs,
-};
+use super::helpers::{err, json_to_decimal, parse_timestamp_secs, single_result, unwrap_scan_docs};
 
 pub async fn balance_as_of(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    sql: &str,
+    args: &BalanceAsOfArgs,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = extract_function_args(sql, "BALANCE_AS_OF")?;
-    if args.len() < 4 {
-        return Err(err(
-            "42601",
-            "BALANCE_AS_OF requires (collection, key, column, timestamp)",
-        ));
-    }
-
-    let collection = clean_arg(args[0]);
-    let key = clean_arg(args[1]);
-    let column = clean_arg(args[2]);
-    let as_of_str = clean_arg(args[3]);
+    let collection = args.collection.clone();
+    let key = args.key.clone();
+    let column = args.column.clone();
+    let as_of_str = args.timestamp.clone();
 
     let as_of_secs = parse_timestamp_secs(&as_of_str)?;
 

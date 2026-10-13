@@ -311,15 +311,16 @@ pub fn line_row(
                 }
                 ColumnType::Symbol => {
                     // Look up tag value first (tags are borrowed &str), then
-                    // string field value (now an owned String after ILP unescape).
-                    let val: String = line
+                    // string field value (now an owned String after ILP
+                    // unescape). A line that names neither stores NULL, never
+                    // an empty string: `''` is a value of its own.
+                    let val = line
                         .tags
                         .iter()
                         .find(|(key, _)| key.as_ref() == col_name)
                         .map(|(_, value)| value.to_string())
-                        .or_else(|| find_field_str(&line.fields, col_name))
-                        .unwrap_or_default();
-                    values.push(ColumnValue::Symbol(val));
+                        .or_else(|| find_field_str(&line.fields, col_name));
+                    values.push(val.map_or(ColumnValue::Null, ColumnValue::Symbol));
                 }
                 ColumnType::Float64 => {
                     let val = find_field_f64(&line.fields, col_name);
@@ -743,6 +744,33 @@ mod tests {
         assert!(
             reason.contains("cardinality"),
             "the reason must name the rule that was broken; got {reason}"
+        );
+    }
+
+    /// A symbol column the line does not name is NULL. An empty string the
+    /// line names is the value `''`.
+    #[test]
+    fn an_unnamed_symbol_is_null_and_an_empty_one_is_a_value() {
+        let schema = super::super::columnar_memtable::ColumnarSchema {
+            columns: vec![
+                ("timestamp".into(), ColumnType::Timestamp(TimeKind::Millis)),
+                ("host".into(), ColumnType::Symbol),
+                ("note".into(), ColumnType::Symbol),
+                ("value".into(), ColumnType::Float64),
+            ],
+            timestamp_idx: 0,
+            codecs: Vec::new(),
+        };
+        let parsed = parse_batch("cpu note=\"\",value=1.5 1000000000")
+            .expect("parse line")
+            .into_lines();
+        let line = parsed.first().expect("one line");
+        let (_, values) = line_row(&schema, line, 0, None);
+        assert_eq!(values[1], ColumnValue::Null, "absent tag is NULL");
+        assert_eq!(
+            values[2],
+            ColumnValue::Symbol(String::new()),
+            "'' is a value"
         );
     }
 }

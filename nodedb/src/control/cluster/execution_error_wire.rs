@@ -118,6 +118,7 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::UndefinedFunction { .. }
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::WrongObjectType { .. }
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }

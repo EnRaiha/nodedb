@@ -233,6 +233,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         }
     }
 

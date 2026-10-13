@@ -162,6 +162,7 @@ mod tests {
                     position: None,
                 }],
                 row_changes: Vec::new(),
+                user_roles: vec!["approver".into()],
             },
             collections: vec!["accounts".into(), "entries".into()],
             sum_targets: vec![RedoSumTargets {

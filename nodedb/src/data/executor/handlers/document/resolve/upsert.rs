@@ -62,6 +62,22 @@ impl CoreLoop {
         let document_identity = RowIdentity::from_user_key(document_id);
 
         let existing = self.doc_resolve_read(&ctx, collection, &row_key)?;
+        // A merge writes the `ON CONFLICT DO UPDATE SET` targets, else every
+        // field of the incoming body. Typeguards judge those fields and the
+        // fields a guard injects. An insert is judged whole.
+        let assigned: Vec<String> = if on_conflict_updates.is_empty() {
+            match nodedb_types::value_from_msgpack(value) {
+                Ok(nodedb_types::Value::Object(fields)) => fields.into_keys().collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            crate::data::executor::handlers::write_body::assigned_names(on_conflict_updates)
+        };
+        let guards = if existing.is_some() {
+            crate::data::executor::enforcement::typeguard::GuardScope::Assigned(&assigned)
+        } else {
+            crate::data::executor::enforcement::typeguard::GuardScope::Document
+        };
         let (body, precondition) = match existing {
             Some(current_bytes) => {
                 let merged = self.merge_upsert_body(
@@ -105,6 +121,7 @@ impl CoreLoop {
                 sys_from_ms: self.bitemporal_now_ms(),
                 valid_from_ms: i64::MIN,
                 valid_until_ms: i64::MAX,
+                guards,
             })
             .map_err(ErrorCode::from)?
             .stored;

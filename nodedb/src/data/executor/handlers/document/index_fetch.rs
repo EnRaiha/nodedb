@@ -255,8 +255,18 @@ impl CoreLoop {
         }
 
         let identity_column = self.identity_column(database_id, tid, collection);
+        // `offset` and `limit` count rows that pass the residual, so the
+        // residual runs on every candidate before either applies. A no-LIMIT
+        // fetch (`limit == usize::MAX`) is bounded by the per-query byte
+        // budget below, never by a row cap.
+        let unbounded = limit == usize::MAX;
+        let mut skipped = 0usize;
+        let mut total_bytes = 0usize;
         let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
-        for doc_id in doc_ids.iter().skip(offset).take(limit) {
+        for doc_id in doc_ids.iter() {
+            if rows.len() >= limit {
+                break;
+            }
             // Bitemporal collections keep the current body on the versioned
             // document table; the plain DOCUMENTS table is empty for them.
             // A doc ID the overlay merge added or superseded above has no
@@ -295,17 +305,45 @@ impl CoreLoop {
                             return self.response_error(task, ErrorCode::from(e));
                         }
                     }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
                     let payload = if let Some(ref schema) = strict_schema {
+                        // A body that does not decode under its schema is an
+                        // error, never passed on as if it were msgpack.
                         match super::super::super::strict_format::binary_tuple_to_msgpack(
                             &bytes, schema,
                         ) {
                             Some(mp) => mp,
-                            None => bytes,
+                            None => {
+                                return self.response_error(
+                                    task,
+                                    ErrorCode::Internal {
+                                        detail: format!(
+                                            "indexed fetch on '{collection}': stored body of \
+                                             '{doc_id}' does not decode under the strict schema"
+                                        ),
+                                    },
+                                );
+                            }
                         }
                     } else {
                         bytes
                     };
-                    rows.push((doc_id.to_string(), payload));
+                    let doc_id = doc_id.to_string();
+                    total_bytes = total_bytes
+                        .saturating_add(doc_id.len())
+                        .saturating_add(payload.len());
+                    if unbounded
+                        && crate::data::executor::handlers::scan_budget::budget_exceeded(
+                            total_bytes,
+                            self.query_tuning.max_scan_result_bytes,
+                        )
+                    {
+                        return self.response_error(task, ErrorCode::ResourcesExhausted);
+                    }
+                    rows.push((doc_id, payload));
                 }
                 Ok(None) => {
                     // Index entry pointed at a deleted doc — skip, don't

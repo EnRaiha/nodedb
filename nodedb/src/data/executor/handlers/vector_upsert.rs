@@ -26,6 +26,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+use super::returning_rows::VectorRowColumns;
 use super::rls_write_gate;
 use super::upsert::apply_on_conflict_updates;
 use super::vector_direct_row::{
@@ -256,7 +257,10 @@ impl CoreLoop {
                         task,
                         spec,
                         rls_filters,
-                        &identity_column,
+                        VectorRowColumns {
+                            identity: &identity_column,
+                            vector: field,
+                        },
                         &[],
                     );
                 }
@@ -318,8 +322,11 @@ impl CoreLoop {
                 task,
                 spec,
                 rls_filters,
-                &identity_column,
-                &[(&storage_key, sidecar.as_slice())],
+                VectorRowColumns {
+                    identity: &identity_column,
+                    vector: field,
+                },
+                &[(&storage_key, sidecar.as_slice(), vector)],
             );
         }
         if !on_conflict_updates.is_empty() {

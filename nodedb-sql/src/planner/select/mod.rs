@@ -28,3 +28,4 @@ pub use helpers::{
     extract_string_literal, qualified_name,
 };
 pub(crate) use order_by::select_output_aliases;
+pub(crate) use select_stmt::has_aggregation;

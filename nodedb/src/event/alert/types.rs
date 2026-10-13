@@ -142,6 +142,8 @@ pub enum AlertStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertEvent {
     pub alert_name: String,
+    /// The group's cells as SQL literals (`'pump-1', 7`, `NULL`), or
+    /// `__all__` for an alert without GROUP BY.
     pub group_key: String,
     pub severity: String,
     pub status: String,

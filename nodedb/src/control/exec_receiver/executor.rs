@@ -247,6 +247,9 @@ impl LocalPlanExecutor {
                     });
                 }
                 Ok(Some(entry)) => {
+                    // The coordinator's roles ride the entry, so every
+                    // replica judges a role-guarded transition the same way.
+                    let entry = entry.with_user_roles(req.user_roles.clone());
                     return match crate::control::wal_replication::propose_replicated_entry(
                         &self.state,
                         proposer,

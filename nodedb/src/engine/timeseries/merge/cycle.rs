@@ -15,10 +15,30 @@ use super::partitions::merge_partitions;
 /// 1. Write merged partition to new directory (crash → orphan, no manifest entry)
 /// 2. Commit to registry + persist manifest atomically (crash → write-rename atomic)
 /// 3. Background cleanup of source directories (crash → cleanup on next startup)
+///
+/// ## Continuous-aggregate invariant
+///
+/// Every continuous aggregate records, by directory name, the sealed
+/// partitions it has folded. A merge must keep that record exact:
+///
+/// - A merge moves rows and never changes them. The merged partition holds
+///   exactly the union of its sources' rows.
+/// - The merged directory name joins an aggregate's folded set only when
+///   every source partition was already in it. The source names then leave
+///   the set.
+/// - A group where some aggregate has folded some sources and not others
+///   does not merge. The maintenance tick folds the missing sources first.
+/// - A rewrite that adds, removes, or changes rows in place is forbidden.
+///   The folded set cannot express it, and the aggregate would count those
+///   rows twice or lose them.
+/// - The aggregate image is rewritten after the merge commits, before the
+///   source directories are removed. A crash between the two leaves both
+///   names on disk, and the image still names only the sources.
 pub fn run_merge_cycle(
     registry: &mut PartitionRegistry,
     base_dir: &Path,
     now_ms: i64,
+    kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
 ) -> Result<usize, SegmentError> {
     let groups = registry.find_mergeable(now_ms);
     let mut merge_count = 0;
@@ -49,7 +69,7 @@ pub fn run_merge_cycle(
         let output_name = format_partition_dir(first_start, last_end);
 
         // Execute merge.
-        match merge_partitions(base_dir, &source_dirs, &output_name) {
+        match merge_partitions(base_dir, &source_dirs, &output_name, kek) {
             Ok(result) => {
                 // Step 2: Atomic manifest update.
                 registry.commit_merge(result.meta, result.dir_name, group_starts);
@@ -75,10 +95,12 @@ pub fn run_merge_cycle(
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::timeseries::{MetricSample, PartitionInterval, TieredPartitionConfig};
+    use nodedb_types::timeseries::{PartitionInterval, TieredPartitionConfig};
     use tempfile::TempDir;
 
-    use crate::engine::timeseries::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
+    use crate::engine::timeseries::columnar_memtable::{
+        ColumnValue, ColumnarMemtable, ColumnarMemtableConfig,
+    };
     use crate::engine::timeseries::columnar_segment::ColumnarSegmentWriter;
     use crate::engine::timeseries::partition_registry::PartitionRegistry;
 
@@ -96,13 +118,14 @@ mod tests {
         let writer = ColumnarSegmentWriter::new(base_dir);
         let mut mt = ColumnarMemtable::new_metric(test_config());
         for i in 0..count {
-            mt.ingest_metric(
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: start_ts + i as i64,
-                    value: (start_ts + i as i64) as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(start_ts + i as i64),
+                    ColumnValue::Float64((start_ts + i as i64) as f64),
+                ],
+            )
+            .unwrap();
         }
         let drain = mt.drain();
         writer
@@ -142,7 +165,7 @@ mod tests {
 
         // Run merge — should merge all 3.
         let now = 10 * day_ms; // far enough in the future
-        let merged = run_merge_cycle(&mut registry, tmp.path(), now).unwrap();
+        let merged = run_merge_cycle(&mut registry, tmp.path(), now, None).unwrap();
         assert_eq!(merged, 1);
 
         // Purge deleted.

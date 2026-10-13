@@ -154,13 +154,16 @@ impl OriginCatalog {
         std::mem::take(&mut *guard)
     }
 
+    /// Whether `collection` has a retention policy with AUTO_TIER on.
+    /// Policies are keyed by policy name, so the lookup is by the
+    /// collection the policy targets.
     pub(super) fn has_auto_tier(&self, collection: &str) -> bool {
         let registry = match &self.retention_policy_registry {
             Some(r) => r,
             None => return false,
         };
         registry
-            .get(self.database_id.as_u64(), self.tenant_id, collection)
+            .get_for_collection(self.database_id.as_u64(), self.tenant_id, collection)
             .is_some_and(|p| p.auto_tier)
     }
 }

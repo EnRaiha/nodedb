@@ -102,8 +102,6 @@ fn inline_hash_join_honors_qualified_left_keys() {
             on: vec![("id".into(), "user_id".into())],
             join_type: "inner".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -160,8 +158,6 @@ fn inline_hash_join_honors_qualified_left_keys() {
             on: vec![("orders.id".into(), "order_id".into())],
             join_type: "inner".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -169,6 +165,7 @@ fn inline_hash_join_honors_qualified_left_keys() {
             left_input: Some(Box::new(PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: None,
                 rows: response_codec::flatten_to_relational_rows(&left_data),
+                sources: Vec::new(),
                 filters: Vec::new(),
                 projection: Vec::new(),
                 computed_columns: Vec::new(),
@@ -181,6 +178,7 @@ fn inline_hash_join_honors_qualified_left_keys() {
             right_input: Some(Box::new(PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: None,
                 rows: response_codec::flatten_to_relational_rows(&right_data),
+                sources: Vec::new(),
                 filters: Vec::new(),
                 projection: Vec::new(),
                 computed_columns: Vec::new(),

@@ -89,7 +89,7 @@ impl GroupBySpiller {
                 self.spill_current_run()?;
             }
             let key_len = key.len();
-            let mut state = GroupState::new(aggregates);
+            let mut state = GroupState::new(aggregates)?;
             state.feed(aggregates, doc)?;
             self.in_mem.insert(key, state);
             self.bytes_estimate = self
@@ -154,13 +154,18 @@ mod tests {
 
     use super::GroupBySpiller;
 
+    /// A spec over `field`. `approx_percentile` gets the median.
     fn make_spec(func: &str, field: &str) -> AggregateSpec {
+        let param = (func == "approx_percentile").then_some(
+            nodedb_physical::physical_plan::AggregateParam::Percentile { fraction: 0.5 },
+        );
         AggregateSpec {
             function: func.to_string(),
             field: field.to_string(),
             alias: format!("{func}({field})"),
             user_alias: None,
             expr: None,
+            param,
         }
     }
 
@@ -186,7 +191,7 @@ mod tests {
         let mut map: HashMap<String, GroupState> = HashMap::new();
         for (key, doc) in groups {
             map.entry(key.clone())
-                .or_insert_with(|| GroupState::new(specs))
+                .or_insert_with(|| GroupState::new(specs).expect("group state"))
                 .feed(specs, doc)
                 .unwrap();
         }
@@ -517,7 +522,7 @@ mod tests {
 
     #[test]
     fn merge_correctness_tdigest() {
-        let specs = vec![make_spec("approx_percentile", "0.5:v")];
+        let specs = vec![make_spec("approx_percentile", "v")];
         let spill_dir = temp_spill_dir("corr_tdigest");
 
         let groups: Vec<(String, Vec<u8>)> = (0..200i64)

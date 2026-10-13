@@ -208,6 +208,7 @@ impl CoreLoop {
                 collection,
                 documents,
                 surrogates,
+                if_absent,
                 ..
             }) => {
                 let resp = self.stage_document_batch_insert(StageBatchInsertParams {
@@ -217,6 +218,7 @@ impl CoreLoop {
                     collection: collection.as_str(),
                     documents,
                     surrogates,
+                    if_absent: *if_absent,
                 });
                 Self::stage_result(&resp)
             }

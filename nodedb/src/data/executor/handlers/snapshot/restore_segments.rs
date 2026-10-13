@@ -91,6 +91,14 @@ impl CoreLoop {
                 crate::types::TenantId::new(tenant_id),
                 collection.clone(),
             );
+            // Under `replace_mode` the snapshot is authoritative for the
+            // collection: the local aggregate state and its image give way to
+            // the snapshot's, installed below once the partitions are in.
+            if replace_mode {
+                self.remove_cagg_image(database_id, tenant_id, &collection)?;
+                self.continuous_agg_mgr
+                    .reset_for_source(database_id, tenant_id, &collection);
+            }
 
             for part_blob in &coll_blob.partitions {
                 // Deserialize PartitionMeta from the embedded msgpack bytes.
@@ -273,6 +281,17 @@ impl CoreLoop {
                 // is idempotent, which is what a repeated restore does.
                 registry.insert_partition(pe);
             }
+            // The restored partitions kept their directory names, so the
+            // snapshot image's folded sets name them. Partitions no aggregate
+            // holds after the merge fold on the maintenance tick.
+            if !coll_blob.cagg_image.is_empty() {
+                self.install_snapshot_cagg_image(
+                    database_id,
+                    tenant_id,
+                    &collection,
+                    &coll_blob.cagg_image,
+                )?;
+            }
         }
         Ok(())
     }
@@ -442,6 +461,7 @@ mod tests {
                     ("value.col".to_string(), b"new-col".to_vec()),
                 ],
             }],
+            cagg_image: Vec::new(),
         }
     }
 
@@ -539,5 +559,113 @@ mod tests {
         );
         let registry = core.ts_registries.get(&key).expect("registry registered");
         assert_eq!(registry.get(5).expect("partition entry").dir_name, "ts-5_6");
+    }
+
+    mod cagg {
+        use crate::bridge::envelope::Status;
+        use crate::data::executor::core_loop::tests::make_core_with_dir;
+        use crate::data::executor::handlers::timeseries::cagg_test_support::{
+            COLLECTION, ROWS_A, TENANT, flush, host_def, ingest, register, totals,
+        };
+        use crate::engine::timeseries::continuous_agg::RefreshPolicy;
+        use crate::types::{DatabaseId, TenantId};
+
+        fn aggregated_source(dir: &std::path::Path) -> crate::data::executor::core_loop::CoreLoop {
+            let (mut core, _tx, _rx) = make_core_with_dir(dir);
+            register(&mut core, host_def("by_host", RefreshPolicy::OnFlush));
+            core.fold_pending_cagg_partitions(0);
+            assert_eq!(ingest(&mut core, ROWS_A, 1), Status::Ok);
+            flush(&mut core);
+            core
+        }
+
+        /// The image travels with the partitions it names, and the restore
+        /// keeps their names, so the restored aggregate counts every row once.
+        #[test]
+        fn snapshot_image_and_partitions_restore_in_step() {
+            let source_dir = tempfile::tempdir().expect("tempdir");
+            let mut source = aggregated_source(source_dir.path());
+            let blobs = source
+                .capture_flushed_ts_segments(0, TenantId::new(TENANT))
+                .expect("capture");
+            assert_eq!(blobs.len(), 1);
+            assert!(!blobs[0].cagg_image.is_empty());
+
+            let target_dir = tempfile::tempdir().expect("tempdir");
+            let (mut target, _tx, _rx) = make_core_with_dir(target_dir.path());
+            register(&mut target, host_def("by_host", RefreshPolicy::OnFlush));
+            target
+                .restore_flushed_ts_segments(&blobs, true)
+                .expect("restore");
+            target.fold_pending_cagg_partitions(0);
+            assert_eq!(totals(&target, "by_host"), (3, 111));
+        }
+
+        /// A collection whose raw partitions are gone still ships the
+        /// buckets folded from them.
+        #[test]
+        fn snapshot_carries_history_beyond_raw_retention() {
+            let source_dir = tempfile::tempdir().expect("tempdir");
+            let mut source = aggregated_source(source_dir.path());
+            let key = (
+                DatabaseId::DEFAULT,
+                TenantId::new(TENANT),
+                COLLECTION.to_string(),
+            );
+            let names: Vec<String> = source
+                .ts_registries
+                .get(&key)
+                .map(|r| r.iter().map(|(_, e)| e.dir_name.clone()).collect())
+                .unwrap_or_default();
+            source.ts_registries.remove(&key);
+            let ts_dir = crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
+                source_dir.path(),
+                0,
+                TENANT,
+                COLLECTION,
+            );
+            for name in &names {
+                std::fs::remove_dir_all(ts_dir.join(name)).expect("remove partition");
+            }
+            source
+                .continuous_agg_mgr
+                .forget_partitions(0, TENANT, COLLECTION, &names);
+            let blobs = source
+                .capture_flushed_ts_segments(0, TenantId::new(TENANT))
+                .expect("capture");
+            assert_eq!(blobs.len(), 1);
+            assert!(blobs[0].partitions.is_empty());
+
+            let target_dir = tempfile::tempdir().expect("tempdir");
+            let (mut target, _tx, _rx) = make_core_with_dir(target_dir.path());
+            register(&mut target, host_def("by_host", RefreshPolicy::OnFlush));
+            target
+                .restore_flushed_ts_segments(&blobs, true)
+                .expect("restore");
+            target.fold_pending_cagg_partitions(0);
+            assert_eq!(totals(&target, "by_host"), (3, 111));
+        }
+
+        /// A merge restore into an aggregate that already holds other
+        /// partitions adds the snapshot's buckets once.
+        #[test]
+        fn merge_restore_adds_disjoint_history_once() {
+            let source_dir = tempfile::tempdir().expect("tempdir");
+            let mut source = aggregated_source(source_dir.path());
+            let blobs = source
+                .capture_flushed_ts_segments(0, TenantId::new(TENANT))
+                .expect("capture");
+
+            let target_dir = tempfile::tempdir().expect("tempdir");
+            let (mut target, _tx, _rx) = make_core_with_dir(target_dir.path());
+            register(&mut target, host_def("by_host", RefreshPolicy::OnFlush));
+            target.fold_pending_cagg_partitions(0);
+            target
+                .restore_flushed_ts_segments(&blobs, false)
+                .expect("restore");
+            target.fold_pending_cagg_partitions(0);
+            target.fold_pending_cagg_partitions(0);
+            assert_eq!(totals(&target, "by_host"), (3, 111));
+        }
     }
 }

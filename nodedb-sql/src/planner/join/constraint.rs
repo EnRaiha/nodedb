@@ -8,7 +8,7 @@ use crate::error::{Result, SqlError};
 use crate::parser::normalize::normalize_ident;
 use crate::planner::predicate_coerce::coerce_predicate_literals;
 use crate::resolver::ColumnScope;
-use crate::resolver::columns::TableScope;
+use crate::resolver::columns::{BareColumn, ColumnNaming, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -16,40 +16,45 @@ use crate::types::*;
 pub(super) type JoinSpec = (JoinType, Vec<(String, String)>, Option<SqlExpr>);
 
 /// Extract join type, equi-join keys, and non-equi condition.
-pub(super) fn extract_join_spec(op: &ast::JoinOperator, scope: &TableScope) -> Result<JoinSpec> {
-    match op {
+///
+/// `right_ref` is the scope key of the relation this join adds: a `USING`
+/// column must exist on it and on a relation before it.
+pub(super) fn extract_join_spec(
+    op: &ast::JoinOperator,
+    scope: &TableScope,
+    right_ref: Option<&str>,
+) -> Result<JoinSpec> {
+    let (join_type, constraint) = match op {
         ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Inner, keys, cond))
+            (JoinType::Inner, constraint)
         }
         ast::JoinOperator::Left(constraint) | ast::JoinOperator::LeftOuter(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Left, keys, cond))
+            (JoinType::Left, constraint)
         }
         ast::JoinOperator::Right(constraint) | ast::JoinOperator::RightOuter(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Right, keys, cond))
+            (JoinType::Right, constraint)
         }
-        ast::JoinOperator::FullOuter(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Full, keys, cond))
+        ast::JoinOperator::FullOuter(constraint) => (JoinType::Full, constraint),
+        // `CROSS JOIN` takes no ON or USING clause: every left row pairs
+        // with every right row.
+        ast::JoinOperator::CrossJoin(ast::JoinConstraint::None) => {
+            return Ok((JoinType::Cross, Vec::new(), None));
         }
-        ast::JoinOperator::CrossJoin(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Cross, keys, cond))
-        }
+        ast::JoinOperator::CrossJoin(constraint) => (JoinType::Cross, constraint),
         ast::JoinOperator::Semi(constraint) | ast::JoinOperator::LeftSemi(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Semi, keys, cond))
+            (JoinType::Semi, constraint)
         }
         ast::JoinOperator::Anti(constraint) | ast::JoinOperator::LeftAnti(constraint) => {
-            let (keys, cond) = extract_join_constraint(constraint, scope)?;
-            Ok((JoinType::Anti, keys, cond))
+            (JoinType::Anti, constraint)
         }
-        _ => Err(SqlError::Unsupported {
-            detail: format!("join type: {op:?}"),
-        }),
-    }
+        _ => {
+            return Err(SqlError::Unsupported {
+                detail: format!("join type: {op:?}"),
+            });
+        }
+    };
+    let (keys, cond) = extract_join_constraint(constraint, scope, right_ref)?;
+    Ok((join_type, keys, cond))
 }
 
 /// (equi_keys, non-equi condition)
@@ -58,6 +63,7 @@ type JoinConstraintResult = (Vec<(String, String)>, Option<SqlExpr>);
 fn extract_join_constraint(
     constraint: &ast::JoinConstraint,
     scope: &TableScope,
+    right_ref: Option<&str>,
 ) -> Result<JoinConstraintResult> {
     match constraint {
         ast::JoinConstraint::On(expr) => {
@@ -83,12 +89,14 @@ fn extract_join_constraint(
             };
             Ok((keys, cond))
         }
+        // `USING (k)` names `k` on both sides, so it is not an ambiguous
+        // bare reference. Each side reads its own `k` before the rows merge.
         ast::JoinConstraint::Using(columns) => {
             let keys = columns
                 .iter()
                 .map(|c| {
                     let name = crate::parser::normalize::normalize_object_name_checked(c)?;
-                    scope.check_name(None, &name)?;
+                    scope.check_using_column(right_ref, &name)?;
                     Ok((name.clone(), name))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -124,9 +132,7 @@ fn extract_equi_keys(
             right,
         } => {
             if let (Some(l), Some(r)) = (extract_col_ref(left), extract_col_ref(right)) {
-                check_join_key(scope, &l)?;
-                check_join_key(scope, &r)?;
-                keys.push((l, r));
+                keys.push((resolve_join_key(scope, l)?, resolve_join_key(scope, r)?));
             } else {
                 non_equi.push(expr.clone());
             }
@@ -168,12 +174,25 @@ pub(super) fn orient_keys_to_sides(keys: &mut [(String, String)], right_ids: &[S
     }
 }
 
-/// Reject a join key, qualified or bare, that names nothing in `scope`.
-fn check_join_key(scope: &TableScope, key: &str) -> Result<()> {
-    match key.rsplit_once('.') {
-        Some((table, column)) => scope.check_name(Some(table), column),
-        None => scope.check_name(None, key),
+/// Check a join key, qualified or bare, against `scope` and return it in the
+/// form the join reads.
+///
+/// A qualified key is kept as written. Over a join's merged rows, a bare key
+/// is qualified with the relation that owns it, as written-qualified keys
+/// are, so it orients to its side and an ambiguous one is refused.
+fn resolve_join_key(scope: &TableScope, key: String) -> Result<String> {
+    if let Some((table, column)) = key.rsplit_once('.') {
+        scope.check_name(Some(table), column)?;
+        return Ok(key);
     }
+    let owner = scope.resolve_bare(&key)?;
+    Ok(match (scope.column_naming(), owner) {
+        (ColumnNaming::JoinRow, BareColumn::Relation(table)) => {
+            format!("{}.{key}", table.ref_name())
+        }
+        (ColumnNaming::JoinRow, BareColumn::Output | BareColumn::Outer)
+        | (ColumnNaming::AsWritten | ColumnNaming::OutputRow, _) => key,
+    })
 }
 
 fn extract_col_ref(expr: &ast::Expr) -> Option<String> {

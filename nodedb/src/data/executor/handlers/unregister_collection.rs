@@ -272,6 +272,16 @@ impl CoreLoop {
             removed
         };
 
+        // Continuous aggregates rooted here. The owning core removes their
+        // image first: a clear-then-install restores partitions under new
+        // folded sets, and a stale image would count their rows twice. Every
+        // core resets the aggregates in memory.
+        if self.owns_collection(db, collection)? {
+            self.remove_cagg_image(db_raw, tid_raw, collection)?;
+        }
+        self.continuous_agg_mgr
+            .reset_for_source(db_raw, tid_raw, collection);
+
         // Timeseries engine.
         let ts_removed = {
             let key = (db, tid, coll.clone());

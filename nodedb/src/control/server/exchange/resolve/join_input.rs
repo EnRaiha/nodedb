@@ -14,6 +14,7 @@ use crate::control::server::exchange::gather::{finalize_aggregate, gather_all_vs
 
 use super::capture::DistributedReadCapture;
 use super::exchange::provider_scan_of_rows;
+use crate::control::server::shared::authorization::gathered_sources;
 
 /// Resolve a `HashJoin` input slot.
 ///
@@ -58,9 +59,10 @@ pub(super) async fn resolve_join_input(
             // The gather reads every vShard of the child from its owner, not
             // only the groups this node replicates, and confirms each leg as
             // `scope` requires.
+            let sources = gathered_sources(&child, database_id)?;
             let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
             let provider_scan =
-                provider_scan_of_rows(flatten_to_relational_rows(&outcome.merged_array));
+                provider_scan_of_rows(flatten_to_relational_rows(&outcome.merged_array), sources);
             Ok(Some(Box::new(provider_scan)))
         }
 
@@ -105,6 +107,7 @@ pub(super) async fn resolve_join_input(
             } else {
                 None
             };
+            let sources = gathered_sources(&child, database_id)?;
             // Read from every vShard's owner, as the Broadcast arm does.
             let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
             if let Some(coll) = child_collection
@@ -125,7 +128,7 @@ pub(super) async fn resolve_join_input(
             } else {
                 outcome.merged_array
             };
-            let provider_scan = provider_scan_of_rows(flatten_to_relational_rows(&merged));
+            let provider_scan = provider_scan_of_rows(flatten_to_relational_rows(&merged), sources);
             Ok(Some(Box::new(provider_scan)))
         }
 
@@ -204,6 +207,7 @@ pub(super) async fn gather_join_build_side(
     // → `resolve_exchange` → here. The cycle terminates at runtime (the scan
     // plan is Exchange-free), but the future must be heap-indirected so its size
     // is finite.
+    let sources = gathered_sources(&scan_plan, database_id)?;
     let outcome = Box::pin(gather_all_vshards(state, scan_plan, scope)).await?;
 
     if let Some(scan_plan) = capture_plan {
@@ -215,5 +219,6 @@ pub(super) async fn gather_join_build_side(
 
     Ok(Some(Box::new(provider_scan_of_rows(
         flatten_to_relational_rows(&outcome.merged_array),
+        sources,
     ))))
 }

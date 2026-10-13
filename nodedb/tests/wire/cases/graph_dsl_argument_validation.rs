@@ -2,7 +2,7 @@
 
 //! The Graph DSL must reject arguments outside its own vocabulary.
 //!
-//! Two contracts, both about telling the caller what is wrong:
+//! Three contracts, all about telling the caller what is wrong:
 //!
 //! 1. A clause value the DSL does not recognise is refused, not quietly
 //!    replaced by the default. Defaulting an *omitted* clause is correct and
@@ -12,6 +12,8 @@
 //!    variant parsers return `Option`, so a malformed graph statement is
 //!    indistinguishable from input that was never a graph statement, and the
 //!    caller is told `GRAPH` is not an SQL statement at all.
+//! 3. Every token is a clause keyword or a clause value. A misspelled clause
+//!    keyword, a stray token, or a repeated clause is refused by name.
 //!
 //! Sibling numeric-range coverage lives in `graph_dsl_handlers.rs`
 //! (`graph_traverse_rejects_absurd_depth` and friends), which rejects values
@@ -213,4 +215,83 @@ async fn traverse_without_depth_still_defaults() {
         .query_text("GRAPH TRAVERSE IN 'gdepth_default' FROM 'a'")
         .await
         .expect("an omitted DEPTH must keep defaulting, not error");
+}
+
+// ── 3. Every token is a clause or a clause value ─────────────────────
+
+/// A misspelled clause keyword must be refused by name. Skipping it would
+/// run the walk at the default depth, a different question from the one
+/// asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn traverse_rejects_misspelled_depth_clause() {
+    let server = TestServer::start().await;
+    seed(&server, "gtok_depth").await;
+
+    server
+        .expect_error(
+            "GRAPH TRAVERSE IN 'gtok_depth' FROM 'a' DEPTS 3",
+            "unexpected token 'DEPTS' in GRAPH TRAVERSE",
+        )
+        .await;
+}
+
+/// A misspelled `LABEL` must be refused. Skipping it would drop the label
+/// filter and return every neighbour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn neighbors_rejects_misspelled_label_clause() {
+    let server = TestServer::start().await;
+    seed(&server, "gtok_label").await;
+
+    server
+        .expect_error(
+            "GRAPH NEIGHBORS IN 'gtok_label' OF 'a' LABELS 'knows'",
+            "unexpected token 'LABELS' in GRAPH NEIGHBORS",
+        )
+        .await;
+}
+
+/// Arbitrary tokens between clauses are refused by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn traverse_rejects_stray_tokens() {
+    let server = TestServer::start().await;
+    seed(&server, "gtok_stray").await;
+
+    server
+        .expect_error(
+            "GRAPH TRAVERSE IN 'gtok_stray' FROM 'a' BANANA PHONE",
+            "unexpected token 'BANANA'",
+        )
+        .await;
+}
+
+/// A clause given twice is refused rather than silently taking one value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn traverse_rejects_repeated_clause() {
+    let server = TestServer::start().await;
+    seed(&server, "gtok_dup").await;
+
+    server
+        .expect_error(
+            "GRAPH TRAVERSE IN 'gtok_dup' FROM 'a' DEPTH 1 DEPTH 3",
+            "DEPTH given more than once",
+        )
+        .await;
+}
+
+/// The value `in` of a `DIRECTION` clause is not the `IN <collection>`
+/// clause. The walk must run on the named collection, inbound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direction_value_in_does_not_shadow_in_clause() {
+    let server = TestServer::start().await;
+    seed(&server, "gtok_dir").await;
+
+    let rows = server
+        .query_text_joined("GRAPH TRAVERSE FROM 'b' DIRECTION in IN 'gtok_dir' DEPTH 1")
+        .await
+        .expect("clauses in any order must parse");
+
+    assert!(
+        rows.iter().any(|r| r.contains('a')),
+        "an inbound walk from 'b' must reach 'a': {rows:?}"
+    );
 }

@@ -18,6 +18,9 @@ pub(crate) struct AutocommitWrite {
     pub trace_id: TraceId,
     pub event_source: crate::event::EventSource,
     pub txn_id: Option<crate::types::TxnId>,
+    /// The roles of the identity that wrote the write. Empty for a write no
+    /// user made.
+    pub user_roles: Vec<String>,
 }
 
 /// Identity + WAL LSN of a single autocommit write dispatched to the Data
@@ -55,6 +58,8 @@ pub(super) struct DataPlaneDispatch {
     pub(super) trace_id: TraceId,
     pub(super) event_source: crate::event::EventSource,
     pub(super) txn_id: Option<crate::types::TxnId>,
+    /// The roles of the identity that wrote the write.
+    pub(super) user_roles: Vec<String>,
     /// Who owns this write's durable redo record — the funnel appends it under
     /// the write-admission guard, or the caller already recorded durability
     /// elsewhere and supplies the LSN it minted.

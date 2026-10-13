@@ -6,6 +6,7 @@
 //! Data enters via INGEST (mapped to `TimeseriesIngest`).
 //! Scans route to `TimeseriesScan` for time-range-aware execution.
 
+use crate::engine_rules::timeseries_native::native_shape;
 use crate::engine_rules::*;
 use crate::error::{Result, SqlError};
 use crate::types::*;
@@ -20,6 +21,16 @@ impl EngineRules for TimeseriesRules {
             rows: p.rows,
             volatile_defaults: p.volatile_defaults,
         })])
+    }
+
+    fn plan_insert_select(&self, p: InsertSelectParams) -> Result<Vec<SqlPlan>> {
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "INSERT ... SELECT into timeseries collection '{}' is not supported; \
+                 the target must be a document collection",
+                p.collection
+            ),
+        })
     }
 
     fn plan_upsert(&self, _p: UpsertParams) -> Result<Vec<SqlPlan>> {
@@ -47,11 +58,14 @@ impl EngineRules for TimeseriesRules {
             group_by: Vec::new(),
             aggregates: Vec::new(),
             filters: p.filters,
+            having: Vec::new(),
             projection: p.projection,
             gap_fill: String::new(),
-            limit: p.limit.unwrap_or(10000),
+            // No LIMIT reads every row. The Data Plane bounds that read by
+            // the per-query byte budget and fails it loudly past the budget.
+            limit: p.limit.unwrap_or(usize::MAX),
             sort_keys: p.sort_keys,
-            tiered: false,
+            tiered: p.has_auto_tier,
             temporal: p.temporal,
         }))
     }
@@ -111,13 +125,46 @@ impl EngineRules for TimeseriesRules {
                 ),
             });
         }
+        let Some(shape) = native_shape(&p) else {
+            // The generic aggregate runs over the raw row source: memtable,
+            // flushed partitions, staged rows, read policy and bitemporal
+            // scope. On an auto-tier collection the scan refuses a range that
+            // only downsampled tiers hold, since those carry no raw rows.
+            let input = SqlPlan::TimeseriesScan(TimeseriesScanPlan {
+                collection: p.collection,
+                time_range: default_time_range(),
+                bucket_interval_ms: 0,
+                group_by: Vec::new(),
+                aggregates: Vec::new(),
+                filters: p.filters,
+                having: Vec::new(),
+                projection: Vec::new(),
+                gap_fill: String::new(),
+                limit: usize::MAX,
+                sort_keys: Vec::new(),
+                tiered: p.has_auto_tier,
+                temporal: p.temporal,
+            });
+            return Ok(SqlPlan::Aggregate {
+                input: Box::new(input),
+                group_by: p.group_by,
+                group_by_aliases: Vec::new(),
+                output_order: Vec::new(),
+                aggregates: p.aggregates,
+                having: p.having,
+                limit: p.limit,
+                grouping_sets: p.grouping_sets,
+                sort_keys: Vec::new(),
+            });
+        };
         Ok(SqlPlan::TimeseriesScan(TimeseriesScanPlan {
             collection: p.collection,
             time_range: default_time_range(),
-            bucket_interval_ms: p.bucket_interval_ms.unwrap_or(0),
-            group_by: p.group_columns,
+            bucket_interval_ms: shape.bucket_interval_ms,
+            group_by: shape.group_columns,
             aggregates: p.aggregates,
             filters: p.filters,
+            having: p.having,
             projection: Vec::new(),
             gap_fill: String::new(),
             limit: p.limit,
@@ -151,4 +198,42 @@ impl EngineRules for TimeseriesRules {
 /// At the SqlPlan level, we pass unbounded defaults.
 fn default_time_range() -> (i64, i64) {
     (i64::MIN, i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(limit: Option<usize>) -> SqlPlan {
+        TimeseriesRules
+            .plan_scan(ScanParams {
+                collection: "metrics".into(),
+                alias: None,
+                filters: Vec::new(),
+                projection: Vec::new(),
+                sort_keys: Vec::new(),
+                limit,
+                offset: 0,
+                distinct: false,
+                window_functions: Vec::new(),
+                indexes: Vec::new(),
+                temporal: crate::temporal::TemporalScope::default(),
+                bitemporal: false,
+                has_auto_tier: false,
+            })
+            .expect("plans")
+    }
+
+    /// No LIMIT reads every row. A 10,000-row default cut the read silently.
+    #[test]
+    fn plan_scan_without_limit_is_unbounded() {
+        let SqlPlan::TimeseriesScan(plan) = scan(None) else {
+            panic!("expected a timeseries scan");
+        };
+        assert_eq!(plan.limit, usize::MAX);
+        let SqlPlan::TimeseriesScan(plan) = scan(Some(5)) else {
+            panic!("expected a timeseries scan");
+        };
+        assert_eq!(plan.limit, 5);
+    }
 }

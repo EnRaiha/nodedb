@@ -141,6 +141,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             collection,
             documents,
             surrogates,
+            if_absent,
             resolved_sum_targets,
             deferred_sum_targets,
             resolved_sum_target_bindings,
@@ -150,6 +151,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             collection,
             documents,
             surrogates,
+            *if_absent,
             &sums(resolved_sum_target_bindings, resolved_sum_targets),
             deferred_sum_targets,
             ReturningFields {
@@ -191,19 +193,6 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
             },
             declared_primary_key.clone(),
         )),
-        ReplicatedWrite::InsertSelect {
-            target_collection,
-            source_collection,
-            source_filters,
-            source_limit,
-            column_map,
-        } => Ok(document::insert_select(
-            target_collection,
-            source_collection,
-            source_filters,
-            *source_limit,
-            column_map,
-        )),
         ReplicatedWrite::ApplyBalanceDelta {
             collection,
             document_id,
@@ -229,7 +218,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
         } => Ok(document::resolved_write(mutations, response_payload)),
         ReplicatedWrite::MergeApply {
             target_collection,
-            source_collection,
+            source,
             source_alias,
             target_join_col,
             source_join_col,
@@ -245,7 +234,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
         } => Ok(document_join::merge_apply(
             document_join::JoinFields {
                 target_collection,
-                source_collection,
+                source,
                 source_alias,
                 target_join_col,
                 source_join_col,
@@ -265,7 +254,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
         )),
         ReplicatedWrite::UpdateFromJoinApply {
             target_collection,
-            source_collection,
+            source,
             source_alias,
             target_join_col,
             source_join_col,
@@ -280,7 +269,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
         } => Ok(document_join::update_from_join_apply(
             document_join::JoinFields {
                 target_collection,
-                source_collection,
+                source,
                 source_alias,
                 target_join_col,
                 source_join_col,

@@ -56,6 +56,7 @@ use super::grace_partitioner::GraceSpec;
 use super::grace_spill::PartitionedSpiller;
 use super::params::JoinParams;
 use super::row_source::RowSource;
+use super::support::row_qualifier;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::scan_budget::budget_exceeded;
@@ -156,8 +157,11 @@ impl CoreLoop {
             left_scan_filters,
             right_scan_filters,
         } = sides;
-        let probe_collection = left_alias.unwrap_or(left_collection);
-        let index_collection = right_alias.unwrap_or(right_collection);
+        let database_id = join.task.request.database_id;
+        let probe_collection =
+            left_alias.unwrap_or_else(|| row_qualifier(left_collection, database_id));
+        let index_collection =
+            right_alias.unwrap_or_else(|| row_qualifier(right_collection, database_id));
 
         // Probe-side (left) and build-side (right) join-key field names.
         let probe_keys: Vec<&str> = join.on.iter().map(|(l, _)| l.as_str()).collect();

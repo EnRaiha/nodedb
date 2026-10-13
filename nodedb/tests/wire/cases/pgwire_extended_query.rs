@@ -405,7 +405,10 @@ async fn extended_query_untyped_numeric_where_equals() {
 async fn extended_query_dsl_search_vector_substitutes_params() {
     let server = TestServer::start().await;
     server
-        .exec("CREATE COLLECTION v (id STRING PRIMARY KEY, embedding VECTOR(3)) WITH (engine='vector')")
+        .exec(
+            "CREATE COLLECTION v (id STRING PRIMARY KEY, embedding VECTOR(3)) \
+             WITH (engine='vector', vector_field='embedding', dim=3)",
+        )
         .await
         .unwrap();
     server

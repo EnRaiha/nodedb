@@ -119,8 +119,6 @@ fn hash_join_completeness_past_50k_cap() {
             join_type: "inner".into(),
             // Use a large limit so the join itself doesn't cap results.
             limit: 1_000_000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -192,6 +190,8 @@ fn sort_merge_join_completeness_past_50k_cap() {
             pre_sorted: false,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -260,6 +260,8 @@ fn nested_loop_join_completeness_past_50k_cap() {
             limit: 1_000_000,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -323,8 +325,6 @@ fn hash_join_left_side_over_budget_streams_and_completes() {
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -395,8 +395,6 @@ fn hash_join_right_side_over_budget_spills_and_completes() {
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -466,8 +464,6 @@ fn hash_join_build_side_spill_returns_all_matches_across_partitions() {
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -547,8 +543,6 @@ fn hash_join_probe_side_spill_returns_all_matches() {
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -610,6 +604,8 @@ fn sort_merge_join_left_over_budget_surfaces_error() {
             pre_sorted: false,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -654,6 +650,8 @@ fn sort_merge_join_right_over_budget_surfaces_error() {
             pre_sorted: false,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -697,6 +695,8 @@ fn nested_loop_join_left_over_budget_surfaces_error() {
             limit: 1_000_000,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -740,6 +740,8 @@ fn nested_loop_join_right_over_budget_surfaces_error() {
             limit: 1_000_000,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -795,6 +797,8 @@ fn no_limit_join_output_over_budget_surfaces_error() {
             limit: usize::MAX,
             left_rls_filters: Vec::new(),
             right_rls_filters: Vec::new(),
+            left_input: None,
+            right_input: None,
         }),
     );
 
@@ -852,8 +856,6 @@ fn no_limit_join_within_budget_returns_all_rows_past_10k() {
             join_type: "inner".into(),
             // No SQL LIMIT.
             limit: usize::MAX,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -918,8 +920,6 @@ fn explicit_limit_join_caps_at_k_regardless_of_budget() {
             join_type: "inner".into(),
             // Explicit LIMIT k — honored exactly.
             limit: k,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -980,8 +980,6 @@ fn join_budget_zero_is_unlimited() {
             on: vec![("key".into(), "key".into())],
             join_type: "inner".into(),
             limit: 1_000_000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),

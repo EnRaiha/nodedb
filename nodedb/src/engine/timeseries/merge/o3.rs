@@ -18,10 +18,33 @@ use crate::engine::timeseries::o3_buffer::O3Row;
 /// writes a new partition file, then atomically swaps via rename.
 /// The old partition file is untouched until the swap succeeds — concurrent
 /// queries read the old version until the swap completes.
+///
+/// ## Continuous-aggregate invariant
+///
+/// Every continuous aggregate records, by directory name, the sealed
+/// partitions it has folded. A merge must keep that record exact:
+///
+/// - A merge moves rows and never changes them. The merged partition holds
+///   exactly the union of its sources' rows.
+/// - The merged directory name joins an aggregate's folded set only when
+///   every source partition was already in it. The source names then leave
+///   the set.
+/// - A group where some aggregate has folded some sources and not others
+///   does not merge. The maintenance tick folds the missing sources first.
+/// - A rewrite that adds, removes, or changes rows in place is forbidden.
+///   The folded set cannot express it, and the aggregate would count those
+///   rows twice or lose them.
+/// - The aggregate image is rewritten after the merge commits, before the
+///   source directories are removed. A crash between the two leaves both
+///   names on disk, and the image still names only the sources.
+///
+/// `kek` is the timeseries segment key: the partition is read and written
+/// with it. `None` reads and writes plaintext.
 pub fn merge_o3_into_partition(
     base_dir: &Path,
     partition_dir_name: &str,
     o3_rows: &[O3Row],
+    kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
 ) -> Result<PartitionMeta, SegmentError> {
     if o3_rows.is_empty() {
         return Err(SegmentError::Io("no O3 rows to merge".into()));
@@ -36,8 +59,8 @@ pub fn merge_o3_into_partition(
     }
 
     // Read existing partition data.
-    let existing_meta = ColumnarSegmentReader::read_meta(&partition_dir, None)?;
-    let existing_schema = ColumnarSegmentReader::read_schema(&partition_dir, None)?;
+    let existing_meta = ColumnarSegmentReader::read_meta(&partition_dir, kek)?;
+    let existing_schema = ColumnarSegmentReader::read_schema(&partition_dir, kek)?;
     let ts_type = existing_schema
         .columns
         .get(existing_schema.timestamp_idx)
@@ -48,9 +71,9 @@ pub fn merge_o3_into_partition(
             ))
         })?;
 
-    let ts_col = ColumnarSegmentReader::read_column(&partition_dir, "timestamp", ts_type, None)?;
+    let ts_col = ColumnarSegmentReader::read_column(&partition_dir, "timestamp", ts_type, kek)?;
     let val_col =
-        ColumnarSegmentReader::read_column(&partition_dir, "value", ColumnType::Float64, None)?;
+        ColumnarSegmentReader::read_column(&partition_dir, "value", ColumnType::Float64, kek)?;
 
     let existing_ts = ts_col.as_timestamps();
     let existing_val = val_col.as_f64();
@@ -122,7 +145,7 @@ pub fn merge_o3_into_partition(
         &drain.view(),
         existing_meta.interval_ms,
         existing_meta.last_flushed_wal_lsn,
-        None,
+        kek,
     )?;
 
     // Durable directory swap: rename original → backup, tmp → original, then
@@ -137,7 +160,12 @@ pub fn merge_o3_into_partition(
         &tmp_name,
     )
     .map_err(|e| SegmentError::Io(format!("atomic dir swap: {e}")))?;
-    let _ = std::fs::remove_dir_all(&backup_dir); // Best-effort cleanup.
+    std::fs::remove_dir_all(&backup_dir).map_err(|e| {
+        SegmentError::Io(format!(
+            "remove replaced partition {}: {e}",
+            backup_dir.display()
+        ))
+    })?;
 
     Ok(new_meta)
 }

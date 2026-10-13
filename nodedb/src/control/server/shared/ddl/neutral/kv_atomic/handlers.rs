@@ -16,7 +16,8 @@ use nodedb_sql::planner::dml_helpers::KvCounterKind;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::dispatch::{
-    ddl_err, dispatch_and_respond, parse_function_args, parse_i64, parse_optional_ttl, unquote,
+    KvAtomicDispatch, ddl_err, dispatch_and_respond, parse_function_args, parse_i64,
+    parse_optional_ttl, unquote,
 };
 
 /// Handle `SELECT KV_INCR(collection, key, delta [, TTL => seconds])`
@@ -25,6 +26,7 @@ use super::dispatch::{
 pub async fn kv_incr(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
     negate: bool,
     txn_ctx: &DmlTxnCtx<'_>,
@@ -52,19 +54,26 @@ pub async fn kv_incr(
 
     let ttl_ms = parse_optional_ttl(&args[3..])?;
 
-    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
         state,
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         identity.tenant_id,
         key.as_bytes(),
         crate::types::TraceId::ZERO,
     )
     .await
     .map_err(|e| DdlError::from_error(&e))?;
-    let shape = counter_shape(state, identity, &collection, &key, KvCounterKind::Integer)?;
+    let shape = counter_shape(
+        state,
+        identity,
+        database_id,
+        &collection,
+        &key,
+        KvCounterKind::Integer,
+    )?;
     let plan = PhysicalPlan::Kv(KvOp::Incr {
-        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         key: key.as_bytes().to_vec(),
         delta,
         ttl_ms,
@@ -78,10 +87,13 @@ pub async fn kv_incr(
     dispatch_and_respond(
         state,
         identity,
-        vshard,
-        plan,
-        func_name,
-        &[collection.as_str()],
+        database_id,
+        KvAtomicDispatch {
+            vshard,
+            plan,
+            func_name,
+            collections: &[collection.as_str()],
+        },
         txn_ctx,
     )
     .await
@@ -93,6 +105,7 @@ pub async fn kv_incr(
 pub async fn kv_incr_float(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -120,19 +133,26 @@ pub async fn kv_incr_float(
         ));
     }
 
-    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
         state,
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         identity.tenant_id,
         key.as_bytes(),
         crate::types::TraceId::ZERO,
     )
     .await
     .map_err(|e| DdlError::from_error(&e))?;
-    let shape = counter_shape(state, identity, &collection, &key, KvCounterKind::Float)?;
+    let shape = counter_shape(
+        state,
+        identity,
+        database_id,
+        &collection,
+        &key,
+        KvCounterKind::Float,
+    )?;
     let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         key: key.as_bytes().to_vec(),
         delta,
         surrogate,
@@ -144,10 +164,13 @@ pub async fn kv_incr_float(
     dispatch_and_respond(
         state,
         identity,
-        vshard,
-        plan,
-        "KV_INCR_FLOAT",
-        &[collection.as_str()],
+        database_id,
+        KvAtomicDispatch {
+            vshard,
+            plan,
+            func_name: "KV_INCR_FLOAT",
+            collections: &[collection.as_str()],
+        },
         txn_ctx,
     )
     .await
@@ -161,15 +184,13 @@ pub async fn kv_incr_float(
 fn counter_shape(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
     key: &str,
     kind: KvCounterKind,
 ) -> Result<KvCounterShape, DdlError> {
-    let gate = super::super::read_gate::CollectionReadGate::for_request(
-        state,
-        identity,
-        DatabaseId::DEFAULT,
-    );
+    let gate =
+        super::super::read_gate::CollectionReadGate::for_request(state, identity, database_id);
     gate.authorize(collection)?;
     gate.authorize_permission(
         collection,
@@ -178,7 +199,7 @@ fn counter_shape(
     crate::control::planner::sql_plan_convert::kv_counter_shape::kv_counter_shape(
         state,
         identity.tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         collection,
         key,
         kind,
@@ -196,6 +217,7 @@ fn counter_shape(
 pub async fn kv_cas(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -213,10 +235,10 @@ pub async fn kv_cas(
     let expected = unquote(&args[2]);
     let new_value = unquote(&args[3]);
 
-    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
         state,
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         identity.tenant_id,
         key.as_bytes(),
         crate::types::TraceId::ZERO,
@@ -224,7 +246,7 @@ pub async fn kv_cas(
     .await
     .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::Cas {
-        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         key: key.as_bytes().to_vec(),
         expected: expected.into_bytes(),
         new_value: new_value.into_bytes(),
@@ -236,10 +258,13 @@ pub async fn kv_cas(
     dispatch_and_respond(
         state,
         identity,
-        vshard,
-        plan,
-        "KV_CAS",
-        &[collection.as_str()],
+        database_id,
+        KvAtomicDispatch {
+            vshard,
+            plan,
+            func_name: "KV_CAS",
+            collections: &[collection.as_str()],
+        },
         txn_ctx,
     )
     .await
@@ -251,6 +276,7 @@ pub async fn kv_cas(
 pub async fn kv_getset(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -267,10 +293,10 @@ pub async fn kv_getset(
     let key = unquote(&args[1]);
     let new_value = unquote(&args[2]);
 
-    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
     let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
         state,
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         identity.tenant_id,
         key.as_bytes(),
         crate::types::TraceId::ZERO,
@@ -278,7 +304,7 @@ pub async fn kv_getset(
     .await
     .map_err(|e| DdlError::from_error(&e))?;
     let plan = PhysicalPlan::Kv(KvOp::GetSet {
-        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         key: key.as_bytes().to_vec(),
         new_value: new_value.into_bytes(),
         surrogate,
@@ -291,10 +317,13 @@ pub async fn kv_getset(
     dispatch_and_respond(
         state,
         identity,
-        vshard,
-        plan,
-        "KV_GETSET",
-        &[collection.as_str()],
+        database_id,
+        KvAtomicDispatch {
+            vshard,
+            plan,
+            func_name: "KV_GETSET",
+            collections: &[collection.as_str()],
+        },
         txn_ctx,
     )
     .await

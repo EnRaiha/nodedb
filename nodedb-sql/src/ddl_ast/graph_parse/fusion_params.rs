@@ -2,23 +2,20 @@
 
 //! Shared parameter extraction for graph-vector fusion SQL surfaces.
 //!
-//! Two syntaxes reach the same `GraphOp::RagFusion` executor today:
+//! Two syntaxes reach the same `GraphOp::RagFusion` executor:
 //!
 //! - `GRAPH RAG FUSION ON <col> QUERY ARRAY[...] ...` (DSL form)
 //! - `SEARCH <col> USING FUSION(ARRAY[...] ...)` (wrapped form)
 //!
 //! They use different keyword aliases for the same parameters
 //! (`EXPANSION_DEPTH` vs `DEPTH`, `EDGE_LABEL` vs `LABEL`, `FINAL_TOP_K`
-//! vs `TOP`). Both must extract the same typed bag so future fusion
-//! variants (hybrid text+vector, multi-vector, etc.) can share this
-//! code and cannot silently drop parameters the way substring-find
-//! parsing did.
+//! vs `TOP`). Both read into the same typed bag through one left-to-right
+//! clause reader, so an unknown or misspelled parameter is refused by name.
 
 use super::super::statement::GraphDirection;
-use super::helpers::{
-    array_floats_after, float_pair_after, float_triple_after, quoted_after, usize_after, word_after,
-};
-use super::tokenizer::{Tok, tokenize};
+use super::cursor::{Cursor, set_once};
+use super::tokenizer::{Tok, blank_comments, tokenize};
+use crate::error::SqlError;
 
 /// Keyword aliases for the shared fusion parameters.
 ///
@@ -108,65 +105,103 @@ pub struct FusionParams {
 }
 
 impl FusionParams {
-    pub(super) fn extract(toks: &[Tok<'_>], sql: &str, kw: &FusionKeywords) -> Self {
-        let direction = match word_after(toks, kw.direction)
-            .as_deref()
-            .map(str::to_ascii_uppercase)
-            .as_deref()
-        {
-            Some("IN") => Some(GraphDirection::In),
-            Some("BOTH") => Some(GraphDirection::Both),
-            Some("OUT") => Some(GraphDirection::Out),
-            _ => None,
-        };
-
-        // Try to parse a three-value RRF_K triple first; fall back to the
-        // two-value pair. This way `RRF_K (60.0, 35.0, 50.0)` populates
-        // `rrf_k_triple` and leaves `rrf_k` as None, while the legacy
-        // `RRF_K (60.0, 35.0)` continues to populate only `rrf_k`.
-        let rrf_k_triple = float_triple_after(toks, kw.rrf_k);
-        let rrf_k = if rrf_k_triple.is_some() {
-            None
-        } else {
-            float_pair_after(toks, kw.rrf_k)
-        };
-
-        // BM25 text leg — only parsed when the keyword is non-empty.
-        let (bm25_query, bm25_field) = if !kw.bm25_query.is_empty() {
-            (
-                quoted_after(toks, kw.bm25_query),
-                quoted_after(toks, kw.bm25_field),
-            )
-        } else {
-            (None, None)
-        };
-
-        Self {
-            query_vector: array_floats_after(sql, kw.query_anchor),
-            vector_top_k: usize_after(toks, kw.vector_top_k),
-            expansion_depth: usize_after(toks, kw.expansion_depth),
-            edge_label: quoted_after(toks, kw.edge_label),
-            final_top_k: usize_after(toks, kw.final_top_k),
-            rrf_k,
-            rrf_k_triple,
-            vector_field: quoted_after(toks, kw.vector_field),
-            direction,
-            max_visited: usize_after(toks, kw.max_visited),
-            bm25_query,
-            bm25_field,
+    /// Read the fusion clauses left to right until the end of the statement.
+    ///
+    /// A keyword outside `kw` is refused by name, a clause given twice is
+    /// refused, and a value that does not read as its type is refused.
+    pub(super) fn parse(c: &mut Cursor<'_, '_>, kw: &FusionKeywords) -> Result<Self, SqlError> {
+        let stmt = c.statement();
+        let mut p = Self::default();
+        while let Some(clause) = c.next_clause()? {
+            let k = clause.as_str();
+            if k == kw.query_anchor {
+                if kw.query_anchor != "ARRAY" && !c.eat_keyword("ARRAY") {
+                    return Err(SqlError::Parse {
+                        detail: format!("{k} needs ARRAY[...] in {stmt}"),
+                    });
+                }
+                let vector = parse_vector(c.list(k)?, k)?;
+                set_once(&mut p.query_vector, vector, k, stmt)?;
+            } else if k == kw.vector_top_k {
+                set_once(&mut p.vector_top_k, c.usize(k)?, k, stmt)?;
+            } else if k == kw.expansion_depth {
+                set_once(&mut p.expansion_depth, c.usize(k)?, k, stmt)?;
+            } else if k == kw.edge_label {
+                set_once(&mut p.edge_label, c.value(k)?, k, stmt)?;
+            } else if k == kw.final_top_k {
+                set_once(&mut p.final_top_k, c.usize(k)?, k, stmt)?;
+            } else if k == kw.rrf_k {
+                if p.rrf_k.is_some() || p.rrf_k_triple.is_some() {
+                    return Err(SqlError::Parse {
+                        detail: format!("{k} given more than once in {stmt}"),
+                    });
+                }
+                match (c.number_word(), c.number_word(), c.number_word()) {
+                    (Some(vector_k), Some(graph_k), None) => p.rrf_k = Some((vector_k, graph_k)),
+                    (Some(vector_k), Some(text_k), Some(graph_k)) => {
+                        p.rrf_k_triple = Some((vector_k, text_k, graph_k));
+                    }
+                    _ => {
+                        return Err(SqlError::Parse {
+                            detail: format!("{k} needs two or three numbers, as {k} (60.0, 35.0)"),
+                        });
+                    }
+                }
+            } else if k == kw.vector_field {
+                set_once(&mut p.vector_field, c.value(k)?, k, stmt)?;
+            } else if k == kw.direction {
+                set_once(&mut p.direction, c.direction()?, k, stmt)?;
+            } else if k == kw.max_visited {
+                set_once(&mut p.max_visited, c.usize(k)?, k, stmt)?;
+            } else if !kw.bm25_query.is_empty() && k == kw.bm25_query {
+                set_once(&mut p.bm25_query, c.value(k)?, k, stmt)?;
+                // The field clause belongs to the BM25 clause only when it
+                // follows it directly.
+                if c.eat_keyword(kw.bm25_field) {
+                    set_once(
+                        &mut p.bm25_field,
+                        c.value(kw.bm25_field)?,
+                        kw.bm25_field,
+                        stmt,
+                    )?;
+                }
+            } else {
+                return Err(c.unknown_clause());
+            }
         }
+        Ok(p)
     }
 }
 
+/// Read the comma-separated numbers of an `ARRAY[...]` literal.
+fn parse_vector(inner: &str, clause: &str) -> Result<Vec<f32>, SqlError> {
+    if inner.trim().is_empty() {
+        return Err(SqlError::Parse {
+            detail: format!("{clause} ARRAY[...] needs one or more numbers"),
+        });
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            let text = part.trim();
+            text.parse::<f32>().map_err(|_| SqlError::Parse {
+                detail: format!("{clause} ARRAY element must be a number — found '{text}'"),
+            })
+        })
+        .collect()
+}
+
 /// Parse `SEARCH <collection> USING FUSION(...)` into its collection name
-/// and a typed [`FusionParams`]. Returns `None` when the SQL does not
-/// match the expected shape.
+/// and a typed [`FusionParams`].
 ///
-/// Body extraction uses the same quote- and bracket-aware tokenizer as
-/// the `GRAPH RAG FUSION` path, so a keyword-shaped string literal (e.g.
-/// a label value `'TOP'`) cannot shadow a real parameter keyword.
-pub fn parse_search_using_fusion(sql: &str) -> Option<(String, FusionParams)> {
-    let toks = tokenize(sql);
+/// `None` means the SQL does not start with `SEARCH <collection> USING
+/// FUSION`. `Some(Err)` means it does and a clause is malformed. The body
+/// goes through the same quote- and bracket-aware tokenizer and the same
+/// clause reader as `GRAPH RAG FUSION`, so a keyword-shaped string literal
+/// (e.g. a label value `'TOP'`) cannot shadow a real parameter keyword.
+pub fn parse_search_using_fusion(sql: &str) -> Option<Result<(String, FusionParams), SqlError>> {
+    let sql = blank_comments(sql);
+    let toks = tokenize(&sql);
     let collection = match toks.as_slice() {
         [Tok::Word(s), Tok::Word(c), Tok::Word(u), Tok::Word(f), ..]
             if s.eq_ignore_ascii_case("SEARCH")
@@ -177,10 +212,11 @@ pub fn parse_search_using_fusion(sql: &str) -> Option<(String, FusionParams)> {
         }
         _ => return None,
     };
-    Some((
-        collection,
-        FusionParams::extract(&toks, sql, &SEARCH_FUSION_KEYWORDS),
-    ))
+    let mut cursor = Cursor::new(&toks, "SEARCH USING FUSION", 4);
+    Some(
+        FusionParams::parse(&mut cursor, &SEARCH_FUSION_KEYWORDS)
+            .map(|params| (collection, params)),
+    )
 }
 
 #[cfg(test)]
@@ -193,7 +229,8 @@ mod tests {
             "SEARCH mycol USING FUSION(ARRAY[0.1, 0.2] VECTOR_TOP_K 5 DEPTH 2 \
              LABEL 'related' TOP 10 RRF_K (60.0, 35.0))",
         )
-        .unwrap();
+        .expect("SEARCH USING FUSION form")
+        .expect("well-formed fusion clauses");
         assert_eq!(col, "mycol");
         assert_eq!(p.query_vector.as_deref().map(<[f32]>::len), Some(2));
         assert_eq!(p.vector_top_k, Some(5));
@@ -211,7 +248,8 @@ mod tests {
              VECTOR_TOP_K 50 BM25 'transformer attention' ON 'body' \
              DEPTH 2 LABEL 'related_to' TOP 10 RRF_K (60.0, 35.0, 50.0))",
         )
-        .unwrap();
+        .expect("SEARCH USING FUSION form")
+        .expect("well-formed fusion clauses");
         assert_eq!(col, "entities");
         assert_eq!(p.rrf_k, None);
         assert_eq!(p.rrf_k_triple, Some((60.0, 35.0, 50.0)));
@@ -229,7 +267,8 @@ mod tests {
         // quoted strings whole, so `TOP 10` is the real parameter.
         let (_, p) =
             parse_search_using_fusion("SEARCH c USING FUSION(ARRAY[0.5] LABEL 'TOP_SECRET' TOP 7)")
-                .unwrap();
+                .expect("SEARCH USING FUSION form")
+                .expect("well-formed fusion clauses");
         assert_eq!(p.edge_label.as_deref(), Some("TOP_SECRET"));
         assert_eq!(p.final_top_k, Some(7));
     }
@@ -238,5 +277,39 @@ mod tests {
     fn search_fusion_rejects_wrong_prefix() {
         assert!(parse_search_using_fusion("INSERT INTO x VALUES (1)").is_none());
         assert!(parse_search_using_fusion("SEARCH x USING VECTOR(ARRAY[1.0])").is_none());
+    }
+
+    fn search_error(sql: &str) -> String {
+        parse_search_using_fusion(sql)
+            .expect("SEARCH USING FUSION form")
+            .expect_err("malformed fusion clauses must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn search_fusion_refuses_misspelled_parameter() {
+        let error = search_error("SEARCH c USING FUSION(ARRAY[0.5] TOPP 7)");
+        assert!(
+            error.contains("unexpected token 'TOPP' in SEARCH USING FUSION"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn search_fusion_refuses_non_numeric_vector_element() {
+        let error = search_error("SEARCH c USING FUSION(ARRAY[0.1, x] TOP 3)");
+        assert!(error.contains("'x'"), "{error}");
+    }
+
+    #[test]
+    fn search_fusion_refuses_unknown_direction() {
+        let error = search_error("SEARCH c USING FUSION(ARRAY[0.1] DIRECTION sideways)");
+        assert!(error.contains("sideways"), "{error}");
+    }
+
+    #[test]
+    fn search_fusion_refuses_repeated_parameter() {
+        let error = search_error("SEARCH c USING FUSION(ARRAY[0.1] TOP 3 TOP 4)");
+        assert!(error.contains("TOP given more than once"), "{error}");
     }
 }

@@ -71,6 +71,11 @@ impl CloneCheckedTask {
     pub fn plan(&self) -> &PhysicalPlan {
         self.task.plan()
     }
+
+    /// The roles of the identity the task was authorized for.
+    pub fn user_roles(&self) -> Vec<String> {
+        self.task.identity().role_names()
+    }
 }
 
 /// Take a descriptor lease on every collection a write-class `task` touches,

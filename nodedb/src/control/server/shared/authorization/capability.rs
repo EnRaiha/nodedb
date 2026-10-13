@@ -4,7 +4,7 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::{DatabaseId, TenantId};
 
-use crate::control::security::identity::Permission;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 
 use crate::types::{TxnId, VShardId};
 
@@ -54,9 +54,13 @@ pub struct AuthorizedTaskSet {
 }
 
 impl AuthorizedTaskSet {
-    pub(super) fn new(tasks: &[PhysicalTask]) -> Self {
+    pub(super) fn new(tasks: &[PhysicalTask], identity: &AuthenticatedIdentity) -> Self {
         Self {
-            tasks: tasks.iter().cloned().map(AuthorizedTask::new).collect(),
+            tasks: tasks
+                .iter()
+                .cloned()
+                .map(|task| AuthorizedTask::new(task, identity.clone()))
+                .collect(),
         }
     }
 
@@ -81,11 +85,19 @@ impl AuthorizedTaskSet {
 #[must_use = "an authorized task must be dispatched or explicitly discarded"]
 pub struct AuthorizedTask {
     task: PhysicalTask,
+    /// The identity the task was authorized for. A Control-Plane
+    /// orchestrated write reads its source as this identity.
+    identity: AuthenticatedIdentity,
 }
 
 impl AuthorizedTask {
-    fn new(task: PhysicalTask) -> Self {
-        Self { task }
+    fn new(task: PhysicalTask, identity: AuthenticatedIdentity) -> Self {
+        Self { task, identity }
+    }
+
+    /// The identity the task was authorized for.
+    pub(crate) fn identity(&self) -> &AuthenticatedIdentity {
+        &self.identity
     }
 
     pub fn tenant_id(&self) -> TenantId {

@@ -115,39 +115,108 @@ impl TimeSeries {
             .map_or("", |l| l.value.as_str())
     }
 
-    /// Convert to ILP line format for ingestion into the timeseries engine.
+    /// Convert to ILP lines for ingestion into the metric's timeseries
+    /// collection.
     ///
-    /// Format: `measurement,tag1=val1,tag2=val2 value=X timestampNs`
-    pub fn to_ilp_lines(&self) -> Vec<String> {
+    /// Format: `metric,label1=v1,label2=v2 value=X timestampNs`. Names and
+    /// values are escaped for line protocol. An empty-valued label is left
+    /// out, because Prometheus treats it as absent.
+    ///
+    /// The whole series is refused when it has no metric name, when a label
+    /// would collide with a stored column (`value`, `timestamp`, the
+    /// bitemporal system columns), or when a label holds a newline, which
+    /// line protocol cannot carry. A single sample is skipped, and counted,
+    /// when its value is not finite (line protocol has no NaN or infinity,
+    /// and Prometheus sends NaN as a staleness marker) or its timestamp does
+    /// not fit in nanoseconds.
+    pub fn to_ilp_lines(&self) -> Result<IlpSeries, super::PromqlError> {
         let metric = self.metric_name();
         if metric.is_empty() {
-            return vec![];
+            return Err(unwritable(
+                metric,
+                "the series has no __name__ label".into(),
+            ));
+        }
+        if metric.contains(['\n', '\r']) {
+            return Err(unwritable(metric, "the metric name holds a newline".into()));
         }
 
-        // Build tag set from labels (excluding __name__).
-        let tags: Vec<String> = self
-            .labels
-            .iter()
-            .filter(|l| l.name != "__name__" && !l.name.is_empty())
-            .map(|l| format!("{}={}", l.name, l.value))
-            .collect();
+        let mut tag_str = String::new();
+        for label in &self.labels {
+            if label.name == "__name__" || label.name.is_empty() || label.value.is_empty() {
+                continue;
+            }
+            if RESERVED_COLUMNS.contains(&label.name.as_str()) {
+                return Err(unwritable(
+                    metric,
+                    format!("label '{}' collides with a stored column", label.name),
+                ));
+            }
+            if label.name.contains(['\n', '\r']) || label.value.contains(['\n', '\r']) {
+                return Err(unwritable(
+                    metric,
+                    format!("label '{}' holds a newline", label.name),
+                ));
+            }
+            tag_str.push(',');
+            escape_into(&mut tag_str, &label.name, true);
+            tag_str.push('=');
+            escape_into(&mut tag_str, &label.value, true);
+        }
 
-        let tag_str = if tags.is_empty() {
-            String::new()
-        } else {
-            format!(",{}", tags.join(","))
-        };
+        let mut measurement = String::with_capacity(metric.len());
+        escape_into(&mut measurement, metric, false);
 
-        self.samples
-            .iter()
-            .map(|s| {
-                format!(
-                    "{metric}{tag_str} value={} {}",
-                    s.value,
-                    s.timestamp * 1_000_000 // ms → ns for ILP
-                )
-            })
-            .collect()
+        let mut out = IlpSeries::default();
+        for sample in &self.samples {
+            let Some(ts_ns) = sample.timestamp.checked_mul(1_000_000) else {
+                out.rejected += 1;
+                continue;
+            };
+            if !sample.value.is_finite() {
+                out.rejected += 1;
+                continue;
+            }
+            out.lines.push(format!(
+                "{measurement}{tag_str} value={} {ts_ns}",
+                sample.value
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// The ILP lines of one series and the samples it could not encode.
+#[derive(Debug, Default)]
+pub struct IlpSeries {
+    pub lines: Vec<String>,
+    pub rejected: u64,
+}
+
+/// Columns every metric collection stores beside its labels.
+const RESERVED_COLUMNS: &[&str] = &[
+    "value",
+    "timestamp",
+    nodedb_types::columnar::schema::TS_SYSTEM,
+    nodedb_types::columnar::schema::TS_VALID_FROM,
+    nodedb_types::columnar::schema::TS_VALID_UNTIL,
+];
+
+fn unwritable(metric: &str, detail: String) -> super::PromqlError {
+    super::PromqlError::UnwritableSeries {
+        metric: metric.to_owned(),
+        detail,
+    }
+}
+
+/// Escape line-protocol delimiters. A measurement escapes `,`, space and
+/// `\`; a tag key or value also escapes `=`.
+fn escape_into(out: &mut String, raw: &str, escape_equals: bool) {
+    for ch in raw.chars() {
+        if ch == ',' || ch == ' ' || ch == '\\' || (escape_equals && ch == '=') {
+            out.push('\\');
+        }
+        out.push(ch);
     }
 }
 
@@ -210,10 +279,80 @@ mod tests {
             ],
             exemplars: vec![],
         };
-        let lines = ts.to_ilp_lines();
+        let series = ts.to_ilp_lines().unwrap();
+        let lines = series.lines;
         assert_eq!(lines.len(), 2);
+        assert_eq!(series.rejected, 0);
         assert!(lines[0].starts_with("http_requests,method=GET value=42"));
         assert!(lines[0].ends_with("1000000000"));
+    }
+
+    fn series(labels: &[(&str, &str)], samples: &[(f64, i64)]) -> TimeSeries {
+        TimeSeries {
+            labels: labels
+                .iter()
+                .map(|(n, v)| Label {
+                    name: (*n).into(),
+                    value: (*v).into(),
+                })
+                .collect(),
+            samples: samples
+                .iter()
+                .map(|&(value, timestamp)| Sample { value, timestamp })
+                .collect(),
+            exemplars: vec![],
+        }
+    }
+
+    #[test]
+    fn escaped_labels_parse_back_unchanged() {
+        let ts = series(
+            &[("__name__", "req total"), ("path", "/a b,c=d\\e")],
+            &[(1.0, 1000)],
+        );
+        let lines = ts.to_ilp_lines().unwrap().lines;
+        let parsed = crate::engine::timeseries::ilp::parse_batch(&lines[0])
+            .unwrap()
+            .into_lines();
+        assert_eq!(parsed[0].measurement, "req total");
+        assert_eq!(parsed[0].tags[0].0, "path");
+        assert_eq!(parsed[0].tags[0].1, "/a b,c=d\\e");
+    }
+
+    #[test]
+    fn non_finite_samples_are_skipped_and_counted() {
+        let ts = series(
+            &[("__name__", "up")],
+            &[
+                (1.0, 1000),
+                (f64::NAN, 2000),
+                (f64::INFINITY, 3000),
+                (3.0, 4000),
+            ],
+        );
+        let out = ts.to_ilp_lines().unwrap();
+        assert_eq!(out.lines.len(), 2);
+        assert_eq!(out.rejected, 2);
+    }
+
+    #[test]
+    fn empty_label_value_is_left_out() {
+        let ts = series(&[("__name__", "up"), ("env", "")], &[(1.0, 1000)]);
+        let lines = ts.to_ilp_lines().unwrap().lines;
+        assert!(lines[0].starts_with("up value=1 "));
+    }
+
+    #[test]
+    fn unwritable_series_are_refused() {
+        for labels in [
+            vec![("job", "api")],
+            vec![("__name__", "up"), ("value", "x")],
+            vec![("__name__", "up"), ("timestamp", "x")],
+            vec![("__name__", "up"), ("job", "a\nb")],
+        ] {
+            let ts = series(&labels, &[(1.0, 1000)]);
+            assert!(ts.to_ilp_lines().is_err(), "{labels:?}");
+        }
     }
 
     #[test]

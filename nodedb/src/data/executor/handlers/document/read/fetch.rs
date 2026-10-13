@@ -331,8 +331,11 @@ impl CoreLoop {
         // it sees for every other collection. Without it the tagged values pass
         // through untouched and reach the client as `[4,"alice"]`. The key
         // stays typed; the row's envelope id is rendered once downstream.
+        // The row's vector lives on its HNSW node; it joins the sidecar
+        // columns under the collection's vector field.
         let rows: Vec<(StorageKey, Vec<u8>)> = if is_vector_sidecar {
-            rows.into_iter()
+            let mut rows: Vec<(StorageKey, Vec<u8>)> = rows
+                .into_iter()
                 .map(|(key, body)| {
                     let (_, mp) = crate::data::executor::scan_normalize::sparse_row_to_doc(
                         &key,
@@ -342,7 +345,11 @@ impl CoreLoop {
                     );
                     (key, mp)
                 })
-                .collect()
+                .collect();
+            if let Some(field) = self.vector_primary_field(database_id, tid, collection) {
+                self.attach_primary_vectors(database_id, tid, collection, &field, &mut rows)?;
+            }
+            rows
         } else {
             rows
         };

@@ -208,7 +208,10 @@ impl NodeDbPgHandler {
             )?,
         )? {
             let async_proposer = self.state.async_raft_proposer()?;
-            let (_authorized, _lease) = checked.into_parts();
+            let (authorized, _lease) = checked.into_parts();
+            // Every replica judges a role-guarded transition against the
+            // writer's roles the entry carries.
+            let entry = entry.with_user_roles(authorized.identity().role_names());
             return self
                 .dispatch_replicated_write(ReplicatedWrite {
                     entry,

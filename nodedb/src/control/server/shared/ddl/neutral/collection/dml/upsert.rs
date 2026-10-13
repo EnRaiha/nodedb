@@ -8,7 +8,6 @@ use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
-use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 
@@ -86,27 +85,15 @@ async fn upsert_parsed(
     let fires_row_body = [DmlEvent::Insert, DmlEvent::Update]
         .into_iter()
         .any(|event| fires_joined_body(state, scope, &parsed.coll_name, event));
-    let mut fields = parsed.fields.clone();
+    let fields = parsed.fields.clone();
 
-    // Inject defaults and enforce type guards and CHECK constraints. The
-    // route checks a write that fires a row body, after its BEFORE bodies.
+    // Enforce CHECK constraints. The route checks a write that fires a row
+    // body, after its BEFORE bodies. Typeguards are enforced on the Data
+    // Plane, on the body every write form stores.
     let catalog = state.credentials.catalog();
     if let Ok(Some(coll_def)) =
         catalog.get_collection(database_id, tenant_id.as_u64(), &parsed.coll_name)
     {
-        // Inject DEFAULT/VALUE + validate type guards (combined).
-        if !coll_def.type_guards.is_empty()
-            && let Err(violation) =
-                crate::data::executor::enforcement::typeguard::inject_and_validate(
-                    &parsed.coll_name,
-                    &coll_def.type_guards,
-                    &mut fields,
-                )
-        {
-            let (_severity, code, message) = error_code_to_sqlstate(&violation);
-            return Err(DdlError::new(code.to_owned(), message));
-        }
-
         // General CHECK constraints (Control Plane enforcement, can have subqueries).
         if !fires_row_body
             && !coll_def.check_constraints.is_empty()

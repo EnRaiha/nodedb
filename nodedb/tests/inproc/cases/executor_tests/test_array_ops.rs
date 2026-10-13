@@ -244,6 +244,7 @@ fn array_agg_aggregate() {
                 user_alias: None,
                 field: "color".into(),
                 expr: None,
+                param: None,
             }],
             filters: Vec::new(),
             having: Vec::new(),

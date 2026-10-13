@@ -89,6 +89,7 @@ fn agg_specs() -> Vec<AggregateSpec> {
         user_alias: Some(user_alias.to_string()),
         field: field.to_string(),
         expr: None,
+        param: None,
     };
     vec![
         spec("count", "*", "cnt"),
@@ -105,6 +106,7 @@ fn producer_plan(rows: &[&Row]) -> Vec<u8> {
     let scan = PhysicalPlan::Query(QueryOp::ProviderScan {
         provider: None,
         rows: msgpack_array(rows),
+        sources: Vec::new(),
         filters: Vec::new(),
         projection: Vec::new(),
         computed_columns: Vec::new(),

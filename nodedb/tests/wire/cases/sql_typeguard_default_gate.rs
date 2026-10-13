@@ -98,3 +98,52 @@ async fn typeguard_evaluable_defaults_stay_accepted() {
         "DEFAULT must still inject: {stored:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typeguard_bare_generator_keyword_is_refused() {
+    let server = TestServer::start().await;
+
+    server.exec("CREATE COLLECTION tg_gate_gen").await.unwrap();
+
+    // The write path reads a bare `UUID_V7` as a field, which stores that
+    // field's value instead of generating one, so the declaration is refused.
+    server
+        .expect_error(
+            "CREATE TYPEGUARD ON tg_gate_gen (k STRING DEFAULT UUID_V7)",
+            "42601",
+        )
+        .await;
+    server
+        .expect_error(
+            "CREATE TYPEGUARD ON tg_gate_gen (at STRING VALUE current_timestamp)",
+            "42601",
+        )
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crdt_collection_refuses_default_and_value_guards() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE COLLECTION tg_gate_crdt (id TEXT PRIMARY KEY, v INT) WITH (crdt='true')")
+        .await
+        .unwrap();
+
+    // Every replica merges the CRDT state, so the server injects nothing.
+    server
+        .expect_error(
+            "CREATE TYPEGUARD ON tg_gate_crdt (v INT DEFAULT 1)",
+            "0A000",
+        )
+        .await;
+    server
+        .expect_error("CREATE TYPEGUARD ON tg_gate_crdt (v INT VALUE 1)", "0A000")
+        .await;
+
+    // A validating guard is accepted.
+    server
+        .exec("CREATE TYPEGUARD ON tg_gate_crdt (v INT CHECK (v >= 0))")
+        .await
+        .unwrap();
+}

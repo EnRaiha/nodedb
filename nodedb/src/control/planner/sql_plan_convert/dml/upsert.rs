@@ -50,6 +50,8 @@ pub(in super::super) fn convert_upsert(
         tenant_id,
         ctx,
     } = args;
+    // The name the user wrote, for refusal messages.
+    let user_collection = collection;
     let key = ctx.collection_key(collection);
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
@@ -57,11 +59,21 @@ pub(in super::super) fn convert_upsert(
     let vshard = key.vshard();
     let mut tasks = Vec::new();
 
-    // Detect CRDT document collections once. An explicit `ON CONFLICT DO UPDATE
-    // SET ...` cannot be honored: CRDT conflict resolution IS the LWW
-    // full-replace `DocUpsert` performs, so a caller-supplied merge clause has
-    // no place to run. Reject rather than silently ignore it.
-    let is_crdt = super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    // Detect CRDT document collections once, in the same catalog read as the
+    // write checks. An explicit `ON CONFLICT DO UPDATE SET ...` cannot be
+    // honored: CRDT conflict resolution IS the LWW full-replace `DocUpsert`
+    // performs, so a caller-supplied merge clause has no place to run. Reject
+    // rather than silently ignore it.
+    let gates = super::balanced_gate::document_collection_write_gates(ctx, collection)?;
+    // A write that supplies a generated column is refused, in its rows and
+    // in its `ON CONFLICT DO UPDATE SET` targets.
+    super::write_checks::refuse_generated_cells(user_collection, &gates.generated, rows)?;
+    crate::control::security::catalog::collection_generated::refuse_generated_write(
+        user_collection,
+        &gates.generated,
+        on_conflict_updates.iter().map(|(name, _)| name.as_str()),
+    )?;
+    let is_crdt = gates.crdt;
     if is_crdt && !on_conflict_updates.is_empty() {
         return Err(crate::Error::BadRequest {
             detail: format!(

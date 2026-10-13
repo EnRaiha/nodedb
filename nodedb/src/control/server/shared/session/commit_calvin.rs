@@ -42,6 +42,9 @@ pub(super) struct CalvinCommit<'a> {
     /// The lines the statements' stage-time previews rejected, by
     /// collection.
     pub ts_preview: &'a super::commit::ts_rejections::RejectedByCollection,
+    /// The roles of the identity that commits. Every participant's redo
+    /// record carries them.
+    pub user_roles: Vec<String>,
 }
 
 /// Dispatch a multi-shard transaction batch through Calvin. Strict commits the
@@ -107,6 +110,7 @@ async fn submit_commit_calvin(
         publishes,
         applied_key,
         ts_preview: _,
+        user_roles,
     } = commit;
     let publishes =
         crate::wal::RedoPublish::encode_all(publishes).map_err(AbortReason::Dispatch)?;
@@ -143,6 +147,7 @@ async fn submit_commit_calvin(
                     body_tasks: body_task_indexes(sessions, session_id),
                     publishes,
                     applied_key,
+                    user_roles,
                 },
             )
             .await;
@@ -217,6 +222,7 @@ async fn submit_commit_calvin(
                 tx_class.set_lock_owner(reservation_owner);
                 tx_class.set_event_source(group_source.wal_code());
                 tx_class.set_body_plans(body_tasks);
+                tx_class.set_user_roles(user_roles.clone());
                 if let Some(publishes) = publishes.take() {
                     tx_class.set_publishes(publishes);
                 }

@@ -31,6 +31,21 @@ pub(super) fn ilp_payload(collection: &str, count: usize, start_ts_ns: i64) -> V
     lines.into_bytes()
 }
 
+/// The `TimeseriesBatch` WAL payload a live ILP ingest of `payload` into
+/// `collection` writes: the six-element tuple `("timeseries", collection,
+/// payload, provenance, format, default_timestamp_ms)`.
+pub(super) fn ilp_wal_payload(collection: &str, payload: Vec<u8>) -> Vec<u8> {
+    zerompk::to_msgpack_vec(&(
+        "timeseries".to_string(),
+        collection.to_string(),
+        payload,
+        None::<nodedb_types::sync::wire::SyncProvenance>,
+        "ilp".to_string(),
+        1_700_000_000_000i64,
+    ))
+    .unwrap()
+}
+
 /// A one-node server with its Data Plane core, response poller and Raft
 /// groups, as production boots it.
 pub(super) struct TestStack {
@@ -159,6 +174,8 @@ impl TestStack {
                     system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                     computed_columns: Vec::new(),
+                    having: Vec::new(),
+                    tiering: None,
                 }),
                 collection,
             )
@@ -172,7 +189,7 @@ impl TestStack {
     /// Append `payload` to the WAL alone, as a dispatch the Data Plane never
     /// received.
     pub(super) fn write_to_wal(&self, collection: &str, payload: Vec<u8>) {
-        let wal_payload = zerompk::to_msgpack_vec(&(collection.to_string(), payload)).unwrap();
+        let wal_payload = ilp_wal_payload(collection, payload);
         self.wal
             .appender(NO_APPLY_KEY)
             .with_event_source(nodedb::event::EventSource::User)

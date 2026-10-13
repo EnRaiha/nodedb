@@ -117,8 +117,6 @@ mod tests {
             on: vec![("id".into(), "id".into())],
             join_type: "left".into(),
             limit: 10,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: vec![JoinProjection {
                 source: "l.id".into(),
                 output: "id".into(),

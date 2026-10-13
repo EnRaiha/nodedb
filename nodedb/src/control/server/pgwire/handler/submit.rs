@@ -22,6 +22,9 @@ pub(super) struct SubmitArgs {
     pub(super) database_id: DatabaseId,
     pub(super) plan: crate::bridge::envelope::PhysicalPlan,
     pub(super) user_id: Option<Arc<str>>,
+    /// Roles of the identity that wrote the write. Empty for a write no
+    /// user made.
+    pub(super) user_roles: Vec<String>,
     pub(super) txn_id: Option<crate::types::TxnId>,
     /// Who owns this write's durable redo record — see [`WalDurability`].
     pub(super) durability: WalDurability,
@@ -38,6 +41,7 @@ impl NodeDbPgHandler {
     ) -> crate::Result<Response> {
         // The write lease lives until the submit returns its outcome.
         let (authorized, _lease) = checked.into_parts();
+        let user_roles = authorized.identity().role_names();
         let task = authorized.into_physical_task();
         self.submit_to_data_plane(SubmitArgs {
             tenant_id: task.tenant_id,
@@ -45,6 +49,7 @@ impl NodeDbPgHandler {
             database_id: task.database_id,
             plan: task.plan,
             user_id,
+            user_roles,
             txn_id: task.txn_id,
             durability,
         })
@@ -61,6 +66,7 @@ impl NodeDbPgHandler {
             database_id,
             plan,
             user_id,
+            user_roles,
             txn_id,
             durability,
         } = args;
@@ -75,6 +81,7 @@ impl NodeDbPgHandler {
                 event_source: crate::event::EventSource::User,
                 txn_id,
                 user_id,
+                user_roles,
                 durability,
                 ordering: WriteOrdering::Gate,
                 // This node alone applies the write: `dispatch_local` is reached

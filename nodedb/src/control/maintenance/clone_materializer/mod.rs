@@ -23,4 +23,4 @@ pub(crate) use dispatch::{
     dispatch_local, dispatch_local_on_vshard, dispatch_on_this_node, dispatch_resolve_pass,
     dispatch_to_owner,
 };
-pub(crate) use document::{read_all_source_rows, scan_source_page};
+pub(crate) use document::scan_source_page;

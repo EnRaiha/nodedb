@@ -54,6 +54,8 @@ impl TestClusterNode {
                 rls_filters: Vec::new(),
                 system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
+                having: Vec::new(),
+                tiering: None,
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
             priority: Priority::Normal,

@@ -3,6 +3,7 @@
 mod aggregate;
 mod graph;
 mod lookup;
+mod orchestrated;
 mod plan;
 mod streaming_mv;
 mod text;

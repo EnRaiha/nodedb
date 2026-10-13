@@ -71,8 +71,11 @@ impl Gateway {
         ctx: &QueryContext,
         checked: CloneCheckedTask,
     ) -> Result<Response, Error> {
-        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
-        Ok(self.execute_plan_outcome(ctx, plan).await?.into_response())
+        let (plan, user_roles, _lease) = authorized_plan_for_context(ctx, checked)?;
+        Ok(self
+            .execute_plan_outcome(ctx, plan, &user_roles)
+            .await?
+            .into_response())
     }
 }
 

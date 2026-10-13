@@ -18,6 +18,7 @@
 //! - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
 mod aggregate_input_arm;
+mod by_name_join_arm;
 mod dispatch;
 mod entry;
 mod gather_arm;
@@ -25,6 +26,7 @@ mod hash_join_arm;
 mod post_process_arm;
 mod set_op_arm;
 mod shuffle_arm;
+mod txn_source_arm;
 
 pub use entry::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};
 pub(crate) use post_process_arm::provider_scan_of_rows;

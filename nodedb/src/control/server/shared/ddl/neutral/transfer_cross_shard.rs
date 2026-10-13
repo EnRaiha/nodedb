@@ -38,6 +38,7 @@ use super::read_gate::CollectionReadGate;
 pub(super) async fn transfer_item_across_shards(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     txn_ctx: &DmlTxnCtx<'_>,
     mut plan: PhysicalPlan,
     collections: [&str; 2],
@@ -46,7 +47,6 @@ pub(super) async fn transfer_item_across_shards(
     if txn_ctx.sessions.transaction_state(txn_ctx.session_id) != TransactionState::Idle {
         return Err(error_to_ddl(&crate::Error::CrossShardInExplicitTransaction));
     }
-    let database_id = DatabaseId::DEFAULT;
     let gate = CollectionReadGate::for_request(state, identity, database_id);
     for collection in collections {
         gate.authorize(collection)?;

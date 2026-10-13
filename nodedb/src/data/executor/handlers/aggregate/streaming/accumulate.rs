@@ -72,17 +72,8 @@ impl CoreLoop {
             database_id,
             tenant_id,
         } = params;
-        let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
-            Vec::new()
-        } else {
-            match zerompk::from_msgpack(filters) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(core = self.core_id, error = %e, "filter predicate deserialization failed");
-                    Vec::new()
-                }
-            }
-        };
+        let filter_predicates =
+            crate::bridge::scan_filter::decode_scan_filters(filters, "aggregate WHERE filter")?;
 
         let use_field_index = filter_predicates.len() + group_by.len() >= 2;
         let need_sub = !sub_group_by.is_empty() && !sub_aggregates.is_empty();

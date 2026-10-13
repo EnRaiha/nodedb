@@ -11,7 +11,7 @@ use nodedb_physical::physical_plan::*;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::convert::{ConvertContext, convert_one, db_qualified};
-use super::super::expr::sql_expr_to_bridge_expr;
+use super::super::expr::{sql_expr_to_bridge_expr, sql_expr_to_bridge_expr_qualified};
 
 /// Convert a join-side sub-plan to an optional embedded `PhysicalPlan`.
 ///
@@ -39,11 +39,14 @@ pub(in crate::control::planner::sql_plan_convert) fn inline_join_side(
     if matches!(plan, SqlPlan::PointGet { .. }) {
         return Ok(None);
     }
-    // Plain user-collection scan side: handled via the parent HashJoin's
-    // `left_collection` / `right_collection` by name. Catalog scans fall
-    // through to conversion so we embed their ProviderScan.
-    if let SqlPlan::Scan { collection, .. } = plan
-        && !scan_is_catalog(collection)
+    // Plain current-state user-collection scan side: handled via the parent
+    // HashJoin's `left_collection` / `right_collection` by name. Catalog
+    // scans fall through to conversion so we embed their ProviderScan. A scan
+    // under `FOR SYSTEM_TIME` / `FOR VALID_TIME` is converted and embedded
+    // too, since only the engine scan carries the temporal scope.
+    if let SqlPlan::Scan { temporal, .. } = plan
+        && !plan_is_provider(plan)
+        && !temporal.is_temporal()
     {
         return Ok(None);
     }
@@ -59,7 +62,10 @@ pub(in crate::control::planner::sql_plan_convert) fn inline_join_side(
     }
     Ok(tasks.pop().map(|t| {
         let p = t.plan;
-        if p.is_sharded_source() {
+        // A sharded side, or a side homed on one collection's core (a
+        // timeseries or KV scan), is gathered on the coordinator from where
+        // its rows live. Embedded bare, it would run on the join's core.
+        if p.is_sharded_source() || p.collection().is_some() {
             Box::new(PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
                 child: Box::new(p),
                 mode: ExchangeMode::Broadcast,
@@ -70,11 +76,22 @@ pub(in crate::control::planner::sql_plan_convert) fn inline_join_side(
     }))
 }
 
-/// Whether a (raw, non-db-qualified) collection name resolves to a system
-/// catalog table (pg_class, information_schema.*, _system.*, etc.). Catalog
-/// tables are coordinator-materialized, not per-shard.
-fn scan_is_catalog(collection: &str) -> bool {
-    crate::control::server::pgwire::catalog::schema::catalog_collection_info(collection).is_some()
+/// Whether a scan-shaped plan reads a provider relation: a system catalog
+/// table (pg_class, information_schema.*, _system.*, etc.) or a continuous
+/// aggregate. Provider relations are coordinator-materialized, not
+/// per-shard. A join answers for its left side, the side that names its
+/// routing collection.
+fn plan_is_provider(plan: &SqlPlan) -> bool {
+    match plan {
+        SqlPlan::Scan {
+            collection, engine, ..
+        }
+        | SqlPlan::PointGet {
+            collection, engine, ..
+        } => super::super::scan::is_provider_relation(collection, engine),
+        SqlPlan::Join { left, .. } => plan_is_provider(left),
+        _ => false,
+    }
 }
 
 /// Resolve the `left_collection` / `right_collection` name for a `HashJoin`
@@ -88,9 +105,15 @@ pub(in crate::control::planner::sql_plan_convert) fn join_side_collection(
     database_id: crate::types::DatabaseId,
 ) -> String {
     // An input-sourced join side carries no routing collection; its rows come
-    // from `left_input` / `right_input`.
+    // from `left_input` / `right_input`. A temporal scan side is embedded
+    // (see `inline_join_side`), so it names no collection either.
+    if let SqlPlan::Scan { temporal, .. } = plan
+        && temporal.is_temporal()
+    {
+        return String::new();
+    }
     match extract_collection_name(plan) {
-        Some(raw) if !scan_is_catalog(&raw) => db_qualified(database_id, &raw),
+        Some(raw) if !plan_is_provider(plan) => db_qualified(database_id, &raw),
         Some(_) | None => String::new(),
     }
 }
@@ -123,12 +146,117 @@ pub(in crate::control::planner::sql_plan_convert) fn extract_scan_alias(
     }
 }
 
+/// The constant second argument of a parameterized aggregate
+/// (`approx_topk(v, 3)`, `approx_percentile(v, 0.9)`), as its typed
+/// parameter. `None` for a function that takes none. A missing, non-constant
+/// or out-of-range parameter is refused: the Data Plane has no default to
+/// fall back to.
+fn aggregate_parameter(function: &str, a: &AggregateExpr) -> crate::Result<Option<AggregateParam>> {
+    use nodedb_sql::types::SqlValue;
+    use rust_decimal::prelude::ToPrimitive;
+    let refuse = |what: &str| crate::Error::PlanError {
+        detail: format!("{}() needs {what} as its second argument", a.function),
+    };
+    let constant = || -> crate::Result<SqlValue> {
+        let param = a.args.get(1).ok_or_else(|| refuse("a numeric constant"))?;
+        let (negative, inner) = match param {
+            SqlExpr::UnaryOp {
+                op: nodedb_sql::types::UnaryOp::Neg,
+                expr,
+            } => (true, expr.as_ref()),
+            other => (false, other),
+        };
+        match inner {
+            SqlExpr::Literal(SqlValue::Int(n)) => Ok(SqlValue::Int(if negative {
+                n.saturating_neg()
+            } else {
+                *n
+            })),
+            SqlExpr::Literal(SqlValue::Float(f)) => {
+                Ok(SqlValue::Float(if negative { -f } else { *f }))
+            }
+            SqlExpr::Literal(SqlValue::Decimal(d)) => {
+                Ok(SqlValue::Decimal(if negative { -*d } else { *d }))
+            }
+            _ => Err(refuse("a numeric constant")),
+        }
+    };
+    match function {
+        "approx_percentile" | "percentile_cont" => {
+            let fraction = match constant()? {
+                SqlValue::Int(n) => n as f64,
+                SqlValue::Float(f) => f,
+                SqlValue::Decimal(d) => d.to_f64().ok_or_else(|| refuse("a fraction"))?,
+                _ => return Err(refuse("a numeric constant")),
+            };
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(refuse("a fraction in [0, 1]"));
+            }
+            Ok(Some(AggregateParam::Percentile { fraction }))
+        }
+        "approx_topk" => match constant()? {
+            SqlValue::Int(n) => match u32::try_from(n) {
+                Ok(k) if k >= 1 => Ok(Some(AggregateParam::TopK { k })),
+                _ => Err(refuse("a k from 1 to 4294967295")),
+            },
+            _ => Err(refuse("an integer k")),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// How the aggregate's input rows key their fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::control::planner::sql_plan_convert) enum InputFieldNames {
+    /// Each field is keyed by its bare column name.
+    Bare,
+    /// Each field is keyed `qualifier.column`, as in a join's merged rows.
+    /// The qualifier is the side's alias, else its collection name.
+    Qualified,
+}
+
+impl InputFieldNames {
+    /// The input-row key a column reference reads.
+    fn field(self, table: Option<&str>, name: &str) -> String {
+        match self {
+            Self::Bare => name.to_string(),
+            Self::Qualified => nodedb_sql::planner::qualified_name(table, name),
+        }
+    }
+
+    /// The bridge expression evaluated against one input row.
+    fn expr(self, expr: &SqlExpr) -> crate::bridge::expr_eval::SqlExpr {
+        match self {
+            Self::Bare => sql_expr_to_bridge_expr(expr),
+            Self::Qualified => sql_expr_to_bridge_expr_qualified(expr),
+        }
+    }
+}
+
+/// Convert an `AggregateExpr` to the Data Plane aggregate spec over rows
+/// keyed by bare column names.
+pub(in crate::control::planner::sql_plan_convert) fn agg_expr_to_spec(
+    a: &AggregateExpr,
+) -> crate::Result<AggregateSpec> {
+    agg_expr_to_spec_over(a, InputFieldNames::Bare)
+}
+
 /// Convert an `AggregateExpr` to the Data Plane aggregate spec.
-pub(super) fn agg_expr_to_spec(a: &AggregateExpr) -> AggregateSpec {
+///
+/// Refuses a function the generic aggregate has no accumulator for, and a
+/// `GROUPING()` call the planner did not resolve to a GROUP BY key. A
+/// parameterized aggregate carries its constant in `param`. `names` says how
+/// the input rows key the columns the argument reads.
+pub(in crate::control::planner::sql_plan_convert) fn agg_expr_to_spec_over(
+    a: &AggregateExpr,
+    names: InputFieldNames,
+) -> crate::Result<AggregateSpec> {
     // GROUPING(col) pseudo-aggregate: encode the canonical key index in the
     // `field` so the Data Plane executor can read the grouping-set bitmask.
     if a.function == "grouping" {
-        let idx = a.grouping_col_index.unwrap_or(0);
+        let idx = a.grouping_col_index.ok_or(crate::Error::PlanError {
+            detail: format!("GROUPING() in '{}' names no GROUP BY key", a.alias),
+        })?;
         let field = idx.to_string();
         let canonical = format!("grouping({field})");
         let user_alias = if a.alias.eq_ignore_ascii_case(&canonical) {
@@ -136,60 +264,82 @@ pub(super) fn agg_expr_to_spec(a: &AggregateExpr) -> AggregateSpec {
         } else {
             Some(a.alias.clone())
         };
-        return AggregateSpec {
+        return Ok(AggregateSpec {
             function: "grouping".into(),
             alias: canonical,
             user_alias,
             field,
             expr: None,
-        };
+            param: None,
+        });
+    }
+
+    let function = nodedb_sql::planner::agg_naming::aggregate_function_name(a);
+    if !GENERIC_AGGREGATE_FUNCTIONS.contains(&function.as_str()) {
+        return Err(crate::Error::FeatureNotSupported {
+            detail: format!(
+                "aggregate function {}() is not supported in this query shape",
+                a.function
+            ),
+        });
     }
 
     let (field, expr) = a
         .args
         .first()
         .map(|arg| match arg {
-            SqlExpr::Column { name, .. } => (name.clone(), None),
+            SqlExpr::Column { table, name } => (names.field(table.as_deref(), name), None),
             SqlExpr::Wildcard => ("*".into(), None),
-            _ => ("*".into(), Some(sql_expr_to_bridge_expr(arg))),
+            _ => ("*".into(), Some(names.expr(arg))),
         })
         .unwrap_or_else(|| ("*".into(), None));
+    let param = aggregate_parameter(&function, a)?;
 
-    let function = nodedb_sql::planner::agg_naming::aggregate_function_name(a);
-    let canonical = nodedb_query::agg_key::canonical_agg_key(&function, &field);
+    // The same key HAVING binds to, so a computed or filtered aggregate
+    // lands under a key no other aggregate shares.
+    let canonical = nodedb_sql::planner::agg_naming::aggregate_output_key(a);
     let user_alias = if a.alias.eq_ignore_ascii_case(&canonical) {
         None
     } else {
         Some(a.alias.clone())
     };
 
-    AggregateSpec {
+    Ok(AggregateSpec {
         function,
         alias: canonical,
         user_alias,
         field,
         expr,
-    }
+        param,
+    })
 }
 
-/// Convert an `AggregateExpr` to the legacy `(op, field)` pair used by
-/// non-QueryOp aggregate paths (timeseries, post-join aggregation).
+/// Convert an `AggregateExpr` to the `(op, field)` pair the grouped
+/// timeseries scan accumulates.
+///
+/// That scan reads one column per aggregate. A computed argument has no
+/// column to read, so it is refused; the planner routes such aggregates to
+/// the generic aggregate before they reach here.
 pub(in crate::control::planner::sql_plan_convert) fn agg_expr_to_pair(
     a: &AggregateExpr,
-) -> (String, String) {
-    let field = a
-        .args
-        .first()
-        .map(|arg| match arg {
-            SqlExpr::Column { name, .. } => name.clone(),
-            SqlExpr::Wildcard => "*".into(),
-            _ => format!("{arg:?}"),
-        })
-        .unwrap_or_else(|| "*".into());
-    (
+) -> crate::Result<(String, String)> {
+    let field = match a.args.first() {
+        None | Some(SqlExpr::Wildcard) => "*".to_string(),
+        Some(SqlExpr::Column { name, .. }) => name.clone(),
+        Some(_) => {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "aggregate '{}' has a computed argument the grouped timeseries scan cannot \
+                     read",
+                    a.alias
+                ),
+            });
+        }
+    };
+    Ok((
         nodedb_sql::planner::agg_naming::aggregate_function_name(a),
         field,
-    )
+    ))
 }
 
 pub(super) fn group_by_to_strings(exprs: &[SqlExpr]) -> Vec<String> {
@@ -219,12 +369,16 @@ pub(in crate::control::planner::sql_plan_convert) struct InputSourcedTaskParams<
     pub aggregates: &'a [AggregateExpr],
     pub having_bytes: Vec<u8>,
     pub limit: usize,
+    /// ROLLUP / CUBE / GROUPING SETS, as indices into `group_by`.
+    pub grouping_sets: Vec<Vec<u32>>,
     pub sort_keys: Vec<SortKeySpec>,
+    /// How `child`'s rows key their fields.
+    pub names: InputFieldNames,
 }
 
 pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggregate_task(
     p: InputSourcedTaskParams<'_>,
-) -> PhysicalTask {
+) -> crate::Result<PhysicalTask> {
     let InputSourcedTaskParams {
         tenant_id,
         ctx,
@@ -234,11 +388,16 @@ pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggrega
         aggregates,
         having_bytes,
         limit,
+        grouping_sets,
         sort_keys,
+        names,
     } = p;
-    let group_specs = group_by_to_specs(group_by);
-    let agg_specs: Vec<AggregateSpec> = aggregates.iter().map(agg_expr_to_spec).collect();
-    PhysicalTask {
+    let group_specs = group_by_to_specs(group_by, names);
+    let agg_specs = aggregates
+        .iter()
+        .map(|a| agg_expr_to_spec_over(a, names))
+        .collect::<crate::Result<Vec<AggregateSpec>>>()?;
+    Ok(PhysicalTask {
         tenant_id,
         // Coordinator-local: empty collection keeps the task on the
         // coordinator vshard (the child's rows are not per-shard).
@@ -256,14 +415,12 @@ pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggrega
             limit,
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
-            // Guarded by the caller: input-sourced aggregates never carry
-            // grouping sets.
-            grouping_sets: Vec::new(),
+            grouping_sets,
             sort_keys,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
-    }
+    })
 }
 
 /// Lower GROUP BY expressions to Data-Plane group-key specs.
@@ -275,18 +432,94 @@ pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggrega
 /// [`group_key_output_name`] name (`group_{index}`) — a purely internal
 /// executor↔shaper handshake, matching the response shaper's `lookup_key`. The
 /// SELECT alias never enters here; it reaches only the shaper's `display_name`.
-pub(super) fn group_by_to_specs(exprs: &[SqlExpr]) -> Vec<GroupKeySpec> {
+///
+/// `names` says how the input rows key their fields. Over qualified rows a
+/// column key reads `qualifier.column` and is still emitted under its bare
+/// column name, the name the response shaper looks up.
+pub(super) fn group_by_to_specs(exprs: &[SqlExpr], names: InputFieldNames) -> Vec<GroupKeySpec> {
     use super::super::group_key_name::group_key_output_name;
     exprs
         .iter()
         .enumerate()
         .map(|(index, e)| match e {
-            SqlExpr::Column { name, .. } => GroupKeySpec::column(name.clone()),
+            SqlExpr::Column { table, name } => GroupKeySpec {
+                output_name: group_key_output_name(e, index),
+                field: Some(names.field(table.as_deref(), name)),
+                expr: None,
+            },
             _ => GroupKeySpec {
                 output_name: group_key_output_name(e, index),
                 field: None,
-                expr: Some(sql_expr_to_bridge_expr(e)),
+                expr: Some(names.expr(e)),
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_sql::types::{BinaryOp, SqlValue};
+
+    fn column(table: &str, name: &str) -> SqlExpr {
+        SqlExpr::Column {
+            table: Some(table.into()),
+            name: name.into(),
+        }
+    }
+
+    fn agg(function: &str, arg: SqlExpr) -> AggregateExpr {
+        AggregateExpr {
+            function: function.into(),
+            args: vec![arg],
+            alias: format!("{function}(x)"),
+            distinct: false,
+            grouping_col_index: None,
+            filter_text: None,
+            arg_text: None,
+        }
+    }
+
+    #[test]
+    fn qualified_group_key_reads_the_qualified_field_under_its_bare_name() {
+        let specs = group_by_to_specs(&[column("c", "region")], InputFieldNames::Qualified);
+        assert_eq!(specs[0].field.as_deref(), Some("c.region"));
+        assert_eq!(specs[0].output_name, "region");
+        assert!(specs[0].expr.is_none());
+    }
+
+    #[test]
+    fn bare_group_key_reads_the_bare_field() {
+        let specs = group_by_to_specs(&[column("c", "region")], InputFieldNames::Bare);
+        assert_eq!(specs[0].field.as_deref(), Some("region"));
+        assert_eq!(specs[0].output_name, "region");
+    }
+
+    #[test]
+    fn qualified_aggregate_argument_reads_the_qualified_field() {
+        let spec = agg_expr_to_spec_over(
+            &agg("sum", column("o", "amount")),
+            InputFieldNames::Qualified,
+        )
+        .expect("sum is a generic aggregate");
+        assert_eq!(spec.field, "o.amount");
+    }
+
+    #[test]
+    fn qualified_computed_argument_reads_qualified_columns() {
+        let arg = SqlExpr::BinaryOp {
+            left: Box::new(column("o", "amount")),
+            op: BinaryOp::Mul,
+            right: Box::new(SqlExpr::Literal(SqlValue::Int(2))),
+        };
+        let spec = agg_expr_to_spec_over(&agg("sum", arg), InputFieldNames::Qualified)
+            .expect("sum is a generic aggregate");
+        let Some(crate::bridge::expr_eval::SqlExpr::BinaryOp { left, .. }) = spec.expr else {
+            panic!("expected a computed argument");
+        };
+        assert!(matches!(
+            *left,
+            crate::bridge::expr_eval::SqlExpr::Column(ref name) if name == "o.amount"
+        ));
+    }
 }

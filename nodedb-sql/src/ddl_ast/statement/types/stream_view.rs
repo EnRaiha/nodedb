@@ -60,5 +60,10 @@ pub enum StreamViewStmt {
         name: String,
         if_exists: bool,
     },
+    /// `REFRESH CONTINUOUS AGGREGATE <name>`: fold every sealed source
+    /// partition the aggregate lacks.
+    RefreshContinuousAggregate {
+        name: String,
+    },
     ShowContinuousAggregates,
 }

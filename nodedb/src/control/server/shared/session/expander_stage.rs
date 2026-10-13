@@ -20,6 +20,7 @@ use crate::control::merge_orchestrator::resolve_and_emit_merge_ops;
 use crate::control::planner::calvin::write_class::{
     plan_counts_toward_statement_tag, plans_have_user_write,
 };
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::plan_admission::append_sum_and_period_targets;
 use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops;
@@ -42,6 +43,7 @@ pub(crate) enum ExpanderOutcome {
 /// [`ExpanderOutcome::Passthrough`] otherwise, no clone needed.
 pub(crate) async fn route_in_tx_expander<F, Fut>(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     sessions: &SessionStore,
     session_id: SessionId,
     mut task: PhysicalTask,
@@ -51,7 +53,7 @@ where
     F: Fn(PhysicalTask) -> Fut,
     Fut: Future<Output = crate::Result<Response>>,
 {
-    match expand_in_tx(state, sessions, session_id, &mut task).await? {
+    match expand_in_tx(state, identity, sessions, session_id, &mut task).await? {
         Some((ops, kind)) => Ok(ExpanderOutcome::Handled(
             stage_and_aggregate(state, sessions, session_id, ops, kind, dispatch).await?,
         )),
@@ -67,8 +69,13 @@ where
 /// The ops are `PointInsert` for an inserted row, `PointPut` for an updated
 /// row's post-image, `PointDelete` for a removed row, and an
 /// `ApplyBalanceDelta` for each cross-shard materialized-sum balance they move.
+///
+/// The source is read as `identity`, the identity running the statement on
+/// whatever entry path it came in: pgwire, HTTP, ws-rpc, a procedure or a
+/// trigger body.
 pub(crate) async fn expand_in_tx(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     sessions: &SessionStore,
     session_id: SessionId,
     task: &mut PhysicalTask,
@@ -85,7 +92,7 @@ pub(crate) async fn expand_in_tx(
             // Stamp txn_id so the resolve pass folds this transaction's staging overlay.
             task.txn_id = sessions.tx_id(session_id);
             // A resolve/surrogate-assignment failure maps to the gate's `Dispatch` variant.
-            let ops = resolve_and_emit_merge_ops(state, task.tenant_id, task)
+            let ops = resolve_and_emit_merge_ops(state, identity, task.tenant_id, task)
                 .await
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::Merge)
@@ -94,7 +101,7 @@ pub(crate) async fn expand_in_tx(
             // Stamp txn_id so the resolve pass folds this transaction's staging overlay.
             task.txn_id = sessions.tx_id(session_id);
             // A resolve failure maps to the gate's `Dispatch` variant.
-            let ops = resolve_and_emit_update_from_join_ops(state, task.tenant_id, task)
+            let ops = resolve_and_emit_update_from_join_ops(state, identity, task.tenant_id, task)
                 .await
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::UpdateFromJoin)
@@ -103,7 +110,7 @@ pub(crate) async fn expand_in_tx(
             // Stamp txn_id so the source scan folds this transaction's staging overlay.
             task.txn_id = sessions.tx_id(session_id);
             // Reuses `StagedTagKind::Insert` — `INSERT ... SELECT` renders the `INSERT n` tag.
-            let ops = resolve_and_emit_insert_select_ops(state, task.tenant_id, task)
+            let ops = resolve_and_emit_insert_select_ops(state, identity, task.tenant_id, task)
                 .await
                 .map_err(StagingGateError::Dispatch)?;
             (ops, StagedTagKind::Insert)
@@ -150,11 +157,11 @@ fn expand_batch_insert(task: &PhysicalTask) -> crate::Result<Vec<PhysicalTask>> 
         collection,
         documents,
         surrogates,
+        if_absent,
         returning,
         rls_filters,
         resolved_sum_targets,
         deferred_sum_targets,
-        ..
     }) = &task.plan
     else {
         return Ok(Vec::new());
@@ -182,8 +189,10 @@ fn expand_batch_insert(task: &PhysicalTask) -> crate::Result<Vec<PhysicalTask>> 
                 collection: collection.clone(),
                 document_id: document_id.clone(),
                 value: value.clone(),
-                // A page carries no per-row conflict behaviour.
-                if_absent: false,
+                // Each row keeps the page's conflict behaviour. A key the page
+                // names twice is present in the overlay when its later row
+                // stages, so that row is refused or skipped as the page is.
+                if_absent: *if_absent,
                 surrogate,
                 returning: returning.clone(),
                 rls_filters: rls_filters.clone(),

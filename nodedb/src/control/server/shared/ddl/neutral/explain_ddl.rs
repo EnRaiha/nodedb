@@ -165,37 +165,44 @@ pub fn explain_scope(
 
 /// `SELECT nodedb_assert_visible('<collection>', '<row_id>', '<user_id>')`
 ///
-/// Test helper: returns true/false whether a row is visible to a user under RLS.
+/// Returns whether RLS lets a user see rows of a collection.
+///
+/// The target user is resolved in the caller's tenant and the session's
+/// database, where the named collection lives.
 pub fn assert_visible(
     state: &SharedState,
-    _identity: &AuthenticatedIdentity,
-    parts: &[&str],
+    identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
+    sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    // Parse: nodedb_assert_visible('collection', 'row_id', 'user_id')
-    if parts.len() < 4 {
-        return Err(ddl_err(
+    let syntax = || {
+        ddl_err(
             "42601",
             "syntax: SELECT nodedb_assert_visible('<collection>', '<row_id>', '<user_id>')",
-        ));
-    }
-
-    let collection = parts[1].trim_matches('\'').trim_end_matches(',');
-    let _row_id = parts[2].trim_matches('\'').trim_end_matches(',');
-    let user_id = parts[3].trim_matches('\'').trim_end_matches(')');
+        )
+    };
+    let args = super::kv_atomic::parse_function_args(sql, "NODEDB_ASSERT_VISIBLE")?;
+    let [collection, _row_id, user_id] = args.as_slice() else {
+        return Err(syntax());
+    };
+    let collection = super::kv_atomic::unquote(collection);
+    let user_id = super::kv_atomic::unquote(user_id);
 
     // Build AuthContext for the target user.
     let target_identity = crate::control::security::identity::AuthenticatedIdentity::new_regular(
         user_id.parse().unwrap_or(0),
-        user_id,
-        crate::types::TenantId::new(1),
+        &user_id,
+        identity.tenant_id,
         crate::control::security::identity::AuthMethod::Trust,
         vec![crate::control::security::identity::Role::ReadWrite],
         None,
-        crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![
-            nodedb_types::id::DatabaseId::DEFAULT,
-        ]),
+        crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![database_id]),
     );
     let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build();
+
+    // RLS policies are keyed by the database-qualified collection name.
+    let qualified =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, &collection);
 
     // Check if RLS policies would filter this user. An unencodable policy
     // is an error, not an answer.
@@ -203,7 +210,7 @@ pub fn assert_visible(
         .rls
         .combined_read_predicate_with_auth(
             target_identity.tenant_id.as_u64(),
-            collection,
+            &qualified,
             scope.auth(),
         )
         .map_err(|e| DdlError::from_error_in_context("rls compile", &e))?;

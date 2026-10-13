@@ -9,16 +9,16 @@
 use super::document::{ReturningFields, WireSumResolution, plan_targets};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::document::MergeClauseOp;
-use nodedb_physical::physical_plan::{DocumentOp, UpdateValue};
+use nodedb_physical::physical_plan::{DocumentOp, RowSource, UpdateValue};
 
 /// The join the two writes share, as the record carries it.
 pub(super) struct JoinFields<'a> {
     pub target_collection: &'a str,
-    pub source_collection: &'a str,
+    pub source: &'a RowSource,
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
-    pub source_rows: &'a [(String, Vec<u8>)],
+    pub source_rows: &'a [Vec<u8>],
     pub resolved_sum_targets: &'a WireSumResolution<'a>,
     pub declared_primary_key: Option<String>,
 }
@@ -39,9 +39,7 @@ pub(super) fn merge_apply(
         target_collection: nodedb_types::QualifiedCollection::from_stored(
             join.target_collection.to_owned(),
         ),
-        source_collection: nodedb_types::QualifiedCollection::from_stored(
-            join.source_collection.to_owned(),
-        ),
+        source: join.source.clone(),
         source_alias: join.source_alias.to_owned(),
         target_join_col: join.target_join_col.to_owned(),
         source_join_col: join.source_join_col.to_owned(),
@@ -67,9 +65,7 @@ pub(super) fn update_from_join_apply(
         target_collection: nodedb_types::QualifiedCollection::from_stored(
             join.target_collection.to_owned(),
         ),
-        source_collection: nodedb_types::QualifiedCollection::from_stored(
-            join.source_collection.to_owned(),
-        ),
+        source: join.source.clone(),
         source_alias: join.source_alias.to_owned(),
         target_join_col: join.target_join_col.to_owned(),
         source_join_col: join.source_join_col.to_owned(),
@@ -92,7 +88,9 @@ mod tests {
     use nodedb_physical::physical_plan::document::{
         MergeActionOp, MergeClauseKindOp, MergeClauseOp,
     };
-    use nodedb_physical::physical_plan::{DocumentOp, ResolvedSumTarget, UpdateValue};
+    use nodedb_physical::physical_plan::{
+        DocumentOp, KvOp, QuerySource, ResolvedSumTarget, RowSource, UpdateValue,
+    };
     use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
 
     /// Decide + encode + decode in one call.
@@ -117,11 +115,24 @@ mod tests {
         ResolvedSumTarget::new("ledger", "acct-1", Surrogate::new(77))
     }
 
+    /// A query source: the record carries it as the proposing node read it.
+    fn kv_source() -> RowSource {
+        RowSource::Query(QuerySource {
+            plan: Box::new(PhysicalPlan::Kv(KvOp::Get {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "rates"),
+                key: b"r1".to_vec(),
+                rls_filters: Vec::new(),
+                surrogate_ceiling: None,
+            })),
+            column_map: Vec::new(),
+        })
+    }
+
     #[test]
     fn resolved_merge_apply_roundtrips() {
         let plan = PhysicalPlan::Document(DocumentOp::Merge {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+            source: RowSource::whole_collection(QualifiedCollection::new(DatabaseId::DEFAULT, "s")),
             source_alias: "s".into(),
             target_join_col: "id".into(),
             source_join_col: "id".into(),
@@ -136,10 +147,7 @@ mod tests {
             returning: None,
             resolved_inserts: Some(vec![("k2".into(), 9001)]),
             resolved_insert_identities: vec![("k2".into(), 9001)],
-            source_rows: Some(vec![(
-                "k2".into(),
-                vec![0x81, 0xa1, 0x76, 0xa3, 0x74, 0x77, 0x6f],
-            )]),
+            source_rows: Some(vec![vec![0x81, 0xa1, 0x76, 0xa3, 0x74, 0x77, 0x6f]]),
             rls_filters: vec![1, 2],
             rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             resolved_sum_targets: vec![sum_target()],
@@ -147,6 +155,7 @@ mod tests {
         });
         let decoded = roundtrip(&plan);
         let PhysicalPlan::Document(DocumentOp::Merge {
+            source,
             resolved_inserts,
             resolved_insert_identities,
             source_rows,
@@ -160,6 +169,7 @@ mod tests {
         else {
             panic!("expected Document(Merge)");
         };
+        assert_eq!(source.paged_collection().map(|c| c.as_str()), Some("s"));
         assert_eq!(resolved_inserts, Some(vec![("k2".to_owned(), 9001)]));
         assert_eq!(resolved_insert_identities, vec![("k2".to_owned(), 9001)]);
         assert_eq!(source_rows.map(|r| r.len()), Some(1));
@@ -174,7 +184,7 @@ mod tests {
     fn resolved_update_from_join_apply_roundtrips() {
         let plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+            source: kv_source(),
             source_alias: "s".into(),
             target_join_col: "id".into(),
             source_join_col: "id".into(),
@@ -184,7 +194,7 @@ mod tests {
             )],
             target_filters: vec![7],
             returning: None,
-            source_rows: Some(vec![("k1".into(), vec![0x80])]),
+            source_rows: Some(vec![vec![0x80]]),
             rls_filters: Vec::new(),
             rls_write_check: RlsWriteCheck::decided_earlier_in_request(),
             resolved_sum_targets: vec![sum_target()],
@@ -192,6 +202,7 @@ mod tests {
         });
         let decoded = roundtrip(&plan);
         let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+            source,
             updates,
             target_filters,
             source_rows,
@@ -202,6 +213,7 @@ mod tests {
         else {
             panic!("expected Document(UpdateFromJoin)");
         };
+        assert_eq!(source, kv_source());
         assert_eq!(updates.len(), 1);
         assert_eq!(target_filters, vec![7]);
         assert_eq!(source_rows.map(|r| r.len()), Some(1));

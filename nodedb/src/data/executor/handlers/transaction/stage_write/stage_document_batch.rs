@@ -9,9 +9,10 @@
 //! resolve builds from that overlay. A plan that stages nothing therefore
 //! installs nothing.
 //!
-//! - `BatchInsert` stages each row the way a document `PointPut` stages it.
-//!   The live batch writes each row through `apply_point_put`, which
-//!   overwrites a row already stored at its surrogate.
+//! - `BatchInsert` stages each row the way a document `PointInsert` stages
+//!   it, as the live batch judges it: a key present in BASE ∪ OVERLAY — an
+//!   earlier row of the same page included — is a `unique` violation, or a
+//!   skipped row under `if_absent`.
 //! - `ApplyBalanceDelta` reads the target row under BASE ∪ OVERLAY, adds the
 //!   delta to the balance column, and stages the new row. The arithmetic,
 //!   the encoding and the refusals are those of
@@ -42,6 +43,23 @@ pub(in crate::data::executor) struct StageBatchInsertParams<'a> {
     pub documents: &'a [(String, Vec<u8>)],
     /// One surrogate per row, parallel to `documents`.
     pub surrogates: &'a [Surrogate],
+    /// `ON CONFLICT DO NOTHING`: a present key skips its row.
+    pub if_absent: bool,
+}
+
+/// The row count a staged point write answered with.
+fn staged_affected(response: &Response) -> crate::Result<usize> {
+    let value: serde_json::Value = nodedb_types::json_from_msgpack(response.payload.as_ref())
+        .map_err(|e| crate::Error::Internal {
+            detail: format!("staged insert count: {e}"),
+        })?;
+    value
+        .get("affected")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| crate::Error::Internal {
+            detail: format!("staged insert answered no affected count: {value}"),
+        })
 }
 
 /// Inputs for [`CoreLoop::stage_apply_balance_delta`].
@@ -66,7 +84,8 @@ pub(in crate::data::executor) struct StageBalanceDeltaParams<'a> {
 
 impl CoreLoop {
     /// Stage every row of a document batch insert. Answers the number of
-    /// rows staged. A row that fails its UNIQUE check fails the whole plan.
+    /// rows staged. A row that fails its primary-key or UNIQUE check fails
+    /// the whole plan; under `if_absent` a present key skips its row.
     pub(in crate::data::executor) fn stage_document_batch_insert(
         &mut self,
         params: StageBatchInsertParams<'_>,
@@ -78,6 +97,7 @@ impl CoreLoop {
             collection,
             documents,
             surrogates,
+            if_absent,
         } = params;
         // Every overlay slot and every index is keyed by surrogate, so a row
         // without one cannot be staged.
@@ -104,6 +124,7 @@ impl CoreLoop {
                 return self.response_error(task, refusal);
             }
         }
+        let mut affected = 0usize;
         for ((document_id, value), surrogate) in documents.iter().zip(surrogates) {
             let ctx = StageCtx::new(
                 task,
@@ -113,12 +134,18 @@ impl CoreLoop {
                 RowIdentity::from_user_key(document_id.as_str()),
                 *surrogate,
             );
-            let staged = self.stage_point_put(&ctx, value);
+            // An earlier row of this page is staged by now, so a key the page
+            // names twice is present for the later row.
+            let staged = self.stage_point_insert(&ctx, value, if_absent);
             if staged.status == Status::Error {
                 return staged;
             }
+            match staged_affected(&staged) {
+                Ok(n) => affected += n,
+                Err(e) => return self.response_error(task, e),
+            }
         }
-        self.stage_count_response(task, documents.len())
+        self.stage_count_response(task, affected)
     }
 
     /// Stage the target row of a materialized-sum balance move with the delta
@@ -371,6 +398,7 @@ mod tests {
                 ("o1".to_string(), object(&[("a", "one")])),
                 ("o2".to_string(), object(&[("a", "two")])),
             ],
+            if_absent: false,
             surrogates: vec![Surrogate::new(7), Surrogate::new(8)],
             returning: None,
             rls_filters: Vec::new(),
@@ -400,6 +428,7 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
             documents: vec![("o1".to_string(), object(&[("a", "one")]))],
+            if_absent: false,
             surrogates: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -411,6 +440,69 @@ mod tests {
 
         assert_eq!(response.status, Status::Error);
         assert_eq!(field(&core, "orders", 7, "a"), None);
+    }
+
+    fn batch(rows: &[(&str, u32, &str)], if_absent: bool) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::BatchInsert {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
+            documents: rows
+                .iter()
+                .map(|(id, _, a)| (id.to_string(), object(&[("a", *a)])))
+                .collect(),
+            if_absent,
+            surrogates: rows.iter().map(|(_, s, _)| Surrogate::new(*s)).collect(),
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets: Vec::new(),
+            deferred_sum_targets: Vec::new(),
+        })
+    }
+
+    /// A Calvin batch row whose key is stored, or named twice by the page,
+    /// is refused, and the stored row stays.
+    #[test]
+    fn a_calvin_batch_insert_refuses_a_duplicate_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        seed(&mut core, "orders", 7, &[("a", "stored")]);
+
+        let stored_dup = commit(&mut core, &[batch(&[("o7", 7, "over")], false)]);
+        assert_eq!(stored_dup.status, Status::Error);
+        assert_eq!(
+            field(&core, "orders", 7, "a"),
+            Some(Value::String("stored".into()))
+        );
+
+        let page_dup = commit(
+            &mut core,
+            &[batch(&[("o8", 8, "one"), ("o8", 8, "two")], false)],
+        );
+        assert_eq!(page_dup.status, Status::Error);
+        assert_eq!(field(&core, "orders", 8, "a"), None);
+    }
+
+    /// Under `if_absent` a Calvin batch skips a present key and installs the
+    /// rest.
+    #[test]
+    fn a_calvin_batch_insert_skips_a_present_key_under_if_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        seed(&mut core, "orders", 7, &[("a", "stored")]);
+
+        let response = commit(
+            &mut core,
+            &[batch(&[("o7", 7, "over"), ("o9", 9, "new")], true)],
+        );
+
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        assert_eq!(
+            field(&core, "orders", 7, "a"),
+            Some(Value::String("stored".into()))
+        );
+        assert_eq!(
+            field(&core, "orders", 9, "a"),
+            Some(Value::String("new".into()))
+        );
     }
 
     /// A Calvin truncate removes every base row of the collection.

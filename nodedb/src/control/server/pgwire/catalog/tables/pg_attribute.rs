@@ -15,9 +15,10 @@ use super::collections::{encode_row, field_type_to_oid, load_collections, type_o
 pub fn pg_attribute(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
 ) -> crate::Result<Vec<Vec<u8>>> {
     let mut rows = Vec::new();
-    for coll in load_collections(state, identity) {
+    for coll in load_collections(state, identity, database_id) {
         let rel_oid = stable_collection_oid(coll.tenant_id, &coll.name);
         for (col_num, (field_name, field_type)) in coll.fields.iter().enumerate() {
             let (_, is_primary_key, is_not_null, default_expr) =

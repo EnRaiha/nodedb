@@ -28,12 +28,17 @@ pub fn try_parse(sql: &str) -> Option<Result<NodedbStatement, SqlError>> {
         return None;
     }
 
-    Some(parse_graph(trimmed, &upper))
+    Some(parse_graph(trimmed))
 }
 
-/// Parse a statement known to start with `GRAPH `. A trailing `EDGE WHERE`
-/// predicate splits off first, so the clause text before it tokenizes alone.
-fn parse_graph(trimmed: &str, upper: &str) -> Result<NodedbStatement, SqlError> {
+/// Parse a statement known to start with `GRAPH `. Comments are blanked
+/// first. A trailing `EDGE WHERE` predicate splits off next, so the clause
+/// text before it tokenizes alone.
+fn parse_graph(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let blanked = tokenizer::blank_comments(sql);
+    let trimmed = blanked.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let upper = upper.as_str();
     let (head, predicate_text) = edge_predicate::split_edge_where(trimmed)?;
     let predicate = match predicate_text {
         Some(text) => edge_predicate::parse_edge_predicate(text)?,
@@ -70,7 +75,7 @@ fn parse_graph(trimmed: &str, upper: &str) -> Result<NodedbStatement, SqlError> 
     } else if upper.starts_with("GRAPH ALGO ") {
         variants::parse_algo(&toks)
     } else if upper.starts_with("GRAPH RAG FUSION ") {
-        variants::parse_rag_fusion(&toks, trimmed)
+        variants::parse_rag_fusion(&toks)
     } else {
         // Starts with `GRAPH ` but names no known command. Still graph DSL,
         // so report it here rather than letting the SQL parser guess.
@@ -531,5 +536,143 @@ mod tests {
                 .is_ok(),
             "an omitted DIRECTION must keep defaulting"
         );
+    }
+
+    // ── Unconsumed and misplaced tokens ───────────────────────────────────
+
+    fn parse_error(sql: &str) -> String {
+        try_parse(sql)
+            .expect("input is graph DSL")
+            .expect_err("statement must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn misspelled_clause_keyword_is_named() {
+        let error = parse_error("GRAPH TRAVERSE FROM 1 DEPTS 3 IN g");
+        assert!(
+            error.contains("unexpected token 'DEPTS' in GRAPH TRAVERSE"),
+            "{error}"
+        );
+        let error = parse_error("GRAPH NEIGHBORS OF 1 LABELS 'follows' IN g");
+        assert!(
+            error.contains("unexpected token 'LABELS' in GRAPH NEIGHBORS"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn stray_tokens_are_refused() {
+        for (sql, token) in [
+            ("GRAPH TRAVERSE FROM 1 SIDEWAYS IN g", "SIDEWAYS"),
+            ("GRAPH TRAVERSE FROM 1 BANANA PHONE IN g", "BANANA"),
+            ("GRAPH INSERT EDGE IN 'e' FROM 'a' TO 'b' TYP 'x'", "TYP"),
+            (
+                "GRAPH DELETE EDGE IN 'e' FROM 'a' TO 'b' TYPE 'x' EXTRA",
+                "EXTRA",
+            ),
+            ("GRAPH PATH IN 'g' FROM 'a' TO 'b' MAXDEPTH 3", "MAXDEPTH"),
+            ("GRAPH LABEL 'a' AS 'P' EXTRA", "EXTRA"),
+            ("GRAPH ALGO PAGERANK ON g ITERATION 5", "ITERATION"),
+            (
+                "GRAPH RAG FUSION ON e QUERY ARRAY[0.1] VECTOR_TOPK 5",
+                "VECTOR_TOPK",
+            ),
+            ("GRAPH TRAVERSE IN 'g' FROM 'a' ]", "]"),
+        ] {
+            let error = parse_error(sql);
+            assert!(
+                error.contains(&format!("unexpected token '{token}'")),
+                "{sql}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn stray_string_at_clause_position_is_refused() {
+        let error = parse_error("GRAPH TRAVERSE IN 'g' FROM 'a' 'b'");
+        assert!(error.contains("unexpected string 'b'"), "{error}");
+    }
+
+    #[test]
+    fn repeated_clause_is_refused() {
+        let error = parse_error("GRAPH TRAVERSE IN 'g' FROM 'a' DEPTH 1 DEPTH 3");
+        assert!(
+            error.contains("DEPTH given more than once in GRAPH TRAVERSE"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn direction_value_in_does_not_shadow_in_clause() {
+        match parsed("GRAPH TRAVERSE FROM 'b' DIRECTION in IN 'g'") {
+            NodedbStatement::Graph(GraphStmt::GraphTraverse {
+                collection,
+                start,
+                direction,
+                ..
+            }) => {
+                assert_eq!(collection, "g");
+                assert_eq!(start, "b");
+                assert_eq!(direction, GraphDirection::In);
+            }
+            other => panic!("expected GraphTraverse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_numeric_clause_values_are_refused() {
+        let error = parse_error("GRAPH ALGO PAGERANK ON g DAMPING abc");
+        assert!(error.contains("DAMPING must be a number"), "{error}");
+        let error = parse_error("GRAPH TRAVERSE IN 'g' FROM 'a' DEPTH '3'");
+        assert!(
+            error.contains("DEPTH must be a non-negative integer"),
+            "{error}"
+        );
+        let error = parse_error("GRAPH RAG FUSION ON e QUERY ARRAY[0.1, x]");
+        assert!(error.contains("'x'"), "{error}");
+    }
+
+    #[test]
+    fn comments_are_not_tokens() {
+        match parsed("GRAPH TRAVERSE IN 'g' /* note */ FROM 'a' -- trailing note") {
+            NodedbStatement::Graph(GraphStmt::GraphTraverse {
+                collection, start, ..
+            }) => {
+                assert_eq!(collection, "g");
+                assert_eq!(start, "a");
+            }
+            other => panic!("expected GraphTraverse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quoted_identifier_is_a_value() {
+        match parsed(r#"GRAPH NEIGHBORS IN "My Graph" OF 'a'"#) {
+            NodedbStatement::Graph(GraphStmt::GraphNeighbors { collection, .. }) => {
+                assert_eq!(collection, "My Graph");
+            }
+            other => panic!("expected GraphNeighbors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rag_fusion_bm25_field_is_the_on_after_bm25() {
+        let params_of = |sql: &str| match parsed(sql) {
+            NodedbStatement::Graph(GraphStmt::GraphRagFusion { collection, params }) => {
+                assert_eq!(collection, "entities");
+                params
+            }
+            other => panic!("expected GraphRagFusion, got {other:?}"),
+        };
+        let params = params_of(
+            "GRAPH RAG FUSION ON entities QUERY ARRAY[0.1] BM25 'q' ON 'body' \
+             RRF_K (1.0, 2.0, 3.0)",
+        );
+        assert_eq!(params.bm25_query.as_deref(), Some("q"));
+        assert_eq!(params.bm25_field.as_deref(), Some("body"));
+        assert_eq!(params.rrf_k_triple, Some((1.0, 2.0, 3.0)));
+        let params = params_of("GRAPH RAG FUSION ON entities QUERY ARRAY[0.1]");
+        assert_eq!(params.bm25_field, None);
     }
 }

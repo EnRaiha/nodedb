@@ -7,21 +7,21 @@
 //! - `DROP SYNONYM GROUP [IF EXISTS] <name>`
 //! - `SHOW SYNONYM GROUPS`
 
+use super::clause::{ClauseCursor, tokenize};
 use crate::ddl_ast::statement::{NodedbStatement, PolicyStmt};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::find_ascii_keyword;
 
 /// Try to parse synonym group DDL statements.
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
     if upper.starts_with("CREATE SYNONYM GROUP ") {
-        return Some(parse_create(parts, trimmed));
+        return Some(parse_create(trimmed));
     }
     if upper.starts_with("DROP SYNONYM GROUP ") {
-        return Some(parse_drop(parts));
+        return Some(parse_drop(trimmed));
     }
     if upper == "SHOW SYNONYM GROUPS" {
         return Some(Ok(NodedbStatement::Policy(PolicyStmt::ShowSynonymGroups)));
@@ -29,133 +29,48 @@ pub(super) fn try_parse(
     None
 }
 
-/// Parse `CREATE SYNONYM GROUP <name> AS ('term1', 'term2', ...)`.
-fn parse_create(parts: &[&str], trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    // parts: [CREATE, SYNONYM, GROUP, <name>, AS, ...]
-    let name = parts.get(3).ok_or_else(|| SqlError::Parse {
-        detail: "syntax: CREATE SYNONYM GROUP <name> AS ('term1', ...)".to_string(),
+/// Parse `CREATE SYNONYM GROUP <name> AS ('term1', 'term2', ...)`. Terms are
+/// trimmed and case-folded; a duplicate term is refused.
+fn parse_create(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "CREATE SYNONYM GROUP");
+    c.expect_keywords(&["CREATE", "SYNONYM", "GROUP"])?;
+    let name = c.name("group name")?;
+    c.expect_keyword("AS")?;
+    let terms = c.paren_list("term list", |c| {
+        let term = c.string("term")?.trim().to_lowercase();
+        if term.is_empty() {
+            return Err(c.error("a term must not be empty"));
+        }
+        Ok(term)
     })?;
+    c.finish()?;
 
-    let as_idx = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("AS"))
-        .ok_or_else(|| SqlError::Parse {
-            detail: "CREATE SYNONYM GROUP: missing AS keyword".to_string(),
-        })?;
-
-    // Everything after AS is the term list in parentheses.
-    let after_as = parts[as_idx + 1..].join(" ");
-    let terms = parse_term_list(&after_as, trimmed)?;
-
-    if terms.is_empty() {
-        return Err(SqlError::Parse {
-            detail: "CREATE SYNONYM GROUP: term list must not be empty".to_string(),
-        });
-    }
-
-    // Reject duplicate terms.
     let mut seen = std::collections::HashSet::new();
     for term in &terms {
         if !seen.insert(term.as_str()) {
-            return Err(SqlError::Parse {
-                detail: format!("CREATE SYNONYM GROUP: duplicate term '{term}'"),
-            });
+            return Err(c.error(format!("duplicate term '{term}'")));
         }
     }
 
     Ok(NodedbStatement::Policy(PolicyStmt::CreateSynonymGroup {
-        name: name.to_lowercase(),
+        name,
         terms,
     }))
 }
 
 /// Parse `DROP SYNONYM GROUP [IF EXISTS] <name>`.
-fn parse_drop(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
-    // parts: [DROP, SYNONYM, GROUP, ...]
-    // Optional IF EXISTS:
-    let (if_exists, name_idx) = if parts.len() >= 6
-        && parts[3].eq_ignore_ascii_case("IF")
-        && parts[4].eq_ignore_ascii_case("EXISTS")
-    {
-        (true, 5)
-    } else {
-        (false, 3)
-    };
-
-    let name = parts.get(name_idx).ok_or_else(|| SqlError::Parse {
-        detail: "syntax: DROP SYNONYM GROUP [IF EXISTS] <name>".to_string(),
-    })?;
-
+fn parse_drop(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "DROP SYNONYM GROUP");
+    c.expect_keywords(&["DROP", "SYNONYM", "GROUP"])?;
+    let if_exists = c.eat_keywords(&["IF", "EXISTS"]);
+    let name = c.name("group name")?;
+    c.finish()?;
     Ok(NodedbStatement::Policy(PolicyStmt::DropSynonymGroup {
-        name: name.to_lowercase(),
+        name,
         if_exists,
     }))
-}
-
-/// Parse a `('term1', 'term2', ...)` term list from the raw fragment after AS.
-///
-/// Extracts all single-quoted strings within the outer parentheses.
-fn parse_term_list(_fragment: &str, original: &str) -> Result<Vec<String>, SqlError> {
-    // Find the AS keyword in the original to get the parenthesised region.
-    // We use a simple scan: find '(' and matching ')'.
-    let as_pos = find_ascii_keyword(original, "AS").ok_or_else(|| SqlError::Parse {
-        detail: "CREATE SYNONYM GROUP: missing AS keyword".to_string(),
-    })?;
-
-    let s = original[as_pos + "AS".len()..].trim_start();
-
-    let open = s.find('(').ok_or_else(|| SqlError::Parse {
-        detail: "CREATE SYNONYM GROUP: term list must start with '('".to_string(),
-    })?;
-    let close = s.rfind(')').ok_or_else(|| SqlError::Parse {
-        detail: "CREATE SYNONYM GROUP: term list must end with ')'".to_string(),
-    })?;
-
-    if close <= open {
-        return Err(SqlError::Parse {
-            detail: "CREATE SYNONYM GROUP: malformed term list".to_string(),
-        });
-    }
-
-    let inner = &s[open + 1..close];
-    if inner.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut terms = Vec::new();
-    // Split on commas outside of quotes.
-    let mut in_quote = false;
-    let mut current = String::new();
-    for ch in inner.chars() {
-        match ch {
-            '\'' if !in_quote => {
-                in_quote = true;
-            }
-            '\'' if in_quote => {
-                in_quote = false;
-            }
-            ',' if !in_quote => {
-                let t = current.trim().to_lowercase();
-                if !t.is_empty() {
-                    terms.push(t);
-                }
-                current.clear();
-            }
-            _ if in_quote => {
-                current.push(ch);
-            }
-            _ => {}
-        }
-    }
-    // Last term.
-    let t = current.trim().to_lowercase();
-    if !t.is_empty() {
-        terms.push(t);
-    }
-
-    // Remove empty strings that might appear from bare commas.
-    let terms: Vec<String> = terms.into_iter().filter(|t| !t.is_empty()).collect();
-    Ok(terms)
 }
 
 #[cfg(test)]
@@ -219,6 +134,18 @@ mod tests {
         let e = err("CREATE SYNONYM GROUP foo AS ('db', 'db', 'database')");
         assert!(matches!(e, SqlError::Parse { .. }));
         assert!(e.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn unconsumed_clause_before_as_is_refused() {
+        let e = err("CREATE SYNONYM GROUP cars FOR LANGUAGE 'de' AS ('auto', 'wagen')");
+        assert!(matches!(e, SqlError::Parse { .. }));
+    }
+
+    #[test]
+    fn trailing_tokens_after_term_list_are_refused() {
+        let e = err("CREATE SYNONYM GROUP cars AS ('auto', 'wagen') EXTRA");
+        assert!(matches!(e, SqlError::Parse { .. }));
     }
 
     #[test]

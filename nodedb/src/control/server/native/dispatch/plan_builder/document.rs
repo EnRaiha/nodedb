@@ -113,6 +113,7 @@ pub(crate) async fn build_point_put(
                 .to_string(),
         }),
         Some(CollectionType::Document(_)) | None => {
+            super::generated_gate::refuse_generated_body(ctx, collection, &value)?;
             let value = if schemaless {
                 let column = identity_column(declared_primary_key(ctx, collection)?);
                 identified_body(&value, &doc_id, &column)?
@@ -239,7 +240,7 @@ pub(crate) async fn build_range_scan(
             detail: "missing 'field'".to_string(),
         })?
         .clone();
-    let limit = fields.limit.unwrap_or(100) as usize;
+    let limit = super::requested_limit(fields)?;
     Ok(PhysicalPlan::Document(DocumentOp::RangeScan {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         field,
@@ -266,6 +267,11 @@ pub(crate) async fn build_batch_insert(
             detail: "documents array is empty".to_string(),
         });
     }
+    super::generated_gate::refuse_generated_documents(
+        ctx,
+        collection,
+        batch_docs.iter().map(|d| &d.fields),
+    )?;
     // Every row's identity in one batch at the collection's home.
     let pks: Vec<&[u8]> = batch_docs.iter().map(|d| d.id.as_bytes()).collect();
     let surrogates = super::helpers::assign_surrogates(ctx, collection, &pks).await?;
@@ -286,6 +292,8 @@ pub(crate) async fn build_batch_insert(
     Ok(PhysicalPlan::Document(DocumentOp::BatchInsert {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         documents,
+        // A batch insert inserts: a key already stored is refused.
+        if_absent: false,
         surrogates,
         // See `build_point_put`.
         returning: None,
@@ -355,7 +363,7 @@ pub(crate) async fn build_scan(
         }
         Some(CollectionType::Document(_)) | None => {}
     }
-    let limit = fields.limit.unwrap_or(1000) as usize;
+    let limit = super::requested_limit(fields)?;
     let filters = fields.filters.clone().unwrap_or_default();
     Ok(PhysicalPlan::Document(DocumentOp::Scan {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -380,6 +388,7 @@ pub(crate) async fn build_upsert(
 ) -> crate::Result<PhysicalPlan> {
     let doc_id = require_doc_id(fields)?;
     let value = fields.data.clone().unwrap_or_default();
+    super::generated_gate::refuse_generated_body(ctx, collection, &value)?;
     let value = if stores_schemaless_bodies(collection_type(ctx, collection)?.as_ref()) {
         let column = identity_column(declared_primary_key(ctx, collection)?);
         identified_body(&value, &doc_id, &column)?

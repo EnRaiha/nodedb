@@ -231,7 +231,7 @@ pub fn authorize_task_set(
             }
         }
     }
-    Ok(AuthorizedTaskSet::new(tasks))
+    Ok(AuthorizedTaskSet::new(tasks, identity))
 }
 
 fn authorize_collection_requirement(

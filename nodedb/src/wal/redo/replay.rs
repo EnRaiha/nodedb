@@ -276,6 +276,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let outer = redo_wal_record(77, 9, 3, &redo);
 
@@ -355,6 +356,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         // The transaction committed at LSN 50; an autocommit overwrote the same
         // key at LSN 100.
@@ -402,6 +404,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let standalone = vec![redo_wal_record(7, 0, 0, &redo)];
         let redo_ops = reconstitute_redo_records(&standalone).expect("well-formed redo");
@@ -429,6 +432,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let standalone = vec![
             put_wal_record(1, vec![1]),

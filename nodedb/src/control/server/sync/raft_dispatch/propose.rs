@@ -30,12 +30,17 @@ use crate::event::EventSource;
 ///
 /// Every sync write plan has a replicated form. A plan without one is
 /// refused.
+///
+/// The entry carries `user_roles`, the roles of the session identity that
+/// wrote the write. Every replica judges a role-guarded state transition
+/// against them. A trusted internal write passes none.
 pub(crate) async fn propose_sync_plan(
     state: &SharedState,
     owner: RecordOwner,
     plan: &PhysicalPlan,
     event_source: EventSource,
     deadline: StatementDeadline,
+    user_roles: Vec<String>,
 ) -> crate::Result<Vec<u8>> {
     let RecordOwner {
         tenant_id,
@@ -67,7 +72,9 @@ pub(crate) async fn propose_sync_plan(
     )?;
     propose_sync_write(
         state,
-        entry.with_event_source(event_source),
+        entry
+            .with_event_source(event_source)
+            .with_user_roles(user_roles),
         proposer,
         deadline,
     )

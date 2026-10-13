@@ -50,6 +50,12 @@ pub(super) fn describe_timeseries(op: &TimeseriesOp) -> PlanKind {
 
         // Read-only resolve: payload is the internal admission verdict, never a client row.
         TimeseriesOp::ResolveIngest(_) => PlanKind::Execution,
+        // Internal: the REFRESH handler reads the apply's acknowledgement.
+        TimeseriesOp::RefreshAggregate { .. } => PlanKind::Execution,
+        // Internal: the SHOW / REWRITE PARTITIONS handler decodes the payload.
+        TimeseriesOp::Partitions { .. } => PlanKind::Execution,
+        // Internal: the coordinator splits the payload into provider rows.
+        TimeseriesOp::ReadAggregate { .. } => PlanKind::Execution,
     }
 }
 

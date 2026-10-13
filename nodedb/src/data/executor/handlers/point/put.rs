@@ -110,6 +110,7 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: resolved_sum_targets,
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::Document,
             },
         ) {
             Ok(p) => p,

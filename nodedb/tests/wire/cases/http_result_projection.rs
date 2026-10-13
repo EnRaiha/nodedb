@@ -184,7 +184,7 @@ async fn http_kv_full_scan_includes_value_column() {
 #[tokio::test]
 async fn http_vector_search_serializes_distance() {
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION nb_vec_http WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION nb_vec_http WITH (engine='document_schemaless')")
         .await
         .expect("create");
     srv.exec("CREATE INDEX ON nb_vec_http (embedding)")

@@ -119,8 +119,11 @@ pub async fn execute_sql(
 
         // Resolved once and reused at every decode site — orchestrated rows and plain
         // dispatch rows must be redacted by the same policy snapshot.
-        let redaction =
-            QueryRedaction::for_plans(tenant_id, scope.auth(), tasks.iter().map(|t| &t.plan));
+        let redaction = QueryRedaction::for_plans(
+            tenant_id,
+            scope.auth(),
+            tasks.iter().map(|t| (&t.plan, t.database_id)),
+        );
 
         let mut results = Vec::new();
         // Checked once, not per task: keeps per-task extraction a no-op when metering
@@ -219,7 +222,7 @@ pub async fn execute_sql(
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::Merge {
                     target_collection: _,
-                    source_collection: _,
+                    source: _,
                     source_alias: _,
                     target_join_col: _,
                     source_join_col: _,
@@ -273,7 +276,7 @@ pub async fn execute_sql(
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
                     target_collection: _,
-                    source_collection: _,
+                    source: _,
                     source_alias: _,
                     target_join_col: _,
                     source_join_col: _,

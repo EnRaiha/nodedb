@@ -42,8 +42,8 @@ pub(super) fn convert_identifier(ident: &Ident, scope: &ColumnScope<'_>) -> Resu
             distinct: false,
         });
     }
-    scope.check_column(None, &name)?;
-    Ok(SqlExpr::Column { table: None, name })
+    let table = scope.column_qualifier(None, &name)?;
+    Ok(SqlExpr::Column { table, name })
 }
 
 pub(super) fn convert_compound_identifier(
@@ -64,11 +64,8 @@ pub(super) fn convert_compound_identifier(
     }
     let table = normalize_ident(&parts[0]);
     let name = normalize_ident(&parts[1]);
-    scope.check_column(Some(&table), &name)?;
-    Ok(SqlExpr::Column {
-        table: Some(table),
-        name,
-    })
+    let table = scope.column_qualifier(Some(&table), &name)?;
+    Ok(SqlExpr::Column { table, name })
 }
 
 #[cfg(test)]

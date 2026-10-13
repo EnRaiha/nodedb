@@ -227,6 +227,7 @@ pub async fn run_commit(
                         publishes: &publishes,
                         applied_key: dp.applied_key().zip(dp.applied_key_vshard()),
                         ts_preview: &ts_preview,
+                        user_roles: identity.role_names(),
                     },
                 )
                 .await
@@ -272,6 +273,7 @@ pub async fn run_commit(
                             publishes: &publishes,
                             applied_key: dp.applied_key().zip(dp.applied_key_vshard()),
                             ts_preview: &ts_preview,
+                            user_roles: identity.role_names(),
                         },
                     )
                     .await
@@ -298,7 +300,7 @@ pub async fn run_commit(
                         state,
                         dp,
                         &buffered,
-                        tenant_id,
+                        identity,
                         vshard_id,
                         publishes,
                         &ts_preview,

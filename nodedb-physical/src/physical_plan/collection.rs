@@ -82,6 +82,9 @@ impl PhysicalPlan {
             | PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. })
             | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. })
             | PhysicalPlan::Timeseries(TimeseriesOp::Truncate { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::Partitions { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::ReadAggregate { collection, .. })
             | PhysicalPlan::Spatial(SpatialOp::Scan { collection, .. })
             | PhysicalPlan::Document(DocumentOp::Register { collection, .. })
             | PhysicalPlan::Document(DocumentOp::IndexLookup { collection, .. })
@@ -94,7 +97,10 @@ impl PhysicalPlan {
             PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match &inner.ingest {
                 TimeseriesOp::Scan { collection, .. }
                 | TimeseriesOp::Ingest { collection, .. }
-                | TimeseriesOp::Truncate { collection, .. } => Some(collection.as_str()),
+                | TimeseriesOp::Truncate { collection, .. }
+                | TimeseriesOp::RefreshAggregate { collection, .. }
+                | TimeseriesOp::Partitions { collection, .. }
+                | TimeseriesOp::ReadAggregate { collection, .. } => Some(collection.as_str()),
                 TimeseriesOp::ResolveIngest(_) => None,
             },
             // Same shape on the graph side, and `EdgeDelete` itself reports

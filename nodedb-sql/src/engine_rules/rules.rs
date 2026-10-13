@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::types::SqlPlan;
 
 use super::params::{
-    AggregateParams, DeleteParams, InsertParams, MergeParams, PointGetParams, ScanParams,
-    TruncateParams, UpdateFromParams, UpdateParams, UpsertParams,
+    AggregateParams, DeleteParams, InsertParams, InsertSelectParams, MergeParams, PointGetParams,
+    ScanParams, TruncateParams, UpdateFromParams, UpdateParams, UpsertParams,
 };
 
 /// Engine-specific planning rules.
@@ -20,6 +20,11 @@ pub trait EngineRules {
     /// Plan an INSERT. Returns `Err` if the engine does not support inserts
     /// (e.g. timeseries routes to `TimeseriesIngest` instead).
     fn plan_insert(&self, params: InsertParams) -> Result<Vec<SqlPlan>>;
+    /// Plan an `INSERT ... SELECT` into a collection on this engine. The
+    /// Control Plane copies the rows and gives each a fresh surrogate, which
+    /// the document engines support. Every other engine returns
+    /// `Err(SqlError::Unsupported)`.
+    fn plan_insert_select(&self, params: InsertSelectParams) -> Result<Vec<SqlPlan>>;
     /// Plan an UPSERT (insert-or-merge). Returns `Err` for append-only or
     /// columnar engines that don't support merge semantics.
     fn plan_upsert(&self, params: UpsertParams) -> Result<Vec<SqlPlan>>;

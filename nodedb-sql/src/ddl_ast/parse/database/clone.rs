@@ -1,80 +1,60 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! `CLONE DATABASE <new> FROM <source> [AS OF SYSTEM TIME <ms> | LATEST]`.
+//! `CLONE DATABASE <new> FROM <source> [AS OF SYSTEM TIME <ms> | AS OF
+//! LATEST | LATEST]`.
 
+use crate::ddl_ast::parse::clause::ClauseCursor;
 use crate::ddl_ast::statement::{CloneAsOf, DatabaseStmt, NodedbStatement};
 use crate::error::SqlError;
 
-pub(super) fn parse_clone_database(
-    parts: &[&str],
-    upper: &str,
-) -> Result<NodedbStatement, SqlError> {
-    let new_name = parts
-        .get(2)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "CLONE DATABASE requires a target name".into(),
-        })?
-        .trim_matches('"')
-        .to_string();
-    let from_idx = parts
-        .iter()
-        .position(|w| w.to_uppercase() == "FROM")
-        .ok_or_else(|| SqlError::Parse {
-            detail: "CLONE DATABASE requires FROM <source>".into(),
-        })?;
-    let source_name = parts
-        .get(from_idx + 1)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "CLONE DATABASE FROM requires a source name".into(),
-        })?
-        .trim_matches('"')
-        .to_string();
+use super::dispatch::db_name;
 
-    // Determine the AS OF clause.
-    // Accepted forms:
-    //   (no AS OF)                            → Latest
-    //   AS OF SYSTEM TIME LATEST              → Latest
-    //   AS OF SYSTEM TIME <ms>                → SystemTimeMs(<ms>)
-    let as_of = if upper.contains("AS OF SYSTEM TIME") {
-        let ms_idx = parts
-            .iter()
-            .position(|w| w.to_uppercase() == "AS")
-            .and_then(|i| {
-                if parts.get(i + 1).map(|w| w.to_uppercase()).as_deref() == Some("OF")
-                    && parts.get(i + 2).map(|w| w.to_uppercase()).as_deref() == Some("SYSTEM")
-                    && parts.get(i + 3).map(|w| w.to_uppercase()).as_deref() == Some("TIME")
-                {
-                    Some(i + 4)
-                } else {
-                    None
-                }
-            });
-        match ms_idx {
-            Some(idx) => match parts.get(idx) {
-                Some(tok) if tok.to_uppercase() == "LATEST" => CloneAsOf::Latest,
-                Some(ms_str) => {
-                    let ms = ms_str.parse::<i64>().map_err(|_| SqlError::Parse {
-                        detail: format!(
-                            "CLONE DATABASE AS OF SYSTEM TIME: expected integer milliseconds \
-                             or LATEST, got '{ms_str}'"
-                        ),
-                    })?;
-                    CloneAsOf::SystemTimeMs(ms)
-                }
-                None => {
-                    return Err(SqlError::Parse {
-                        detail: "CLONE DATABASE AS OF SYSTEM TIME requires a timestamp or LATEST"
-                            .into(),
-                    });
-                }
-            },
-            None => CloneAsOf::Latest,
+/// Read `<new> FROM <source> [AS OF LATEST | AS OF SYSTEM TIME <ms> | AS OF
+/// SYSTEM TIME LATEST]` after `CLONE DATABASE`. Keywords are matched in any
+/// case; a misspelled `AS OF` clause is refused, never read as LATEST.
+pub(super) fn parse_clone_database(
+    c: &mut ClauseCursor<'_, '_>,
+) -> Result<NodedbStatement, SqlError> {
+    if c.at_end() {
+        return Err(c.error("CLONE DATABASE requires a target name"));
+    }
+    let new_name = db_name(c, "target name")?;
+    if !c.eat_keyword("FROM") {
+        return Err(c.error("CLONE DATABASE requires FROM <source>"));
+    }
+    if c.at_end() {
+        return Err(c.error("CLONE DATABASE FROM requires a source name"));
+    }
+    let source_name = db_name(c, "source name")?;
+
+    let as_of = if c.eat_keywords(&["AS", "OF"]) {
+        if c.eat_keyword("LATEST") {
+            CloneAsOf::Latest
+        } else {
+            c.expect_keywords(&["SYSTEM", "TIME"])?;
+            if c.eat_keyword("LATEST") {
+                CloneAsOf::Latest
+            } else if c.at_end() {
+                return Err(
+                    c.error("CLONE DATABASE AS OF SYSTEM TIME requires a timestamp or LATEST")
+                );
+            } else {
+                let next = c.describe_next();
+                let ms = c.i64("AS OF SYSTEM TIME").map_err(|_| SqlError::Parse {
+                    detail: format!(
+                        "CLONE DATABASE AS OF SYSTEM TIME: expected integer milliseconds \
+                         or LATEST, got {next}"
+                    ),
+                })?;
+                CloneAsOf::SystemTimeMs(ms)
+            }
         }
     } else {
+        // A bare `LATEST` names the default explicitly.
+        c.eat_keyword("LATEST");
         CloneAsOf::Latest
     };
+    c.finish()?;
 
     Ok(NodedbStatement::Database(DatabaseStmt::CloneDatabase {
         new_name,
@@ -112,6 +92,43 @@ mod tests {
     #[test]
     fn parse_clone_database_latest() {
         let stmt = ok("CLONE DATABASE newdb FROM srcdb AS OF LATEST");
+        assert_eq!(
+            stmt,
+            NodedbStatement::Database(DatabaseStmt::CloneDatabase {
+                new_name: "newdb".into(),
+                source_name: "srcdb".into(),
+                as_of: CloneAsOf::Latest,
+            })
+        );
+    }
+
+    #[test]
+    fn lowercase_as_of_system_time_is_read() {
+        let stmt = ok("clone database newdb from srcdb as of system time 42");
+        assert_eq!(
+            stmt,
+            NodedbStatement::Database(DatabaseStmt::CloneDatabase {
+                new_name: "newdb".into(),
+                source_name: "srcdb".into(),
+                as_of: CloneAsOf::SystemTimeMs(42),
+            })
+        );
+    }
+
+    #[test]
+    fn misspelled_as_of_clause_is_refused() {
+        let sql = "CLONE DATABASE newdb FROM srcdb AS OF SYSTEM TIMESTAMP 42";
+        let upper = sql.to_uppercase();
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        assert!(matches!(
+            try_parse(&upper, &parts, sql),
+            Some(Err(SqlError::Parse { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_bare_latest_is_read() {
+        let stmt = ok("CLONE DATABASE newdb FROM srcdb LATEST");
         assert_eq!(
             stmt,
             NodedbStatement::Database(DatabaseStmt::CloneDatabase {

@@ -32,6 +32,7 @@ use super::super::timeseries;
 use super::super::transfer;
 use super::super::weighted_pick;
 use super::helpers::{extract_last_value_args, extract_last_values_arg};
+use super::route_tokens::RouteTokens;
 
 pub(super) async fn try_string(
     state: &SharedState,
@@ -50,16 +51,16 @@ pub(super) async fn try_string(
     // string-prefix arms above (alongside the vector-index lifecycle forms).
     //
     // `CREATE TIMESERIES` / `ALTER TIMESERIES` / `REWRITE PARTITIONS` are
-    // routed here, but `SHOW PARTITIONS ` is intentionally NOT — it is already
-    // claimed by the consumer-group handler above, so the timeseries
-    // `show_partitions` handler stays shadowed.
+    // routed here. `SHOW PARTITIONS FOR <timeseries>` is routed with the
+    // consumer-group form `SHOW PARTITIONS ON <stream>` in the streaming
+    // arms, by the token after PARTITIONS.
 
     // Weighted random selection — anchored to the statement prefix so a
     // doc-object UPSERT body carrying the token never reaches this arm.
     if upper.starts_with("SELECT * FROM WEIGHTED_PICK(")
         || upper.starts_with("SELECT * FROM WEIGHTED_PICK (")
     {
-        return Some(weighted_pick::weighted_pick(state, identity, sql).await);
+        return Some(weighted_pick::weighted_pick(state, identity, database_id, sql).await);
     }
 
     // Rate gate / cooldown functions.
@@ -75,10 +76,10 @@ pub(super) async fn try_string(
 
     // Atomic transfer functions.
     if upper.starts_with("SELECT TRANSFER(") || upper.starts_with("SELECT TRANSFER (") {
-        return Some(transfer::transfer(state, identity, sql, txn_ctx).await);
+        return Some(transfer::transfer(state, identity, database_id, sql, txn_ctx).await);
     }
     if upper.starts_with("SELECT TRANSFER_ITEM(") || upper.starts_with("SELECT TRANSFER_ITEM (") {
-        return Some(transfer::transfer_item(state, identity, sql, txn_ctx).await);
+        return Some(transfer::transfer_item(state, identity, database_id, sql, txn_ctx).await);
     }
 
     // Sorted index DDL.
@@ -112,9 +113,7 @@ pub(super) async fn try_string(
         );
     }
     // RANGE as a sorted index function (check it's not a standard SQL RANGE).
-    if (upper.starts_with("SELECT * FROM RANGE(") || upper.starts_with("SELECT * FROM RANGE ("))
-        && !upper.contains(" BETWEEN ")
-    {
+    if is_sorted_index_range(sql) {
         return Some(
             kv_sorted_index::select_range(state, identity, database_id, sql, txn_ctx).await,
         );
@@ -122,34 +121,33 @@ pub(super) async fn try_string(
 
     // KV_INCR / KV_DECR / KV_INCR_FLOAT / KV_CAS / KV_GETSET — atomic KV operations.
     if upper.starts_with("SELECT KV_INCR(") || upper.starts_with("SELECT KV_INCR (") {
-        return Some(kv_atomic::kv_incr(state, identity, sql, false, txn_ctx).await);
+        return Some(kv_atomic::kv_incr(state, identity, database_id, sql, false, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_DECR(") || upper.starts_with("SELECT KV_DECR (") {
-        return Some(kv_atomic::kv_incr(state, identity, sql, true, txn_ctx).await);
+        return Some(kv_atomic::kv_incr(state, identity, database_id, sql, true, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_INCR_FLOAT(") || upper.starts_with("SELECT KV_INCR_FLOAT (") {
-        return Some(kv_atomic::kv_incr_float(state, identity, sql, txn_ctx).await);
+        return Some(kv_atomic::kv_incr_float(state, identity, database_id, sql, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_CAS(") || upper.starts_with("SELECT KV_CAS (") {
-        return Some(kv_atomic::kv_cas(state, identity, sql, txn_ctx).await);
+        return Some(kv_atomic::kv_cas(state, identity, database_id, sql, txn_ctx).await);
     }
     if upper.starts_with("SELECT KV_GETSET(") || upper.starts_with("SELECT KV_GETSET (") {
-        return Some(kv_atomic::kv_getset(state, identity, sql, txn_ctx).await);
+        return Some(kv_atomic::kv_getset(state, identity, database_id, sql, txn_ctx).await);
     }
 
     // Timeseries: CREATE TIMESERIES, ALTER TIMESERIES, REWRITE PARTITIONS.
-    // (SHOW PARTITIONS is shadowed by consumer_group above, as noted.)
     if upper.starts_with("CREATE TIMESERIES ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(timeseries::create_timeseries(state, identity, &parts, database_id).await);
     }
     if upper.starts_with("ALTER TIMESERIES ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(timeseries::alter_timeseries(state, identity, &parts).await);
+        return Some(timeseries::alter_timeseries(state, identity, database_id, &parts).await);
     }
     if upper.starts_with("REWRITE PARTITIONS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(timeseries::rewrite_partitions(state, identity, &parts));
+        return Some(timeseries::rewrite_partitions(state, identity, database_id, &parts).await);
     }
 
     // Last-value cache queries.
@@ -207,14 +205,10 @@ pub(super) async fn try_string(
         );
     }
 
-    // CONVERT COLLECTION between storage modes. `CONVERT COLLECTION <name> TO
-    // <target>` parses into no typed AST variant — the router dispatches it by
-    // string prefix from the raw SQL, before the parse gate (the
-    // `CONVERT COLLECTION ` form plus the broader `CONVERT ... TO ...` form, in
-    // that `||`/`&&` precedence).
-    if upper.starts_with("CONVERT COLLECTION ")
-        || upper.starts_with("CONVERT ") && upper.contains(" TO ")
-    {
+    // CONVERT COLLECTION between storage modes. `CONVERT [COLLECTION] <name>
+    // TO <target>` parses into no typed AST variant — the router dispatches it
+    // by its leading words from the raw SQL, before the parse gate.
+    if is_convert_collection(sql) {
         return Some(convert::convert_collection(state, identity, database_id, sql).await);
     }
 
@@ -242,17 +236,25 @@ pub(super) async fn try_string(
     // otherwise parse into a typed graph statement and be captured by the graph
     // dispatch below. `SEARCH ... USING VECTOR(...)` never reaches here — it is
     // preprocessor-rewritten to a canonical `SELECT ... vector_distance(...)`.
-    if upper.starts_with("SEARCH ") && upper.contains("USING FUSION") {
-        return Some(
-            dsl::search_fusion(
-                state,
-                identity,
-                database_id,
-                sql,
-                txn_ctx.linearizable_reads(),
-            )
-            .await,
-        );
+    // The statement is recognized from its tokens, so `USING FUSION` inside a
+    // string literal or a comment never routes here.
+    if upper.starts_with("SEARCH ")
+        && let Some(parsed) = nodedb_sql::ddl_ast::parse_search_using_fusion(sql)
+    {
+        return Some(match parsed {
+            Ok((collection, params)) => {
+                dsl::search_fusion(
+                    state,
+                    identity,
+                    database_id,
+                    collection,
+                    params,
+                    txn_ctx.linearizable_reads(),
+                )
+                .await
+            }
+            Err(e) => Err(DdlError::from_sql_error(e, identity.tenant_id)),
+        });
     }
     if upper.starts_with("CREATE VECTOR INDEX ") {
         return Some(dsl::create_vector_index(state, identity, database_id, sql).await);
@@ -352,10 +354,53 @@ fn crdt_transaction_error() -> DdlError {
     DdlError::from_error(&crate::Error::CrdtApplyForbiddenInTransaction)
 }
 
+/// `SELECT * FROM RANGE(<index>, <min>, <max>)`, the sorted-index range read.
+/// A top-level `BETWEEN` marks a standard SQL range instead.
+fn is_sorted_index_range(sql: &str) -> bool {
+    let tokens = RouteTokens::new(sql);
+    tokens.leads_with(&["SELECT", "*", "FROM", "RANGE", "("]) && !tokens.has_word_from(0, "BETWEEN")
+}
+
+/// `CONVERT COLLECTION <name> TO <target>`, or `CONVERT <name> TO <target>`,
+/// which the handler refuses for its missing `COLLECTION` keyword.
+fn is_convert_collection(sql: &str) -> bool {
+    let tokens = RouteTokens::new(sql);
+    tokens.leads_with(&["CONVERT", "COLLECTION"])
+        || (tokens.leads_with(&["CONVERT"]) && tokens.phrase_at(tokens.skip_name(1), &["TO"]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::server::shared::session::{SessionId, SessionStore};
+
+    #[test]
+    fn sorted_index_range_is_routed_on_its_leading_words() {
+        assert!(is_sorted_index_range(
+            "SELECT * FROM RANGE('scores', 10, 20)"
+        ));
+        assert!(is_sorted_index_range(
+            "select * from range ('scores', 10, 20)"
+        ));
+        // `BETWEEN` inside a literal argument is data.
+        assert!(is_sorted_index_range(
+            "SELECT * FROM RANGE('between_scores', 10, 20)"
+        ));
+        assert!(!is_sorted_index_range(
+            "SELECT * FROM RANGE(1, 9) WHERE x BETWEEN 2 AND 3"
+        ));
+        assert!(!is_sorted_index_range("SELECT * FROM ranges"));
+    }
+
+    #[test]
+    fn convert_is_routed_on_its_leading_words() {
+        assert!(is_convert_collection(
+            "CONVERT COLLECTION events TO document_strict"
+        ));
+        assert!(is_convert_collection("CONVERT events TO kv"));
+        // `TO` inside a literal is data.
+        assert!(!is_convert_collection("CONVERT 'a TO b'"));
+    }
 
     #[test]
     fn crdt_apply_and_merge_are_forbidden_in_active_or_failed_transactions() {

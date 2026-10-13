@@ -67,10 +67,11 @@ pub(crate) fn build_kv_collection_type(
     }
 
     // Validate: PK type must be hashable.
-    let pk = col_defs
-        .iter()
-        .find(|c| c.primary_key)
-        .expect("invariant: pk_count validated to be exactly 1 in the checks above");
+    let Some(pk) = col_defs.iter().find(|c| c.primary_key) else {
+        return Err(SqlError::Parse {
+            detail: "KV collections require a PRIMARY KEY column (the hash key)".to_string(),
+        });
+    };
     if !nodedb_types::is_valid_kv_key_type(&pk.column_type) {
         return Err(SqlError::Parse {
             detail: format!(
@@ -86,7 +87,7 @@ pub(crate) fn build_kv_collection_type(
     })?;
 
     let ttl = build_kv_ttl(options, &schema)?;
-    let capacity_hint = build_kv_capacity(options);
+    let capacity_hint = build_kv_capacity(options)?;
 
     let config = nodedb_types::KvConfig {
         schema,
@@ -150,11 +151,62 @@ fn build_kv_ttl(
     }))
 }
 
-/// Parse optional `capacity` from the options list.
-fn build_kv_capacity(options: &[(String, String)]) -> u32 {
-    options
+/// Parse optional `capacity` from the options list. Absent is `0`, which
+/// sizes the table by the engine default. A value that is not a positive
+/// integer within `u32` is refused by value, never replaced by the default.
+fn build_kv_capacity(options: &[(String, String)]) -> Result<u32, SqlError> {
+    let Some((_, raw)) = options
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("capacity"))
-        .and_then(|(_, v)| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
+    else {
+        return Ok(0);
+    };
+    let text = raw.trim().trim_matches('\'');
+    match text.parse::<u32>() {
+        Ok(capacity) if capacity > 0 => Ok(capacity),
+        _ => Err(SqlError::Parse {
+            detail: format!(
+                "KV capacity '{raw}' is not valid; capacity must be a positive integer up to {}",
+                u32::MAX
+            ),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(value: &str) -> Vec<(String, String)> {
+        vec![("capacity".to_string(), value.to_string())]
+    }
+
+    #[test]
+    fn an_absent_capacity_is_the_default() {
+        assert_eq!(build_kv_capacity(&[]).expect("absent capacity"), 0);
+    }
+
+    #[test]
+    fn a_positive_capacity_is_kept() {
+        assert_eq!(
+            build_kv_capacity(&options("10000")).expect("capacity"),
+            10_000
+        );
+        assert_eq!(
+            build_kv_capacity(&options("'64'")).expect("quoted capacity"),
+            64
+        );
+    }
+
+    #[test]
+    fn a_bad_capacity_is_refused_by_value() {
+        for bad in ["lots", "-5", "0", "1.5", "99999999999"] {
+            match build_kv_capacity(&options(bad)) {
+                Err(SqlError::Parse { detail }) => {
+                    assert!(detail.contains(&format!("'{bad}'")), "{detail}");
+                }
+                other => panic!("capacity '{bad}' must be refused, got {other:?}"),
+            }
+        }
+    }
 }

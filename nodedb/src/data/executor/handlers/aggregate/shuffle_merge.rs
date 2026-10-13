@@ -175,6 +175,7 @@ mod tests {
             alias: format!("{func}({field})"),
             user_alias: None,
             expr: None,
+            param: None,
         }
     }
 
@@ -205,7 +206,7 @@ mod tests {
                 nodedb_query::msgpack_scan::build_group_key(doc, group_by).expect("group key");
             groups
                 .entry(key)
-                .or_insert_with(|| GroupState::new(specs))
+                .or_insert_with(|| GroupState::new(specs).expect("group state"))
                 .feed(specs, doc)
                 .expect("feed");
         }
@@ -255,7 +256,7 @@ mod tests {
             let key =
                 nodedb_query::msgpack_scan::build_group_key(doc, group_by).expect("group key");
             map.entry(key)
-                .or_insert_with(|| GroupState::new(specs))
+                .or_insert_with(|| GroupState::new(specs).expect("group state"))
                 .feed(specs, doc)
                 .expect("feed");
         }

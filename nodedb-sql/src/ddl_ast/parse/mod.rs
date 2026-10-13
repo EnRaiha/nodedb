@@ -3,6 +3,7 @@
 mod alert;
 mod backup;
 mod change_stream;
+mod clause;
 mod cluster_admin;
 mod collection;
 mod conflict_policy;

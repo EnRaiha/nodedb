@@ -11,6 +11,7 @@ use super::engines::{GraphTuning, KvTuning, SparseTuning, TimeseriesToning, Vect
 use super::maintenance::MaintenanceTuning;
 use super::memory::MemoryTuning;
 use super::network::{BridgeTuning, ClusterTransportTuning, NetworkTuning, WalTuning};
+use super::promql::PromqlTuning;
 use super::scheduler::SchedulerTuning;
 use super::shutdown::ShutdownTuning;
 
@@ -54,6 +55,8 @@ pub struct TuningConfig {
     pub maintenance: MaintenanceTuning,
     #[serde(default)]
     pub calvin: CalvinTuning,
+    #[serde(default)]
+    pub promql: PromqlTuning,
 }
 
 impl TuningConfig {
@@ -152,7 +155,6 @@ default_deadline_secs = 60
         let cfg: TuningConfig = toml::from_str(toml_str).expect("deserialize");
         assert_eq!(cfg.query.sort_run_size, 50_000);
         assert_eq!(cfg.network.default_deadline_secs, 60);
-        assert_eq!(cfg.query.aggregate_scan_cap, 10_000_000);
         assert_eq!(cfg.vector.seal_threshold, 65_536);
         // Unset fields retain defaults.
         assert_eq!(cfg.query.columnar_flush_threshold, 65_536);

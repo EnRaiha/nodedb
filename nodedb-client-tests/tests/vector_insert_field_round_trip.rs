@@ -28,9 +28,8 @@ async fn vector_insert_field_must_not_silently_delegate_to_unfielded() {
     // `primary='vector'` is the server contract that routes per-row
     // INSERT through `VectorOp::DirectUpsert`, which binds the vector
     // under the named-field HNSW key — exactly the path
-    // `vector_insert_field` must target. Plain `engine='vector'`
-    // without `primary='vector'` is a schemaless collection that
-    // happens to have a VECTOR column: the data lands in the document
+    // `vector_insert_field` must target. A `document_schemaless`
+    // collection with a VECTOR column keeps the data in the document
     // body, not in a per-field HNSW index, so a field-aware insert is
     // unverifiable in that mode.
     remote

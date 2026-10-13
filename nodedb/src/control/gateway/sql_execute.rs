@@ -13,7 +13,9 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 use super::core::{Gateway, QueryContext, authorized_plan_for_context};
 use super::lowered_plan::LoweredPlan;
 use super::plan_cache::{PlanCacheKey, SqlKey, hash_placeholder_types, hash_sql};
-use super::version_set::{permission_tree_version_key, rls_version_key};
+use super::version_set::{
+    continuous_aggregate_of_key, permission_tree_version_key, rls_version_key,
+};
 
 impl Gateway {
     /// Execute SQL through the two-phase, descriptor-version-aware plan cache.
@@ -68,6 +70,16 @@ impl Gateway {
                 if name == rls_key.as_str() {
                     return rls_version;
                 }
+                if let Some(aggregate) =
+                    continuous_aggregate_of_key(name, ctx.database_id.as_u64(), tenant_id)
+                {
+                    return super::version_set::continuous_aggregate_version(
+                        catalog,
+                        ctx.database_id.as_u64(),
+                        tenant_id,
+                        aggregate,
+                    );
+                }
                 catalog
                     .get_collection(ctx.database_id, tenant_id, name)
                     .ok()
@@ -84,9 +96,9 @@ impl Gateway {
                 if let Some(cached_plan) = self.plan_cache.get(&full_key) {
                     debug!(sql = %sql, "gateway: plan cache hit (two-phase)");
                     let checked = authorize_fn(cached_plan.as_ref().clone()).await?;
-                    let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
+                    let (plan, user_roles, _lease) = authorized_plan_for_context(ctx, checked)?;
                     return self
-                        .execute_with_version_set(ctx, plan, stored_vs)
+                        .execute_with_version_set(ctx, plan, stored_vs, &user_roles)
                         .await
                         .map(|outcome| outcome.payloads);
                 }
@@ -118,8 +130,8 @@ impl Gateway {
         }
 
         let checked = authorize_fn(plan.clone()).await?;
-        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
-        self.execute_with_version_set(ctx, plan, actual_vs)
+        let (plan, user_roles, _lease) = authorized_plan_for_context(ctx, checked)?;
+        self.execute_with_version_set(ctx, plan, actual_vs, &user_roles)
             .await
             .map(|outcome| outcome.payloads)
     }

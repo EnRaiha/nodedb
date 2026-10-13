@@ -200,11 +200,30 @@ impl CoreLoop {
     /// in each partition directory from disk, and returns the packed blobs.
     /// Returns `Err` on any I/O failure so the snapshot aborts cleanly rather
     /// than silently omitting data.
-    fn capture_flushed_ts_segments(
-        &self,
+    ///
+    /// Each collection's continuous-aggregate image travels in its blob. The
+    /// images are captured first: completing an aggregate's backfill loads
+    /// the collection's registry, so the partitions read below are exactly
+    /// the ones the image can name. A collection whose raw partitions
+    /// retention removed still carries the buckets folded from them, so it
+    /// gets a blob of its own.
+    pub(super) fn capture_flushed_ts_segments(
+        &mut self,
         database_id: u64,
         tid: crate::types::TenantId,
     ) -> crate::Result<Vec<TsFlushedCollectionBlob>> {
+        let now_ms = self.ingest_now_ms();
+        let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+        for (db, root_tid, root) in self.continuous_agg_mgr.root_sources() {
+            if db != database_id || root_tid != tid.as_u64() {
+                continue;
+            }
+            let image = self.capture_cagg_image(db, root_tid, &root, now_ms)?;
+            if !image.is_empty() {
+                images.push((format!("{db}:{root_tid}:{root}"), image));
+            }
+        }
+
         let mut result = Vec::new();
 
         for ((reg_db, reg_tid, collection), registry) in &self.ts_registries {
@@ -277,7 +296,22 @@ impl CoreLoop {
                 result.push(TsFlushedCollectionBlob {
                     collection_key,
                     partitions: partition_blobs,
+                    cagg_image: Vec::new(),
                 });
+            }
+        }
+
+        for (collection_key, image) in images {
+            match result
+                .iter_mut()
+                .find(|blob| blob.collection_key == collection_key)
+            {
+                Some(blob) => blob.cagg_image = image,
+                None => result.push(TsFlushedCollectionBlob {
+                    collection_key,
+                    partitions: Vec::new(),
+                    cagg_image: image,
+                }),
             }
         }
 

@@ -204,9 +204,14 @@ pub(super) fn extract_write_metadata(
             vec![(collection.to_string(), every_row(), ChangeOperation::Delete)]
         }
         // Scan and the resolve pass are reads — no row changed.
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
-            Vec::new()
-        }
+        // A refresh cut and partition maintenance change no row either.
+        PhysicalPlan::Timeseries(
+            TimeseriesOp::Scan { .. }
+            | TimeseriesOp::ResolveIngest(_)
+            | TimeseriesOp::RefreshAggregate { .. }
+            | TimeseriesOp::Partitions { .. }
+            | TimeseriesOp::ReadAggregate { .. },
+        ) => Vec::new(),
 
         // KV engine write operations.
         PhysicalPlan::Kv(KvOp::Put {

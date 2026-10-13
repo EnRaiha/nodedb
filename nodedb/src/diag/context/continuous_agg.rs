@@ -52,6 +52,55 @@ impl DomainContext for ContinuousAggregateNotApplied<'_> {
     }
 }
 
+/// Continuous-aggregate state that could not move between memory and its
+/// on-disk image, or a watermark payload that could not be read.
+pub(in crate::diag) struct ContinuousAggregateStateFault<'a> {
+    /// What failed: `image_write`, `image_read`, `fold`, or
+    /// `watermark_decode`.
+    pub stage: &'static str,
+    pub database_id: u64,
+    pub tenant_id: u64,
+    /// Root collection or aggregate the state belongs to.
+    pub subject: &'a str,
+    /// What failed, without the per-occurrence detail.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for ContinuousAggregateStateFault<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.continuous_aggregate_state_fault"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The stage and class name the bug. The subject is the occurrence.
+        format!("stage={};cause={}", self.stage, self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "stage": self.stage,
+            "database_id": self.database_id,
+            "tenant_id": self.tenant_id,
+            "subject": self.subject,
+            "error_class": self.error_class,
+            "consequence": match self.stage {
+                "image_write" => "the image keeps its previous state. Folds since then \
+                                  redo from partitions at the next restart, and raw \
+                                  retention refuses to remove partitions until a write \
+                                  succeeds",
+                "image_read" | "fold" => "every aggregate rooted at the subject is marked stale and \
+                                 takes no fold, so its buckets never mix with state it \
+                                 cannot trust",
+                _ => "raw retention treats the tier watermark as unknown and keeps the \
+                      raw partitions",
+            },
+            "operator_action": "inspect the collection directory for a damaged or \
+                                unwritable cagg.state file. Drop and re-create an \
+                                aggregate marked stale to rebuild it from its partitions",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

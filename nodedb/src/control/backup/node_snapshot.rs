@@ -75,6 +75,7 @@ pub(super) async fn snapshot_remote(
         txn_id: None,
         vshard_id: None,
         read_groups: Vec::new(),
+        user_roles: Vec::new(),
     });
 
     let resp = transport

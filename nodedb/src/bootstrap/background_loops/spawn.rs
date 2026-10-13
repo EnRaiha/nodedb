@@ -107,6 +107,12 @@ pub fn spawn_background_loops(
         config.tuning.maintenance.scope_expiry_interval_secs,
     );
 
+    // Periodic continuous-aggregate refresh cuts. The metadata leader
+    // proposes one replicated cut per aggregate per period slot.
+    crate::control::server::shared::ddl::neutral::continuous_agg::spawn_periodic_refresh_loop(
+        Arc::clone(shared),
+    );
+
     spawn_storage_tiers(shared, config, shutdown_rx);
 
     event_plane

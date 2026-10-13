@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use zerompk::{FromMessagePack, ToMessagePack};
 
-use super::ingest::{LogEntry, TimeRange};
+use super::ingest::TimeRange;
 
 /// Error parsing a partition interval string (e.g., "1h", "3d").
 #[derive(Debug, thiserror::Error)]
@@ -206,29 +206,6 @@ impl std::fmt::Display for PartitionInterval {
             Self::Auto => write!(f, "AUTO"),
         }
     }
-}
-
-/// Data from a single series after memtable drain.
-#[derive(Debug)]
-pub struct FlushedSeries {
-    pub series_id: super::series::SeriesId,
-    pub kind: FlushedKind,
-    pub min_ts: i64,
-    pub max_ts: i64,
-}
-
-/// Type-specific flushed data.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum FlushedKind {
-    Metric {
-        gorilla_block: Vec<u8>,
-        sample_count: u64,
-    },
-    Log {
-        entries: Vec<LogEntry>,
-        total_bytes: usize,
-    },
 }
 
 /// Segment file reference for the L1/L2 index.

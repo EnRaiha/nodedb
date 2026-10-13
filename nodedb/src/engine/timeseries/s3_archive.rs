@@ -19,6 +19,7 @@ use super::columnar_segment::{ColumnarSegmentReader, SegmentError};
 use super::partition_registry::PartitionRegistry;
 
 use nodedb_types::timeseries::PartitionState;
+use nodedb_wal::crypto::WalEncryptionKey;
 
 /// Configuration for S3-compatible archival.
 #[derive(Debug, Clone)]
@@ -107,9 +108,10 @@ pub async fn archive_partition(
     collection: &str,
     partition_dir: &Path,
     partition_dir_name: &str,
+    kek: Option<&WalEncryptionKey>,
 ) -> Result<String, SegmentError> {
     // Read partition metadata to verify it's sealed.
-    let meta = ColumnarSegmentReader::read_meta(partition_dir, None)?;
+    let meta = ColumnarSegmentReader::read_meta(partition_dir, kek)?;
     if meta.state != PartitionState::Sealed && meta.state != PartitionState::Merged {
         return Err(SegmentError::Io(format!(
             "cannot archive partition in state {:?}",
@@ -172,6 +174,16 @@ pub async fn archive_partition(
     Ok(marker_key)
 }
 
+/// The collection one archival cycle reads its partitions from.
+pub struct ArchiveSource<'a> {
+    pub registry: &'a mut PartitionRegistry,
+    pub collection: &'a str,
+    pub base_dir: &'a Path,
+    /// The timeseries segment key the partitions were written with, or
+    /// `None` for plaintext partitions.
+    pub kek: Option<&'a WalEncryptionKey>,
+}
+
 /// Run an archival cycle: find partitions older than `archive_after`,
 /// upload to S3, mark as `Archived` in the registry.
 ///
@@ -179,12 +191,16 @@ pub async fn archive_partition(
 pub async fn run_archive_cycle(
     store: &impl ObjectStore,
     config: &S3ArchiveConfig,
-    registry: &mut PartitionRegistry,
-    collection: &str,
-    base_dir: &Path,
+    source: ArchiveSource<'_>,
     archive_after_ms: u64,
     now_ms: i64,
 ) -> Result<usize, SegmentError> {
+    let ArchiveSource {
+        registry,
+        collection,
+        base_dir,
+        kek,
+    } = source;
     if archive_after_ms == 0 {
         return Ok(0); // Archival disabled.
     }
@@ -208,7 +224,7 @@ pub async fn run_archive_cycle(
             continue;
         }
 
-        match archive_partition(store, config, collection, &partition_dir, &dir_name).await {
+        match archive_partition(store, config, collection, &partition_dir, &dir_name, kek).await {
             Ok(key) => {
                 tracing::info!(
                     collection,

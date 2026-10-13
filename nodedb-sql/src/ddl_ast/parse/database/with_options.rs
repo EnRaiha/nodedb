@@ -1,50 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared `WITH (key=value, ...)` extraction for database DDL.
+//! Shared `WITH (key = value, ...)` reader for database DDL.
 
-use crate::parser::preprocess::lex::find_ascii_keyword;
+use crate::ddl_ast::parse::clause::ClauseCursor;
+use crate::error::SqlError;
 
-/// Extract `WITH (key=value, ...)` pairs from a raw SQL string.
-/// Returns an empty vec if no WITH clause is present.
-pub(super) fn parse_with_options(sql: &str) -> Vec<(String, String)> {
-    let with_start = match find_ascii_keyword(sql, "WITH") {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let after = &sql[with_start + 4..];
-    let paren_start = match after.find('(') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let inner = &after[paren_start + 1..];
-    let paren_end = match inner.find(')') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let inner = &inner[..paren_end];
-    inner
-        .split(',')
-        .filter_map(|pair| {
-            let mut it = pair.splitn(2, '=');
-            let k = it.next()?.trim().to_string();
-            let v = it
-                .next()
-                .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
-                .unwrap_or_default();
-            if k.is_empty() { None } else { Some((k, v)) }
-        })
-        .collect()
+/// Read an optional `WITH (key = value, ...)` at the cursor. A value is a
+/// quoted string or a run of tokens such as `eu-west` or `1.5`. Returns an
+/// empty vec when the next token is not `WITH`.
+pub(super) fn parse_with_options(
+    c: &mut ClauseCursor<'_, '_>,
+) -> Result<Vec<(String, String)>, SqlError> {
+    if !c.eat_keyword("WITH") {
+        return Ok(Vec::new());
+    }
+    c.paren_list("WITH options", |c| {
+        let key = c.word("option name")?.to_string();
+        c.expect_punct('=')?;
+        let value = match c.string(&key) {
+            Ok(value) => value,
+            Err(_) => {
+                let raw = c.raw_run(&key)?;
+                raw.trim_matches('"').to_string()
+            }
+        };
+        Ok((key, value))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ddl_ast::parse::clause::tokenize;
+
+    fn options(sql: &str) -> Result<Vec<(String, String)>, SqlError> {
+        let toks = tokenize(sql);
+        let mut c = ClauseCursor::new(sql, &toks, "CREATE DATABASE");
+        parse_with_options(&mut c)
+    }
 
     #[test]
-    fn with_clause_after_unicode_database_name_preserves_original_offsets() {
+    fn with_clause_values_keep_their_text() {
         assert_eq!(
-            parse_with_options("CREATE DATABASE tenantﬀﬀ WITH (region='eu')"),
-            vec![("region".to_string(), "eu".to_string())]
+            options("WITH (region='eu', tier = gold)").expect("parses"),
+            vec![
+                ("region".to_string(), "eu".to_string()),
+                ("tier".to_string(), "gold".to_string())
+            ]
         );
+    }
+
+    #[test]
+    fn a_pair_without_equals_is_refused() {
+        assert!(options("WITH (region)").is_err());
     }
 }

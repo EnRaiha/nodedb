@@ -330,7 +330,10 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
         | PhysicalPlan::Timeseries(
             TimeseriesOp::Scan { .. }
             | TimeseriesOp::ResolveIngest(_)
-            | TimeseriesOp::Truncate { .. },
+            | TimeseriesOp::Truncate { .. }
+            | TimeseriesOp::RefreshAggregate { .. }
+            | TimeseriesOp::Partitions { .. }
+            | TimeseriesOp::ReadAggregate { .. },
         )
         | PhysicalPlan::Spatial(
             SpatialOp::Insert { .. } | SpatialOp::Delete { .. } | SpatialOp::Scan { .. },
@@ -384,6 +387,8 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | MetaOp::RegisterContinuousAggregate { .. }
             | MetaOp::UnregisterContinuousAggregate { .. }
             | MetaOp::ListContinuousAggregates
+            | MetaOp::ContinuousAggregatesRegistered
+            | MetaOp::AwaitContinuousAggregateRefresh { .. }
             | MetaOp::ConvertCollection { .. }
             | MetaOp::CreateTenantSnapshot { .. }
             | MetaOp::RestoreTenantSnapshot { .. }
@@ -463,10 +468,9 @@ mod tests {
     fn an_insert_plan_with_no_returning_slot_is_refused() {
         let plan = PhysicalPlan::Document(DocumentOp::InsertSelect {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "dst"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
-            source_filters: Vec::new(),
-            source_limit: 0,
-            column_map: Vec::new(),
+            source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
+            ),
         });
         let detail = refuse_unprojectable_insert_returning(&plan)
             .expect_err("an INSERT ... SELECT cannot carry the clause")

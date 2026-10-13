@@ -10,8 +10,7 @@ use std::sync::atomic::Ordering;
 
 use nodedb_types::{DatabaseId, TenantId};
 
-use crate::bridge::envelope::{ErrorCode, Priority, Request, Response};
-use crate::control::gateway::core::QueryContext;
+use crate::bridge::envelope::{Priority, Request, Response};
 use crate::control::server::dispatch_utils::{OwnedRead, OwnedReadScope, route_owned_read};
 use crate::control::server::shared::session::StatementDeadline;
 use crate::control::server::shared::write_admission::plan_is_write;
@@ -34,30 +33,15 @@ pub(crate) async fn dispatch_to_owner(
     collection_qualified: &str,
     plan: PhysicalPlan,
 ) -> crate::Result<Vec<u8>> {
-    let gateway = state.installed_gateway()?;
-    let ctx = QueryContext {
+    crate::control::server::exchange::owner_dispatch::dispatch_to_owner(
+        state,
         tenant_id,
-        trace_id: TraceId::generate(),
         database_id,
-        txn_id: None,
-        linearizable: true,
-    };
-    let mut payloads = match gateway.execute_internal(&ctx, plan).await {
-        Ok(payloads) => payloads,
-        Err(crate::Error::DataPlane(ErrorCode::NotFound)) => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    if payloads.len() > 1 {
-        return Err(crate::Error::Storage {
-            engine: "clone_materializer".into(),
-            detail: format!(
-                "plan on '{collection_qualified}' answered from {} shards; \
-                 a materializer page walks one shard",
-                payloads.len()
-            ),
-        });
-    }
-    Ok(payloads.pop().unwrap_or_default())
+        collection_qualified,
+        plan,
+        "clone_materializer",
+    )
+    .await
 }
 
 /// Dispatch a `PhysicalPlan` to the Data Plane and await the response.

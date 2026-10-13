@@ -86,8 +86,16 @@ impl PermissionStore {
             return true;
         }
 
+        // Collections and continuous aggregates share one relation namespace,
+        // so the owner of an aggregate owns the relation of that name.
         if self.is_owner(
             "collection",
+            database_id,
+            identity.tenant_id,
+            collection,
+            &identity.username,
+        ) || self.is_owner(
+            crate::control::security::catalog::auth_types::object_type::CONTINUOUS_AGGREGATE,
             database_id,
             identity.tenant_id,
             collection,

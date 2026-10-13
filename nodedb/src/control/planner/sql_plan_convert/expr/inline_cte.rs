@@ -120,14 +120,44 @@ pub(in crate::control::planner::sql_plan_convert) fn inline_cte(
         SqlPlan::InsertSelect {
             target,
             source,
-            limit,
             column_map,
+            source_columns,
         } => SqlPlan::InsertSelect {
             target: target.clone(),
             source: Box::new(inline_cte(source, cte_name, cte_plan)),
-            limit: *limit,
             column_map: column_map.clone(),
+            source_columns: source_columns.clone(),
         },
+
+        // `UPDATE ... FROM cte` and `MERGE ... USING cte` read the CTE as
+        // their source relation. The source alias is carried on the plan, so
+        // it survives the replacement.
+        SqlPlan::UpdateFrom {
+            collection,
+            engine,
+            source,
+            source_alias,
+            target_join_col,
+            source_join_col,
+            assignments,
+            target_filters,
+            returning,
+        } => SqlPlan::UpdateFrom {
+            collection: collection.clone(),
+            engine: *engine,
+            source: Box::new(inline_cte(source, cte_name, cte_plan)),
+            source_alias: source_alias.clone(),
+            target_join_col: target_join_col.clone(),
+            source_join_col: source_join_col.clone(),
+            assignments: assignments.clone(),
+            target_filters: target_filters.clone(),
+            returning: *returning,
+        },
+        SqlPlan::Merge(merge) => {
+            let mut merge = merge.clone();
+            merge.source = Box::new(inline_cte(&merge.source, cte_name, cte_plan));
+            SqlPlan::Merge(merge)
+        }
 
         // A post-processor produced by an earlier CTE definition: recurse into
         // its body so a later definition's references inside it still inline.

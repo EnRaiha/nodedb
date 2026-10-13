@@ -8,6 +8,15 @@ use super::{KvEngine, ScanResult};
 use crate::engine::kv::engine_helpers::table_key;
 use crate::engine::kv::scan::{KvScanParams, matches_pattern_pub};
 
+/// The candidate position an index-scan cursor names. An index-scan cursor
+/// is the 8-byte big-endian position of the next candidate; any other
+/// cursor starts at the first candidate.
+fn index_cursor_position(cursor: &[u8]) -> usize {
+    <[u8; 8]>::try_from(cursor)
+        .map(u64::from_be_bytes)
+        .map_or(0, |pos| usize::try_from(pos).unwrap_or(usize::MAX))
+}
+
 impl KvEngine {
     /// SCAN: cursor-based iteration with optional key pattern matching and
     /// index-accelerated predicate pushdown.
@@ -64,10 +73,15 @@ impl KvEngine {
             };
 
             if !candidate_keys.is_empty() {
-                let mut results = Vec::with_capacity(count.min(candidate_keys.len()));
-
-                for pk in candidate_keys {
+                // The cursor of an index scan is the position of the next
+                // candidate, so a caller paging with `count` reads every
+                // candidate exactly once.
+                let start = index_cursor_position(cursor).min(candidate_keys.len());
+                let mut results = Vec::with_capacity(count.min(candidate_keys.len() - start));
+                let mut next = candidate_keys.len();
+                for (pos, pk) in candidate_keys.iter().enumerate().skip(start) {
                     if results.len() >= count {
+                        next = pos;
                         break;
                     }
                     if let Some((val, surrogate)) = table.get_with_surrogate(pk, now_ms)
@@ -77,8 +91,12 @@ impl KvEngine {
                         results.push((pk.to_vec(), val.to_vec()));
                     }
                 }
-
-                return (results, Vec::new());
+                let next_cursor = if next < candidate_keys.len() {
+                    (next as u64).to_be_bytes().to_vec()
+                } else {
+                    Vec::new()
+                };
+                return (results, next_cursor);
             }
         }
 
@@ -178,8 +196,9 @@ impl KvEngine {
             };
 
             if !candidate_keys.is_empty() {
+                let start = index_cursor_position(cursor);
                 let mut emitted = 0usize;
-                for pk in candidate_keys {
+                for pk in candidate_keys.into_iter().skip(start) {
                     if emitted >= count {
                         break;
                     }
@@ -382,6 +401,58 @@ mod tests {
         .unwrap();
 
         assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn index_scan_pages_through_every_candidate() {
+        // An index scan cut at `count` returned an empty cursor, so a
+        // caller paging to the end saw only the first page.
+        let mut e = make_engine();
+        let n = now();
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        for i in 0..5u8 {
+            let key = [b's', i];
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "sessions",
+                key: &key,
+                value: &mp_obj(&[("region", "us-east")]),
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: row_surrogate(&key),
+            })
+            .expect("a bound row writes");
+        }
+
+        let mut cursor: Vec<u8> = Vec::new();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let (page, next) = e.scan(KvScanParams {
+                cursor: &cursor,
+                filter_field: Some("region"),
+                filter_value: Some(b"us-east"),
+                ..scan_params("sessions", 2, n)
+            });
+            assert!(page.len() <= 2);
+            seen.extend(page.into_iter().map(|(k, _)| k));
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 5);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "no candidate is read twice");
     }
 
     #[test]

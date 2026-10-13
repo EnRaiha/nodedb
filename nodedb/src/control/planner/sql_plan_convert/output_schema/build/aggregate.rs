@@ -3,12 +3,10 @@
 //! Aggregate output ordering and catalog-derived types.
 
 use super::super::columns::{column_types_for, group_by_key_column};
-use crate::control::planner::sql_plan_convert::aggregate::agg_expr_to_pair;
 use crate::control::planner::sql_plan_convert::lateral::collection_name_from_plan;
 use crate::control::planner::sql_plan_convert::output_schema_types::infer_aggregate_type;
 use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
 use crate::control::server::response_shape::types::DdlColType;
-use nodedb_query::agg_key::canonical_agg_key;
 use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::SqlPlan;
@@ -35,8 +33,7 @@ pub(super) fn timeseries_group_schema<C: SqlCatalog + ?Sized>(
         });
     }
     for agg in aggregates {
-        let (function, field) = agg_expr_to_pair(agg);
-        let key = canonical_agg_key(&function, &field);
+        let key = nodedb_sql::planner::agg_naming::aggregate_output_key(agg);
         columns.push(OutputColumn {
             display_name: key.clone(),
             lookup_key: key,
@@ -166,6 +163,8 @@ mod tests {
                     alias: "total".to_string(),
                     distinct: false,
                     grouping_col_index: None,
+                    filter_text: None,
+                    arg_text: None,
                 },
                 AggregateExpr {
                     function: "count".to_string(),
@@ -173,6 +172,8 @@ mod tests {
                     alias: "count(*)".to_string(),
                     distinct: false,
                     grouping_col_index: None,
+                    filter_text: None,
+                    arg_text: None,
                 },
             ],
             having: Vec::new(),

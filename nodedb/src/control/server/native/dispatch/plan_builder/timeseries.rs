@@ -16,16 +16,22 @@ pub(crate) async fn build_scan(
 ) -> crate::Result<PhysicalPlan> {
     let start = fields.time_range_start.unwrap_or(0);
     let end = fields.time_range_end.unwrap_or(i64::MAX);
-    let limit = fields.limit.unwrap_or(10_000) as usize;
-    let bucket_interval_ms = fields
-        .bucket_interval
-        .as_deref()
-        .map(|s| {
-            nodedb_types::kv_parsing::parse_interval_to_ms(s)
-                .map(|ms| ms as i64)
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
+    let limit = super::requested_limit(fields)?;
+    // An interval that does not parse is refused by value, never read as
+    // "no bucketing".
+    let bucket_interval_ms = match fields.bucket_interval.as_deref() {
+        None => 0,
+        Some(text) => {
+            let ms = nodedb_types::kv_parsing::parse_interval_to_ms(text).map_err(|_| {
+                crate::Error::BadRequest {
+                    detail: format!("invalid bucket_interval '{text}'"),
+                }
+            })?;
+            i64::try_from(ms).map_err(|_| crate::Error::BadRequest {
+                detail: format!("bucket_interval '{text}' is too large"),
+            })?
+        }
+    };
 
     Ok(PhysicalPlan::Timeseries(TimeseriesOp::Scan {
         collection: QualifiedCollection::new(ctx.database_id(), collection),
@@ -42,6 +48,8 @@ pub(crate) async fn build_scan(
         rls_filters: Vec::new(),
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
+        having: Vec::new(),
+        tiering: None,
     }))
 }
 

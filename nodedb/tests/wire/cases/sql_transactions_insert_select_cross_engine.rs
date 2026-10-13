@@ -240,3 +240,44 @@ async fn txn_insert_select_from_strict_source_normalizes_and_resolves() {
         "vector search must resolve the copied strict-source 'alpha'; got {near_e1:?}"
     );
 }
+
+/// A transactional copy out of a key-value source sees the rows the same
+/// transaction staged: the source is read through its own engine with the
+/// transaction's overlay folded in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_select_from_kv_sees_staged_rows() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION istx_kv (key TEXT PRIMARY KEY, n INT) WITH (engine='kv')")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO istx_kv (key, n) VALUES ('k1', 1)")
+        .await
+        .unwrap();
+    server.exec("CREATE COLLECTION istx_kv_t").await.unwrap();
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec("INSERT INTO istx_kv (key, n) VALUES ('k2', 2)")
+        .await
+        .expect("stage a kv row");
+    server
+        .exec("INSERT INTO istx_kv_t (id, n) SELECT key, n FROM istx_kv")
+        .await
+        .expect("in-tx copy out of a kv source");
+    server.exec("COMMIT").await.unwrap();
+
+    let copied = server
+        .query_rows("SELECT id, n FROM istx_kv_t ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(
+        copied,
+        vec![
+            vec!["k1".to_string(), "1".to_string()],
+            vec!["k2".to_string(), "2".to_string()],
+        ],
+        "the copy must include the row staged earlier in the transaction"
+    );
+}

@@ -37,7 +37,7 @@ use crate::control::state::SharedState;
 /// | PutApiKey / RevokeApiKey                | ❌ no       | same |
 /// | PutAuthUser                             | ❌ no       | account status re-read at admission time |
 /// | PutMaterializedView / DeleteMaterializedView | ❌ no  | MV definition is its own catalog object; write-path `materialized_sum_sources` is set at collection-register time via PutCollection, not updated by PutMaterializedView independently |
-/// | PutContinuousAggregate / DeleteContinuousAggregate | ❌ no | CA definition is its own catalog object; runtime manager re-registers via MetaOp dispatch, never appears in a PhysicalPlan variant |
+/// | PutContinuousAggregate / DeleteContinuousAggregate | ✅ yes | a read of the aggregate as a relation carries its version under a pseudo-entry |
 /// | PutTenant / DeleteTenant                | ❌ no       | tenant identity does not affect plan shape |
 /// | PutRlsPolicy / DeleteRlsPolicy          | ❌ no       | `execute_sql` is only called from CDC path (no RLS injection via `inject_rls`); per-session pgwire cache has its own DDL invalidation |
 /// | PutRedactionPolicy / DeleteRedactionPolicy | ❌ no    | redaction rules are applied post-scan on the decoded document by role, so they are not baked into `PhysicalPlan` shape; the fail-closed refusal is re-evaluated against the live store on every execution, so no cached plan goes stale either |
@@ -169,14 +169,33 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
             // and never alter a PhysicalPlan's shape.
         }
 
-        // ── Continuous aggregate: definition is its own catalog object ────────
-        CatalogEntry::PutContinuousAggregate(_) => {
-            // no-op: CA definition is its own catalog object and does not
-            // directly modify any PhysicalPlan. The Data Plane manager
-            // re-registers via MetaOp dispatch on apply or startup replay.
+        // ── Continuous aggregate: read as a relation through a provider scan ─
+        // A plan that reads the aggregate carries its version under a
+        // pseudo-entry, so a change evicts the plans keyed on the old one.
+        CatalogEntry::PutContinuousAggregate(stored) => {
+            inv.invalidate(
+                &crate::control::gateway::version_set::continuous_aggregate_version_key(
+                    stored.database_id,
+                    stored.tenant_id,
+                    &stored.name,
+                ),
+                stored.modification_hlc.wall_ns.max(1),
+            );
         }
-        CatalogEntry::DeleteContinuousAggregate { .. } => {
-            // no-op: same as PutContinuousAggregate.
+        CatalogEntry::DeleteContinuousAggregate {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => {
+            inv.invalidate(
+                &crate::control::gateway::version_set::continuous_aggregate_version_key(
+                    *database_id,
+                    *tenant_id,
+                    name,
+                ),
+                0,
+            );
         }
 
         // ── Tenant: identity does not affect plan shape ───────────────────────

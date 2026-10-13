@@ -44,7 +44,8 @@ pub(crate) fn data_plane_response_to_native(
         }
         return native;
     }
-    let redaction = QueryRedaction::for_plan(ctx.tenant_id(), ctx.auth_context(), plan);
+    let redaction =
+        QueryRedaction::for_plan(ctx.tenant_id(), ctx.database_id(), ctx.auth_context(), plan);
     match shape_response_materialized(MaterializedShapeRequest {
         payload: &response.payload,
         plan,

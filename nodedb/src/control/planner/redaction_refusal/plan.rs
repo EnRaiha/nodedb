@@ -17,7 +17,7 @@
 //! Plane before dispatch, next to `rls_injection::inject_rls`, which resolves
 //! the same two shapes the same way.
 
-use nodedb_physical::physical_plan::{QueryOp, VectorOp};
+use nodedb_physical::physical_plan::{QueryOp, TimeseriesOp, VectorOp};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -25,7 +25,9 @@ use crate::control::security::auth_context::AuthContext;
 use crate::control::security::redaction::RedactionStore;
 use crate::types::TenantId;
 
-use super::aggregate::{JoinSide, refuse_aggregates, refuse_facet_fields, refuse_join_aggregates};
+use super::aggregate::{
+    refuse_aggregates, refuse_facet_fields, refuse_input_aggregates, refuse_timeseries_aggregates,
+};
 use super::graph::{refuse_graph_op, refuse_match_scoped};
 use super::lookup::RefusalCtx;
 use super::text::refuse_text_op;
@@ -170,13 +172,30 @@ fn walk(plan: &PhysicalPlan, ctx: &RefusalCtx<'_>) -> crate::Result<()> {
         }) => walk(child, ctx),
         // A text match or score is computed over the stored text.
         PhysicalPlan::Text(op) => refuse_text_op(op, ctx),
+        // A grouped timeseries scan aggregates the stored values.
+        PhysicalPlan::Timeseries(TimeseriesOp::Scan {
+            collection,
+            aggregates,
+            ..
+        }) => refuse_timeseries_aggregates(ctx, collection, aggregates),
+        // An orchestrated write copies its source's values past the masking
+        // hook. A query source is walked too, since it can aggregate.
+        PhysicalPlan::Document(op) => match super::orchestrated::orchestrated_source(op) {
+            Some((statement, source)) => {
+                super::orchestrated::refuse_redacted_source(ctx, statement, source)?;
+                match source.query_plan() {
+                    Some(child) => walk(child, ctx),
+                    None => Ok(()),
+                }
+            }
+            None => Ok(()),
+        },
         // Every remaining op returns stored columns (which the result-path
         // hook masks), a write acknowledgement, or maintenance metadata — and
         // none of them embeds a sub-plan. The inner wildcards keep this arm
         // total over each engine's own operations while the outer match stays
         // exhaustive over `PhysicalPlan`.
         PhysicalPlan::Vector(_)
-        | PhysicalPlan::Document(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Columnar(_)
         | PhysicalPlan::Timeseries(_)
@@ -209,13 +228,19 @@ fn walk_query(op: &QueryOp, ctx: &RefusalCtx<'_>) -> crate::Result<()> {
             sub_aggregates,
             ..
         } => {
-            // `collection` stays populated whether the rows come from the
-            // named collection or from `input`, so both aggregate lists are
-            // resolved against it either way.
+            // A named collection resolves both aggregate lists. An
+            // aggregate over an input with no collection of its own resolves
+            // them against what the input scans.
             refuse_aggregates(ctx, collection, aggregates)?;
             refuse_aggregates(ctx, collection, sub_aggregates)?;
             match input {
-                Some(child) => walk(child, ctx),
+                Some(child) => {
+                    if collection.as_str().is_empty() {
+                        refuse_input_aggregates(ctx, child, aggregates)?;
+                        refuse_input_aggregates(ctx, child, sub_aggregates)?;
+                    }
+                    walk(child, ctx)
+                }
                 None => Ok(()),
             }
         }
@@ -239,27 +264,15 @@ fn walk_query(op: &QueryOp, ctx: &RefusalCtx<'_>) -> crate::Result<()> {
             }
         }
 
+        // A join aggregates nothing itself. An aggregate over a join is an
+        // input-sourced `Aggregate`, refused by its own arm.
         QueryOp::HashJoin {
-            left_collection,
-            right_collection,
-            left_alias,
-            right_alias,
-            post_aggregates,
             left_input,
             right_input,
             left_bitmap,
             right_bitmap,
             ..
         } => {
-            let left = JoinSide {
-                alias: left_alias.as_deref(),
-                collection: left_collection.as_str(),
-            };
-            let right = JoinSide {
-                alias: right_alias.as_deref(),
-                collection: right_collection.as_str(),
-            };
-            refuse_join_aggregates(ctx, &left, &right, post_aggregates)?;
             for child in [left_input, right_input, left_bitmap, right_bitmap]
                 .into_iter()
                 .flatten()
@@ -286,10 +299,11 @@ fn walk_query(op: &QueryOp, ctx: &RefusalCtx<'_>) -> crate::Result<()> {
         QueryOp::ShuffleAggregateConsume { .. } | QueryOp::ShuffleJoinConsume { .. } => Ok(()),
 
         // No aggregate, no embedded sub-plan: these return stored columns that
-        // the result-path masking hook rewrites (`ProviderScan` returns
-        // coordinator-materialized catalog or constant rows; the recursive and
-        // non-hash join ops scan their named collections), so there is nothing
-        // unredactable to refuse.
+        // the result-path masking hook rewrites (a named `ProviderScan` reads
+        // a continuous aggregate or catalog relation the hook keys rules on
+        // by name; an unnamed one returns constant rows; the recursive and
+        // non-hash join ops scan their named collections), so there is
+        // nothing unredactable to refuse.
         QueryOp::ProviderScan { .. }
         | QueryOp::NestedLoopJoin { .. }
         | QueryOp::SortMergeJoin { .. }
@@ -359,6 +373,7 @@ mod tests {
             user_alias: None,
             field: field.into(),
             expr: None,
+            param: None,
         }
     }
 
@@ -475,10 +490,7 @@ mod tests {
         assert_refused(check(&plan, &store, "support"));
     }
 
-    fn hash_join(
-        post_aggregates: Vec<(String, String)>,
-        left_input: Option<PhysicalPlan>,
-    ) -> PhysicalPlan {
+    fn hash_join(left_input: Option<PhysicalPlan>) -> PhysicalPlan {
         PhysicalPlan::Query(QueryOp::HashJoin {
             left_collection: nodedb_types::QualifiedCollection::new(
                 nodedb_types::DatabaseId::DEFAULT,
@@ -493,8 +505,6 @@ mod tests {
             on: Vec::new(),
             join_type: "inner".into(),
             limit: 0,
-            post_group_by: Vec::new(),
-            post_aggregates,
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -514,27 +524,45 @@ mod tests {
     #[test]
     fn aggregate_under_a_join_child_is_refused() {
         let store = store_with_rule("users", "support", "ssn");
-        let plan = hash_join(
-            Vec::new(),
-            Some(aggregate_plan("users", vec![agg_spec("min", "ssn")])),
-        );
+        let plan = hash_join(Some(aggregate_plan("users", vec![agg_spec("min", "ssn")])));
         assert_refused(check(&plan, &store, "support"));
     }
 
-    /// A post-join aggregate qualified with a side's alias resolves to that
-    /// side's collection.
+    /// An aggregate over a join: the aggregate names no collection and reads
+    /// the join as its input.
+    fn join_aggregate(spec: AggregateSpec) -> PhysicalPlan {
+        PhysicalPlan::Query(QueryOp::Aggregate {
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "",
+            ),
+            input: Some(Box::new(hash_join(None))),
+            group_by: Vec::<GroupKeySpec>::new(),
+            aggregates: vec![spec],
+            filters: Vec::new(),
+            having: Vec::new(),
+            limit: 0,
+            sub_group_by: Vec::new(),
+            sub_aggregates: Vec::new(),
+            grouping_sets: Vec::new(),
+            sort_keys: Vec::new(),
+        })
+    }
+
+    /// An aggregate over a join qualified with a side's alias resolves to
+    /// that side's collection.
     #[test]
-    fn qualified_post_join_aggregate_over_redacted_column_is_refused() {
+    fn qualified_join_aggregate_over_redacted_column_is_refused() {
         let store = store_with_rule("users", "support", "ssn");
-        let plan = hash_join(vec![("min".into(), "u.ssn".into())], None);
+        let plan = join_aggregate(agg_spec("min", "u.ssn"));
         assert_refused(check(&plan, &store, "support"));
     }
 
     /// …and one naming the other side's unruled column still runs.
     #[test]
-    fn qualified_post_join_aggregate_over_the_other_side_is_allowed() {
+    fn qualified_join_aggregate_over_the_other_side_is_allowed() {
         let store = store_with_rule("users", "support", "ssn");
-        let plan = hash_join(vec![("sum".into(), "o.total".into())], None);
+        let plan = join_aggregate(agg_spec("sum", "o.total"));
         assert!(check(&plan, &store, "support").is_ok());
     }
 
@@ -628,5 +656,121 @@ mod tests {
             field: "id".into(),
         });
         assert!(check(&plan, &store, "support").is_ok());
+    }
+
+    fn provider_scan(name: &str) -> PhysicalPlan {
+        PhysicalPlan::Query(QueryOp::ProviderScan {
+            provider: Some(name.into()),
+            rows: Vec::new(),
+            sources: Vec::new(),
+            filters: Vec::new(),
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+        })
+    }
+
+    fn aggregate_over(input: PhysicalPlan, spec: AggregateSpec) -> PhysicalPlan {
+        PhysicalPlan::Query(QueryOp::Aggregate {
+            collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "",
+            ),
+            input: Some(Box::new(input)),
+            group_by: Vec::<GroupKeySpec>::new(),
+            aggregates: vec![spec],
+            filters: Vec::new(),
+            having: Vec::new(),
+            limit: usize::MAX,
+            sub_group_by: Vec::new(),
+            sub_aggregates: Vec::new(),
+            grouping_sets: Vec::new(),
+            sort_keys: Vec::new(),
+        })
+    }
+
+    /// A plain read of a continuous aggregate or catalog relation returns
+    /// its columns, which the result-path masking hook rewrites by the
+    /// relation's name: it is never refused.
+    #[test]
+    fn a_plain_provider_read_is_left_to_masking() {
+        let store = store_with_rule("salary_1h", "support", "total");
+        let gathered = PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child: Box::new(provider_scan("salary_1h")),
+            mode: ExchangeMode::Gather {
+                as_aggregate: false,
+            },
+        }));
+        assert!(check(&provider_scan("salary_1h"), &store, "support").is_ok());
+        assert!(check(&gathered, &store, "support").is_ok());
+    }
+
+    /// An aggregate over rows the coordinator gathered reads the stored
+    /// values of the collections those rows came from, so a rule on one of
+    /// them refuses it.
+    #[test]
+    fn an_aggregate_over_a_gathered_input_is_refused() {
+        let store = store_with_rule("users", "support", "ssn");
+        let gathered = PhysicalPlan::Query(QueryOp::ProviderScan {
+            provider: None,
+            rows: Vec::new(),
+            sources: vec![nodedb_physical::physical_plan::GatheredSource::Collection(
+                "users".into(),
+            )],
+            filters: Vec::new(),
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+        });
+        let plan = aggregate_over(gathered, agg_spec("min", "ssn"));
+        assert_refused(check(&plan, &store, "support"));
+        assert!(check(&plan, &store, "analyst").is_ok());
+    }
+
+    /// An aggregate over a post-processed join body resolves its fields
+    /// against the join's sides, through the wrapper.
+    #[test]
+    fn an_aggregate_over_a_post_processed_join_is_refused() {
+        let store = store_with_rule("users", "support", "ssn");
+        let body = |spec| {
+            aggregate_over(
+                PhysicalPlan::Query(QueryOp::PostProcess {
+                    input: Box::new(hash_join(None)),
+                    filters: Vec::new(),
+                    projection: Vec::new(),
+                    computed_columns: Vec::new(),
+                    window_functions: Vec::new(),
+                    sort_keys: Vec::new(),
+                    limit: None,
+                    offset: 0,
+                    distinct: false,
+                }),
+                spec,
+            )
+        };
+        assert_refused(check(&body(agg_spec("min", "u.ssn")), &store, "support"));
+        assert_refused(check(&body(agg_spec("min", "ssn")), &store, "support"));
+        assert_refused(check(&body(agg_spec("min", "t.ssn")), &store, "support"));
+        assert!(check(&body(agg_spec("sum", "o.total")), &store, "support").is_ok());
+    }
+
+    /// An aggregate over a provider relation's redacted column is computed
+    /// over the stored values, so it is refused as over a collection.
+    #[test]
+    fn an_aggregate_over_a_redacted_provider_column_is_refused() {
+        let store = store_with_rule("salary_1h", "support", "total");
+        let summed = aggregate_over(provider_scan("salary_1h"), agg_spec("sum", "total"));
+        assert_refused(check(&summed, &store, "support"));
+        assert!(check(&summed, &store, "analyst").is_ok());
+        let counted = aggregate_over(provider_scan("salary_1h"), agg_spec("count", "*"));
+        assert!(check(&counted, &store, "support").is_ok());
     }
 }

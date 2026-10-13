@@ -35,8 +35,11 @@ pub use catalog::{
     catalog_apply_orphan_row, collection_purge_row_missing, consumer_group_offsets_retained,
     metadata_apply_wedged, synonym_group_not_applied,
 };
-pub use columnar::{columnar_segment_corrupt, timeseries_partition_unreadable};
-pub use continuous_agg::continuous_aggregate_not_applied;
+pub use columnar::{
+    columnar_segment_corrupt, timeseries_flush_not_installed, timeseries_idle_flush_failed,
+    timeseries_partition_unreadable,
+};
+pub use continuous_agg::{continuous_aggregate_not_applied, continuous_aggregate_state_fault};
 pub use crdt::{
     crdt_dead_letter_not_enqueued, crdt_dead_letter_not_restored, crdt_dead_letter_not_stored,
     history_compaction_not_applied,

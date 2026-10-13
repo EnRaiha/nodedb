@@ -5,6 +5,7 @@
 //! Convenience overload: performs TEMPORAL_LOOKUP internally to find the rate,
 //! then applies the arithmetic conversion.
 
+use nodedb_sql::parser::query_function::ConvertCurrencyLookupArgs;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -15,9 +16,7 @@ use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
-use super::helpers::{
-    clean_arg, err, extract_function_args, json_to_decimal, single_result, unwrap_scan_docs,
-};
+use super::helpers::{err, json_to_decimal, single_result, unwrap_scan_docs};
 
 /// Convenience currency conversion with rate table lookup.
 ///
@@ -27,26 +26,19 @@ pub async fn convert_currency_lookup(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    sql: &str,
+    args: &ConvertCurrencyLookupArgs,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = extract_function_args(sql, "CONVERT_CURRENCY_LOOKUP")?;
-    if args.len() < 9 {
-        return Err(err(
-            "42601",
-            "CONVERT_CURRENCY_LOOKUP requires (amount, from, to, rate_table, as_of, key_column, rate_column, time_column, precision)",
-        ));
-    }
-
-    let amount_str = clean_arg(args[0]);
-    let from_ccy = clean_arg(args[1]);
-    let to_ccy = clean_arg(args[2]);
-    let rate_table = clean_arg(args[3]);
-    let as_of = clean_arg(args[4]);
-    let key_column = clean_arg(args[5]);
-    let rate_column = clean_arg(args[6]);
-    let time_column = clean_arg(args[7]);
-    let precision: u32 = clean_arg(args[8])
+    let amount_str = args.amount.clone();
+    let from_ccy = args.from.clone();
+    let to_ccy = args.to.clone();
+    let rate_table = args.rate_table.clone();
+    let as_of = args.as_of.clone();
+    let key_column = args.key_column.clone();
+    let rate_column = args.rate_column.clone();
+    let time_column = args.time_column.clone();
+    let precision: u32 = args
+        .precision
         .parse()
         .map_err(|_| err("22023", "precision must be an integer"))?;
     if precision > 38 {

@@ -15,9 +15,10 @@ use super::collections::{encode_row, has_secondary_index, load_collections};
 pub fn pg_class(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
 ) -> crate::Result<Vec<Vec<u8>>> {
     let mut rows = Vec::new();
-    for coll in load_collections(state, identity) {
+    for coll in load_collections(state, identity, database_id) {
         let oid = stable_collection_oid(coll.tenant_id, &coll.name);
         let has_index = has_secondary_index(&coll);
         let has_triggers = !coll.event_defs.is_empty();

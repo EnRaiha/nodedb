@@ -3,15 +3,9 @@
 //! Permission-tree resolution for document-engine operations.
 
 use nodedb_physical::physical_plan::document::MergeActionOp;
-use nodedb_physical::physical_plan::{DocumentOp, DocumentResolvedMutation};
+use nodedb_physical::physical_plan::{DocumentOp, DocumentResolvedMutation, RowSource};
 
 use super::context::{PermCtx, PermTreeLevel};
-
-/// A source collection read into a mutation carries its values into rows the
-/// caller can read afterwards, and no plan node in these shapes has a slot to
-/// narrow that read to the caller's subtree.
-const JOINED_SOURCE_REASON: &str = "the statement copies values out of the source collection through a join that carries no \
-     subtree filter, so rows outside the caller's subtree would reach the target";
 
 /// Exhaustive over [`DocumentOp`] so a new document operation forces a
 /// decision between filtering, refusing, and no-op.
@@ -109,39 +103,38 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
             ctx.filter_into(collection, PermTreeLevel::Delete, filters)
         }
 
-        // Target writes blind to the tree; source narrows via `source_filters`.
+        // Target writes blind to the tree; the source narrows like any read.
         DocumentOp::InsertSelect {
             target_collection,
-            source_collection,
-            source_filters,
-            ..
+            source,
         } => {
             ctx.authorize(target_collection, PermTreeLevel::Write)?;
-            ctx.filter_into(source_collection, PermTreeLevel::Read, source_filters)
+            apply_row_source(ctx, source)
         }
 
-        // Target narrows via `target_filters`; joined source has no slot,
-        // refused when a tree governs it.
+        // Target narrows via `target_filters`; the source narrows like any
+        // read.
         DocumentOp::UpdateFromJoin {
             target_collection,
-            source_collection,
+            source,
             target_filters,
             ..
         } => {
-            ctx.refuse_if_tree(source_collection, JOINED_SOURCE_REASON)?;
+            apply_row_source(ctx, source)?;
             ctx.authorize(target_collection, PermTreeLevel::Write)?;
             ctx.filter_into(target_collection, PermTreeLevel::Write, target_filters)
         }
 
         // Target matches by join key, not predicate, so it gets the blanket
-        // check (delete level too, if any arm deletes); source refused as above.
+        // check (delete level too, if any arm deletes); the source narrows
+        // like any read.
         DocumentOp::Merge {
             target_collection,
-            source_collection,
+            source,
             clauses,
             ..
         } => {
-            ctx.refuse_if_tree(source_collection, JOINED_SOURCE_REASON)?;
+            apply_row_source(ctx, source)?;
             ctx.authorize(target_collection, PermTreeLevel::Write)?;
             if clauses
                 .iter()
@@ -172,6 +165,17 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
         DocumentOp::Register { .. }
         | DocumentOp::DropIndex { .. }
         | DocumentOp::BackfillIndex { .. } => Ok(()),
+    }
+}
+
+/// Narrow an orchestrated write's source to the readable subtree: a page
+/// source through its filter slot, a query source through its whole plan.
+fn apply_row_source(ctx: &PermCtx<'_>, source: &mut RowSource) -> crate::Result<()> {
+    match source {
+        RowSource::DocumentPages(page) => {
+            ctx.filter_into(&page.collection, PermTreeLevel::Read, &mut page.filters)
+        }
+        RowSource::Query(query) => super::plan::walk(ctx, &mut query.plan),
     }
 }
 
@@ -236,6 +240,44 @@ mod tests {
                     sorted(injected_resources(filters)),
                     vec!["doc_a".to_owned()]
                 );
+            }
+            other => panic!("plan shape changed: {other:?}"),
+        }
+    }
+
+    /// A MERGE source is narrowed to the readable subtree through its page
+    /// filter slot, so no row outside the subtree reaches the target.
+    #[test]
+    fn merge_source_receives_the_subtree_filter() {
+        let cache = cache_with_tree("docs");
+        let mut plan = PhysicalPlan::Document(DocumentOp::Merge {
+            target_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "target",
+            ),
+            source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                nodedb_types::QualifiedCollection::new(nodedb_types::DatabaseId::DEFAULT, "docs"),
+            ),
+            source_alias: "s".into(),
+            target_join_col: "id".into(),
+            source_join_col: "id".into(),
+            clauses: Vec::new(),
+            returning: None,
+            resolved_inserts: None,
+            resolved_insert_identities: Vec::new(),
+            source_rows: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+            resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
+        });
+        assert!(apply(&mut plan, &cache).is_ok());
+        match &plan {
+            PhysicalPlan::Document(DocumentOp::Merge {
+                source: nodedb_physical::physical_plan::RowSource::DocumentPages(page),
+                ..
+            }) => {
+                assert_eq!(sorted(injected_resources(&page.filters)), readable());
             }
             other => panic!("plan shape changed: {other:?}"),
         }

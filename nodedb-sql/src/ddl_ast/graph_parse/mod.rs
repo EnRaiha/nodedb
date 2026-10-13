@@ -2,14 +2,12 @@
 
 //! Typed parsing for the graph DSL (`GRAPH ...`, `MATCH ...`).
 //!
-//! The handler layer historically parsed graph statements with
-//! `upper.find("KEYWORD")` substring matching, which collapsed when
-//! a node id, label, or property value shadowed a DSL keyword. This
-//! module is the structural replacement: a quote- and brace-aware
-//! tokeniser feeds a variant-building parser that produces a typed
-//! [`NodedbStatement`]. Every graph DSL command flows through here
-//! before reaching a pgwire handler, so the handlers never touch
-//! raw SQL again.
+//! A quote-, brace- and bracket-aware tokeniser feeds one parser per
+//! statement. Each parser reads its clauses left to right and produces a
+//! typed [`NodedbStatement`]. A token that is not a clause of the statement
+//! is a parse error, so a misspelled clause keyword never runs the
+//! statement with a default. Every graph DSL command flows through here
+//! before reaching a handler, so the handlers never touch raw SQL.
 //!
 //! Numeric *ranges* and engine-level caps stay unvalidated here and are
 //! enforced at the pgwire boundary, which keeps this module free of
@@ -20,10 +18,10 @@
 //! vocabulary, means no statement reaches the boundary at all. Both are
 //! reported as a parse error naming what is wrong.
 
+mod cursor;
 mod edge_predicate;
 mod entry;
 pub mod fusion_params;
-mod helpers;
 mod tokenizer;
 mod variants;
 

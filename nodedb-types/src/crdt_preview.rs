@@ -14,6 +14,10 @@
 pub struct CrdtPreviewResult {
     /// Canonical zerompk encoding of the validated target post-image.
     pub post_image_msgpack: Vec<u8>,
+    /// The target row before the delta, encoded as `post_image_msgpack` is.
+    /// Encodes `None` when the row is absent. Admission judges the
+    /// collection's transition rules on this image and the post-image.
+    pub pre_image_msgpack: Vec<u8>,
     /// Number of newly imported operations represented by this delta.
     pub imported_ops: u64,
     /// Domain-bound current frontier digest used to fence the subsequent apply.

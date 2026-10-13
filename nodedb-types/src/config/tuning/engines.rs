@@ -203,6 +203,11 @@ pub struct TimeseriesToning {
     pub total_budget_bytes: usize,
     #[serde(default = "default_ts_block_size")]
     pub block_size: usize,
+    /// Sealed partitions one maintenance tick reads to fold into continuous
+    /// aggregates. Bounds the time a tick holds the core while an aggregate
+    /// backfills after a CREATE or a restart.
+    #[serde(default = "default_cagg_fold_partitions_per_tick")]
+    pub cagg_fold_partitions_per_tick: usize,
 }
 
 impl Default for TimeseriesToning {
@@ -213,6 +218,7 @@ impl Default for TimeseriesToning {
             max_tag_cardinality: default_max_tag_cardinality(),
             total_budget_bytes: default_total_budget_bytes(),
             block_size: default_ts_block_size(),
+            cagg_fold_partitions_per_tick: default_cagg_fold_partitions_per_tick(),
         }
     }
 }
@@ -231,6 +237,9 @@ fn default_total_budget_bytes() -> usize {
 }
 fn default_ts_block_size() -> usize {
     1024
+}
+fn default_cagg_fold_partitions_per_tick() -> usize {
+    8
 }
 
 /// KV engine tuning (hash table, expiry wheel, slab allocator).

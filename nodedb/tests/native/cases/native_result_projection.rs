@@ -259,7 +259,7 @@ async fn kv_point_lookup_includes_value_column() {
 #[tokio::test]
 async fn vector_search_serializes_distance() {
     let srv = TestServer::start().await;
-    srv.exec("CREATE COLLECTION nb_vec WITH (engine='vector')")
+    srv.exec("CREATE COLLECTION nb_vec WITH (engine='document_schemaless')")
         .await
         .expect("create");
     srv.exec("CREATE INDEX ON nb_vec (embedding)")

@@ -390,3 +390,97 @@ async fn check_constraint_with_subquery() {
         "non-existent role should be rejected: {err:?}"
     );
 }
+
+// ── Constraint DDL takes effect on the running server ──
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constraint_added_takes_effect_without_restart() {
+    let server = TestServer::start().await;
+    server.exec("CREATE COLLECTION live_rules").await.unwrap();
+    server
+        .exec("INSERT INTO live_rules { id: 'a', status: 'draft', val: 1 }")
+        .await
+        .unwrap();
+
+    // A state constraint is enforced on the Data Plane.
+    server
+        .exec(
+            "ALTER COLLECTION live_rules ADD CONSTRAINT flow \
+             ON COLUMN status TRANSITIONS ('draft' -> 'active')",
+        )
+        .await
+        .unwrap();
+    let refused = server
+        .exec("UPDATE live_rules SET status = 'closed' WHERE id = 'a'")
+        .await;
+    assert!(
+        refused.is_err(),
+        "draft -> closed is not allowed: {refused:?}"
+    );
+
+    // A CHECK constraint is enforced on the next statement.
+    server
+        .exec("ALTER COLLECTION live_rules ADD CONSTRAINT positive CHECK (NEW.val > 0)")
+        .await
+        .unwrap();
+    let refused = server
+        .exec("INSERT INTO live_rules { id: 'b', status: 'draft', val: -1 }")
+        .await;
+    assert!(refused.is_err(), "val must be positive: {refused:?}");
+
+    // DROP lifts both on the next statement.
+    server
+        .exec("DROP CONSTRAINT flow ON live_rules")
+        .await
+        .unwrap();
+    server
+        .exec("DROP CONSTRAINT positive ON live_rules")
+        .await
+        .unwrap();
+    server
+        .exec("UPDATE live_rules SET status = 'closed' WHERE id = 'a'")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO live_rules { id: 'b', status: 'draft', val: -1 }")
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn constraint_added_in_a_transaction_binds_its_later_statements() {
+    let server = TestServer::start().await;
+    server.exec("CREATE COLLECTION txn_rules").await.unwrap();
+    server
+        .exec("INSERT INTO txn_rules { id: 'a', status: 'draft' }")
+        .await
+        .unwrap();
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .exec(
+            "ALTER COLLECTION txn_rules ADD CONSTRAINT flow \
+             ON COLUMN status TRANSITIONS ('draft' -> 'active')",
+        )
+        .await
+        .unwrap();
+    // The refusal lands on the UPDATE or, for a staged write, on COMMIT.
+    let update = server
+        .exec("UPDATE txn_rules SET status = 'closed' WHERE id = 'a'")
+        .await;
+    let outcome = if update.is_err() {
+        server.exec("ROLLBACK").await.unwrap();
+        update
+    } else {
+        server.exec("COMMIT").await
+    };
+    assert!(
+        outcome.is_err(),
+        "the transaction's own constraint binds it: {outcome:?}"
+    );
+    let rows = server
+        .query_text("SELECT status FROM txn_rules WHERE id = 'a'")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec!["draft".to_string()]);
+}

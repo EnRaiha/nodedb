@@ -2,14 +2,13 @@
 
 //! `SEARCH <collection> USING FUSION(...)` DSL.
 //!
-//! Parsing is delegated to `nodedb_sql::ddl_ast::parse_search_using_fusion`
-//! so this SQL surface shares the same quote- and bracket-aware tokenizer
-//! and the same typed [`FusionParams`](nodedb_sql::ddl_ast::FusionParams)
-//! extractor as `GRAPH RAG FUSION`. Both surfaces dispatch through the same
-//! protocol-neutral [`rag_fusion`], so defaults and caps cannot drift
-//! between them.
+//! The router parses the statement with
+//! `nodedb_sql::ddl_ast::parse_search_using_fusion`, which shares the
+//! tokenizer and the clause reader of `GRAPH RAG FUSION`. Both surfaces
+//! dispatch through the same protocol-neutral [`rag_fusion`], so defaults and
+//! caps cannot drift between them.
 
-use nodedb_sql::ddl_ast::parse_search_using_fusion;
+use nodedb_sql::ddl_ast::FusionParams;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -17,21 +16,16 @@ use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::graph_ops::rag_fusion::rag_fusion;
-use super::support::ddl_err;
 
+/// Run a parsed `SEARCH <collection> USING FUSION(...)` statement.
 pub async fn search_fusion(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    sql: &str,
+    collection: String,
+    params: FusionParams,
     linearizable: bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let (collection, params) = parse_search_using_fusion(sql).ok_or_else(|| {
-        ddl_err(
-            "42601",
-            "syntax: SEARCH <collection> USING FUSION(ARRAY[...] ...)",
-        )
-    })?;
     rag_fusion(
         state,
         identity,

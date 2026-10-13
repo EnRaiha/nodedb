@@ -10,6 +10,9 @@ use crate::control::state::SharedState;
 use super::super::super::result::{DdlError, DdlResult};
 use super::helpers::{ddl_err, parse_column_defs, parse_with_clause};
 
+/// The partition interval of a collection that declares none.
+const DEFAULT_PARTITION_INTERVAL: &str = "1h";
+
 /// CREATE TIMESERIES <name> [WITH (key = 'value', ...)]
 pub async fn create_timeseries(
     state: &SharedState,
@@ -43,6 +46,24 @@ pub async fn create_timeseries(
     }
 
     let config_json = parse_with_clause(parts);
+    // A declared partition_by must parse. It becomes the collection type's
+    // interval, the one source a flush reads. Undeclared, it is one hour.
+    let partition_by = match config_json
+        .as_deref()
+        .and_then(|json| sonic_rs::from_str::<serde_json::Value>(json).ok())
+        .and_then(|config| {
+            config
+                .get("partition_by")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        }) {
+        Some(text) => {
+            nodedb_types::timeseries::PartitionInterval::parse(&text)
+                .map_err(|e| ddl_err("22023", format!("invalid partition_by '{text}': {e}")))?;
+            text
+        }
+        None => DEFAULT_PARTITION_INTERVAL.to_string(),
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -74,7 +95,7 @@ pub async fn create_timeseries(
         fields,
         field_defs: Vec::new(),
         event_defs: Vec::new(),
-        collection_type: nodedb_types::CollectionType::timeseries("timestamp", "1h"),
+        collection_type: nodedb_types::CollectionType::timeseries("timestamp", partition_by),
         timeseries_config: config_json,
         conflict_policy: None,
         is_active: true,
@@ -109,17 +130,6 @@ pub async fn create_timeseries(
     crate::control::catalog_entry::persist_collection_replicated(state, &coll)
         .await
         .map_err(|e| DdlError::from_error(&e))?;
-
-    // Initialize partition registry for this timeseries collection.
-    if let Some(registries) = state.timeseries_registries() {
-        let config = nodedb_types::timeseries::TieredPartitionConfig::origin_defaults();
-        let registry =
-            crate::engine::timeseries::partition_registry::PartitionRegistry::new(config);
-        let key = format!("{}:{}", tenant_id.as_u64(), name);
-        let mut regs =
-            crate::control::lock_utils::lock_or_recover(registries.lock(), "ts_registries");
-        regs.insert(key, registry);
-    }
 
     tracing::info!(
         collection = name,

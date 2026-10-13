@@ -99,6 +99,7 @@ impl CoreLoop {
         self.collect_state_files(&mut files)?;
         self.collect_live_arrays(&mut files)?;
         self.collect_owned_timeseries(&mut files)?;
+        self.collect_owned_cagg_images(&mut files)?;
 
         Ok(CoreSnapshot { stamp, files, dirs })
     }
@@ -419,13 +420,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut core = open_core(dir.path());
         let mut memtable = ColumnarMemtable::new_metric(ColumnarMemtableConfig::default());
-        memtable.ingest_metric(
-            1,
-            nodedb_types::timeseries::MetricSample {
-                timestamp_ms: 1_000,
-                value: 42.0,
-            },
-        );
+        memtable
+            .ingest_row(
+                1,
+                &[
+                    crate::engine::timeseries::columnar_memtable::ColumnValue::Timestamp(1_000),
+                    crate::engine::timeseries::columnar_memtable::ColumnValue::Float64(42.0),
+                ],
+            )
+            .unwrap();
         let key = (DB, tid(), "metrics".to_string());
         core.columnar_memtables.insert(key.clone(), memtable);
 
@@ -675,13 +678,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut core = open_core(dir.path());
         let mut memtable = ColumnarMemtable::new_metric(ColumnarMemtableConfig::default());
-        memtable.ingest_metric(
-            1,
-            nodedb_types::timeseries::MetricSample {
-                timestamp_ms: 1_000,
-                value: 42.0,
-            },
-        );
+        memtable
+            .ingest_row(
+                1,
+                &[
+                    crate::engine::timeseries::columnar_memtable::ColumnValue::Timestamp(1_000),
+                    crate::engine::timeseries::columnar_memtable::ColumnValue::Float64(42.0),
+                ],
+            )
+            .unwrap();
         core.columnar_memtables
             .insert((DB, tid(), "metrics".to_string()), memtable);
         settle(&mut core, 750);

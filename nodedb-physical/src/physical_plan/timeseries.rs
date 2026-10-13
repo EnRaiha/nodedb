@@ -62,6 +62,15 @@ pub enum TimeseriesOp {
         /// `[_ts_valid_from, _ts_valid_until)` contains it are returned.
         #[serde(default)]
         valid_at_ms: Option<i64>,
+        /// HAVING predicates (MessagePack `Vec<ScanFilter>`) over the
+        /// finalized group rows, applied after gap-fill and before sort and
+        /// limit. Empty on a raw scan.
+        #[serde(default)]
+        having: Vec<u8>,
+        /// AUTO_TIER layout. `Some` routes each segment of the range to the
+        /// raw rows or to a downsample tier's buckets.
+        #[serde(default)]
+        tiering: Option<crate::physical_plan::TieringPlan>,
     },
 
     /// Write a batch of samples to the columnar memtable.
@@ -116,6 +125,105 @@ pub enum TimeseriesOp {
         #[serde(default)]
         restart_identity: bool,
     },
+
+    /// A refresh cut of one continuous aggregate rooted at `collection`.
+    ///
+    /// The cut replicates on the collection's data group and applies on
+    /// every replica in log order. At apply the replica flushes the
+    /// collection's memtable, so every row of every record before the cut
+    /// sits in a partition and no row after it does. The aggregate then
+    /// folds exactly the partitions present at that moment, on the
+    /// maintenance tick, so every replica folds the same rows.
+    RefreshAggregate {
+        collection: QualifiedCollection,
+        cut: RefreshCut,
+    },
+
+    /// Partition maintenance on the core that owns `collection`:
+    /// `SHOW PARTITIONS FOR` lists its partitions, and `REWRITE PARTITIONS
+    /// FOR` rewrites each sealed one. Neither changes a row, so neither is
+    /// logged or replicated.
+    Partitions {
+        collection: QualifiedCollection,
+        action: PartitionsAction,
+    },
+
+    /// The finalized rows of continuous aggregate `aggregate`, read on the
+    /// core that owns its root source `collection`: one map per bucket and
+    /// group, holding `bucket`, the GROUP BY columns and the output columns.
+    /// The read completes the aggregate's backfill and pending refresh cuts
+    /// first, so it never answers from partial buckets. It changes no row,
+    /// so it is neither logged nor replicated.
+    ReadAggregate {
+        collection: QualifiedCollection,
+        aggregate: String,
+    },
+}
+
+/// What a [`TimeseriesOp::Partitions`] does.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(c_enum)]
+pub enum PartitionsAction {
+    /// List every queryable partition with its state, time range, row count,
+    /// size and interval.
+    List,
+    /// Rewrite every sealed or merged partition with the collection's current
+    /// schema and codecs. A column the schema no longer holds is dropped.
+    Rewrite,
+}
+
+/// One continuous aggregate by name and incarnation.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct AggregateIncarnation {
+    pub name: String,
+    pub incarnation: nodedb_types::Hlc,
+}
+
+/// The cut a [`TimeseriesOp::RefreshAggregate`] makes in one continuous
+/// aggregate.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct RefreshCut {
+    /// Aggregate name.
+    pub aggregate: String,
+    /// Incarnation of the aggregate the cut was proposed for. A replica
+    /// whose aggregate of that name has another incarnation never applies
+    /// the cut to it.
+    pub incarnation: nodedb_types::Hlc,
+    /// Names the cut on every replica. A second apply of the same id is a
+    /// no-op, and a waiter asks for completion by it. For a periodic cut it
+    /// is the period slot: `now_ms / interval_ms`.
+    pub refresh_id: u64,
+    /// The periodic catch-up proposed for slot `refresh_id`. A replica
+    /// applies only slots above the last one it applied.
+    pub periodic: bool,
 }
 
 /// What a [`TimeseriesOp::ResolveIngest`] resolves.

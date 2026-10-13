@@ -27,6 +27,7 @@ use tracing::{info, warn};
 use super::registry::{BitemporalEngineKind, BitemporalRetentionRegistry, Entry};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
+use crate::engine::timeseries::retention_policy::rooted_aggregates::aggregates_rooted_at;
 use nodedb_physical::physical_plan::MetaOp;
 
 /// Default tick interval when no shorter deadline is needed. One hour
@@ -123,14 +124,38 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
                 cutoff_system_ms,
             })
         }
-        BitemporalEngineKind::Columnar => PhysicalPlan::Meta(MetaOp::TemporalPurgeColumnar {
-            tenant_id: tenant_id.as_u64(),
-            collection: nodedb_types::QualifiedCollection::new(
-                entry.database_id,
+        BitemporalEngineKind::Columnar => {
+            // A timeseries purge removes partitions, so it carries the
+            // aggregates that must hold them first, as raw retention does.
+            let aggregates = match aggregates_rooted_at(
+                state,
+                &state.retention_policy_registry,
+                entry.database_id.as_u64(),
+                tenant_id.as_u64(),
                 &entry.collection,
-            ),
-            cutoff_system_ms,
-        }),
+            ) {
+                Ok(aggregates) => aggregates,
+                Err(e) => {
+                    warn!(
+                        tenant = tenant_id.as_u64(),
+                        collection = %entry.collection,
+                        error = %e,
+                        "skipping temporal purge: the aggregates rooted at the collection \
+                         could not be read; the next pass retries"
+                    );
+                    return;
+                }
+            };
+            PhysicalPlan::Meta(MetaOp::TemporalPurgeColumnar {
+                tenant_id: tenant_id.as_u64(),
+                collection: nodedb_types::QualifiedCollection::new(
+                    entry.database_id,
+                    &entry.collection,
+                ),
+                cutoff_system_ms,
+                aggregates,
+            })
+        }
         BitemporalEngineKind::Crdt => PhysicalPlan::Meta(MetaOp::TemporalPurgeCrdt {
             tenant_id: tenant_id.as_u64(),
             collection: nodedb_types::QualifiedCollection::new(

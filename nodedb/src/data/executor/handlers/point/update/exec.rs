@@ -213,6 +213,18 @@ impl CoreLoop {
                     return self.response_error(task, e);
                 }
 
+                // State and transition constraints judge the change from the
+                // stored row to the post-image, as they do for a put.
+                if let Err(e) = self.check_stored_update_transitions(
+                    &config_key,
+                    collection,
+                    &current_bytes,
+                    &updated_bytes,
+                    &task.request.user_roles,
+                ) {
+                    return self.response_error(task, e);
+                }
+
                 // Gate the persist on the collection's write policy, decided
                 // against the post-update image the row will actually hold.
                 // Placed after the generated columns are recomputed — a policy
@@ -650,6 +662,74 @@ mod tests {
             doc.get("amount").and_then(|v| v.as_i64()),
             Some(10),
             "a refused update must leave the chained row byte-identical"
+        );
+    }
+
+    /// A point update obeys the collection's state constraint: a declared
+    /// transition is admitted, any other change of the column is refused.
+    #[test]
+    fn a_point_update_obeys_the_state_constraint() {
+        use nodedb_physical::physical_plan::document::{StateTransitionDef, TransitionRule};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let mut config = CollectionConfig::new(SOURCE);
+        config.enforcement.state_constraints = vec![StateTransitionDef {
+            name: "flow".to_string(),
+            column: "status".to_string(),
+            transitions: vec![TransitionRule {
+                from: "draft".to_string(),
+                to: "active".to_string(),
+                required_role: None,
+            }],
+        }];
+        core.doc_configs.insert(config_key(SOURCE), config);
+        let task = make_default_task();
+        let body = doc_format::encode_to_msgpack(&serde_json::json!({"status": "draft"}));
+        let inserted = core.execute_point_insert(PointInsertParams {
+            task: &task,
+            tid: TID,
+            collection: SOURCE,
+            document_id: "s1",
+            surrogate: Surrogate(71),
+            value: &body,
+            if_absent: false,
+            returning: None,
+            rls_filters: &[],
+            resolved_sum_targets: &[],
+            deferred_sum_targets: &[],
+        });
+        assert_eq!(inserted.status, Status::Ok);
+
+        let set_status = |core: &mut CoreLoop, status: &str| {
+            let value = nodedb_types::json_to_msgpack(&serde_json::json!(status)).expect("encode");
+            let updates = vec![("status".to_string(), UpdateValue::Literal(value))];
+            core.execute_point_update(
+                &task,
+                PointUpdateParams {
+                    tid: TID,
+                    collection: SOURCE,
+                    document_id: "s1",
+                    surrogate: Some(Surrogate(71)),
+                    updates: &updates,
+                    returning: None,
+                    rls_filters: &[],
+                    rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                    resolved_sum_targets: &[],
+                    declared_primary_key: None,
+                },
+            )
+            .status
+        };
+        assert_eq!(
+            set_status(&mut core, "closed"),
+            Status::Error,
+            "draft -> closed is not a declared transition"
+        );
+        assert_eq!(
+            set_status(&mut core, "active"),
+            Status::Ok,
+            "draft -> active is declared"
         );
     }
 }

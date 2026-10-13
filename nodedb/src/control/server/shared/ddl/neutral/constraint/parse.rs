@@ -14,11 +14,13 @@ use crate::control::server::shared::ddl::result::DdlError;
 use super::support::err;
 
 /// Parse transition rules from `TRANSITIONS ('a' -> 'b', 'b' -> 'c' BY ROLE 'role', ...)`.
-pub(super) fn parse_transitions(upper: &str) -> Result<Vec<TransitionRule>, DdlError> {
-    let start = upper
-        .find("TRANSITIONS")
+///
+/// Keywords match in any case. State values keep the case the author wrote,
+/// because enforcement compares them with the stored column value exactly.
+pub(super) fn parse_transitions(sql: &str) -> Result<Vec<TransitionRule>, DdlError> {
+    let start = find_ascii_case_insensitive(sql, "TRANSITIONS")
         .ok_or_else(|| err("42601", "missing TRANSITIONS keyword"))?;
-    let after = &upper[start + "TRANSITIONS".len()..];
+    let after = &sql[start + "TRANSITIONS".len()..];
     let paren_start = after
         .find('(')
         .ok_or_else(|| err("42601", "TRANSITIONS requires (...)"))?;
@@ -63,7 +65,7 @@ fn parse_single_transition(s: &str) -> Result<TransitionRule, DdlError> {
         .trim_matches('"')
         .to_string();
 
-    let (to, required_role) = if let Some(by_pos) = rest.find("BY ROLE") {
+    let (to, required_role) = if let Some(by_pos) = find_ascii_case_insensitive(rest, "BY ROLE") {
         let to = rest[..by_pos]
             .trim()
             .trim_matches('\'')

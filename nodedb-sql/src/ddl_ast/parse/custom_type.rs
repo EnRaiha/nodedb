@@ -9,24 +9,24 @@
 //! - `ALTER TYPE <name> ADD VALUE 'label'`
 //! - `SHOW TYPES`
 
+use super::clause::{ClauseCursor, Tok, tokenize};
 use crate::ddl_ast::statement::{NodedbStatement, PolicyStmt};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::find_ascii_case_insensitive;
 
 /// Try to parse custom type DDL statements.
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
     if upper.starts_with("CREATE TYPE ") {
-        return Some(parse_create(parts, trimmed));
+        return Some(parse_create(trimmed));
     }
     if upper.starts_with("DROP TYPE ") || upper == "DROP TYPE" {
-        return Some(parse_drop(parts));
+        return Some(parse_drop(trimmed));
     }
     if upper.starts_with("ALTER TYPE ") {
-        return Some(parse_alter(parts, trimmed));
+        return Some(parse_alter(trimmed));
     }
     if upper == "SHOW TYPES" {
         return Some(Ok(NodedbStatement::Policy(PolicyStmt::ShowTypes)));
@@ -35,228 +35,145 @@ pub(super) fn try_parse(
 }
 
 /// Parse `CREATE TYPE <name> AS ENUM (...)` or `CREATE TYPE <name> AS (...)`.
-fn parse_create(parts: &[&str], trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    // parts: [CREATE, TYPE, <name>, AS, ...]
-    let name = parts.get(2).ok_or_else(|| SqlError::Parse {
-        detail: "syntax: CREATE TYPE <name> AS ENUM (...) | AS (<f> <t>, ...)".to_string(),
-    })?;
+fn parse_create(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "CREATE TYPE");
+    c.expect_keywords(&["CREATE", "TYPE"])?;
+    let name = c.name("type name")?;
+    c.expect_keyword("AS")?;
 
-    let as_pos = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("AS"))
-        .ok_or_else(|| SqlError::Parse {
-            detail: "CREATE TYPE: missing AS keyword".to_string(),
+    if c.eat_keyword("ENUM") {
+        let labels = c.paren_list("ENUM label list", |c| {
+            let label = c.string("ENUM label")?.trim().to_string();
+            if label.is_empty() {
+                return Err(c.error("an ENUM label must not be empty"));
+            }
+            Ok(label)
         })?;
-
-    // What follows AS?
-    let after_as = parts.get(as_pos + 1).copied().unwrap_or("").to_uppercase();
-
-    if after_as == "ENUM" {
-        let labels = parse_label_list(trimmed)?;
-        if labels.is_empty() {
-            return Err(SqlError::Parse {
-                detail: "CREATE TYPE … AS ENUM: label list must not be empty".to_string(),
-            });
-        }
-        // Reject duplicates.
+        c.finish()?;
         let mut seen = std::collections::HashSet::new();
         for label in &labels {
             if !seen.insert(label.as_str()) {
-                return Err(SqlError::Parse {
-                    detail: format!("CREATE TYPE … AS ENUM: duplicate label '{label}'"),
-                });
+                return Err(c.error(format!("AS ENUM: duplicate label '{label}'")));
             }
         }
-        Ok(NodedbStatement::Policy(PolicyStmt::CreateEnumType {
-            name: name.to_lowercase(),
+        return Ok(NodedbStatement::Policy(PolicyStmt::CreateEnumType {
+            name,
             labels,
-        }))
-    } else {
-        // Composite: AS (<field> <type>, ...)
-        let fields = parse_composite_fields(trimmed)?;
-        if fields.is_empty() {
-            return Err(SqlError::Parse {
-                detail: "CREATE TYPE … AS: composite field list must not be empty".to_string(),
-            });
-        }
-        Ok(NodedbStatement::Policy(PolicyStmt::CreateCompositeType {
-            name: name.to_lowercase(),
-            fields,
-        }))
+        }));
     }
-}
 
-/// Parse `DROP TYPE [IF EXISTS] <name>`.
-fn parse_drop(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
-    // parts: [DROP, TYPE, ...]
-    let (if_exists, name_idx) = if parts.len() >= 5
-        && parts[2].eq_ignore_ascii_case("IF")
-        && parts[3].eq_ignore_ascii_case("EXISTS")
-    {
-        (true, 4)
-    } else {
-        (false, 2)
-    };
-
-    let name = parts.get(name_idx).ok_or_else(|| SqlError::Parse {
-        detail: "syntax: DROP TYPE [IF EXISTS] <name>".to_string(),
-    })?;
-
-    Ok(NodedbStatement::Policy(PolicyStmt::DropType {
-        name: name.to_lowercase(),
-        if_exists,
+    let inner = c.raw_paren("composite field list")?;
+    c.finish()?;
+    let fields = parse_composite_fields(inner)?;
+    if fields.is_empty() {
+        return Err(c.error("AS: composite field list must not be empty"));
+    }
+    Ok(NodedbStatement::Policy(PolicyStmt::CreateCompositeType {
+        name,
+        fields,
     }))
 }
 
-/// Parse `ALTER TYPE <name> ADD VALUE 'label'`.
-fn parse_alter(parts: &[&str], trimmed: &str) -> Result<NodedbStatement, SqlError> {
-    // parts: [ALTER, TYPE, <name>, ADD, VALUE, ...]
-    let name = parts.get(2).ok_or_else(|| SqlError::Parse {
-        detail: "syntax: ALTER TYPE <name> ADD VALUE 'label'".to_string(),
-    })?;
-
-    let action = parts.get(3).copied().unwrap_or("").to_uppercase();
-    if action != "ADD" {
-        return Err(SqlError::Parse {
-            detail: format!("ALTER TYPE: unsupported action '{action}'; expected ADD VALUE"),
-        });
-    }
-    let value_kw = parts.get(4).copied().unwrap_or("").to_uppercase();
-    if value_kw != "VALUE" {
-        return Err(SqlError::Parse {
-            detail: "ALTER TYPE <name> ADD VALUE 'label': missing VALUE keyword".to_string(),
-        });
-    }
-
-    // Extract the label: everything after ADD VALUE, trimmed, possibly quoted.
-    let add_value_pos =
-        find_ascii_case_insensitive(trimmed, " ADD VALUE ").ok_or_else(|| SqlError::Parse {
-            detail: "ALTER TYPE: could not locate ADD VALUE in statement".to_string(),
-        })?;
-    let after_add_value = trimmed[add_value_pos + " ADD VALUE ".len()..].trim();
-    let label = strip_single_quotes(after_add_value);
-    if label.is_empty() {
-        return Err(SqlError::Parse {
-            detail: "ALTER TYPE ADD VALUE: label must not be empty".to_string(),
-        });
-    }
-
-    Ok(NodedbStatement::Policy(PolicyStmt::AlterTypeAddValue {
-        type_name: name.to_lowercase(),
-        label,
-    }))
-}
-
-/// Extract `('label1', 'label2', ...)` after the ENUM keyword.
-fn parse_label_list(original: &str) -> Result<Vec<String>, SqlError> {
-    // Find the opening paren after ENUM.
-    let enum_pos =
-        find_ascii_case_insensitive(original, " AS ENUM").ok_or_else(|| SqlError::Parse {
-            detail: "CREATE TYPE … AS ENUM: cannot locate AS ENUM".to_string(),
-        })?;
-    let s = original[enum_pos + " AS ENUM".len()..].trim_start();
-    extract_quoted_list(s, "CREATE TYPE … AS ENUM")
-}
-
-/// Extract `(<field> <type>, ...)` after the AS keyword for composite types.
-fn parse_composite_fields(original: &str) -> Result<Vec<(String, String)>, SqlError> {
-    // Find " AS (" — skip over "AS ENUM" by checking the next non-ws char.
-    let as_pos = find_ascii_case_insensitive(original, " AS ").ok_or_else(|| SqlError::Parse {
-        detail: "CREATE TYPE: missing AS keyword".to_string(),
-    })?;
-    let after_as = original[as_pos + 4..].trim_start();
-    if after_as.to_uppercase().starts_with("ENUM") {
-        return Err(SqlError::Parse {
-            detail: "CREATE TYPE: expected composite field list, got ENUM".to_string(),
-        });
-    }
-
-    let open = after_as.find('(').ok_or_else(|| SqlError::Parse {
-        detail: "CREATE TYPE … AS: expected '(' to start field list".to_string(),
-    })?;
-    let close = after_as.rfind(')').ok_or_else(|| SqlError::Parse {
-        detail: "CREATE TYPE … AS: missing closing ')'".to_string(),
-    })?;
-    if close <= open {
-        return Err(SqlError::Parse {
-            detail: "CREATE TYPE … AS: malformed field list".to_string(),
-        });
-    }
-    let inner = &after_as[open + 1..close];
-    if inner.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
+/// Split `<field> <type>, ...` at top-level commas. A type keeps every word
+/// and parenthesized argument (`DOUBLE PRECISION`, `NUMERIC(10, 2)`) and is
+/// upper-cased.
+fn parse_composite_fields(inner: &str) -> Result<Vec<(String, String)>, SqlError> {
+    let toks = tokenize(inner);
     let mut fields = Vec::new();
-    for raw in inner.split(',') {
-        let tok: Vec<&str> = raw.split_whitespace().collect();
-        if tok.len() < 2 {
-            return Err(SqlError::Parse {
-                detail: format!(
-                    "CREATE TYPE: field definition '{}' must be '<name> <type>'",
-                    raw.trim()
-                ),
-            });
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for i in 0..=toks.len() {
+        let at_comma = match toks.get(i).map(|t| &t.tok) {
+            Some(Tok::Punct('(')) => {
+                depth += 1;
+                false
+            }
+            Some(Tok::Punct(')')) => {
+                depth -= 1;
+                false
+            }
+            Some(Tok::Punct(',')) => depth == 0,
+            Some(_) => false,
+            None => true,
+        };
+        if !at_comma {
+            continue;
         }
-        let field_name = tok[0].to_lowercase();
-        // Rejoin remaining tokens to handle types like "DOUBLE PRECISION".
-        let type_name = tok[1..].join(" ").to_uppercase();
+        let group = &toks[start..i];
+        start = i + 1;
+        if group.is_empty() && i == toks.len() && fields.is_empty() {
+            break;
+        }
+        let (Some(first), Some(second), Some(last)) = (group.first(), group.get(1), group.last())
+        else {
+            let text = group
+                .first()
+                .zip(group.last())
+                .map_or("", |(f, l)| &inner[f.span.start..l.span.end]);
+            return Err(super::clause::parse_err(format!(
+                "CREATE TYPE: field definition '{text}' must be '<name> <type>'"
+            )));
+        };
+        let field_name = match &first.tok {
+            Tok::Word(w) => w.to_lowercase(),
+            Tok::Ident(s) => s.to_string(),
+            _ => {
+                return Err(super::clause::parse_err(format!(
+                    "CREATE TYPE: field name '{}' is not an identifier",
+                    &inner[first.span.clone()]
+                )));
+            }
+        };
+        let type_name = inner[second.span.start..last.span.end].to_uppercase();
         fields.push((field_name, type_name));
     }
     Ok(fields)
 }
 
-/// Extract a `('a', 'b', ...)` list, returning lowercase strings.
-fn extract_quoted_list(s: &str, ctx: &str) -> Result<Vec<String>, SqlError> {
-    let open = s.find('(').ok_or_else(|| SqlError::Parse {
-        detail: format!("{ctx}: expected '('"),
-    })?;
-    let close = s.rfind(')').ok_or_else(|| SqlError::Parse {
-        detail: format!("{ctx}: missing ')'"),
-    })?;
-    if close <= open {
-        return Err(SqlError::Parse {
-            detail: format!("{ctx}: malformed list"),
-        });
-    }
-    let inner = &s[open + 1..close];
-    if inner.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut labels = Vec::new();
-    let mut in_quote = false;
-    let mut current = String::new();
-    for ch in inner.chars() {
-        match ch {
-            '\'' if !in_quote => in_quote = true,
-            '\'' if in_quote => in_quote = false,
-            ',' if !in_quote => {
-                let t = current.trim().to_string();
-                if !t.is_empty() {
-                    labels.push(t);
-                }
-                current.clear();
-            }
-            _ if in_quote => current.push(ch),
-            _ => {}
-        }
-    }
-    let t = current.trim().to_string();
-    if !t.is_empty() {
-        labels.push(t);
-    }
-    Ok(labels.into_iter().filter(|l| !l.is_empty()).collect())
+/// Parse `DROP TYPE [IF EXISTS] <name>`.
+fn parse_drop(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "DROP TYPE");
+    c.expect_keywords(&["DROP", "TYPE"])?;
+    let if_exists = c.eat_keywords(&["IF", "EXISTS"]);
+    let name = c.name("type name")?;
+    c.finish()?;
+    Ok(NodedbStatement::Policy(PolicyStmt::DropType {
+        name,
+        if_exists,
+    }))
 }
 
-/// Strip surrounding single quotes from a string fragment.
-fn strip_single_quotes(s: &str) -> String {
-    let s = s.trim();
-    if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
+/// Parse `ALTER TYPE <name> ADD VALUE 'label'`. `IF NOT EXISTS`, `BEFORE`,
+/// and `AFTER` are refused: the statement carries no slot for them, so
+/// accepting them will change what the statement does.
+fn parse_alter(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "ALTER TYPE");
+    c.expect_keywords(&["ALTER", "TYPE"])?;
+    let type_name = c.name("type name")?;
+    if !c.eat_keywords(&["ADD", "VALUE"]) {
+        return Err(c.error(format!(
+            "unsupported action {}; expected ADD VALUE 'label'",
+            c.describe_next()
+        )));
     }
+    if c.peek_keyword("IF") {
+        return Err(c.error("ADD VALUE IF NOT EXISTS is not supported"));
+    }
+    let label = c.string("ADD VALUE")?;
+    if label.is_empty() {
+        return Err(c.error("ADD VALUE: label must not be empty"));
+    }
+    if c.peek_keyword("BEFORE") || c.peek_keyword("AFTER") {
+        return Err(c.error("ADD VALUE ... BEFORE/AFTER is not supported; new labels are appended"));
+    }
+    c.finish()?;
+    Ok(NodedbStatement::Policy(PolicyStmt::AlterTypeAddValue {
+        type_name,
+        label,
+    }))
 }
 
 #[cfg(test)]
@@ -350,6 +267,23 @@ mod tests {
     }
 
     #[test]
+    fn composite_type_with_parenthesized_arguments_keeps_them() {
+        let stmt = ok("CREATE TYPE money AS (amount NUMERIC(10, 2), unit DOUBLE PRECISION)");
+        match stmt {
+            NodedbStatement::Policy(PolicyStmt::CreateCompositeType { fields, .. }) => {
+                assert_eq!(
+                    fields,
+                    vec![
+                        ("amount".to_string(), "NUMERIC(10, 2)".to_string()),
+                        ("unit".to_string(), "DOUBLE PRECISION".to_string()),
+                    ]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn drop_basic() {
         let stmt = ok("DROP TYPE status");
         assert_eq!(
@@ -395,6 +329,14 @@ mod tests {
                 label: "archived".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn alter_add_value_before_is_refused_not_folded_into_the_label() {
+        let e = err("ALTER TYPE mood ADD VALUE 'sad' BEFORE 'happy'");
+        assert!(matches!(e, SqlError::Parse { .. }));
+        let e = err("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'sad'");
+        assert!(matches!(e, SqlError::Parse { .. }));
     }
 
     #[test]

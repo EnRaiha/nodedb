@@ -27,7 +27,7 @@ pub fn evaluate_range(
     let mut ts = start_ms;
     while ts <= end_ms {
         let step_ctx = EvalContext {
-            series: ctx.series.clone(),
+            series: std::sync::Arc::clone(&ctx.series),
             timestamp_ms: ts,
             lookback_ms: ctx.lookback_ms,
         };
@@ -73,7 +73,7 @@ mod tests {
         let tokens = tokenize(query).unwrap();
         let expr = parser::parse(&tokens).unwrap();
         let ctx = EvalContext {
-            series,
+            series: series.into(),
             timestamp_ms: ts,
             lookback_ms: DEFAULT_LOOKBACK_MS,
         };
@@ -204,7 +204,7 @@ mod tests {
         let tokens = tokenize("up").unwrap();
         let expr = parser::parse(&tokens).unwrap();
         let ctx = EvalContext {
-            series,
+            series: series.into(),
             timestamp_ms: 0,
             lookback_ms: DEFAULT_LOOKBACK_MS,
         };
@@ -215,5 +215,77 @@ mod tests {
         } else {
             panic!("expected matrix");
         }
+    }
+
+    /// `up` at 1..=10 every second, value equal to the second.
+    fn counting_series() -> Vec<Series> {
+        let samples: Vec<(i64, f64)> = (1..=10).map(|s| (s * 1000, s as f64)).collect();
+        vec![make_series("up", &[("job", "api")], &samples)]
+    }
+
+    fn scalar_of(val: Value) -> f64 {
+        match val {
+            Value::Vector(v) if v.len() == 1 => v[0].value,
+            other => panic!("expected one-element vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subquery_steps_are_aligned_and_left_open() {
+        // Steps at 6s..=10s: the window (5s, 10s] excludes 5s.
+        let max = scalar_of(eval_query(
+            "max_over_time(up[5s:1s])",
+            counting_series(),
+            10_000,
+        ));
+        let min = scalar_of(eval_query(
+            "min_over_time(up[5s:1s])",
+            counting_series(),
+            10_000,
+        ));
+        assert_eq!((min, max), (6.0, 10.0));
+        let count = scalar_of(eval_query(
+            "count_over_time(up[5s:1s])",
+            counting_series(),
+            10_000,
+        ));
+        assert_eq!(count, 5.0);
+    }
+
+    #[test]
+    fn subquery_offset_shifts_the_window() {
+        let max = scalar_of(eval_query(
+            "max_over_time(up[5s:1s] offset 2s)",
+            counting_series(),
+            10_000,
+        ));
+        assert_eq!(max, 8.0);
+    }
+
+    #[test]
+    fn subquery_default_step_is_one_minute() {
+        // No multiple of 60s falls inside (5s, 10s].
+        let val = eval_query("max_over_time(up[5s:])", counting_series(), 10_000);
+        assert!(
+            matches!(val, Value::Vector(ref v) if v.is_empty()),
+            "{val:?}"
+        );
+    }
+
+    #[test]
+    fn quantile_over_time_takes_its_scalar_first() {
+        let val = eval_query("quantile_over_time(1, up[20s])", counting_series(), 10_000);
+        assert_eq!(scalar_of(val), 10.0);
+    }
+
+    #[test]
+    fn subquery_over_a_function_result() {
+        // rate over [2s] is 1/s at every step.
+        let val = eval_query(
+            "avg_over_time(rate(up[2s])[4s:1s])",
+            counting_series(),
+            10_000,
+        );
+        assert!((scalar_of(val) - 1.0).abs() < 1e-9);
     }
 }

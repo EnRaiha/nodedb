@@ -40,13 +40,16 @@ pub(super) fn add_columnar_keys(keys: &mut WriteKeys, op: &ColumnarOp) -> crate:
 /// Add the write keys of timeseries op `op` to `keys`.
 pub(super) fn add_timeseries_keys(keys: &mut WriteKeys, op: &TimeseriesOp) -> crate::Result<()> {
     match op {
-        TimeseriesOp::Ingest { collection, .. } | TimeseriesOp::Truncate { collection, .. } => {
+        TimeseriesOp::Ingest { collection, .. }
+        | TimeseriesOp::Truncate { collection, .. }
+        | TimeseriesOp::RefreshAggregate { collection, .. } => {
             keys.whole_collection(collection.as_str());
             Ok(())
         }
-        TimeseriesOp::ResolveIngest(_) | TimeseriesOp::Scan { .. } => {
-            Err(not_a_write("a timeseries read"))
-        }
+        TimeseriesOp::ResolveIngest(_)
+        | TimeseriesOp::Scan { .. }
+        | TimeseriesOp::ReadAggregate { .. } => Err(not_a_write("a timeseries read")),
+        TimeseriesOp::Partitions { .. } => Err(not_a_write("timeseries partition maintenance")),
     }
 }
 

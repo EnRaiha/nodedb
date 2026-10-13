@@ -42,21 +42,67 @@ pub fn convert_group_by_with_projection(
 ) -> Result<Vec<SqlExpr>> {
     // A key written as an output alias is substituted for its SELECT-list
     // expression above, so only the remaining names need the alias widening.
-    let key_scope =
-        scope.with_output_names(crate::planner::select::select_output_aliases(projection));
+    // `SELECT col AS col` names the column itself, so that alias is left out:
+    // the key resolves to the column and, over a join, to its owning side.
+    let key_scope = scope.with_output_names(
+        crate::planner::select::select_output_aliases(projection)
+            .into_iter()
+            .filter(|alias| !is_self_alias(projection, alias)),
+    );
     let key_scope = ColumnScope::Relations(&key_scope);
     match group_by {
         GroupByExpr::All(_) => Ok(Vec::new()),
         GroupByExpr::Expressions(exprs, _) => exprs
             .iter()
-            .map(
-                |e| match resolve_output_alias(e, projection, table_columns) {
+            .map(|e| {
+                reject_ordinal_out_of_range(e, projection)?;
+                match resolve_output_alias(e, projection, table_columns) {
                     Some(aliased) => convert_expr(aliased, &key_scope),
                     None => convert_expr(e, &key_scope),
-                },
-            )
+                }
+            })
             .collect(),
     }
+}
+
+/// Whether `alias` is the output name of a SELECT item `col AS col` that
+/// projects the column of the same name, bare or qualified.
+fn is_self_alias(projection: &[ast::SelectItem], alias: &str) -> bool {
+    projection.iter().any(|item| match item {
+        ast::SelectItem::ExprWithAlias { expr, alias: name } => {
+            normalize_ident(name) == alias && expr_column_name(expr).is_some_and(|c| c == alias)
+        }
+        ast::SelectItem::UnnamedExpr(_)
+        | ast::SelectItem::ExprWithAliases { .. }
+        | ast::SelectItem::QualifiedWildcard(..)
+        | ast::SelectItem::Wildcard(_) => false,
+    })
+}
+
+/// Refuse `GROUP BY n` when the SELECT list has no `n`-th expression, as
+/// PostgreSQL does. An integer key is never a constant group.
+///
+/// A projection-less call (`convert_group_by`) has no SELECT list to check
+/// against and leaves the key as written.
+fn reject_ordinal_out_of_range(expr: &ast::Expr, projection: &[ast::SelectItem]) -> Result<()> {
+    if projection.is_empty() {
+        return Ok(());
+    }
+    let ast::Expr::Value(v) = expr else {
+        return Ok(());
+    };
+    let ast::Value::Number(n, _) = &v.value else {
+        return Ok(());
+    };
+    let in_range = n
+        .parse::<usize>()
+        .is_ok_and(|position| position >= 1 && position <= projection.len());
+    if in_range {
+        return Ok(());
+    }
+    Err(crate::error::SqlError::Unsupported {
+        detail: format!("GROUP BY position {n} is not in select list"),
+    })
 }
 
 /// The SELECT-list expression a bare GROUP BY identifier refers to, if the
@@ -66,6 +112,19 @@ fn resolve_output_alias<'a>(
     projection: &'a [ast::SelectItem],
     table_columns: &[ColumnInfo],
 ) -> Option<&'a ast::Expr> {
+    // `GROUP BY 2` names the second SELECT-list expression.
+    if let ast::Expr::Value(v) = expr
+        && let ast::Value::Number(n, _) = &v.value
+        && let Ok(position) = n.parse::<usize>()
+        && position >= 1
+    {
+        return match projection.get(position - 1) {
+            Some(
+                ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. },
+            ) => Some(e),
+            Some(_) | None => None,
+        };
+    }
     let ast::Expr::Identifier(ident) = expr else {
         return None;
     };

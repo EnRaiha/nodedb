@@ -10,7 +10,15 @@
 
 use crate::engine::timeseries::columnar_agg::AggAccum;
 use crate::engine::timeseries::gap_fill::GapFillStrategy;
-use crate::engine::timeseries::grouped_scan::GroupedAggResult;
+use crate::engine::timeseries::grouped_scan::{GroupCell, GroupKey, GroupedAggResult};
+
+/// The key of bucket `ts` of the group whose cells are `cells`.
+fn bucket_key(ts: i64, cells: &[GroupCell]) -> GroupKey {
+    GroupKey {
+        bucket: Some(ts),
+        cells: cells.to_vec(),
+    }
+}
 
 /// Apply gap-fill to a `GroupedAggResult` for bucketed queries.
 ///
@@ -32,25 +40,16 @@ pub(super) fn apply_gap_fill_to_grouped(
 
     let num_aggs = aggregates.len();
 
-    // Collect all unique group suffixes (parts after the bucket timestamp).
-    let group_suffixes: std::collections::HashSet<String> = result
-        .groups
-        .keys()
-        .map(|k| {
-            // Key format: "bucket_ts\0group1\0group2"
-            k.find('\0')
-                .map(|pos| k[pos..].to_string())
-                .unwrap_or_default()
-        })
-        .collect();
+    // Collect every distinct group: the GROUP BY cells of each key.
+    let group_suffixes: std::collections::HashSet<Vec<GroupCell>> =
+        result.groups.keys().map(|k| k.cells.clone()).collect();
 
-    // If no groups found (e.g., no GROUP BY), use a single empty suffix.
-    let suffixes: Vec<String> =
-        if group_suffixes.is_empty() || group_suffixes.iter().all(|s| s.is_empty()) {
-            vec![String::new()]
-        } else {
-            group_suffixes.into_iter().collect()
-        };
+    // With no groups (e.g., no GROUP BY), fill the one group with no cells.
+    let suffixes: Vec<Vec<GroupCell>> = if group_suffixes.is_empty() {
+        vec![Vec::new()]
+    } else {
+        group_suffixes.into_iter().collect()
+    };
 
     // Enumerate expected buckets.
     let (start_ms, end_ms) = time_range;
@@ -59,7 +58,7 @@ pub(super) fn apply_gap_fill_to_grouped(
     for suffix in &suffixes {
         let mut ts = aligned_start;
         while ts < end_ms {
-            let key = format!("{ts}{suffix}");
+            let key = bucket_key(ts, suffix);
             if !result.groups.contains_key(&key) {
                 // Missing bucket — create synthetic accumulators.
                 let accums = match strategy {
@@ -117,14 +116,14 @@ fn make_constant_accums(n: usize, val: f64) -> Vec<AggAccum> {
 /// Find the nearest previous real bucket's average value.
 fn find_prev_bucket_avg(
     result: &GroupedAggResult,
-    suffix: &str,
+    suffix: &[GroupCell],
     target_ts: i64,
     interval: i64,
     _end_ms: i64,
 ) -> Option<(i64, f64)> {
     let mut ts = target_ts - interval;
     while ts >= 0 {
-        let key = format!("{ts}{suffix}");
+        let key = bucket_key(ts, suffix);
         if let Some(accums) = result.groups.get(&key)
             && let Some(a) = accums.first()
             && a.count > 0
@@ -139,14 +138,14 @@ fn find_prev_bucket_avg(
 /// Find the nearest next real bucket's average value.
 fn find_next_bucket_avg(
     result: &GroupedAggResult,
-    suffix: &str,
+    suffix: &[GroupCell],
     target_ts: i64,
     interval: i64,
     end_ms: i64,
 ) -> Option<(i64, f64)> {
     let mut ts = target_ts + interval;
     while ts < end_ms {
-        let key = format!("{ts}{suffix}");
+        let key = bucket_key(ts, suffix);
         if let Some(accums) = result.groups.get(&key)
             && let Some(a) = accums.first()
             && a.count > 0

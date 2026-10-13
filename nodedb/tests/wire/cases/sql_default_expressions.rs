@@ -441,3 +441,36 @@ fn assert_not_null(row: &str, label: &str) {
         "{label}: expected a value, got `{row}`"
     );
 }
+
+/// A column DEFAULT that reads another column could never produce a value: it
+/// is evaluated with no row in scope. CREATE and ALTER ADD COLUMN refuse it at
+/// the declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_default_reading_another_column_is_refused() {
+    let server = TestServer::start().await;
+
+    server
+        .expect_error(
+            "CREATE COLLECTION def_cross (\
+                id TEXT PRIMARY KEY, \
+                status TEXT, \
+                lowered TEXT DEFAULT LOWER(status)) WITH (engine='document_strict')",
+            "0A000",
+        )
+        .await;
+
+    server
+        .exec(
+            "CREATE COLLECTION def_cross_alter (\
+                id TEXT PRIMARY KEY, \
+                status TEXT) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    server
+        .expect_error(
+            "ALTER COLLECTION def_cross_alter ADD COLUMN lowered TEXT DEFAULT LOWER(status)",
+            "0A000",
+        )
+        .await;
+}

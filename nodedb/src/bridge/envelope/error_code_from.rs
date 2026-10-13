@@ -264,6 +264,7 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::CrdtApplyRequiresAdmission
             | crate::Error::CloneWriteRequiresMaterialize { .. }
             | crate::Error::MirrorReadOnly { .. }
+            | crate::Error::WrongObjectType { .. }
             | crate::Error::AmbiguousColumn { .. }
             | crate::Error::ExecutionLimitExceeded { .. }
             | crate::Error::LimitExceeded { .. }

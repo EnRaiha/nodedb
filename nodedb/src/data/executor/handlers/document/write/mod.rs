@@ -5,6 +5,7 @@
 //! backfill / drop handlers live in `index_maintenance`.
 
 pub mod batch_insert;
+pub mod batch_insert_judge;
 pub mod register;
 
 pub(in crate::data::executor) use batch_insert::DocumentBatchInsertParams;

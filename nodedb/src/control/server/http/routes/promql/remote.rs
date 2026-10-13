@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Prometheus remote write/read HTTP handlers.
+//! Prometheus remote write HTTP handler.
 //!
-//! - POST `/obsv/api/v1/write`  — accept snappy-compressed protobuf `WriteRequest`
-//! - POST `/obsv/api/v1/read`   — accept snappy-compressed protobuf `ReadRequest`
+//! - POST `/obsv/api/v1/write` — accept snappy-compressed protobuf `WriteRequest`
+//!
+//! Every metric lands in the timeseries collection named after it, in the
+//! database the `X-NodeDB-Database` header selects.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -15,17 +18,17 @@ use prost::Message;
 
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
-use crate::control::promql::remote_proto::{
-    self, Label, MatchType, QueryResult, ReadRequest, ReadResponse, Sample, TimeSeries,
-    WriteRequest,
-};
-use crate::control::promql::{self, types::DEFAULT_LOOKBACK_MS};
+use crate::control::promql::remote_proto::{self, TimeSeries, WriteRequest};
+use crate::control::security::request_scope::ClientRequestScope;
 use crate::control::server::http::admission::admit_without_rate_limit;
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
 use crate::control::server::http::peer::PeerAddr;
-use crate::types::{DatabaseId, TraceId};
+use crate::control::server::ilp_listener::{IlpMeasurementBatch, spawn_schema_projection_merge};
+use crate::types::TraceId;
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+use super::metric_registration::ensure_metric_collection;
 
 /// POST `/obsv/api/v1/write` — Prometheus remote write endpoint.
 ///
@@ -39,30 +42,28 @@ pub async fn remote_write(
     body: Bytes,
 ) -> Response {
     let tenant_id = identity.tenant_id();
+    // The `X-NodeDB-Database` header selects the database the series land in.
+    let database_id = match crate::control::server::http::routes::query::resolve_database_id(
+        &headers,
+        &crate::control::server::http::routes::query::DatabaseQueryParam::default(),
+        &state,
+    ) {
+        Ok(id) => id,
+        Err(error) => return error.into_response(),
+    };
     // Blacklist + account status, no rate limit: remote write is bulk metric
     // ingest, the same shape as ILP/OTLP, and not the per-query traffic the
     // rate limiter's cost table models. It runs before the body is
     // decompressed or decoded, so a refused sender costs nothing.
-    if let Err(error) =
-        admit_without_rate_limit(&state, &identity.0, DatabaseId::DEFAULT, peer.as_str())
-    {
+    if let Err(error) = admit_without_rate_limit(&state, &identity.0, database_id, peer.as_str()) {
         return error.into_response();
     }
 
-    // Decompress snappy if Content-Encoding indicates it (Prometheus always sends snappy).
-    let decompressed = if is_snappy(&headers) {
-        match snap::raw::Decoder::new().decompress_vec(&body) {
-            Ok(d) => d,
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("snappy decode error: {e}"))
-                    .into_response();
-            }
-        }
-    } else {
-        body.to_vec()
+    let decompressed = match decompress_body(&headers, &body) {
+        Ok(d) => d,
+        Err(response) => return *response,
     };
 
-    // Decode protobuf.
     let write_req = match WriteRequest::decode(&decompressed[..]) {
         Ok(r) => r,
         Err(e) => {
@@ -74,7 +75,6 @@ pub async fn remote_write(
         }
     };
 
-    // Convert each TimeSeries to ILP lines and batch-dispatch.
     let mut total_accepted = 0u64;
     let mut total_rejected = 0u64;
 
@@ -82,32 +82,52 @@ pub async fn remote_write(
     // the SQL planner, so it has to run the planner's row-level-security pass
     // over each one explicitly — otherwise remote write will be a way to
     // ingest rows a write policy forbids, with the same identity and the same
-    // collection an `INSERT` refuses.
-    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+    // collection an `INSERT` refuses. The scope is resolved against the
+    // sender's address, as the line-protocol listener resolves it, so an
+    // IP-conditional grant reads the same on both transports.
+    let scope = ClientRequestScope::for_database(
         &identity.0,
         state.shared.auth_stores(),
-        DatabaseId::DEFAULT,
-    );
+        database_id,
+        peer.as_str(),
+    )
+    .into_resolved_scope();
+    let mut registered: HashSet<String> = HashSet::new();
+    // The stored lines of each metric, for the catalog field projection.
+    let mut stored_lines: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for ts in &write_req.timeseries {
-        let lines = ts.to_ilp_lines();
-        if lines.is_empty() {
-            total_rejected += ts.samples.len() as u64;
+        let series_samples = ts.samples.len() as u64;
+        let encoded = match ts.to_ilp_lines() {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                tracing::warn!(error = %error, "remote write series refused");
+                total_rejected += series_samples;
+                continue;
+            }
+        };
+        total_rejected += encoded.rejected;
+        if encoded.lines.is_empty() {
             continue;
         }
-
-        let ilp_payload = lines.join("\n");
+        let line_count = encoded.lines.len() as u64;
         let collection = ts.metric_name().to_string();
-        if collection.is_empty() {
-            total_rejected += ts.samples.len() as u64;
-            continue;
+
+        if !registered.contains(&collection) {
+            if let Err(error) =
+                ensure_metric_collection(&state.shared, &identity.0, database_id, &collection).await
+            {
+                tracing::warn!(error = %error, collection = %collection, "remote write metric registration refused");
+                total_rejected += line_count;
+                continue;
+            }
+            registered.insert(collection.clone());
         }
 
-        let vshard =
-            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+        let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
-            payload: ilp_payload.into_bytes(),
+            collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
+            payload: encoded.lines.join("\n").into_bytes(),
             format: "ilp".into(),
             wal_lsn: None,
             surrogates: Vec::new(),
@@ -124,7 +144,7 @@ pub async fn remote_write(
         let mut task = PhysicalTask {
             tenant_id,
             vshard_id: vshard,
-            database_id: DatabaseId::DEFAULT,
+            database_id,
             plan,
             post_set_op: PostSetOp::None,
             txn_id: None,
@@ -139,7 +159,7 @@ pub async fn remote_write(
             scope.auth(),
         ) {
             tracing::warn!(error = ?error, collection = %collection, "remote write denied by row policy");
-            total_rejected += ts.samples.len() as u64;
+            total_rejected += line_count;
             continue;
         }
         let emitter =
@@ -162,12 +182,12 @@ pub async fn remote_write(
             )) => checked,
             Ok(crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(_)) => {
                 // A timeseries ingest is never a clone-write shape.
-                total_accepted += ts.samples.len() as u64;
+                total_accepted += line_count;
                 continue;
             }
             Err(error) => {
                 tracing::warn!(error = ?error, collection = %collection, "remote write denied");
-                total_rejected += ts.samples.len() as u64;
+                total_rejected += line_count;
                 continue;
             }
         };
@@ -175,7 +195,7 @@ pub async fn remote_write(
         let gw_ctx = QueryContext {
             tenant_id,
             trace_id: TraceId::generate(),
-            database_id: nodedb_types::id::DatabaseId::DEFAULT,
+            database_id,
             txn_id: None,
             linearizable: true,
         };
@@ -185,7 +205,13 @@ pub async fn remote_write(
         };
 
         match dispatch_result {
-            Ok(_) => total_accepted += ts.samples.len() as u64,
+            Ok(_) => {
+                total_accepted += line_count;
+                stored_lines
+                    .entry(collection)
+                    .or_default()
+                    .extend(encoded.lines);
+            }
             Err(e) => {
                 let (_status, msg) = GatewayErrorMap::to_http(&e);
                 tracing::warn!(
@@ -193,9 +219,27 @@ pub async fn remote_write(
                     collection = %collection,
                     "remote write dispatch failed"
                 );
-                total_rejected += ts.samples.len() as u64;
+                total_rejected += line_count;
             }
         }
+    }
+
+    // Label columns join the catalog projection the way line-protocol
+    // ingest adds them, so SQL resolves `WHERE job = ...` on a metric. The
+    // merge runs off this task and is rebuilt by the next write.
+    let mut groups = Vec::with_capacity(stored_lines.len());
+    for (metric, lines) in stored_lines {
+        match IlpMeasurementBatch::from_lines(metric, lines) {
+            Ok(group) => groups.push(group),
+            // The lines were already parsed and stored by the Data Plane,
+            // so a parse error here is an encoder bug.
+            Err(error) => {
+                tracing::error!(error = %error, "remote write lines do not parse for the catalog projection");
+            }
+        }
+    }
+    if !groups.is_empty() {
+        spawn_schema_projection_merge(&state.shared, database_id, tenant_id, groups);
     }
 
     // Record exemplars (stored alongside samples for trace correlation).
@@ -217,147 +261,15 @@ pub async fn remote_write(
     }
 }
 
-/// POST `/obsv/api/v1/read` — Prometheus remote read endpoint.
-///
-/// Accepts: snappy-compressed protobuf `ReadRequest`.
-/// Returns: snappy-compressed protobuf `ReadResponse`.
-pub async fn remote_read(
-    identity: ResolvedIdentity,
-    peer: PeerAddr,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    // Same door as remote write and `/metrics`: this is the observability
-    // surface a Prometheus/Grafana deployment polls, not per-query traffic.
-    // Runs before the body is decompressed or decoded.
-    if let Err(error) =
-        admit_without_rate_limit(&state, &identity.0, DatabaseId::DEFAULT, peer.as_str())
-    {
-        return error.into_response();
+/// The request body, snappy-decompressed when `Content-Encoding` says so.
+/// Prometheus always sends snappy.
+pub(super) fn decompress_body(headers: &HeaderMap, body: &Bytes) -> Result<Vec<u8>, Box<Response>> {
+    if !is_snappy(headers) {
+        return Ok(body.to_vec());
     }
-
-    let decompressed = if is_snappy(&headers) {
-        match snap::raw::Decoder::new().decompress_vec(&body) {
-            Ok(d) => d,
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("snappy decode error: {e}"))
-                    .into_response();
-            }
-        }
-    } else {
-        body.to_vec()
-    };
-
-    let read_req = match ReadRequest::decode(&decompressed[..]) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("protobuf decode error: {e}"),
-            )
-                .into_response();
-        }
-    };
-
-    // Execute each query.
-    let mut results = Vec::with_capacity(read_req.queries.len());
-    for query in &read_req.queries {
-        let series = execute_read_query(&state, query).await;
-        results.push(QueryResult { timeseries: series });
-    }
-
-    let response = ReadResponse { results };
-    let mut response_buf = Vec::new();
-    if let Err(e) = response.encode(&mut response_buf) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("protobuf encode error: {e}"),
-        )
-            .into_response();
-    }
-
-    // Compress response with snappy.
-    let compressed = match snap::raw::Encoder::new().compress_vec(&response_buf) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "snappy compression failed for remote read response");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "compression error".to_string(),
-            )
-                .into_response();
-        }
-    };
-
-    (
-        StatusCode::OK,
-        [
-            ("content-type", "application/x-protobuf"),
-            ("content-encoding", "snappy"),
-        ],
-        compressed,
-    )
-        .into_response()
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-/// Execute a single remote read query by fetching series from the evaluator.
-async fn execute_read_query(state: &AppState, query: &remote_proto::Query) -> Vec<TimeSeries> {
-    let start_ms = query.start_timestamp_ms;
-    let end_ms = query.end_timestamp_ms;
-
-    // Convert protobuf matchers to PromQL label matchers.
-    let matchers: Vec<promql::LabelMatcher> = query
-        .matchers
-        .iter()
-        .map(|m| {
-            let op = match MatchType::try_from(m.match_type) {
-                Ok(MatchType::Eq) => promql::LabelMatchOp::Equal,
-                Ok(MatchType::Neq) => promql::LabelMatchOp::NotEqual,
-                Ok(MatchType::Re) => promql::LabelMatchOp::RegexMatch,
-                Ok(MatchType::Nre) => promql::LabelMatchOp::RegexNotMatch,
-                Err(_) => promql::LabelMatchOp::Equal,
-            };
-            promql::LabelMatcher::new(m.name.clone(), op, m.value.clone())
-        })
-        .collect();
-
-    // Fetch series from the built-in metrics source.
-    let all_series =
-        super::helpers::fetch_series_for_query(state, start_ms - DEFAULT_LOOKBACK_MS, end_ms).await;
-
-    // Filter and convert to protobuf TimeSeries.
-    all_series
-        .iter()
-        .filter(|s| promql::label::matches_all(&matchers, &s.labels))
-        .map(|s| {
-            let labels: Vec<Label> = s
-                .labels
-                .iter()
-                .map(|(k, v)| Label {
-                    name: k.clone(),
-                    value: v.clone(),
-                })
-                .collect();
-            let samples: Vec<Sample> = s
-                .samples
-                .iter()
-                .filter(|sample| sample.timestamp_ms >= start_ms && sample.timestamp_ms <= end_ms)
-                .map(|sample| Sample {
-                    value: sample.value,
-                    timestamp: sample.timestamp_ms,
-                })
-                .collect();
-            TimeSeries {
-                labels,
-                samples,
-                exemplars: vec![],
-            }
-        })
-        .filter(|ts| !ts.samples.is_empty())
-        .collect()
+    snap::raw::Decoder::new().decompress_vec(body).map_err(|e| {
+        Box::new((StatusCode::BAD_REQUEST, format!("snappy decode error: {e}")).into_response())
+    })
 }
 
 /// Store an exemplar for later trace correlation.

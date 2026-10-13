@@ -88,8 +88,6 @@ fn single_core_cross_type_hash_join() {
             on: vec![("id".into(), "key".into())],
             join_type: "inner".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -201,8 +199,6 @@ fn single_core_left_join_with_nulls() {
             on: vec![("id".into(), "key".into())],
             join_type: "left".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -292,8 +288,6 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
             on: vec![("dept".into(), "dept".into())],
             join_type: "inner".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: vec![
                 JoinProjection {
                     source: "a.name".into(),
@@ -383,8 +377,6 @@ fn single_core_self_join_star_keeps_both_sides() {
             on: vec![("dept".into(), "dept".into())],
             join_type: "inner".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -492,8 +484,6 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
             on: vec![("user_id".into(), "user_id".into())],
             join_type: "inner".into(),
             limit: 100,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: vec![
                 JoinProjection {
                     source: "a.id".into(),

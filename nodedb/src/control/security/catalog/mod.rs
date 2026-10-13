@@ -19,6 +19,7 @@ pub mod clone_source_drains;
 pub mod collection;
 pub mod collection_constraints;
 pub mod collection_descriptor_convert;
+pub mod collection_generated;
 pub mod collection_incarnation;
 pub mod collections;
 pub mod column_stats;

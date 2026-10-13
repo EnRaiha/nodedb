@@ -209,20 +209,32 @@ impl CoreLoop {
         }
         identity.check_unchanged(collection, &doc)?;
 
-        // Recompute generated columns if any dependency changed. A column
-        // the engine cannot recompute fails the statement.
-        if let Some(config) = self.doc_configs.get(&config_key)
-            && !config.enforcement.generated_columns.is_empty()
-            && super::super::generated::needs_recomputation(
-                updates,
-                &config.enforcement.generated_columns,
-            )
-        {
-            super::super::generated::evaluate_generated_columns(
-                &mut doc,
-                &config.enforcement.generated_columns,
-            )
-            .map_err(crate::Error::DataPlane)?;
+        // Apply typeguards to the post-image, judging the assigned and
+        // injected fields. Then recompute generated columns if any
+        // dependency changed. A column the engine cannot recompute fails the
+        // statement.
+        if let Some(config) = self.doc_configs.get(&config_key) {
+            if !config.crdt_enabled && !config.type_guards.is_empty() {
+                let assigned = super::super::write_body::assigned_names(updates);
+                crate::data::executor::enforcement::typeguard::enforce_type_guards(
+                    &config.type_guards,
+                    &mut doc,
+                    crate::data::executor::enforcement::typeguard::GuardScope::Assigned(&assigned),
+                )
+                .map_err(crate::Error::DataPlane)?;
+            }
+            if !config.enforcement.generated_columns.is_empty()
+                && super::super::generated::needs_recomputation(
+                    updates,
+                    &config.enforcement.generated_columns,
+                )
+            {
+                super::super::generated::evaluate_generated_columns(
+                    &mut doc,
+                    &config.enforcement.generated_columns,
+                )
+                .map_err(crate::Error::DataPlane)?;
+            }
         }
 
         // A declared numeric column holds the value its type stores, whether
@@ -256,8 +268,9 @@ impl CoreLoop {
 }
 
 impl CoreLoop {
-    /// Run every per-row gate over the whole projected set: the period lock
-    /// on both images and the write policy on the post-image. The apply loop
+    /// Run every per-row gate over the whole projected set: the state and
+    /// transition rules, the period lock on both images and the write policy
+    /// on the post-image. The apply loop
     /// commits one row at a time, so a gate judged there refuses after the
     /// rows ahead of it landed.
     pub(in crate::data::executor) fn gate_bulk_update_rows(
@@ -275,11 +288,26 @@ impl CoreLoop {
             TenantId::new(tid),
             collection.to_string(),
         );
-        let period_lock = self
+        let enforcement = self
             .doc_configs
             .get(&config_key)
-            .and_then(|config| config.enforcement.period_lock.as_ref());
+            .map(|config| &config.enforcement);
+        let period_lock = enforcement.and_then(|enforcement| enforcement.period_lock.as_ref());
         for row in rows {
+            // The collection's state and transition rules judge the change
+            // from the stored row to its post-image.
+            if let Some(enforcement) = enforcement {
+                use crate::data::executor::enforcement::update_transitions::{
+                    UpdateTransitionRules, check_update_transitions,
+                };
+                check_update_transitions(
+                    collection,
+                    UpdateTransitionRules::of(enforcement),
+                    &row.old_doc,
+                    &row.doc,
+                    &task.request.user_roles,
+                )?;
+            }
             // A closed period refuses an edit to a row it holds, and an edit
             // that assigns the period column into it.
             if let Some(lock) = period_lock {

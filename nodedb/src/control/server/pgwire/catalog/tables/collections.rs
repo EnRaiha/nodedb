@@ -23,23 +23,24 @@ pub fn encode_row(row: HashMap<String, Value>) -> crate::Result<Vec<u8>> {
     })
 }
 
-/// Load the collections visible to `identity` (all active collections for a
-/// superuser, tenant-scoped otherwise).
+/// Load the collections of `database_id` visible to `identity` (all active
+/// collections for a superuser, tenant-scoped otherwise).
 pub fn load_collections(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Vec<StoredCollection> {
     let catalog = state.credentials.catalog();
     if identity.is_superuser {
         catalog
-            .load_all_collections(DatabaseId::DEFAULT)
+            .load_all_collections(database_id)
             .unwrap_or_default()
             .into_iter()
             .filter(|c| c.is_active)
             .collect()
     } else {
         catalog
-            .load_collections_for_tenant(DatabaseId::DEFAULT, identity.tenant_id.as_u64())
+            .load_collections_for_tenant(database_id, identity.tenant_id.as_u64())
             .unwrap_or_default()
     }
 }

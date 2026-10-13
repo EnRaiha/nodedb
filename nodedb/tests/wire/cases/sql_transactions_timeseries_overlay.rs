@@ -2,17 +2,17 @@
 
 //! Timeseries-engine `INSERT` (ingest) executes at STATEMENT time inside a
 //! transaction -- staged into the per-transaction overlay with
-//! read-your-own-writes on RAW timeseries scans, a real affected-row count,
-//! and `ROLLBACK` discarding the staged rows -- mirroring the columnar staging
-//! already in place. COMMIT resolves the staged ingest into the
-//! transaction's redo record, which the redo install applies.
+//! read-your-own-writes on raw scans and on aggregates, a real affected-row
+//! count, and `ROLLBACK` discarding the staged rows -- mirroring the columnar
+//! staging. COMMIT resolves the staged ingest into the transaction's redo
+//! record, which the redo install applies.
 //!
 //! A timeseries base row has no cross-engine surrogate identity in the scan
 //! (it is keyed internally by `series_id`), so the overlay merge is
-//! additive-only: RYOW surfaces staged INSERTs, and there is no base-row
-//! supersede/tombstone. The merge runs ONLY on the RAW-scan branch; the
-//! aggregate / time-bucket branch is committed-only (continuous-aggregate
-//! correctness), which the `..._aggregate_is_committed_only` test pins.
+//! additive-only: read-your-own-writes surfaces staged INSERTs, and there is
+//! no base-row supersede/tombstone. A same-transaction aggregate folds the
+//! staged rows into its groups. Continuous aggregates read committed rows
+//! only: they are maintained outside any transaction.
 
 use crate::harness::TestServer;
 use tokio_postgres::SimpleQueryMessage;
@@ -189,12 +189,10 @@ async fn timeseries_in_tx_insert_rollback_discards_staged_rows() {
     );
 }
 
-/// CAGG-exclusion guard: a mid-transaction AGGREGATE over the collection must
-/// NOT include the transaction's own staged rows — aggregates (and continuous
-/// aggregates) are committed-only. The overlay merge runs on the RAW-scan
-/// branch only, never on the aggregate / bucket branch.
+/// A mid-transaction aggregate reads its own writes: the staged rows count
+/// toward COUNT and SUM, exactly as the raw scan sees them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn timeseries_in_tx_aggregate_is_committed_only() {
+async fn timeseries_in_tx_aggregate_reads_own_writes() {
     let server = TestServer::start().await;
     setup(&server).await;
 
@@ -206,7 +204,7 @@ async fn timeseries_in_tx_aggregate_is_committed_only() {
         .unwrap();
     assert_eq!(command_count(&msgs), Some(2));
 
-    // RAW scan sees 5 rows (RYOW), but ...
+    // The raw scan sees 5 rows ...
     let raw = server
         .client
         .simple_query("SELECT v FROM sensors")
@@ -214,25 +212,25 @@ async fn timeseries_in_tx_aggregate_is_committed_only() {
         .unwrap();
     assert_eq!(sorted_col(&raw, "v").len(), 5);
 
-    // ... COUNT(*) must return only the 3 committed base rows.
+    // ... and so does COUNT(*): 3 committed rows plus 2 staged rows.
     let count = server
         .query_rows("SELECT COUNT(*) FROM sensors")
         .await
         .unwrap();
     assert_eq!(
-        count[0][0], "3",
-        "mid-transaction COUNT(*) must exclude staged rows (committed-only)"
+        count[0][0], "5",
+        "mid-transaction COUNT(*) must include the transaction's staged rows"
     );
 
-    // ... and SUM(v) must be the base sum (10+20+30), not 150.
+    // SUM(v) is 10+20+30+40+50.
     let sum = server
         .query_rows("SELECT SUM(v) FROM sensors")
         .await
         .unwrap();
     assert_eq!(
         sum[0][0].parse::<f64>().ok(),
-        Some(60.0),
-        "mid-transaction SUM must exclude staged rows (committed-only)"
+        Some(150.0),
+        "mid-transaction SUM must include the transaction's staged rows"
     );
 
     server.client.simple_query("COMMIT").await.unwrap();
@@ -246,4 +244,76 @@ async fn timeseries_in_tx_aggregate_is_committed_only() {
         count_after[0][0], "5",
         "committed timeseries inserts must be counted after COMMIT"
     );
+}
+
+/// Native and generic aggregates agree on the staged rows: a plain GROUP BY,
+/// a ROLLUP, a HAVING, and a time bucket all fold them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeseries_in_tx_native_and_generic_aggregates_agree() {
+    let server = TestServer::start().await;
+    setup(&server).await;
+
+    server.exec("BEGIN").await.unwrap();
+    server
+        .client
+        .simple_query("INSERT INTO sensors (id, ts, v) VALUES ('s4', 4000, 40)")
+        .await
+        .unwrap();
+
+    let native = server
+        .query_rows("SELECT COUNT(*), SUM(v) FROM sensors")
+        .await
+        .unwrap();
+    let generic = server
+        .query_rows("SELECT COUNT(*), SUM(v) FROM sensors GROUP BY ROLLUP (id) HAVING COUNT(*) = 4")
+        .await
+        .unwrap();
+    assert_eq!(native[0][0], "4", "native COUNT(*) sees the staged row");
+    assert_eq!(
+        generic.len(),
+        1,
+        "only the grand total has 4 rows: {generic:?}"
+    );
+    assert_eq!(native[0], generic[0], "native and generic agree");
+
+    let buckets = server
+        .query_rows(
+            "SELECT time_bucket('10s', ts) AS b, COUNT(*) FROM sensors \
+             GROUP BY b HAVING COUNT(*) > 0",
+        )
+        .await
+        .unwrap();
+    assert_eq!(buckets.len(), 1, "one ten-second bucket: {buckets:?}");
+    assert_eq!(buckets[0][1], "4", "the bucket counts the staged row");
+
+    server.client.simple_query("ROLLBACK").await.unwrap();
+}
+
+/// A transaction that truncated the collection aggregates only its own
+/// staged rows; ROLLBACK restores the committed rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timeseries_in_tx_aggregate_after_truncate_sees_only_staged_rows() {
+    let server = TestServer::start().await;
+    setup(&server).await;
+
+    server.exec("BEGIN").await.unwrap();
+    server.exec("TRUNCATE sensors").await.unwrap();
+    server
+        .client
+        .simple_query("INSERT INTO sensors (id, ts, v) VALUES ('s9', 9000, 90)")
+        .await
+        .unwrap();
+    let rows = server
+        .query_rows("SELECT COUNT(*), SUM(v) FROM sensors")
+        .await
+        .unwrap();
+    assert_eq!(rows[0][0], "1", "only the staged row survives the truncate");
+    assert_eq!(rows[0][1].parse::<f64>().ok(), Some(90.0));
+    server.client.simple_query("ROLLBACK").await.unwrap();
+
+    let rows = server
+        .query_rows("SELECT COUNT(*) FROM sensors")
+        .await
+        .unwrap();
+    assert_eq!(rows[0][0], "3", "ROLLBACK restores the committed rows");
 }

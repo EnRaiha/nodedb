@@ -101,6 +101,7 @@ mod tests {
             refresh_policy: RefreshPolicy::OnFlush,
             retention_period_ms: 0,
             stale: false,
+            incarnation: Default::default(),
         }
     }
 

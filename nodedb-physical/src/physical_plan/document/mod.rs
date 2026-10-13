@@ -8,6 +8,7 @@ pub mod merge_types;
 pub mod ollp_edge;
 pub mod op;
 pub mod resolved_mutation;
+pub mod row_source;
 pub mod sum_target;
 pub mod timeseries_schema;
 pub mod types;
@@ -21,6 +22,7 @@ pub use merge_types::{MergeActionOp, MergeClauseKind as MergeClauseKindOp, Merge
 pub use ollp_edge::OllpPredictedEdge;
 pub use op::DocumentOp;
 pub use resolved_mutation::{DocumentResolveOutcome, DocumentResolvedMutation};
+pub use row_source::{DocumentPageSource, QuerySource, RowSource};
 pub use sum_target::{RedoSumTargets, ResolvedSumTarget, SumTargetKey, resolved_sum_surrogate};
 pub use timeseries_schema::TimeseriesSchema;
 pub use types::{

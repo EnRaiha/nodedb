@@ -2,7 +2,7 @@
 
 //! Set operations and miscellaneous plan conversions (UNION, INTERSECT, EXCEPT, CTE, etc.).
 
-use nodedb_sql::types::{EngineType, Projection, SortKey, SqlExpr, SqlPlan, SqlValue, WindowSpec};
+use nodedb_sql::types::{EngineType, Projection, SortKey, SqlPlan, SqlValue, WindowSpec};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
@@ -60,6 +60,8 @@ pub(super) fn convert_constant_result(
         plan: PhysicalPlan::Query(QueryOp::ProviderScan {
             provider: None,
             rows: payload,
+            // Constant rows read no relation: the tenant-wide fallback applies.
+            sources: Vec::new(),
             filters: Vec::new(),
             projection: Vec::new(),
             computed_columns: Vec::new(),
@@ -123,6 +125,15 @@ pub(super) fn convert_truncate(
             return Err(crate::Error::Internal {
                 detail: format!(
                     "TRUNCATE reached plan conversion for array collection '{collection}'"
+                ),
+            });
+        }
+        // `ContinuousAggregateRules::plan_truncate` refuses before a plan is
+        // built.
+        EngineType::ContinuousAggregate => {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "TRUNCATE reached plan conversion for continuous aggregate '{collection}'"
                 ),
             });
         }
@@ -201,78 +212,6 @@ pub(super) fn convert_except(
     }
     left_tasks.extend(right_tasks);
     Ok(left_tasks)
-}
-
-pub(super) fn convert_insert_select(
-    target: &str,
-    source: &SqlPlan,
-    column_map: &[(String, SqlExpr)],
-    tenant_id: TenantId,
-    ctx: &ConvertContext,
-) -> crate::Result<Vec<PhysicalTask>> {
-    let target_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, target);
-    let target_qualified = super::convert::db_qualified(ctx.database_id, target);
-    let qualified_target = nodedb_types::QualifiedCollection::new(ctx.database_id, target);
-    let target = target_qualified.as_str();
-
-    // A declared PRIMARY KEY implies NOT NULL. A literal `SELECT NULL` into
-    // the pk column is knowable at plan time, before any row is scanned.
-    if let Some(declared) = super::dml::declared_primary_key_name(ctx, target)?
-        && column_map.iter().any(|(field, expr)| {
-            field == &declared && matches!(expr, SqlExpr::Literal(SqlValue::Null))
-        })
-    {
-        return Err(crate::Error::RejectedConstraint {
-            collection: target.to_string(),
-            constraint: "not_null".to_string(),
-            detail: format!("primary key '{declared}' cannot be set to NULL"),
-        });
-    }
-
-    let SqlPlan::Scan {
-        collection,
-        filters,
-        sort_keys,
-        limit,
-        offset,
-        distinct,
-        window_functions,
-        ..
-    } = source
-    else {
-        return Err(crate::Error::PlanError {
-            detail: "INSERT ... SELECT currently requires a direct source scan".into(),
-        });
-    };
-
-    // Ordering, offset, distinct, and window functions each need an ordered
-    // materialization the page-at-a-time copy does not provide.
-    if !sort_keys.is_empty() || *offset != 0 || *distinct || !window_functions.is_empty() {
-        return Err(crate::Error::PlanError {
-            detail: "INSERT ... SELECT currently supports only SELECT * with optional WHERE/LIMIT"
-                .into(),
-        });
-    }
-
-    let filter_bytes = super::filter::serialize_filters(filters)?;
-    let column_map_bytes = super::aggregate::serialize_column_map(column_map)?;
-    let vshard = target_key.vshard();
-    let qualified_source = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
-
-    Ok(vec![PhysicalTask {
-        tenant_id,
-        vshard_id: vshard,
-        database_id: ctx.database_id,
-        plan: PhysicalPlan::Document(DocumentOp::InsertSelect {
-            target_collection: qualified_target,
-            source_collection: qualified_source,
-            source_filters: filter_bytes,
-            source_limit: limit.unwrap_or(10_000),
-            column_map: column_map_bytes,
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
-    }])
 }
 
 pub(super) fn convert_cte(
@@ -482,6 +421,7 @@ fn lower_subquery_sort_keys(keys: &[SortKey], merged_doc_body: bool) -> Vec<Sort
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodedb_sql::types::SqlExpr;
 
     fn bare_ctx() -> ConvertContext {
         ConvertContext {
@@ -599,115 +539,6 @@ mod tests {
         )
         .expect_err("array never reaches conversion");
         assert!(matches!(err, crate::Error::Internal { .. }), "got {err:?}");
-    }
-
-    #[test]
-    fn convert_insert_select_builds_document_op() {
-        let source = SqlPlan::Scan {
-            collection: "batch_test".into(),
-            alias: None,
-            engine: EngineType::DocumentSchemaless,
-            filters: Vec::new(),
-            projection: Vec::new(),
-            sort_keys: Vec::new(),
-            limit: Some(50),
-            offset: 0,
-            distinct: false,
-            window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
-        };
-
-        let tasks = convert_insert_select(
-            "batch_copy",
-            &source,
-            &[],
-            TenantId::new(1),
-            &ConvertContext {
-                purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
-                retention_registry: None,
-                array_catalog: None,
-                credentials: None,
-                wal: None,
-                surrogate_assigner:
-                    crate::control::planner::sql_plan_convert::test_support::test_assigner(),
-                cluster_enabled: false,
-                bitemporal_retention_registry: None,
-                max_vector_dim: 0,
-                force_shuffle_join: false,
-                shuffle_num_parts: 0,
-                force_shuffle_agg: false,
-                shuffle_agg_num_parts: 0,
-                broadcast_threshold_bytes: 8 * 1024 * 1024,
-                shuffle_agg_threshold: 10_000,
-                prefetched: Default::default(),
-                database_id: crate::types::DatabaseId::DEFAULT,
-                tenant_id: crate::types::TenantId::new(0),
-            },
-        )
-        .expect("convert insert-select");
-
-        assert_eq!(tasks.len(), 1);
-        match &tasks[0].plan {
-            PhysicalPlan::Document(DocumentOp::InsertSelect {
-                target_collection,
-                source_collection,
-                source_limit,
-                ..
-            }) => {
-                assert_eq!(target_collection.as_str(), "batch_copy");
-                assert_eq!(source_collection.as_str(), "batch_test");
-                assert_eq!(*source_limit, 50);
-            }
-            other => panic!("expected DocumentOp::InsertSelect, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn convert_insert_select_allows_star_projection() {
-        let source = SqlPlan::Scan {
-            collection: "batch_test".into(),
-            alias: None,
-            engine: EngineType::DocumentSchemaless,
-            filters: Vec::new(),
-            projection: vec![Projection::Star],
-            sort_keys: Vec::new(),
-            limit: None,
-            offset: 0,
-            distinct: false,
-            window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
-        };
-
-        let tasks = convert_insert_select(
-            "batch_copy",
-            &source,
-            &[],
-            TenantId::new(1),
-            &ConvertContext {
-                purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
-                retention_registry: None,
-                array_catalog: None,
-                credentials: None,
-                wal: None,
-                surrogate_assigner:
-                    crate::control::planner::sql_plan_convert::test_support::test_assigner(),
-                cluster_enabled: false,
-                bitemporal_retention_registry: None,
-                max_vector_dim: 0,
-                force_shuffle_join: false,
-                shuffle_num_parts: 0,
-                force_shuffle_agg: false,
-                shuffle_agg_num_parts: 0,
-                broadcast_threshold_bytes: 8 * 1024 * 1024,
-                shuffle_agg_threshold: 10_000,
-                prefetched: Default::default(),
-                database_id: crate::types::DatabaseId::DEFAULT,
-                tenant_id: crate::types::TenantId::new(0),
-            },
-        )
-        .expect("convert insert-select with star");
-
-        assert_eq!(tasks.len(), 1);
     }
 
     /// The text search under the tail, looked up through a gather.

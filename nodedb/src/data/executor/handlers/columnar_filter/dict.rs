@@ -6,8 +6,7 @@ use crate::bridge::scan_filter::ScanFilter;
 
 /// Evaluate a dict-encoded filter against a sparse index set.
 ///
-/// Called from both `eval_filters_sparse` and `eval_filters_dense` (the latter
-/// builds a synthetic 0..N index slice before calling this).
+/// Called from `eval_filters_sparse`.
 pub(super) fn eval_dict_filter_sparse(
     ids: &[u32],
     dictionary: &[String],

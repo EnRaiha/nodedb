@@ -397,7 +397,7 @@ fn plan_spatial_from_where(
         });
     }
     let distance = if args.len() >= 3 {
-        extract_float(&args[2]).unwrap_or(0.0)
+        extract_float(&args[2])?
     } else {
         0.0
     };
@@ -408,7 +408,9 @@ fn plan_spatial_from_where(
         query_geometry: geometry,
         distance_meters: distance,
         attribute_filters: extra_filter_to_filters(extra_filters, table)?,
-        limit: 1000,
+        // No LIMIT reads every matching row; an explicit LIMIT overwrites
+        // this in `apply_limit`.
+        limit: usize::MAX,
         projection: projection.to_vec(),
     }))
 }

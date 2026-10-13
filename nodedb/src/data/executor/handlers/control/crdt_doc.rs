@@ -41,6 +41,9 @@ pub(in crate::data::executor) struct CrdtDocUpsert<'a> {
     pub returning: Option<&'a ReturningSpec>,
     /// Compiled RLS read policy gating the `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],
+    /// Whether the collection's typeguards judge the merged row. WAL replay
+    /// passes `false`: the write's commit already judged it.
+    pub judge_guards: bool,
 }
 
 /// Borrowed arguments for [`CoreLoop::execute_crdt_doc_delete`], grouped so the
@@ -71,6 +74,7 @@ impl CoreLoop {
             partial,
             returning,
             rls_filters,
+            judge_guards,
         } = args;
         debug!(core = self.core_id, %collection, %document_id, partial, "crdt doc upsert");
         if let Some(refusal) = crate::data::executor::handlers::unbound_surrogate::refuse_unbound(
@@ -93,6 +97,17 @@ impl CoreLoop {
             .iter()
             .map(|(k, v)| (k.as_str(), super::convert::json_to_loro_value(v)))
             .collect();
+
+        // The row as stored before this write, for the collection's
+        // transition rules. Read before Loro changes.
+        let prior_body = if judge_guards {
+            match self.crdt_transition_pre_image(task, collection, surrogate) {
+                Ok(body) => body,
+                Err(e) => return self.response_error(task, e),
+            }
+        } else {
+            None
+        };
 
         // The sparse row is built from the merged Loro row, so Loro changes
         // first. The row's prior scalar state is captured before that, and an
@@ -132,6 +147,26 @@ impl CoreLoop {
             }
             Err(e) => return self.abandon_crdt_row(task, row_undo, e),
         };
+
+        // The merged row is the post-image this write produces, so the
+        // collection's typeguards judge it here. A partial UPDATE judges the
+        // fields it assigns. A full replace judges the whole row. A refused
+        // write puts the Loro row back.
+        if judge_guards {
+            let assigned: Option<Vec<String>> = partial.then(|| json_map.keys().cloned().collect());
+            if let Err(error) =
+                self.check_crdt_row_guards(task, collection, &bytes, assigned.as_deref())
+            {
+                return self.abandon_crdt_row(task, row_undo, error);
+            }
+        }
+        // The state and transition rules judge the stored row → merged row
+        // change, as they judge every other update.
+        if let Some(prior) = prior_body.as_deref()
+            && let Err(error) = self.check_crdt_row_transitions(task, collection, prior, &bytes)
+        {
+            return self.abandon_crdt_row(task, row_undo, error);
+        }
 
         // The Loro row and its sparse projection answer the same reads, so a
         // projection that did not land fails the write and puts the Loro row
@@ -174,6 +209,95 @@ impl CoreLoop {
         } else {
             self.response_affected(task, 1)
         }
+    }
+
+    /// Validate a merged CRDT row against the collection's typeguards.
+    ///
+    /// A CRDT collection declares no guard DEFAULT or VALUE, so nothing is
+    /// injected. REQUIRED and type judge the fields in `assigned`, or every
+    /// field when it is `None`. A CHECK judges every present field.
+    fn check_crdt_row_guards(
+        &self,
+        task: &ExecutionTask,
+        collection: &str,
+        merged: &[u8],
+        assigned: Option<&[String]>,
+    ) -> crate::Result<()> {
+        let config_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
+        let Some(config) = self.doc_configs.get(&config_key) else {
+            return Ok(());
+        };
+        if config.type_guards.is_empty() {
+            return Ok(());
+        }
+        let row =
+            nodedb_types::value_from_msgpack(merged).map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("merged CRDT row of '{collection}' does not decode: {e}"),
+            })?;
+        crate::data::executor::enforcement::typeguard::check_type_guards(
+            &config.type_guards,
+            &row,
+            assigned,
+        )
+        .map_err(crate::Error::DataPlane)
+    }
+
+    /// The stored body of the row `surrogate` names, when the collection
+    /// declares a transition rule and the row exists. `None` otherwise.
+    fn crdt_transition_pre_image(
+        &self,
+        task: &ExecutionTask,
+        collection: &str,
+        surrogate: Surrogate,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        let config_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
+        let Some(config) = self.doc_configs.get(&config_key) else {
+            return Ok(None);
+        };
+        use crate::data::executor::enforcement::update_transitions::UpdateTransitionRules;
+        if UpdateTransitionRules::of(&config.enforcement).is_empty() {
+            return Ok(None);
+        }
+        self.sparse.get(
+            task.request.database_id.as_u64(),
+            task.request.tenant_id.as_u64(),
+            collection,
+            &StorageKey::for_surrogate(surrogate),
+        )
+    }
+
+    /// Judge the stored `prior` row → `merged` row change against the
+    /// collection's state constraints and transition checks, with the
+    /// writer's roles.
+    fn check_crdt_row_transitions(
+        &self,
+        task: &ExecutionTask,
+        collection: &str,
+        prior: &[u8],
+        merged: &[u8],
+    ) -> crate::Result<()> {
+        let config_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
+        self.check_stored_update_transitions(
+            &config_key,
+            collection,
+            prior,
+            merged,
+            &task.request.user_roles,
+        )
+        .map_err(crate::Error::DataPlane)
     }
 
     /// Write the CRDT row's captured pre-image back after its write is
@@ -378,6 +502,7 @@ mod tests {
                 partial: false,
                 returning: None,
                 rls_filters: &[],
+                judge_guards: true,
             },
         )
     }
@@ -510,6 +635,84 @@ mod tests {
             crdt_row(&mut core),
             before,
             "the refused upsert leaves the CRDT row as it was"
+        );
+    }
+
+    /// Register `notes` as a CRDT collection whose `a` must be a present INT.
+    fn guard_a(core: &mut CoreLoop) {
+        let mut config = CollectionConfig::new(COLL);
+        config.crdt_enabled = true;
+        config.type_guards =
+            crate::data::executor::enforcement::typeguard::CompiledTypeGuard::compile_all(
+                COLL,
+                &[nodedb_types::TypeGuardFieldDef {
+                    field: "a".to_string(),
+                    type_expr: "INT".to_string(),
+                    required: true,
+                    check_expr: None,
+                    default_expr: None,
+                    value_expr: None,
+                }],
+            );
+        core.doc_configs.insert(
+            (DatabaseId::DEFAULT, TenantId::new(TID), COLL.to_string()),
+            config,
+        );
+    }
+
+    fn partial_set(core: &mut CoreLoop, task: &ExecutionTask, fields_json: &str) -> Response {
+        core.execute_crdt_doc_upsert(
+            task,
+            CrdtDocUpsert {
+                collection: COLL,
+                document_id: DOC,
+                fields_json,
+                surrogate: SURROGATE,
+                partial: true,
+                returning: None,
+                rls_filters: &[],
+                judge_guards: true,
+            },
+        )
+    }
+
+    /// The merged row a CRDT write produces is judged by the typeguards, and
+    /// a refused write puts the Loro row back.
+    #[test]
+    fn a_crdt_write_violating_a_typeguard_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        guard_a(&mut core);
+        assert_eq!(upsert(&mut core, &task, r#"{"a":1}"#).status, Status::Ok);
+        let before = crdt_row(&mut core);
+
+        let resp = upsert(&mut core, &task, r#"{"b":2}"#);
+        assert!(
+            matches!(
+                resp.error_code.as_deref(),
+                Some(ErrorCode::TypeGuardViolation { .. })
+            ),
+            "a full replace without `a` must be refused, got {:?}",
+            resp.error_code
+        );
+        assert_eq!(crdt_row(&mut core), before);
+
+        let resp = partial_set(&mut core, &task, r#"{"a":"text"}"#);
+        assert!(
+            matches!(
+                resp.error_code.as_deref(),
+                Some(ErrorCode::TypeGuardViolation { .. })
+            ),
+            "a partial UPDATE assigning a non-INT must be refused, got {:?}",
+            resp.error_code
+        );
+        assert_eq!(crdt_row(&mut core), before);
+
+        assert_eq!(
+            partial_set(&mut core, &task, r#"{"b":2}"#).status,
+            Status::Ok,
+            "a partial UPDATE that leaves `a` intact lands"
         );
     }
 }

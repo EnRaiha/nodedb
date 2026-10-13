@@ -12,10 +12,17 @@
 //! collection does not key on, and it silently gives up on any time key whose
 //! name is not one of a handful of conventional spellings.
 //!
-//! The envelope is inclusive and deliberately permissive: strict and
-//! non-strict comparisons narrow it identically, because the exact predicate
-//! is still evaluated per row afterwards. A too-wide envelope costs I/O; a
-//! too-narrow one loses rows.
+//! The envelope is inclusive. A strict comparison on a literal that names a
+//! whole millisecond narrows it by exactly one stored millisecond:
+//! `ts < 3600000` is `ts <= 3599999`. AUTO_TIER routing reads the envelope
+//! as the query's exact bounds, so an aligned strict bound must stay aligned.
+//! A literal with a sub-millisecond part narrows to its millisecond and no
+//! further, so the envelope never drops a row the predicate keeps. The exact
+//! predicate is still evaluated per row afterwards. A too-wide envelope costs
+//! I/O; a too-narrow one loses rows.
+
+use nodedb_types::datetime::NdbDateTime;
+use nodedb_types::value::Value;
 
 use crate::bridge::scan_filter::{FilterOp, ScanFilter};
 use crate::engine::timeseries::columnar_memtable::TimeKind;
@@ -43,15 +50,26 @@ pub(in crate::data::executor) fn narrow_time_range(
         let Some(ms) = kind.literal_ms(&filter.value) else {
             continue;
         };
+        let whole = is_whole_ms(&filter.value);
         match filter.op {
             FilterOp::Gt | FilterOp::Gte => {
-                if ms > min_ts {
-                    min_ts = ms;
+                let lower = if filter.op == FilterOp::Gt && whole {
+                    ms.saturating_add(1)
+                } else {
+                    ms
+                };
+                if lower > min_ts {
+                    min_ts = lower;
                 }
             }
             FilterOp::Lt | FilterOp::Lte => {
-                if ms < max_ts {
-                    max_ts = ms;
+                let upper = if filter.op == FilterOp::Lt && whole {
+                    ms.saturating_sub(1)
+                } else {
+                    ms
+                };
+                if upper < max_ts {
+                    max_ts = upper;
                 }
             }
             FilterOp::Eq => {
@@ -66,6 +84,22 @@ pub(in crate::data::executor) fn narrow_time_range(
         }
     }
     (min_ts, max_ts)
+}
+
+/// Whether a time literal names a whole millisecond, so the stored
+/// millisecond it lowers to is the literal itself, with nothing truncated.
+fn is_whole_ms(value: &Value) -> bool {
+    match value {
+        Value::Integer(_) => true,
+        Value::Float(ms) => ms.is_finite() && ms.fract() == 0.0,
+        Value::DateTime(at) | Value::NaiveDateTime(at) => at.micros.rem_euclid(1_000) == 0,
+        Value::String(text) => {
+            NdbDateTime::parse(text).is_some_and(|at| at.micros.rem_euclid(1_000) == 0)
+        }
+        // Any other value lowers to no millisecond, so no bound is taken
+        // from it.
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -101,7 +135,51 @@ mod tests {
         ];
         assert_eq!(
             narrow_time_range(UNBOUNDED, &filters, Some(("captured_at", MILLIS))),
-            (100, 900)
+            (100, 899),
+            "`< 900` keeps 899 and no later millisecond"
+        );
+    }
+
+    /// A strict bound on a whole millisecond keeps an aligned upper edge
+    /// aligned: `ts < 3600000` ends the inclusive range at 3599999.
+    #[test]
+    fn strict_bounds_on_whole_milliseconds_are_exact() {
+        let filters = vec![
+            filter("ts", FilterOp::Gt, Value::Integer(0)),
+            filter("ts", FilterOp::Lt, Value::Integer(3_600_000)),
+        ];
+        assert_eq!(
+            narrow_time_range(UNBOUNDED, &filters, Some(("ts", MILLIS))),
+            (1, 3_599_999)
+        );
+        let inclusive = vec![
+            filter("ts", FilterOp::Gte, Value::Integer(0)),
+            filter("ts", FilterOp::Lte, Value::Integer(3_600_000)),
+        ];
+        assert_eq!(
+            narrow_time_range(UNBOUNDED, &inclusive, Some(("ts", MILLIS))),
+            (0, 3_600_000)
+        );
+    }
+
+    /// A literal with a sub-millisecond part narrows to its millisecond and
+    /// no further: `< 1000.5` still keeps the row at 1000.
+    #[test]
+    fn strict_bounds_on_fractional_literals_stay_permissive() {
+        let filters = vec![filter("ts", FilterOp::Lt, Value::Float(1_000.5))];
+        assert_eq!(
+            narrow_time_range(UNBOUNDED, &filters, Some(("ts", MILLIS))),
+            (i64::MIN, 1_000)
+        );
+        let at = nodedb_types::NdbDateTime::from_micros(1_583_402_400_000_500);
+        let filters = vec![filter(
+            "captured_at",
+            FilterOp::Lt,
+            Value::NaiveDateTime(at),
+        )];
+        assert_eq!(
+            narrow_time_range(UNBOUNDED, &filters, Some(("captured_at", NAIVE))),
+            (i64::MIN, 1_583_402_400_000)
         );
     }
 
@@ -120,7 +198,7 @@ mod tests {
         ];
         assert_eq!(
             narrow_time_range(UNBOUNDED, &filters, Some(("captured_at", NAIVE))),
-            (1_583_402_400_000, 1_583_406_000_000)
+            (1_583_402_400_000, 1_583_405_999_999)
         );
     }
 
@@ -175,7 +253,7 @@ mod tests {
         let filters = vec![filter("TS", FilterOp::Gt, Value::Integer(7))];
         assert_eq!(
             narrow_time_range(UNBOUNDED, &filters, Some(("ts", MILLIS))),
-            (7, i64::MAX)
+            (8, i64::MAX)
         );
     }
 }

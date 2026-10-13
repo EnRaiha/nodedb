@@ -38,7 +38,8 @@ impl CoreLoop {
             MetaOp::Checkpoint => self.execute_checkpoint(task),
 
             MetaOp::RegisterContinuousAggregate { def } => {
-                self.continuous_agg_mgr.register(def.clone());
+                self.continuous_agg_mgr
+                    .register(task.request.tenant_id.as_u64(), def.clone());
                 tracing::info!(
                     name = def.name,
                     source = def.source,
@@ -49,14 +50,20 @@ impl CoreLoop {
             }
 
             MetaOp::UnregisterContinuousAggregate { name } => {
-                self.continuous_agg_mgr
-                    .unregister(task.request.database_id.as_u64(), name);
+                self.continuous_agg_mgr.unregister(
+                    task.request.database_id.as_u64(),
+                    task.request.tenant_id.as_u64(),
+                    name,
+                );
                 tracing::info!(name, "continuous aggregate unregistered");
                 self.response_ok(task)
             }
 
             MetaOp::ListContinuousAggregates => {
-                let infos = self.continuous_agg_mgr.list_aggregates();
+                let infos = self.continuous_agg_mgr.list_aggregates(
+                    task.request.database_id.as_u64(),
+                    task.request.tenant_id.as_u64(),
+                );
                 match response_codec::encode_serde(&infos) {
                     Ok(payload) => self.response_with_payload(task, payload),
                     Err(e) => {
@@ -64,6 +71,27 @@ impl CoreLoop {
                     }
                 }
             }
+
+            MetaOp::ContinuousAggregatesRegistered => {
+                self.finish_cagg_boot_registration();
+                self.response_ok(task)
+            }
+
+            // The task loop holds a refresh wait until its cut folds. A wait
+            // that reaches dispatch answers from the cut's state now.
+            MetaOp::AwaitContinuousAggregateRefresh {
+                name, refresh_id, ..
+            } => self
+                .cagg_refresh_answer(task, name, *refresh_id)
+                .unwrap_or_else(|| {
+                    self.response_error(
+                        task,
+                        crate::Error::ObjectNotInPrerequisiteState {
+                            object: format!("continuous aggregate '{name}'"),
+                            detail: format!("refresh {refresh_id} has not folded yet"),
+                        },
+                    )
+                }),
 
             MetaOp::CreateTenantSnapshot {
                 tenant_id, arrays, ..
@@ -142,7 +170,13 @@ impl CoreLoop {
             MetaOp::EnforceTimeseriesRetention {
                 collection,
                 max_age_ms,
-            } => self.meta_enforce_timeseries_retention(task, collection.as_str(), *max_age_ms),
+                aggregates,
+            } => self.meta_enforce_timeseries_retention(
+                task,
+                collection.as_str(),
+                *max_age_ms,
+                aggregates,
+            ),
             MetaOp::ApplyContinuousAggRetention => self.meta_apply_continuous_agg_retention(task),
             MetaOp::QueryAggregateWatermark { aggregate_name } => {
                 self.meta_query_aggregate_watermark(task, aggregate_name)

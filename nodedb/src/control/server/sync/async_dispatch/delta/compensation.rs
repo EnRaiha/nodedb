@@ -110,6 +110,7 @@ pub(super) fn compensation_hint_for_dispatch_error(e: &crate::Error) -> Compensa
         | crate::Error::UndefinedFunction { .. }
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::WrongObjectType { .. }
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }

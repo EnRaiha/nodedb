@@ -34,8 +34,13 @@ pub(in crate::diag) use catalog::{
     CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
     MetadataApplyWedged, SynonymGroupNotApplied,
 };
-pub(in crate::diag) use columnar::{ColumnarSegmentCorrupt, TimeseriesPartitionUnreadable};
-pub(in crate::diag) use continuous_agg::ContinuousAggregateNotApplied;
+pub(in crate::diag) use columnar::{
+    ColumnarSegmentCorrupt, TimeseriesFlushNotInstalled, TimeseriesIdleFlushFailed,
+    TimeseriesPartitionUnreadable,
+};
+pub(in crate::diag) use continuous_agg::{
+    ContinuousAggregateNotApplied, ContinuousAggregateStateFault,
+};
 pub(in crate::diag) use crdt::{CrdtDeadLetterNotEnqueued, HistoryCompactionNotApplied};
 pub(in crate::diag) use crdt_dead_letter_store::{
     CrdtDeadLetterNotRestored, CrdtDeadLetterNotStored,

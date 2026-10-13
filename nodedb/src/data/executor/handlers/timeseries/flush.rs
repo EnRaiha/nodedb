@@ -7,19 +7,31 @@
 
 use std::path::Path;
 
+use nodedb_types::timeseries::PartitionMeta;
+
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::timeseries_checkpoint::schema::write_ts_schema;
-use crate::data::executor::timeseries_checkpoint::stamp::write_ts_stamp;
+use crate::data::executor::timeseries_checkpoint::stamp::{TsReplayStamp, write_ts_stamp};
+use crate::engine::timeseries::columnar_memtable::ColumnarFlushView;
 use crate::engine::timeseries::columnar_segment::ColumnarSegmentWriter;
+use crate::engine::timeseries::interval_split::split_by_interval;
 use crate::engine::timeseries::partition_registry::PartitionRegistry;
 use crate::types::{DatabaseId, TenantId};
 
 impl CoreLoop {
     /// Flush a timeseries collection's memtable to L1 segments.
     ///
-    /// Writes the partition via `ColumnarSegmentWriter`, drains the columnar
-    /// memtable, registers the new partition in `ts_registries`, and fires the
-    /// continuous aggregate hook.
+    /// Writes one partition per partition interval the rows fall in, drains
+    /// the columnar memtable, registers the new partitions in `ts_registries`,
+    /// and folds each into the continuous aggregates rooted at the collection.
+    /// The interval is the collection's declared `partition_by`, read when the
+    /// flush runs, so an ALTER of it governs later flushes only. A row whose
+    /// interval an earlier flush sealed lands in a new partition of that
+    /// interval.
+    ///
+    /// Rows in one interval commit with that partition's `partition.meta`.
+    /// Rows in several commit together through a flush manifest
+    /// (`flush_commit`): every partition appears, or none does.
     ///
     /// Returns `Ok(())` on success (including when the memtable is empty or
     /// absent — both are no-ops). Returns `Err` if the segment write fails;
@@ -59,6 +71,20 @@ impl CoreLoop {
         now_ms: i64,
     ) -> crate::Result<()> {
         let key = (database_id, tid, collection.to_string());
+        let segment_dir = super::paths::ts_collection_dir(
+            &self.data_dir,
+            database_id.as_u64(),
+            tid.as_u64(),
+            collection,
+        );
+        // A flush that committed and did not install still has its rows at
+        // the front of this memtable. Install it first, so those rows leave
+        // the memtable before a new flush reads it. While that install fails,
+        // the collection takes no new flush: writing those rows again would
+        // store them twice.
+        if super::flush_commit::has_uninstalled_flush(&segment_dir)? {
+            self.roll_forward_ts_flush(&key, now_ms)?;
+        }
         let Some(mt) = self.columnar_memtables.get(&key) else {
             return Ok(());
         };
@@ -66,41 +92,49 @@ impl CoreLoop {
             return Ok(());
         }
 
-        // Write to L1 segments.
-        let segment_dir = super::paths::ts_collection_dir(
-            &self.data_dir,
-            database_id.as_u64(),
-            tid.as_u64(),
-            collection,
-        );
-        let writer = ColumnarSegmentWriter::new(&segment_dir);
+        let interval = self.ts_partition_interval(&key)?;
         let view = mt.flush_view();
 
         let stamp = self.ts_flush_stamp(&key)?;
         // Informational: `PartitionMeta` is shared with Lite, and replay reads
         // the stamp file, never this LSN.
         let flush_wal_lsn = stamp.rows.highest();
-        let partition_name =
-            unique_partition_name(&segment_dir, view.min_ts, view.max_ts, flush_wal_lsn)?;
-        // The stamp lands before `partition.meta`, the partition's commit
-        // point, so a committed partition always carries it.
-        let partition_dir = segment_dir.join(&partition_name);
-        std::fs::create_dir_all(&partition_dir).map_err(|e| crate::Error::Storage {
+        std::fs::create_dir_all(&segment_dir).map_err(|e| crate::Error::Storage {
             engine: "timeseries".into(),
-            detail: format!("create partition dir {}: {e}", partition_dir.display()),
+            detail: format!("create collection dir {}: {e}", segment_dir.display()),
         })?;
-        write_ts_stamp(&partition_dir, &stamp)?;
         // The schema outlives the drain below. It lands before the commit
         // point too, so a restart seeds the memtable with every column a
         // committed partition's records added.
         write_ts_schema(&segment_dir, mt.schema())?;
         let ts_kek = self.segment_keks.ts_segment_kek.as_ref();
-        let meta = writer
-            .write_partition(&partition_name, &view, 0, flush_wal_lsn, ts_kek)
-            .map_err(|e| crate::Error::Storage {
-                engine: "timeseries".into(),
-                detail: format!("columnar flush failed for collection {collection}: {e}"),
-            })?;
+
+        // One partition per interval the rows fall in. Several commit together
+        // and install through the same roll-forward a later flush, the
+        // maintenance tick and boot recovery run.
+        let buckets = split_by_interval(&view, &interval);
+        if buckets.len() > 1 {
+            let committed =
+                super::flush_buckets::stage_and_commit(super::flush_buckets::BucketFlush {
+                    segment_dir: &segment_dir,
+                    view: &view,
+                    buckets: &buckets,
+                    stamp: &stamp,
+                    flush_wal_lsn,
+                    kek: ts_kek,
+                })?;
+            // ── Commit point passed: the flush is durable ────────────────────
+            return self.install_committed_flush(&key, &segment_dir, committed, now_ms);
+        }
+        let (partition_name, meta) = write_single_partition(SinglePartition {
+            segment_dir: &segment_dir,
+            view: &view,
+            interval_ms: buckets.first().map_or(0, |bucket| bucket.interval_ms()),
+            stamp: &stamp,
+            flush_wal_lsn,
+            kek: ts_kek,
+            collection,
+        })?;
 
         // ── Commit point passed: the rows are on disk and reachable ──────────
         let Some(mt) = self.columnar_memtables.get_mut(&key) else {
@@ -136,19 +170,28 @@ impl CoreLoop {
                 nodedb_types::timeseries::TieredPartitionConfig::origin_defaults(),
             )
         });
+        let row_count = meta.row_count;
         let mut reg_meta = meta;
         reg_meta.min_ts = drain.min_ts;
         reg_meta.max_ts = drain.max_ts;
         reg_meta.state = nodedb_types::timeseries::PartitionState::Sealed;
-        let pe = crate::engine::timeseries::partition_registry::PartitionEntry {
-            meta: reg_meta,
-            dir_name: partition_name,
-        };
-        // `insert_partition`, not `import`: two flushes can share a min_ts, and
-        // filing both under it would drop one from the registry.
-        registry.insert_partition(pe);
+        // `insert_partition`, not `import`: two flushes can share a min_ts, a
+        // late row's partition among them, and filing both under it would drop
+        // one from the registry.
+        registry.insert_partition(
+            crate::engine::timeseries::partition_registry::PartitionEntry {
+                meta: reg_meta,
+                dir_name: partition_name.clone(),
+            },
+        );
+        // The ingest rate an `AUTO` interval adapts to. A declared interval
+        // ignores it.
+        registry.record_ingest(row_count, now_ms);
+        registry.maybe_narrow_interval();
 
-        // Fire continuous aggregate hook.
+        // Fold the new partition into the continuous aggregates rooted here.
+        // Its files are durable, so an aggregate image that names it never
+        // names a partition a crash can lose.
         //
         // The derived rows this writes are deliberately NOT put through the
         // row-level-security write gate. An aggregate refresh is system work: it
@@ -159,9 +202,14 @@ impl CoreLoop {
         // on a predicate that cannot be resolved would fail closed and silently
         // stop every continuous aggregate on a governed collection. The rows it
         // derives were already decided by the policy when they were ingested.
-        let refreshed =
-            self.continuous_agg_mgr
-                .on_flush(database_id.as_u64(), collection, &drain, now_ms);
+        let refreshed = self.continuous_agg_mgr.on_flush(
+            database_id.as_u64(),
+            tid.as_u64(),
+            collection,
+            &partition_name,
+            &drain,
+            now_ms,
+        );
         if !refreshed.is_empty() {
             tracing::debug!(
                 collection,
@@ -207,6 +255,47 @@ impl CoreLoop {
     }
 }
 
+/// A flush whose rows all fall in one interval.
+struct SinglePartition<'a> {
+    segment_dir: &'a Path,
+    view: &'a ColumnarFlushView<'a>,
+    interval_ms: u64,
+    stamp: &'a TsReplayStamp,
+    flush_wal_lsn: u64,
+    kek: Option<&'a nodedb_wal::crypto::WalEncryptionKey>,
+    collection: &'a str,
+}
+
+/// Write every row of the view as one partition. Its `partition.meta` is the
+/// commit point, and the stamp lands before it, so a committed partition
+/// always carries the stamp naming its rows.
+fn write_single_partition(p: SinglePartition<'_>) -> crate::Result<(String, PartitionMeta)> {
+    let SinglePartition {
+        segment_dir,
+        view,
+        interval_ms,
+        stamp,
+        flush_wal_lsn,
+        kek,
+        collection,
+    } = p;
+    let partition_name =
+        unique_partition_name(segment_dir, view.min_ts, view.max_ts, flush_wal_lsn)?;
+    let partition_dir = segment_dir.join(&partition_name);
+    std::fs::create_dir_all(&partition_dir).map_err(|e| crate::Error::Storage {
+        engine: "timeseries".into(),
+        detail: format!("create partition dir {}: {e}", partition_dir.display()),
+    })?;
+    write_ts_stamp(&partition_dir, stamp)?;
+    let meta = ColumnarSegmentWriter::new(segment_dir)
+        .write_partition(&partition_name, view, interval_ms, flush_wal_lsn, kek)
+        .map_err(|e| crate::Error::Storage {
+            engine: "timeseries".into(),
+            detail: format!("columnar flush failed for collection {collection}: {e}"),
+        })?;
+    Ok((partition_name, meta))
+}
+
 /// Pick a partition directory name that no existing partition owns.
 ///
 /// The timestamp span alone is NOT an identity: late or duplicate-timestamp
@@ -218,7 +307,7 @@ impl CoreLoop {
 ///
 /// The `ts-` prefix is load-bearing: the boot registry scan and the orphan
 /// sweeper both key on it.
-fn unique_partition_name(
+pub(super) fn unique_partition_name(
     segment_dir: &Path,
     min_ts: i64,
     max_ts: i64,

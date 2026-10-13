@@ -184,6 +184,12 @@ impl AuthenticatedIdentity {
         self.authority.is_superuser || self.roles.contains(role)
     }
 
+    /// The names of the roles this identity holds, as a write carries them to
+    /// every replica that judges a role-guarded state transition.
+    pub fn role_names(&self) -> Vec<String> {
+        self.roles.iter().map(|role| role.to_string()).collect()
+    }
+
     /// Check if this identity has any of the specified roles.
     pub fn has_any_role(&self, roles: &[Role]) -> bool {
         self.authority.is_superuser || roles.iter().any(|r| self.roles.contains(r))

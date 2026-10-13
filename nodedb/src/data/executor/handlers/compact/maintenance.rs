@@ -89,6 +89,14 @@ impl CoreLoop {
                     self.checkpoint_coordinator.record_flush("sparse", *pages);
                 }
                 "timeseries" => {
+                    // A committed flush whose install failed is installed
+                    // first, every tick, whether or not the core is idle.
+                    let tick_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    self.roll_forward_ts_flushes(tick_ms);
+
                     // Idle flush: if no ingest for 5 seconds, flush all
                     // non-empty memtables so data becomes queryable.
                     let idle_threshold = std::time::Duration::from_secs(5);
@@ -122,6 +130,12 @@ impl CoreLoop {
                                         error = %e,
                                         "idle ts flush failed — segment write error; \
                                          collection skipped this maintenance cycle"
+                                    );
+                                    crate::diag::timeseries_idle_flush_failed(
+                                        &e,
+                                        db.as_u64(),
+                                        tid.as_u64(),
+                                        collection,
                                     );
                                 }
                             }
@@ -167,6 +181,20 @@ impl CoreLoop {
                     core = self.core_id,
                     pending,
                     "timeseries truncate backlog still pending after retry"
+                );
+            }
+        }
+
+        // Continuous aggregates: load images, backfill, and fold pending
+        // refresh cuts. Bounded per call by the fold budget.
+        {
+            let now_ms = self.ingest_now_ms();
+            let folded = self.fold_pending_cagg_partitions(now_ms);
+            if folded > 0 {
+                tracing::debug!(
+                    core = self.core_id,
+                    folded,
+                    "continuous aggregate partitions folded"
                 );
             }
         }

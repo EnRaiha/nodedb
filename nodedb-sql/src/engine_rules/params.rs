@@ -54,6 +54,10 @@ pub struct ScanParams {
     /// through versioned storage; when `false`, a non-default
     /// [`Self::temporal`] is rejected.
     pub bitemporal: bool,
+    /// Whether the collection has a retention policy with AUTO_TIER on. A
+    /// timeseries scan then carries the policy's tiers, so a raw read of a
+    /// range only the tiers hold is refused.
+    pub has_auto_tier: bool,
 }
 
 /// Parameters for planning a POINT GET operation.
@@ -81,6 +85,9 @@ pub struct UpdateFromParams {
     pub collection: String,
     /// The FROM source plan (Scan, Join, …).
     pub source: Box<SqlPlan>,
+    /// The name the statement gives the source. See
+    /// `SqlPlan::UpdateFrom::source_alias`.
+    pub source_alias: String,
     /// Column in target used as the equi-join key.
     pub target_join_col: String,
     /// Column in source used as the equi-join key.
@@ -103,6 +110,20 @@ pub struct DeleteParams {
 pub struct TruncateParams {
     pub collection: String,
     pub restart_identity: bool,
+}
+
+/// Parameters for planning an INSERT ... SELECT.
+pub struct InsertSelectParams {
+    /// The target collection.
+    pub collection: String,
+    /// The planned source SELECT.
+    pub source: Box<SqlPlan>,
+    /// `(target_column, source_row_expression)` in target-column order. See
+    /// `SqlPlan::InsertSelect::column_map`.
+    pub column_map: Vec<(String, SqlExpr)>,
+    /// `(target_column, source_output_column)` pairs. See
+    /// `SqlPlan::InsertSelect::source_columns`.
+    pub source_columns: Vec<(String, String)>,
 }
 
 /// Parameters for planning a MERGE operation.
@@ -145,10 +166,19 @@ pub struct AggregateParams {
     pub aggregates: Vec<AggregateExpr>,
     pub having: Vec<Filter>,
     pub limit: usize,
-    /// Timeseries-specific: bucket interval from time_bucket() call.
-    pub bucket_interval_ms: Option<i64>,
-    /// Timeseries-specific: non-time GROUP BY columns.
-    pub group_columns: Vec<String>,
+    /// The `time_bucket(...)` GROUP BY key, when `group_by` holds one.
+    pub time_bucket: Option<TimeBucketKey>,
+    /// ROLLUP / CUBE / GROUPING SETS expansion: each set holds the indices
+    /// into `group_by` present in that set. `None` for a plain GROUP BY.
+    pub grouping_sets: Option<Vec<Vec<usize>>>,
+    /// The collection's declared columns, for engines whose native
+    /// aggregation depends on column types.
+    pub columns: Vec<ColumnInfo>,
+    /// Whether HAVING computes an aggregate the SELECT list does not show.
+    pub hidden_aggregates: bool,
+    /// Whether the caller wraps the input rows in semi or anti joins below
+    /// the aggregate. The plan must then be an aggregate over an input plan.
+    pub input_joins: bool,
     /// Whether the collection has auto-tiering enabled.
     pub has_auto_tier: bool,
     /// Whether this collection was created with bitemporal storage.
@@ -159,4 +189,14 @@ pub struct AggregateParams {
     /// scan so bitemporal aggregate queries project an as-of snapshot
     /// before grouping.
     pub temporal: crate::temporal::TemporalScope,
+}
+
+/// A `time_bucket(interval, column)` GROUP BY key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeBucketKey {
+    /// Index of the key in `AggregateParams::group_by`.
+    pub group_index: usize,
+    /// Bucket width in milliseconds. 0 when the interval is not a literal
+    /// the planner can read.
+    pub interval_ms: i64,
 }

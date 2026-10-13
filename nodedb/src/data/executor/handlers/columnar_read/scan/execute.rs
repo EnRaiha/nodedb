@@ -90,15 +90,12 @@ impl CoreLoop {
             Ok(p) => p,
             Err(e) => return self.response_error(task, e),
         };
-        // A no-LIMIT SQL `SELECT * FROM <columnar>` arrives as
-        // `limit == usize::MAX`. Capture that before the `limit == 0` rewrite
-        // so the budget bound applies only to the unbounded path. Spatial
-        // scans arrive with a finite `10000` and are therefore unaffected.
+        // A no-LIMIT SQL `SELECT * FROM <columnar>` or `<spatial>` arrives as
+        // `limit == usize::MAX`, and the budget bound applies to it. `LIMIT 0`
+        // arrives as `0` and returns no rows.
         let scan_budget_bytes = self.query_tuning.max_scan_result_bytes;
         let unbounded = limit == usize::MAX;
-        let limit = if limit == 0 {
-            1000
-        } else if unbounded {
+        let limit = if unbounded {
             // Bound the materialized row count to a ceiling derived from the
             // memory budget (+1 row to detect "more exist") so the scan does
             // not pull the whole memtable into the `matched` Vec.
@@ -375,8 +372,7 @@ impl CoreLoop {
         // Bound an unbounded (no-LIMIT) scan by the memory budget. The encoded
         // msgpack payload is the authoritative size of the materialized result;
         // surface a deterministic error if it exceeds the budget rather than
-        // silently truncating. Spatial scans are bounded (finite limit) and so
-        // skip this check.
+        // silently truncating.
         if unbounded
             && crate::data::executor::handlers::scan_budget::budget_exceeded(
                 payload.len(),
@@ -575,7 +571,7 @@ mod tests {
         ColumnarScanParams {
             collection,
             projection: &[],
-            limit: 0,
+            limit: usize::MAX,
             filters: &[],
             rls_filters,
             sort_keys: &[],

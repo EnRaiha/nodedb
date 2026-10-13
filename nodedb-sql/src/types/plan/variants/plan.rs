@@ -95,14 +95,22 @@ pub enum SqlPlan {
     Upsert(UpsertPlan),
     InsertSelect {
         target: String,
+        /// The planned source SELECT. Its row count is bounded only by its
+        /// own LIMIT.
         source: Box<SqlPlan>,
-        limit: usize,
-        /// `(target_column, source_expression)`, in target-column order.
+        /// `(target_column, source_expression)`, in target-column order,
+        /// each expression over a stored source row. A plain document scan
+        /// source is read as stored rows and shaped with this map.
         ///
         /// Empty means passthrough: `INSERT INTO t SELECT * FROM s` copies
         /// each source row unchanged. Non-empty means every target column is
         /// materialized from the paired expression over the source row.
         column_map: Vec<(String, SqlExpr)>,
+        /// `(target_column, source_output_column)`, in target-column order.
+        /// Any source other than a plain document scan is read as SELECT
+        /// output rows, and each target column takes its paired output
+        /// column. Empty means passthrough, as for `column_map`.
+        source_columns: Vec<(String, String)>,
     },
     Update {
         collection: String,
@@ -114,10 +122,11 @@ pub enum SqlPlan {
     },
     /// `UPDATE target SET col = src.col2 FROM src WHERE target.id = src.id`
     ///
-    /// Two-phase execution: scan `source` with `source_filters`, then for
-    /// each matched source row that satisfies the join predicates against a
-    /// target row, apply `assignments` (which may reference source columns
-    /// via qualified names `src.col`).
+    /// Two-phase execution: read `source`, whose plan carries the WHERE
+    /// conjuncts over the source alone, then for each matched source row
+    /// that satisfies the join predicates against a target row, apply
+    /// `assignments` (which may reference source columns via qualified names
+    /// `src.col`).
     ///
     /// `join_predicates` are equality pairs `(target_col, source_col)` extracted
     /// from the WHERE clause linking the two tables. `target_filters` are
@@ -125,8 +134,12 @@ pub enum SqlPlan {
     UpdateFrom {
         collection: String,
         engine: EngineType,
-        /// The FROM source: a `Scan`, `Join`, or other read plan.
+        /// The FROM source: a `Scan`, `Join`, or other read plan, with every
+        /// WHERE conjunct that reads only the source as its filters.
         source: Box<SqlPlan>,
+        /// The name the statement gives the source: its alias, else its
+        /// table name. Assignments read source columns as `<alias>.<col>`.
+        source_alias: String,
         /// Column name used as the target's join key (e.g. `"id"`).
         target_join_col: String,
         /// Column name used as the source's join key (e.g. `"id"`).

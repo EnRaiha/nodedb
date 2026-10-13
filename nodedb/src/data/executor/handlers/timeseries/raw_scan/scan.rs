@@ -6,12 +6,8 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::timeseries::columnar_agg::timestamp_range_filter;
 
-use super::partition_scan::scan_partitions_parallel;
-use super::row_emit::{
-    apply_computed_columns_rmpv, emit_memtable_row, rmpv_system_time, row_admitted_by_policy,
-};
+use super::row_emit::{apply_computed_columns_rmpv, rmpv_system_time};
 
 /// Parameters for a timeseries raw scan (no aggregation).
 pub(in crate::data::executor) struct RawScanParams<'a> {
@@ -102,126 +98,19 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let key = (task.request.database_id, tid, collection.to_string());
-        let mut results: Vec<rmpv::Value> = Vec::new();
-
-        // 1. Read from memtable.
-        if let Some(mt) = self.columnar_memtables.get(&key)
-            && !mt.is_empty()
-        {
-            let schema = mt.schema();
-            let timestamps = mt.column(schema.timestamp_idx).as_timestamps();
-            let indices = timestamp_range_filter(timestamps, time_range.0, time_range.1);
-
-            let (filtered_indices, need_json_filter) = if has_filters {
-                let row_count = mt.row_count() as usize;
-                if let Some(bitmask) =
-                    crate::data::executor::handlers::columnar_filter::eval_filters_bitmask(
-                        mt,
-                        filter_predicates,
-                        row_count,
-                    )
-                {
-                    let bm_indices = nodedb_query::simd_filter::bitmask_to_indices(&bitmask);
-                    (bm_indices, false)
-                } else {
-                    match crate::data::executor::handlers::columnar_filter::eval_filters_sparse(
-                        mt,
-                        filter_predicates,
-                        &indices,
-                    ) {
-                        Some(mask) => (
-                            crate::data::executor::handlers::columnar_filter::apply_mask(
-                                &indices, &mask,
-                            ),
-                            false,
-                        ),
-                        None => (indices, true),
-                    }
-                }
-            } else {
-                (indices, false)
-            };
-
-            let columns: Vec<_> = schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, (name, ty))| (i, name, ty, mt.column(i)))
-                .collect();
-            for &idx in &filtered_indices {
-                if results.len() >= gather_limit {
-                    break;
-                }
-                let row = match emit_memtable_row(mt, &columns, idx as usize) {
-                    Ok(row) => row,
-                    Err(e) => return self.response_error(task, e),
-                };
-                if need_json_filter {
-                    // Encode rmpv row to msgpack bytes for binary filter eval.
-                    let mut buf = Vec::new();
-                    rmpv::encode::write_value(&mut buf, &row).ok();
-                    match crate::bridge::scan_filter::ScanFilter::all_match_binary(
-                        filter_predicates,
-                        &buf,
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return self.response_error(task, ErrorCode::from(e));
-                        }
-                    }
-                }
-                // The caller's read policy, after the WHERE predicates and
-                // before the row is gathered, so the limit counts admitted
-                // rows only.
-                match row_admitted_by_policy(&row, rls_predicates) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(e) => return self.response_error(task, e),
-                }
-                results.push(row);
-            }
-        }
-
-        // 2. Read from disk partitions.
-        if let Some(registry) = self.ts_registries.get(&key) {
-            let query_range = nodedb_types::timeseries::TimeRange::new(time_range.0, time_range.1);
-            let entries: Vec<_> = registry.query_partitions(&query_range);
-
-            if !entries.is_empty() {
-                let data_dir = &self.data_dir;
-                let db_id = task.request.database_id.as_u64();
-                let tenant = tid.as_u64();
-                let partition_dirs: Vec<std::path::PathBuf> = entries
-                    .iter()
-                    .map(|e| {
-                        crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
-                            data_dir, db_id, tenant, collection,
-                        )
-                        .join(&e.dir_name)
-                    })
-                    .filter(|p| p.exists())
-                    .collect();
-
-                let remaining = gather_limit.saturating_sub(results.len());
-                if remaining > 0 && !partition_dirs.is_empty() {
-                    let partition_rows = match scan_partitions_parallel(
-                        &partition_dirs,
-                        time_range,
-                        remaining,
-                        filter_predicates,
-                        has_filters,
-                        rls_predicates,
-                    ) {
-                        Ok(rows) => rows,
-                        Err(e) => return self.response_error(task, e),
-                    };
-                    results.extend(partition_rows);
-                    results.truncate(gather_limit);
-                }
-            }
-        }
+        // 1-2. Committed rows: memtable, then flushed partitions.
+        let mut results = match self.gather_ts_rows(super::gather::TsGatherParams {
+            database_id: task.request.database_id,
+            tid,
+            collection,
+            time_range,
+            filter_predicates,
+            rls_predicates,
+            limit: gather_limit,
+        }) {
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
 
         // 3. In-transaction read-your-own-writes: fold this transaction's
         // staged `TimeseriesOp::Ingest` rows into the base result. Gated on

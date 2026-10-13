@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Time-bucket grouping: rows keyed by `time_bucket(ts)` plus the group
-//! columns, resolved to `"bucket_ts\0group1\0group2"` string keys.
+//! columns, resolved to typed group keys.
 
 use rustc_hash::FxHashMap;
 
 use super::super::super::columnar_agg::AggAccum;
+use super::super::group_key::GroupKey;
 use super::super::types::{GroupedAggResult, accumulate_row, for_each_set_bit};
 use super::dispatch::GroupedScanInputs;
-use super::keys::{key_part, push_key_part};
+use super::keys::{key_cells, key_part};
 
 /// Time-bucket aggregation with integer keys.
 ///
@@ -16,8 +17,8 @@ use super::keys::{key_part, push_key_part};
 /// - `parts[0]` = bucket_ts as u64
 /// - `parts[1..]` = group column values (symbol IDs, i64, f64 bits)
 ///
-/// Resolves to string keys with "bucket_ts\0group1\0group2" format
-/// so `emit_grouped_results` can parse them.
+/// Resolves each to a [`GroupKey`] with the bucket and one typed cell per
+/// GROUP BY column.
 pub(super) fn aggregate_with_bucket<'a>(
     inputs: GroupedScanInputs<'a>,
     timestamps: &[i64],
@@ -53,21 +54,15 @@ pub(super) fn aggregate_with_bucket<'a>(
         accumulate_row(accums, resolved, columns, row_idx);
     });
 
-    // Resolve integer keys to string keys: "bucket_ts\0group1\0group2"
+    // Resolve integer keys to typed keys: the bucket, then one cell per
+    // GROUP BY column.
     let mut result = GroupedAggResult::new(num_aggs);
     for (key_parts, accums) in groups {
-        let bucket_ts = key_parts[0] as i64;
-        let mut str_key = bucket_ts.to_string();
-
-        for (i, &part) in key_parts[1..].iter().enumerate() {
-            str_key.push('\0');
-            if i < resolved.group_cols.len() {
-                let (col_idx, ty) = resolved.group_cols[i];
-                push_key_part(&mut str_key, col_idx, ty, part, sym_lookup);
-            }
-        }
-
-        result.merge_group(str_key, &accums);
+        let key = GroupKey {
+            bucket: Some(key_parts[0] as i64),
+            cells: key_cells(&key_parts[1..], resolved, columns, sym_lookup),
+        };
+        result.merge_group(key, &accums);
     }
 
     result

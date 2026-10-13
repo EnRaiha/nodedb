@@ -24,7 +24,7 @@ use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
 use crate::planner::agg_naming::aggregate_output_key;
 use crate::planner::select::select_output_aliases;
-use crate::resolver::columns::TableScope;
+use crate::resolver::columns::{ColumnNaming, TableScope};
 use crate::types::{AggregateExpr, Filter};
 
 /// Convert a HAVING clause into filters over finalized group rows.
@@ -61,12 +61,20 @@ pub fn plan_having(
 
     // The rewritten predicate addresses computed group columns: an
     // aggregate's canonical key, its output alias, or a SELECT-list alias.
-    let having_scope = scope.with_output_names(
-        aggregates
-            .iter()
-            .map(aggregate_output_key)
-            .chain(aggregates.iter().map(|a| a.alias.clone()))
-            .chain(select_output_aliases(projection)),
-    );
+    // Those are the aggregate's output rows. Over a join they key a group
+    // column by its bare name, never by the merged row's `qualifier.column`.
+    let output_naming = match scope.column_naming() {
+        ColumnNaming::JoinRow | ColumnNaming::OutputRow => ColumnNaming::OutputRow,
+        ColumnNaming::AsWritten => ColumnNaming::AsWritten,
+    };
+    let having_scope = scope
+        .with_output_names(
+            aggregates
+                .iter()
+                .map(aggregate_output_key)
+                .chain(aggregates.iter().map(|a| a.alias.clone()))
+                .chain(select_output_aliases(projection)),
+        )
+        .with_column_naming(output_naming);
     crate::planner::select::convert_where_to_filters(&rewritten, &having_scope)
 }

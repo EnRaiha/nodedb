@@ -150,15 +150,17 @@ async fn dispatch_external_crdt_apply(
     // before this dispatch runs), so no re-qualification happens — doing so
     // will double-prefix the name.
     let qualified_collection = collection.as_str();
-    let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
-        tenant_id,
-        ctx.database_id(),
-        qualified_collection,
-        ctx.identity,
-        "native".into(),
-        &ctx.state.rls,
-        &audit,
-    );
+    let policy =
+        crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
+            tenant_id,
+            ctx.database_id(),
+            qualified_collection,
+            ctx.identity,
+            "native".into(),
+            &ctx.state.rls,
+            &audit,
+        )
+        .with_type_guards_from(ctx.state.credentials.catalog(), ctx.database_id());
     let outcome = crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted_outcome(
         ctx.state,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {

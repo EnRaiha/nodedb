@@ -156,11 +156,12 @@ pub(super) fn advise_sequential(mmap: &memmap2::Mmap, col_path: &std::path::Path
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::timeseries::MetricSample;
     use nodedb_wal::crypto::WalEncryptionKey;
     use tempfile::TempDir;
 
-    use super::super::super::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
+    use super::super::super::columnar_memtable::{
+        ColumnValue, ColumnarMemtable, ColumnarMemtableConfig,
+    };
     use super::super::reader::ColumnarSegmentReader;
     use super::super::writer::ColumnarSegmentWriter;
 
@@ -183,13 +184,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut mt = ColumnarMemtable::new_metric(test_config());
         for i in 0..100 {
-            mt.ingest_metric(
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1_000_000 + i * 1000,
-                    value: i as f64 * 2.0,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1_000_000 + i * 1000),
+                    ColumnValue::Float64(i as f64 * 2.0),
+                ],
+            )
+            .unwrap();
         }
         (tmp, mt.drain())
     }

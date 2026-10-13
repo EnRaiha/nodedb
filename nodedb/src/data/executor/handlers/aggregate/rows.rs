@@ -271,6 +271,7 @@ mod tests {
             user_alias: Some("total".into()),
             field: "v".into(),
             expr: None,
+            param: None,
         };
         apply_user_aliases_to_rows(&mut rows, std::slice::from_ref(&spec));
         assert_eq!(column(&rows, "total"), vec![Value::Float(f64::INFINITY)]);

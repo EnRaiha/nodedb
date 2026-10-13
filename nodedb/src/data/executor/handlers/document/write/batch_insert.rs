@@ -24,6 +24,9 @@ pub(in crate::data::executor) struct DocumentBatchInsertParams<'a> {
     pub collection: &'a str,
     pub documents: &'a [(String, Vec<u8>)],
     pub surrogates: &'a [nodedb_types::Surrogate],
+    /// `ON CONFLICT DO NOTHING`: a row whose key is already stored, or named
+    /// by an earlier row of the page, is skipped instead of refused.
+    pub if_absent: bool,
     /// When `Some`, return one row per inserted document — the STORED
     /// post-image of each, in `documents` order.
     pub returning: Option<&'a ReturningSpec>,
@@ -128,6 +131,7 @@ impl CoreLoop {
             collection,
             documents,
             surrogates,
+            if_absent,
             returning,
             rls_filters,
             resolved_sum_targets,
@@ -142,15 +146,36 @@ impl CoreLoop {
             deferred_sum_targets,
             wal_lsn: task.wal_lsn(),
         };
+        let txn = match self.sparse.begin_write() {
+            Ok(t) => t,
+            Err(e) => return self.response_error(task, e),
+        };
+        // Each row is judged as `PointInsert` judges it, inside the page's
+        // write transaction: a key already stored, or one an earlier row of
+        // the page names, is a `unique` violation, or a skipped row under
+        // `if_absent`. A refusal drops the transaction and writes nothing.
+        let landing = match self.batch_insert_landing_rows(
+            &txn,
+            super::batch_insert_judge::BatchPage {
+                database_id,
+                tid,
+                collection,
+                documents,
+                surrogates,
+                if_absent,
+            },
+        ) {
+            Ok(landing) => landing,
+            Err(e) => return self.response_error(task, e),
+        };
         // The page lands as one unit, so UNIQUE is judged on its post-state:
         // two rows of the page claiming one value are refused.
-        let page: Vec<SubmittedWrite<'_>> = documents
+        let page: Vec<SubmittedWrite<'_>> = landing
             .iter()
-            .zip(surrogates)
-            .map(|((_, value), surrogate)| SubmittedWrite {
+            .map(|&i| SubmittedWrite {
                 collection,
-                surrogate: surrogate.as_u32(),
-                body: Some(value.as_slice()),
+                surrogate: surrogates[i].as_u32(),
+                body: Some(documents[i].1.as_slice()),
                 judged: true,
             })
             .collect();
@@ -160,10 +185,6 @@ impl CoreLoop {
         // One guard for the whole page: each row advances the head, and a
         // failure anywhere rolls the page back to the head it started from.
         let mut chain = ChainGuard::begin(self, database_id, tid, collection);
-        let txn = match self.sparse.begin_write() {
-            Ok(t) => t,
-            Err(e) => return self.response_error(task, e),
-        };
 
         // Row identity + storage key for post-commit event emission and cache
         // invalidation, captured as each row applies successfully; the value
@@ -171,9 +192,10 @@ impl CoreLoop {
         // cloned here. On any error we return early (dropping `txn`, which
         // rolls back every row applied so far).
         let mut applied: Vec<(
+            usize,
             crate::engine::document::store::RowIdentity,
             nodedb_types::StorageKey,
-        )> = Vec::with_capacity(documents.len());
+        )> = Vec::with_capacity(landing.len());
         // One post-apply `Put` redo entry per stored row, in insert order:
         // `wal_append_document_op` mints no pre-dispatch record for
         // `BatchInsert`, so these entries are the rows' only WAL record.
@@ -205,7 +227,8 @@ impl CoreLoop {
         // head and the document-cache entries `apply_point_put` populated —
         // are reversed in one place.
         let mut failure: Option<(nodedb_types::StorageKey, crate::Error)> = None;
-        for (i, (document_id, value)) in documents.iter().enumerate() {
+        for &i in &landing {
+            let (document_id, value) = &documents[i];
             let surrogate = surrogates[i];
             let key = nodedb_types::StorageKey::for_surrogate(surrogate);
             // The plan's `document_id` is the identity INSERT minted for this
@@ -236,6 +259,7 @@ impl CoreLoop {
                     unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                     wal_lsn: task.wal_lsn(),
                     resolved_targets: resolved_sum_targets,
+                    guards: crate::data::executor::enforcement::typeguard::GuardScope::Document,
                 },
             ) {
                 Ok(o) => o,
@@ -289,14 +313,14 @@ impl CoreLoop {
                 tuples.extend(outcome.bitemporal_index_tuples);
                 row_index_tuples.push(tuples);
             }
-            applied.push((row_identity, key));
+            applied.push((i, row_identity, key));
         }
 
         // Every row the page called `apply_point_put` for. An abort below
         // drops their cache entries: a cached body for a row that never
         // committed is served to readers as though it had.
         let mut written_keys: Vec<nodedb_types::StorageKey> =
-            applied.iter().map(|(_, key)| *key).collect();
+            applied.iter().map(|(_, _, key)| *key).collect();
 
         if let Some((failed_key, error)) = failure {
             // The whole page rolls back: the chain head, the cache entries
@@ -360,7 +384,7 @@ impl CoreLoop {
 
         // Record each committed row's version against its surrogate and
         // collection.
-        for (_, key) in &applied {
+        for (_, _, key) in &applied {
             self.note_surrogate_write(task, tid, collection, key.surrogate().as_u32());
         }
 
@@ -380,28 +404,30 @@ impl CoreLoop {
         }
 
         self.checkpoint_coordinator
-            .mark_dirty("sparse", documents.len());
+            .mark_dirty("sparse", landing.len());
         if let Some(ref m) = self.metrics {
             m.record_document_insert();
         }
 
-        for (i, (identity, _)) in applied.into_iter().enumerate() {
+        for (i, identity, _) in applied {
             self.emit_put_event(task, tid, collection, identity, &documents[i].1, None);
         }
 
         let mut response = if let Some(spec) = returning {
             // One row per inserted document, in `documents` order — the order
             // the rows were applied in, which is the order PostgreSQL returns
-            // them in for a multi-row INSERT.
+            // them in for a multi-row INSERT. A skipped row returns nothing.
             let strict_schema = self.strict_schema_for(
                 task.request.database_id,
                 crate::types::TenantId::new(tid),
                 collection,
             );
-            let identities: Vec<crate::engine::document::store::RowIdentity> = documents
+            let identities: Vec<crate::engine::document::store::RowIdentity> = landing
                 .iter()
-                .map(|(document_id, _)| {
-                    crate::engine::document::store::RowIdentity::from_user_key(document_id.as_str())
+                .map(|&i| {
+                    crate::engine::document::store::RowIdentity::from_user_key(
+                        documents[i].0.as_str(),
+                    )
                 })
                 .collect();
             let rows: Vec<(&crate::engine::document::store::RowIdentity, &[u8])> = identities
@@ -419,7 +445,7 @@ impl CoreLoop {
                 &rows,
             )
         } else {
-            match crate::data::executor::response_codec::encode_count("inserted", documents.len()) {
+            match crate::data::executor::response_codec::encode_count("inserted", landing.len()) {
                 Ok(bytes) => self.response_with_payload(task, bytes),
                 Err(e) => {
                     return self.response_error(task, ErrorCode::from(e));
@@ -488,6 +514,7 @@ mod tests {
             plan: PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, COLL),
                 documents: documents.to_vec(),
+                if_absent: false,
                 surrogates: surrogates.to_vec(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -548,6 +575,7 @@ mod tests {
                 collection: COLL,
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
                 returning: None,
                 rls_filters: &[],
                 resolved_sum_targets: &[],
@@ -562,6 +590,118 @@ mod tests {
             corpus_size(&core),
             2,
             "both committed rows must be in the FTS corpus"
+        );
+    }
+
+    fn insert_page(
+        core: &mut CoreLoop,
+        documents: &[(String, Vec<u8>)],
+        surrogates: &[Surrogate],
+        if_absent: bool,
+    ) -> crate::bridge::envelope::Response {
+        let task = batch_task(documents, surrogates);
+        core.execute_document_batch_insert(
+            &task,
+            DocumentBatchInsertParams {
+                tid: TID,
+                collection: COLL,
+                documents,
+                surrogates,
+                if_absent,
+                returning: None,
+                rls_filters: &[],
+                resolved_sum_targets: &[],
+                deferred_sum_targets: &[],
+            },
+        )
+    }
+
+    fn inserted(resp: &crate::bridge::envelope::Response) -> u64 {
+        let value: serde_json::Value =
+            nodedb_types::json_from_msgpack(resp.payload.as_ref()).expect("count payload");
+        value
+            .get("inserted")
+            .and_then(serde_json::Value::as_u64)
+            .expect("inserted count")
+    }
+
+    /// A page row whose key is already stored is refused, and the page writes
+    /// nothing: the page once overwrote the stored row.
+    #[test]
+    fn a_page_row_with_a_stored_key_refuses_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let first = vec![("d1".to_string(), br#"{"title":"original"}"#.to_vec())];
+        assert_eq!(
+            insert_page(&mut core, &first, &[Surrogate(31)], false).status,
+            Status::Ok
+        );
+        let original = stored(&core, Surrogate(31));
+
+        let page = vec![
+            ("d9".to_string(), br#"{"title":"new"}"#.to_vec()),
+            ("d1".to_string(), br#"{"title":"overwrite"}"#.to_vec()),
+        ];
+        let resp = insert_page(&mut core, &page, &[Surrogate(39), Surrogate(31)], false);
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "a duplicate key refuses the page"
+        );
+        assert_eq!(
+            stored(&core, Surrogate(31)),
+            original,
+            "the stored row is untouched"
+        );
+        assert!(
+            stored(&core, Surrogate(39)).is_none(),
+            "no row of the page lands"
+        );
+    }
+
+    /// A key the page names twice is refused.
+    #[test]
+    fn a_key_the_page_names_twice_refuses_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let page = vec![
+            ("d1".to_string(), br#"{"title":"a"}"#.to_vec()),
+            ("d1".to_string(), br#"{"title":"b"}"#.to_vec()),
+        ];
+        let resp = insert_page(&mut core, &page, &[Surrogate(41), Surrogate(41)], false);
+        assert_eq!(resp.status, Status::Error);
+        assert!(stored(&core, Surrogate(41)).is_none());
+    }
+
+    /// `ON CONFLICT DO NOTHING` skips stored and repeated keys, lands the
+    /// rest, and counts only what landed.
+    #[test]
+    fn skip_mode_lands_only_new_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let first = vec![("d1".to_string(), br#"{"title":"original"}"#.to_vec())];
+        insert_page(&mut core, &first, &[Surrogate(51)], false);
+        let original = stored(&core, Surrogate(51));
+
+        let page = vec![
+            ("d1".to_string(), br#"{"title":"skipped"}"#.to_vec()),
+            ("d2".to_string(), br#"{"title":"lands"}"#.to_vec()),
+            ("d2".to_string(), br#"{"title":"repeat"}"#.to_vec()),
+        ];
+        let resp = insert_page(
+            &mut core,
+            &page,
+            &[Surrogate(51), Surrogate(52), Surrogate(52)],
+            true,
+        );
+        assert_eq!(resp.status, Status::Ok);
+        assert_eq!(inserted(&resp), 1);
+        assert_eq!(stored(&core, Surrogate(51)), original);
+        assert!(stored(&core, Surrogate(52)).is_some());
+        assert_eq!(
+            resp.write_set.len(),
+            1,
+            "the redo record carries only the row that landed"
         );
     }
 
@@ -586,6 +726,7 @@ mod tests {
                 collection: COLL,
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
                 returning: None,
                 rls_filters: &[],
                 resolved_sum_targets: &[],
@@ -644,6 +785,7 @@ mod tests {
                 collection: COLL,
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
                 returning: None,
                 rls_filters: &[],
                 resolved_sum_targets: &[],
@@ -695,6 +837,7 @@ mod tests {
                 collection: COLL,
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
                 returning: None,
                 rls_filters: &[],
                 resolved_sum_targets: &[],
@@ -822,6 +965,7 @@ mod tests {
                 collection: SUM_SOURCE,
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
                 returning: None,
                 rls_filters: &[],
                 resolved_sum_targets: &resolved,

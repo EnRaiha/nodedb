@@ -63,7 +63,9 @@ mod tests {
     ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::Merge {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "target"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
+            source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
+            ),
             source_alias: "s".to_string(),
             target_join_col: "id".to_string(),
             source_join_col: "id".to_string(),
@@ -128,6 +130,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 documents: Vec::new(),
+                if_absent: false,
                 surrogates: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),

@@ -2,9 +2,7 @@
 
 //! Lower `SqlPlan::Merge` to `DocumentOp::Merge` physical task.
 
-use nodedb_sql::types::{
-    DocumentIndexLookupPlan, MergeClauseKind, MergePlanAction, MergePlanClause, SqlExpr, SqlPlan,
-};
+use nodedb_sql::types::{MergeClauseKind, MergePlanAction, MergePlanClause, SqlExpr, SqlPlan};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
@@ -51,20 +49,16 @@ pub(in super::super) fn convert_merge(
     let target_qualified = super::super::convert::db_qualified(ctx.database_id, target);
     let qualified_target = nodedb_types::QualifiedCollection::new(ctx.database_id, target);
     let target = target_qualified.as_str();
-    // Extract source collection name from the source scan plan.
-    let source_collection = match source {
-        SqlPlan::Scan { collection, .. } => {
-            nodedb_types::QualifiedCollection::new(ctx.database_id, collection)
-        }
-        SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan { collection, .. }) => {
-            nodedb_types::QualifiedCollection::new(ctx.database_id, collection)
-        }
-        other => {
-            return Err(crate::Error::PlanError {
-                detail: format!("Merge source must be a Scan plan, got: {other:?}"),
-            });
-        }
-    };
+    // The source is any SELECT: its WHERE, LIMIT and the rest of the
+    // subquery hold, and its read policy applies. The whole source is read
+    // before the first write, so no collection is written while it is read.
+    let source = super::super::row_source::lower_row_source(
+        source,
+        super::super::row_source::ColumnMaps::PASSTHROUGH,
+        None,
+        tenant_id,
+        ctx,
+    )?;
 
     let clause_ops = clauses
         .iter()
@@ -82,7 +76,7 @@ pub(in super::super) fn convert_merge(
         database_id: ctx.database_id,
         plan: PhysicalPlan::Document(DocumentOp::Merge {
             target_collection: qualified_target,
-            source_collection,
+            source,
             source_alias: source_alias.into(),
             target_join_col: target_join_col.into(),
             source_join_col: source_join_col.into(),
@@ -97,8 +91,8 @@ pub(in super::super) fn convert_merge(
             // Plane directly.
             resolved_inserts: None,
             resolved_insert_identities: Vec::new(),
-            // The source rows are shipped in by the Control-Plane orchestrator
-            // (cross-core source-ship); the neutral plan carries none.
+            // The merge orchestrator reads `source` and ships its rows in;
+            // the neutral plan carries none.
             source_rows: None,
             // Both filled in by the RLS injection pass, which runs after
             // conversion — the read filter gating `returning` and the write

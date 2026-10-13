@@ -28,6 +28,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
         group_by,
         aggregates,
         filters,
+        having,
         projection,
         gap_fill,
         limit,
@@ -40,36 +41,30 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
     let collection_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let filter_bytes = serialize_filters(filters)?;
-    let agg_pairs: Vec<(String, String)> = aggregates.iter().map(agg_expr_to_pair).collect();
+    let having_bytes = serialize_filters(having)?;
+    let agg_pairs: Vec<(String, String)> = aggregates
+        .iter()
+        .map(agg_expr_to_pair)
+        .collect::<crate::Result<_>>()?;
 
-    // AUTO_TIER: split query across retention tiers if enabled.
-    if *tiered
-        && let Some(registry) = &ctx.retention_registry
+    // AUTO_TIER: the owning core routes each segment of the range to raw
+    // rows or to a tier's buckets, then merges before HAVING, sort and limit.
+    let tiering = match &ctx.retention_registry {
         // Policies are keyed by policy name. A collection's policy is found
         // by the bare collection name it targets.
-        && let Some(policy) = registry.get_for_collection(
-            ctx.database_id.as_u64(),
-            tenant_id.as_u64(),
-            collection_key.name(),
-        )
-        && policy.auto_tier
-    {
-        return Ok(super::super::super::auto_tier::plan_tiered_scan(
-            &policy,
-            super::super::super::auto_tier::ScopeIds {
-                tenant_id,
-                database_id: ctx.database_id,
-            },
-            *time_range,
-            filter_bytes,
-            group_by.to_vec(),
-            agg_pairs,
-            gap_fill.to_string(),
-        ));
-    }
+        Some(registry) if *tiered => registry
+            .get_for_collection(
+                ctx.database_id.as_u64(),
+                tenant_id.as_u64(),
+                collection_key.name(),
+            )
+            .filter(|policy| policy.auto_tier)
+            .map(|policy| super::super::super::auto_tier::tiering_plan(&policy)),
+        Some(_) | None => None,
+    };
 
     let proj_names = extract_projection_names(projection, &[]);
-    let computed_bytes = extract_computed_columns(projection, &[], false)?;
+    let computed_bytes = timeseries_computed_columns(projection)?;
     let vshard = collection_key.vshard();
     Ok(vec![PhysicalTask {
         tenant_id,
@@ -90,10 +85,51 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
             rls_filters: Vec::new(),
             system_time: temporal.system_time,
             valid_at_ms: valid_at_from_scope(temporal),
+            having: having_bytes,
+            tiering,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
     }])
+}
+
+/// The computed columns of a raw timeseries scan. A raw scan with computed
+/// columns emits only those columns, so a plain column projected beside a
+/// computed one (`SELECT code AS id, score`) rides along as an identity
+/// column under its own name, in SELECT-list order. A projection with no
+/// computed column, or with `*`, keeps every stored column as before.
+fn timeseries_computed_columns(
+    projection: &[nodedb_sql::types::Projection],
+) -> crate::Result<Vec<u8>> {
+    use nodedb_sql::types::Projection;
+    let has_computed = projection
+        .iter()
+        .any(|p| matches!(p, Projection::Computed { .. }));
+    let has_star = projection
+        .iter()
+        .any(|p| matches!(p, Projection::Star | Projection::QualifiedStar(_)));
+    if !has_computed || has_star {
+        return extract_computed_columns(projection, &[], false);
+    }
+    let columns: Vec<crate::bridge::expr_eval::ComputedColumn> = projection
+        .iter()
+        .filter_map(|p| match p {
+            Projection::Column(name) => Some(crate::bridge::expr_eval::ComputedColumn {
+                alias: name.clone(),
+                expr: crate::bridge::expr_eval::SqlExpr::Column(name.clone()),
+            }),
+            Projection::Computed { expr, alias } => {
+                Some(crate::bridge::expr_eval::ComputedColumn {
+                    alias: alias.clone(),
+                    expr: super::super::expr::sql_expr_to_bridge_expr(expr),
+                })
+            }
+            Projection::CpComputed { .. } | Projection::Star | Projection::QualifiedStar(_) => None,
+        })
+        .collect();
+    zerompk::to_msgpack_vec(&columns).map_err(|e| crate::Error::Internal {
+        detail: format!("serialize computed columns: {e}"),
+    })
 }
 
 pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(

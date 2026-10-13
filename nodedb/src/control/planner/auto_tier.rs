@@ -2,192 +2,59 @@
 
 //! AUTO_TIER query routing for tiered retention policies.
 //!
-//! When a timeseries collection has an enabled retention policy with `auto_tier = true`,
-//! queries are automatically routed to the highest-resolution tier that covers each
-//! time segment. A 6-month query reads hourly aggregates for old data and raw data
-//! for recent data — transparent to the client.
-//!
-//! The routing decision uses the policy's tier definitions and their `retain_ms`
-//! to estimate which tier covers which time range. Watermark-based routing would
-//! be more precise but requires a Data Plane round-trip; retain_ms-based routing
-//! is instantaneous and correct for steady-state operation.
+//! When a timeseries collection has an enabled retention policy with
+//! `auto_tier = true`, a scan carries the policy's tier layout as a
+//! [`TieringPlan`]. The core that owns the collection splits the query range
+//! into segments with [`TieringPlan::segments`], reads recent segments from
+//! raw rows and older ones from each tier's continuous aggregate, and merges
+//! the groups before HAVING, sort and limit. EXPLAIN TIERS shows the same
+//! split through the same function.
 
-use crate::bridge::envelope::PhysicalPlan;
+use nodedb_physical::physical_plan::{TierRead, TierSource, TieringError, TieringPlan};
+
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
-use crate::types::{DatabaseId, TenantId};
-use nodedb_physical::physical_plan::TimeseriesOp;
 
-use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
-
-/// Tenant + database scope identity, passed together to avoid over-8-arg signatures.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ScopeIds {
-    pub(super) tenant_id: TenantId,
-    pub(super) database_id: DatabaseId,
-}
-
-/// A time segment assigned to a specific tier.
-#[derive(Debug)]
-struct TierSegment {
-    /// Tier index (0 = RAW, 1+ = downsample).
-    tier_index: u32,
-    /// Collection name to query (raw collection or aggregate name).
-    collection: String,
-    /// Time range for this segment.
-    time_range: (i64, i64),
-    /// Bucket interval (0 for raw, tier resolution_ms for aggregates).
-    bucket_interval_ms: i64,
-}
-
-/// Aggregation query parameters shared across all tier segments.
-struct AggQueryParams {
-    filters: Vec<u8>,
-    group_by: Vec<String>,
-    aggregates: Vec<(String, String)>,
-    gap_fill: String,
-}
-
-/// Plan a tiered scan: split the query time range across tiers and return
-/// one `PhysicalTask` per tier segment.
+/// The tier layout a scan carries for `policy`.
 ///
-/// Each task targets either the raw collection or a tier's auto-created
-/// continuous aggregate (`_policy_{name}_tier{N}`).
-pub(super) fn plan_tiered_scan(
-    policy: &RetentionPolicyDef,
-    scope: ScopeIds,
-    query_time_range: (i64, i64),
-    filters: Vec<u8>,
-    group_by: Vec<String>,
-    aggregates: Vec<(String, String)>,
-    gap_fill: String,
-) -> Vec<PhysicalTask> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
-    let segments = compute_tier_segments(policy, query_time_range, now_ms);
-    let agg = AggQueryParams {
-        filters,
-        group_by,
-        aggregates,
-        gap_fill,
-    };
-
-    if segments.is_empty() {
-        // Fallback: single raw scan (shouldn't happen, but defensive).
-        return vec![build_scan_task(
-            scope,
-            &policy.collection,
-            query_time_range,
-            0,
-            &agg,
-        )];
-    }
-
-    segments
+/// Tier 0 is the raw tier; its retention bounds the raw segment. Every
+/// later tier reads the continuous aggregate the policy created for it.
+pub(crate) fn tiering_plan(policy: &RetentionPolicyDef) -> TieringPlan {
+    let raw_retain_ms = policy.raw_tier().map_or(0, |raw| raw.retain_ms);
+    let tiers = policy
+        .downsample_tiers()
         .iter()
-        .map(|seg| {
-            build_scan_task(
-                scope,
-                &seg.collection,
-                seg.time_range,
-                seg.bucket_interval_ms,
-                &agg,
-            )
+        .map(|tier| TierRead {
+            tier_index: tier.tier_index,
+            aggregate: policy.aggregate_name(tier.tier_index),
+            resolution_ms: i64::try_from(tier.resolution_ms).unwrap_or(i64::MAX),
+            retain_ms: tier.retain_ms,
         })
-        .collect()
-}
-
-/// Determine which tier covers which time segment.
-///
-/// Works backwards from now: the most recent `retain_ms` goes to the
-/// highest-resolution tier (tier 0 = raw), then the next tier, etc.
-///
-/// Example for policy: RAW 7d, 1m 90d, 1h 2y:
-/// - [now-7d, now] → RAW (tier 0)
-/// - [now-90d, now-7d] → 1m aggregate (tier 1)
-/// - [now-2y, now-90d] → 1h aggregate (tier 2)
-fn compute_tier_segments(
-    policy: &RetentionPolicyDef,
-    query_range: (i64, i64),
-    now_ms: i64,
-) -> Vec<TierSegment> {
-    let (query_start, query_end) = query_range;
-    let mut segments = Vec::new();
-
-    // Build tier boundaries working backward from now.
-    // Each tier covers from (now - cumulative_retain) to (now - previous_cumulative).
-    let mut boundary = now_ms; // Right edge of current tier.
-
-    for tier in &policy.tiers {
-        if tier.retain_ms == 0 {
-            // "forever" retention — this tier covers everything older.
-            let tier_start = i64::MIN;
-            let seg_start = query_start.max(tier_start);
-            let seg_end = query_end.min(boundary);
-            if seg_start < seg_end {
-                segments.push(TierSegment {
-                    tier_index: tier.tier_index,
-                    collection: collection_for_tier(policy, tier.tier_index),
-                    time_range: (seg_start, seg_end),
-                    bucket_interval_ms: tier.resolution_ms as i64,
-                });
-            }
-            break; // Forever tier consumes all remaining time.
-        }
-
-        let tier_start = boundary - tier.retain_ms as i64;
-
-        // Intersect with query range.
-        let seg_start = query_start.max(tier_start);
-        let seg_end = query_end.min(boundary);
-
-        if seg_start < seg_end {
-            segments.push(TierSegment {
-                tier_index: tier.tier_index,
-                collection: collection_for_tier(policy, tier.tier_index),
-                time_range: (seg_start, seg_end),
-                bucket_interval_ms: tier.resolution_ms as i64,
-            });
-        }
-
-        boundary = tier_start;
-    }
-
-    // Reverse so segments are ordered oldest → newest (natural time order).
-    segments.reverse();
-    segments
-}
-
-/// Get the collection name for a tier.
-fn collection_for_tier(policy: &RetentionPolicyDef, tier_index: u32) -> String {
-    if tier_index == 0 {
-        policy.collection.clone()
-    } else {
-        policy.aggregate_name(tier_index)
+        .collect();
+    TieringPlan {
+        raw_retain_ms,
+        tiers,
     }
 }
 
-/// Explain the tier selection for a query — returns human-readable tier plan.
+/// Explain the tier selection for a query: one line per segment.
 ///
-/// Used by EXPLAIN to show which tiers are selected for each time segment.
+/// Used by EXPLAIN TIERS. It splits the range with the same
+/// [`TieringPlan::segments`] the scan executes.
 pub(crate) fn explain_tier_selection(
     policy: &RetentionPolicyDef,
     query_time_range: (i64, i64),
-) -> String {
+) -> Result<String, TieringError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-
-    let segments = compute_tier_segments(policy, query_time_range, now_ms);
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let plan = tiering_plan(policy);
+    let segments = plan.segments(query_time_range, now_ms)?;
 
     if segments.is_empty() {
-        return format!(
+        return Ok(format!(
             "AUTO_TIER on '{}': no tier covers the requested range",
             policy.collection
-        );
+        ));
     }
 
     let mut lines = vec![format!(
@@ -196,60 +63,25 @@ pub(crate) fn explain_tier_selection(
         policy.tiers.len(),
         segments.len()
     )];
-
-    for seg in &segments {
-        let tier_label = if seg.tier_index == 0 {
-            "RAW".to_string()
-        } else {
-            format!(
-                "tier{} ({}ms buckets)",
-                seg.tier_index, seg.bucket_interval_ms
-            )
+    // Oldest first, as a reader expects a timeline.
+    for seg in segments.iter().rev() {
+        let (label, source) = match seg.source {
+            TierSource::Raw => ("RAW".to_string(), policy.collection.clone()),
+            TierSource::Tier(index) => match plan.tiers.get(index) {
+                Some(tier) => (
+                    format!("tier{} ({}ms buckets)", tier.tier_index, tier.resolution_ms),
+                    tier.aggregate.clone(),
+                ),
+                None => continue,
+            },
         };
         lines.push(format!(
-            "  [{} .. {}] → {} ({})",
-            seg.time_range.0, seg.time_range.1, tier_label, seg.collection,
+            "  [{} .. {}) → {} ({})",
+            seg.start, seg.end, label, source,
         ));
     }
 
-    lines.join("\n")
-}
-
-/// Build a single `PhysicalTask` for a tier segment.
-fn build_scan_task(
-    scope: ScopeIds,
-    collection: &str,
-    time_range: (i64, i64),
-    bucket_interval_ms: i64,
-    agg: &AggQueryParams,
-) -> PhysicalTask {
-    let ScopeIds {
-        tenant_id,
-        database_id,
-    } = scope;
-    PhysicalTask {
-        tenant_id,
-        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, collection).vshard(),
-        database_id,
-        plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-            collection: nodedb_types::QualifiedCollection::new(database_id, collection),
-            time_range,
-            projection: Vec::new(),
-            limit: usize::MAX,
-            filters: agg.filters.clone(),
-            sort_keys: Vec::new(),
-            bucket_interval_ms,
-            group_by: agg.group_by.clone(),
-            aggregates: agg.aggregates.clone(),
-            gap_fill: agg.gap_fill.clone(),
-            computed_columns: Vec::new(),
-            rls_filters: Vec::new(),
-            system_time: nodedb_types::SystemTimeScope::Current,
-            valid_at_ms: None,
-        }),
-        post_set_op: PostSetOp::None,
-        txn_id: None,
-    }
+    Ok(lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -295,79 +127,42 @@ mod tests {
     }
 
     #[test]
-    fn segments_cover_full_range() {
-        let policy = make_policy();
-        let now = 100_000_000_000i64; // ~3 years from epoch
-        let query_start = now - 30 * 86_400_000; // 30 days ago
-        let query_end = now;
+    fn plan_names_each_tier_aggregate() {
+        let plan = tiering_plan(&make_policy());
+        assert_eq!(plan.raw_retain_ms, 604_800_000);
+        assert_eq!(plan.tiers.len(), 2);
+        assert_eq!(plan.tiers[0].aggregate, "_policy_sensor_policy_tier1");
+        assert_eq!(plan.tiers[1].resolution_ms, 3_600_000);
+    }
 
-        let segments = compute_tier_segments(&policy, (query_start, query_end), now);
-
-        // Should produce 2 segments: raw (last 7d) + tier1 (7d-30d).
+    #[test]
+    fn range_spanning_raw_and_tier1_gives_two_segments() {
+        let plan = tiering_plan(&make_policy());
+        let now = 100_000_000_000i64;
+        let segments = plan
+            .segments((now - 30 * 86_400_000, now), now)
+            .expect("split");
         assert_eq!(segments.len(), 2);
-
-        // First segment (oldest) = tier1 aggregate.
-        assert_eq!(segments[0].tier_index, 1);
-        assert_eq!(segments[0].collection, "_policy_sensor_policy_tier1");
-        assert_eq!(segments[0].bucket_interval_ms, 60_000);
-
-        // Second segment (newest) = raw.
-        assert_eq!(segments[1].tier_index, 0);
-        assert_eq!(segments[1].collection, "sensor_data");
-        assert_eq!(segments[1].bucket_interval_ms, 0);
+        assert_eq!(segments[0].source, TierSource::Raw);
+        assert_eq!(segments[1].source, TierSource::Tier(0));
     }
 
     #[test]
-    fn recent_query_uses_raw_only() {
-        let policy = make_policy();
+    fn old_range_reads_the_coarsest_tier_only() {
+        let plan = tiering_plan(&make_policy());
         let now = 100_000_000_000i64;
-        let query_start = now - 3_600_000; // 1 hour ago
-        let query_end = now;
-
-        let segments = compute_tier_segments(&policy, (query_start, query_end), now);
-
-        // Entirely within raw tier.
+        let segments = plan
+            .segments((now - 365 * 86_400_000, now - 180 * 86_400_000), now)
+            .expect("split");
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].tier_index, 0);
-        assert_eq!(segments[0].collection, "sensor_data");
+        assert_eq!(segments[0].source, TierSource::Tier(1));
     }
 
     #[test]
-    fn old_query_uses_highest_tier() {
-        let policy = make_policy();
-        let now = 100_000_000_000i64;
-        let query_start = now - 365 * 86_400_000; // 1 year ago
-        let query_end = now - 180 * 86_400_000; // 6 months ago
-
-        let segments = compute_tier_segments(&policy, (query_start, query_end), now);
-
-        // Entirely within tier2 (1h aggregates, 90d-2y).
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].tier_index, 2);
-        assert_eq!(segments[0].collection, "_policy_sensor_policy_tier2");
-    }
-
-    #[test]
-    fn plan_produces_tasks_per_segment() {
-        let policy = make_policy();
-        // Use wall-clock now since plan_tiered_scan uses SystemTime internally.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let tasks = plan_tiered_scan(
-            &policy,
-            ScopeIds {
-                tenant_id: TenantId::new(1),
-                database_id: crate::types::DatabaseId::DEFAULT,
-            },
-            (now - 30 * 86_400_000, now),
-            Vec::new(),
-            Vec::new(),
-            vec![("avg".into(), "temperature".into())],
-            String::new(),
-        );
-
-        assert!(tasks.len() >= 2); // At least raw + tier1.
+    fn explain_lists_segments_oldest_first() {
+        let text = explain_tier_selection(&make_policy(), (0, i64::MAX)).expect("explain");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("AUTO_TIER plan for 'sensor_data'"));
+        assert!(lines.last().is_some_and(|l| l.contains("RAW")));
     }
 }

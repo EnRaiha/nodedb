@@ -13,6 +13,29 @@ pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }
 
+/// Refuse unless `name` is a timeseries collection of `database_id`: `42P01`
+/// when it does not exist, `42809` when it has another engine.
+pub(super) fn require_timeseries(
+    state: &crate::control::state::SharedState,
+    database_id: nodedb_types::DatabaseId,
+    tenant_id: crate::types::TenantId,
+    name: &str,
+) -> Result<(), DdlError> {
+    let catalog = state.credentials.catalog();
+    match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
+        Ok(Some(coll)) if coll.collection_type.is_timeseries() => Ok(()),
+        Ok(Some(_)) => Err(ddl_err(
+            "42809",
+            format!("'{name}' is not a timeseries collection"),
+        )),
+        Ok(None) => Err(ddl_err(
+            "42P01",
+            format!("collection '{name}' does not exist"),
+        )),
+        Err(e) => Err(DdlError::from_error(&e)),
+    }
+}
+
 /// Parse a `WITH (key = 'value', ...)` clause from a split DDL statement.
 ///
 /// Returns `None` if no WITH clause is present or if the clause is empty.

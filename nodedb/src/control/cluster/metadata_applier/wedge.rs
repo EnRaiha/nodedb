@@ -112,6 +112,7 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::UndefinedFunction { .. }
         | crate::Error::UndefinedObject { .. }
         | crate::Error::ObjectNotInPrerequisiteState { .. }
+        | crate::Error::WrongObjectType { .. }
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }

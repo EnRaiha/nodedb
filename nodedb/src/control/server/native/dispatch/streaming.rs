@@ -178,6 +178,7 @@ pub(crate) async fn try_open_sql_stream(
         projection: output_schema.cloned(),
         redaction: Some(QueryRedaction::for_plan(
             ctx.tenant_id(),
+            database_id,
             ctx.auth_context(),
             &child_plan,
         )),

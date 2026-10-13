@@ -240,10 +240,16 @@ fn graph_is_write(op: &GraphOp) -> bool {
 
 fn timeseries_is_write(op: &TimeseriesOp) -> bool {
     match op {
-        TimeseriesOp::Ingest { .. } | TimeseriesOp::Truncate { .. } => true,
+        TimeseriesOp::Ingest { .. }
+        | TimeseriesOp::Truncate { .. }
+        | TimeseriesOp::RefreshAggregate { .. } => true,
         // The resolve pass writes nothing; the ingest it reports is proposed
-        // separately by the write-resolve orchestrator.
-        TimeseriesOp::ResolveIngest(_) | TimeseriesOp::Scan { .. } => false,
+        // separately by the write-resolve orchestrator. Partition maintenance
+        // changes no row.
+        TimeseriesOp::ResolveIngest(_)
+        | TimeseriesOp::Scan { .. }
+        | TimeseriesOp::Partitions { .. }
+        | TimeseriesOp::ReadAggregate { .. } => false,
     }
 }
 

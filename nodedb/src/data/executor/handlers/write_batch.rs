@@ -209,6 +209,8 @@ impl CoreLoop {
                             unique: UniqueJudge::Unit,
                             wal_lsn: task.wal_lsn(),
                             resolved_targets: resolved_sum_targets.as_slice(),
+                            guards:
+                                crate::data::executor::enforcement::typeguard::GuardScope::Document,
                         },
                     )
                 });

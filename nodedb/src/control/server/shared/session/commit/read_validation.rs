@@ -299,6 +299,7 @@ async fn current_versions(
                 // The leader proves its leadership itself: it answers each
                 // home under its leader lease, or refuses it.
                 linearizable: false,
+                user_roles: &[],
             })
             .await?
             .payloads

@@ -156,7 +156,9 @@ where
 
     let sessions = ctx.txn.sessions;
     let session_id = ctx.txn.session_id;
-    if let Some((ops, kind)) = expand_in_tx(ctx.state, sessions, session_id, &mut task).await? {
+    if let Some((ops, kind)) =
+        expand_in_tx(ctx.state, ctx.identity, sessions, session_id, &mut task).await?
+    {
         return route_expanded(ctx, ops, kind, true, &dispatch).await;
     }
     // A predicate write whose collection fires a row body writes each row

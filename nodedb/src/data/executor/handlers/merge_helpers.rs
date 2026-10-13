@@ -2,7 +2,7 @@
 
 //! Pure helper functions for MERGE statement execution (arm selection, action application).
 
-use crate::bridge::scan_filter::ScanFilter;
+use crate::bridge::scan_filter::decode_scan_filters;
 use crate::data::executor::doc_format;
 use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_physical::physical_plan::document::merge_types::{
@@ -29,8 +29,9 @@ pub(super) fn find_arm<'a>(
         if c.extra_predicate.is_empty() {
             return Ok(Some(c));
         }
-        let filters: Vec<ScanFilter> =
-            zerompk::from_msgpack(&c.extra_predicate).unwrap_or_default();
+        // A malformed predicate is an error. Reading it as "no predicate"
+        // would fire this arm for every row.
+        let filters = decode_scan_filters(&c.extra_predicate, "MERGE clause predicate")?;
         let mut all_match = true;
         for f in &filters {
             if !f.matches_binary(&context_bytes)? {
@@ -134,14 +135,17 @@ pub(in crate::data::executor) fn check_declared_pk_not_null(
 /// msgpack encoding, an expression evaluates against the merged document.
 /// Shared by [`build_insert_doc`] and [`build_update_doc`]. An assignment
 /// expression is write-path-shaped, so a division/modulo-by-zero fails the
-/// whole MERGE statement.
+/// whole MERGE statement. A literal that does not decode is an error, never
+/// a NULL written in its place.
 fn resolve_update_value(
     val: &UpdateValue,
     merged_ndb: &nodedb_types::Value,
 ) -> crate::Result<serde_json::Value> {
     Ok(match val {
         UpdateValue::Literal(bytes) => {
-            nodedb_types::json_from_msgpack(bytes).unwrap_or(serde_json::Value::Null)
+            nodedb_types::json_from_msgpack(bytes).map_err(|e| crate::Error::Codec {
+                detail: format!("MERGE assignment literal: {e}"),
+            })?
         }
         UpdateValue::Expr(expr) => expr.eval(merged_ndb)?.into(),
     })
@@ -161,14 +165,4 @@ pub(super) fn build_merged(
         }
     }
     merged
-}
-
-pub(super) fn json_to_str(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
-    }
 }

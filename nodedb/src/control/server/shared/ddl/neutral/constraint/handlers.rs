@@ -8,24 +8,23 @@
 
 use nodedb_types::DatabaseId;
 
-use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::catalog::types::StateTransitionDef;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
 
-use super::support::err;
+use super::support::{err, persist_constraints};
 
 /// Handle `ALTER COLLECTION x ADD CONSTRAINT name ON COLUMN col TRANSITIONS (...)`.
 pub async fn add_state_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let parts: Vec<&str> = sql.split_whitespace().collect();
-    let upper = sql.to_uppercase();
 
     let coll_name = parse_ident_token(
         parts
@@ -49,7 +48,7 @@ pub async fn add_state_constraint(
             .ok_or_else(|| err("42601", "missing column name after ON COLUMN"))?,
     )?;
 
-    let transitions = super::parse::parse_transitions(&upper)?;
+    let transitions = super::parse::parse_transitions(sql)?;
 
     let def = StateTransitionDef {
         name: constraint_name.clone(),
@@ -60,7 +59,7 @@ pub async fn add_state_constraint(
     let catalog = state.credentials.catalog();
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
+        .get_collection(database_id, tenant_id, &coll_name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
@@ -76,11 +75,7 @@ pub async fn add_state_constraint(
     }
 
     coll.state_constraints.push(def);
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_constraints(state, &coll).await?;
 
     Ok(vec![DdlResult::Status {
         command: "ALTER COLLECTION".to_string(),
@@ -92,6 +87,7 @@ pub async fn add_state_constraint(
 pub async fn add_transition_check(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -125,7 +121,7 @@ pub async fn add_transition_check(
     let catalog = state.credentials.catalog();
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
+        .get_collection(database_id, tenant_id, &coll_name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
@@ -137,11 +133,7 @@ pub async fn add_transition_check(
     }
 
     coll.transition_checks.push(def);
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_constraints(state, &coll).await?;
 
     Ok(vec![DdlResult::Status {
         command: "ALTER COLLECTION".to_string(),
@@ -153,6 +145,7 @@ pub async fn add_transition_check(
 pub async fn add_check_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -202,7 +195,7 @@ pub async fn add_check_constraint(
     let catalog = state.credentials.catalog();
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
+        .get_collection(database_id, tenant_id, &coll_name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
@@ -226,11 +219,7 @@ pub async fn add_check_constraint(
     }
 
     coll.check_constraints.push(def);
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_constraints(state, &coll).await?;
 
     Ok(vec![DdlResult::Status {
         command: "ALTER COLLECTION".to_string(),
@@ -242,6 +231,7 @@ pub async fn add_check_constraint(
 pub async fn drop_constraint(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -263,7 +253,7 @@ pub async fn drop_constraint(
     let catalog = state.credentials.catalog();
 
     let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
+        .get_collection(database_id, tenant_id, &coll_name)
         .map_err(|e| DdlError::from_error(&e))?
         .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
 
@@ -285,11 +275,7 @@ pub async fn drop_constraint(
         ));
     }
 
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_constraints(state, &coll).await?;
 
     Ok(vec![DdlResult::Status {
         command: "DROP CONSTRAINT".to_string(),

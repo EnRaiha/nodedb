@@ -5,37 +5,43 @@
 //! Every target row gets its OWN registered surrogate, never the source
 //! row's, so cross-engine search resolves back to the target identity.
 //! Since surrogate registration is Control-Plane-only, the copy runs as a
-//! DP→CP→DP round trip: scan the source page-by-page
-//! (`DocumentOp::MaterializeScan`), assign each row a fresh target-keyed
-//! surrogate, write each page as one atomic `BatchInsert`.
+//! DP→CP→DP round trip: read the source batch by batch
+//! (`control::source_read`), assign each row a fresh target-keyed
+//! surrogate, write each batch as one atomic `BatchInsert`.
 //!
-//! Each page is atomic (a violation aborts only that page); across pages
+//! The source is read like a SELECT: its engine, WHERE, ORDER BY, LIMIT,
+//! OFFSET, DISTINCT, windows, `AS OF`, and read policy all hold. A plain
+//! document scan is read page by page with no row bound. Any other source is
+//! read once, bounded by the scan byte budget, which fails loudly.
+//!
+//! Each batch is atomic (a violation aborts only that batch); across batches
 //! writes are separate transactions with `BatchInsert`'s usual partial
-//! visibility. Source scan and target write are separated by the
+//! visibility. Source read and target write are separated by the
 //! assignment round trip, so this is NOT globally serializable against
-//! concurrent source mutation — a deliberate, documented relaxation.
+//! concurrent source mutation — a deliberate, documented relaxation. A copy
+//! into its own source is planned as a one-shot read, so it never reads the
+//! rows it writes.
 
 use nodedb_types::{DatabaseId, Lsn, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
-use crate::control::maintenance::clone_materializer::scan_source_page;
 use crate::control::orchestrated_write::apply_orchestrated_write;
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::source_read::{SourceReadContext, SourceReader};
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_physical::physical_plan::{DocumentOp, RowSource};
 
 /// Consume an authorized `INSERT ... SELECT` task at the orchestration boundary.
 pub async fn run_authorized_insert_select(
     state: &SharedState,
     authorized: crate::control::server::shared::authorization::AuthorizedTask,
 ) -> crate::Result<Response> {
+    let identity = authorized.identity().clone();
     let task = authorized.into_physical_task();
     let PhysicalPlan::Document(DocumentOp::InsertSelect {
         target_collection,
-        source_collection,
-        source_filters,
-        source_limit,
-        column_map,
+        source,
     }) = task.plan
     else {
         return Err(crate::Error::BadRequest {
@@ -44,168 +50,131 @@ pub async fn run_authorized_insert_select(
     };
     run_insert_select(
         state,
+        &identity,
         task.tenant_id,
         task.database_id,
-        &CopyRequest {
-            target_collection: target_collection.as_str(),
-            source_collection: source_collection.as_str(),
-            source_filters: &source_filters,
-            source_limit,
-            column_map: &column_map,
-        },
+        target_collection.as_str(),
+        &source,
     )
     .await
 }
 
-/// The plan-derived operands of one `INSERT ... SELECT` copy.
-pub(crate) struct CopyRequest<'a> {
-    pub target_collection: &'a str,
-    pub source_collection: &'a str,
-    /// Serialized `Vec<ScanFilter>` residual `WHERE` predicate.
-    pub source_filters: &'a [u8],
-    /// Bounds how many source rows are copied.
-    pub source_limit: usize,
-    /// Serialized `Vec<ComputedColumn>` shaping each copied row. Empty for a
-    /// plain copy.
-    pub column_map: &'a [u8],
-}
-
-/// Drive an `INSERT ... SELECT` from `source_collection` into `target_collection`.
-///
-/// The copy operands travel in `CopyRequest`: `target_collection` /
-/// `source_collection` are the (db-qualified) collection names as they
-/// appear in the `DocumentOp::InsertSelect` plan.
+/// Drive an `INSERT ... SELECT` from `source` into `target_collection`, the
+/// db-qualified name as it appears in the `DocumentOp::InsertSelect` plan.
 ///
 /// Returns a `{"inserted": N}` response mirroring the shape the autocommit
 /// dispatch loops shape as an `INSERT` command tag.
-pub(crate) async fn run_insert_select(
+async fn run_insert_select(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    req: &CopyRequest<'_>,
+    target_collection: &str,
+    source: &RowSource,
 ) -> crate::Result<Response> {
-    let spec = resolve_copy_spec(
+    let spec = resolve_copy_spec(state, tenant_id, database_id, target_collection)?;
+    let ctx = SourceReadContext {
         state,
+        identity,
         tenant_id,
         database_id,
-        req.target_collection,
-        req.source_filters,
-        req.column_map,
-    )?;
-
-    let mut cursor: Vec<u8> = Vec::new();
-    let mut remaining = req.source_limit;
+        txn_id: None,
+    };
+    let mut reader = SourceReader::new(source)?;
     let mut total_inserted: usize = 0;
     let mut max_lsn = Lsn::ZERO;
 
-    while remaining > 0 {
-        // Phase 1: scan one source page (point-in-time snapshot).
-        let (entries, next_cursor) = scan_source_page(
-            state,
-            tenant_id,
-            database_id,
-            req.source_collection,
-            &cursor,
-            None,
-            None,
-        )
-        .await?;
-
-        // Phase 2: normalize (strict → msgpack), filter surviving rows, and
-        // assign fresh target surrogates via the shared copy pipeline.
+    while let Some(batch) = reader.next_batch(&ctx).await? {
+        if batch.is_empty() {
+            continue;
+        }
+        // Assign fresh target surrogates to the shaped source rows.
         let rows = assign_page_rows(
             state,
             tenant_id,
             database_id,
-            req.target_collection,
+            target_collection,
             &spec,
-            entries,
-            &mut remaining,
+            batch,
         )
         .await?;
 
-        // Phase 3: one atomic batch write for this page.
-        if !rows.is_empty() {
-            let page_len = rows.len();
-            let mut documents: Vec<(String, Vec<u8>)> = Vec::with_capacity(page_len);
-            let mut surrogates: Vec<Surrogate> = Vec::with_capacity(page_len);
-            for (document_id, value, surrogate) in rows {
-                documents.push((document_id, value));
-                surrogates.push(surrogate);
-            }
-            // Resolve this page's sum targets: the orchestrated apply bypasses
-            // the statement-level resolution pass, so without this the fold
-            // has no target to credit. Resolved per page since each is its own
-            // atomic write.
-            let page_bodies: Vec<&[u8]> =
-                documents.iter().map(|(_, body)| body.as_slice()).collect();
-            let mut resolved_sum_targets =
-                crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
-                    state,
-                    &page_bodies,
-                    req.target_collection,
-                    tenant_id,
-                    database_id,
-                    crate::types::TraceId::ZERO,
-                )
-                .await?;
-            // Period-lock target for the same page, in the SAME slot — a
-            // target collection under a period lock reads its reference row's
-            // surrogate off `resolved_sum_targets` exactly like a
-            // materialized-sum fold does.
-            resolved_sum_targets.extend(
-                crate::control::planner::period_lock::resolve_period_lock_targets_for_bodies(
-                    state,
-                    &page_bodies,
-                    req.target_collection,
-                    tenant_id,
-                    database_id,
-                    crate::types::TraceId::ZERO,
-                )
-                .await?,
-            );
-
-            let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection: nodedb_types::QualifiedCollection::from_stored(
-                    req.target_collection.to_string(),
-                ),
-                documents,
-                surrogates,
-                // `INSERT ... SELECT` is paged across many of these writes, so
-                // no single page owns the statement's answer; the clause is
-                // refused at planning rather than half-answered here.
-                returning: None,
-                rls_filters: Vec::new(),
-                resolved_sum_targets,
-                // Every page applies on the target's own vShard, so a binding
-                // whose target is co-resident folds here; nothing is deferred
-                // to a sibling task.
-                deferred_sum_targets: Vec::new(),
-            });
-            // Each page lands on the target's owner and every replica.
-            let resp = apply_orchestrated_write(
+        // One atomic batch write per source batch.
+        let mut documents: Vec<(String, Vec<u8>)> = Vec::with_capacity(rows.len());
+        let mut surrogates: Vec<Surrogate> = Vec::with_capacity(rows.len());
+        for (document_id, value, surrogate) in rows {
+            documents.push((document_id, value));
+            surrogates.push(surrogate);
+        }
+        // Resolve this batch's sum targets: the orchestrated apply bypasses
+        // the statement-level resolution pass, so without this the fold has
+        // no target to credit. Resolved per batch since each is its own
+        // atomic write.
+        let page_bodies: Vec<&[u8]> = documents.iter().map(|(_, body)| body.as_slice()).collect();
+        let mut resolved_sum_targets =
+            crate::control::planner::materialized_sum::resolve_sum_targets_for_bodies(
                 state,
+                &page_bodies,
+                target_collection,
                 tenant_id,
                 database_id,
-                req.target_collection,
-                plan,
+                crate::types::TraceId::ZERO,
             )
             .await?;
-            if resp.status != Status::Ok {
-                // Atomic page failure (e.g. constraint violation): the page's
-                // rows did not land. Surface the DP error verbatim.
-                return Ok(resp);
-            }
-            total_inserted += decode_inserted(&resp.payload).unwrap_or(page_len);
-            if resp.watermark_lsn > max_lsn {
-                max_lsn = resp.watermark_lsn;
-            }
-        }
+        // Period-lock target for the same batch, in the SAME slot — a target
+        // collection under a period lock reads its reference row's surrogate
+        // off `resolved_sum_targets` exactly like a materialized-sum fold does.
+        resolved_sum_targets.extend(
+            crate::control::planner::period_lock::resolve_period_lock_targets_for_bodies(
+                state,
+                &page_bodies,
+                target_collection,
+                tenant_id,
+                database_id,
+                crate::types::TraceId::ZERO,
+            )
+            .await?,
+        );
 
-        if next_cursor.is_empty() {
-            break;
+        let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
+            collection: nodedb_types::QualifiedCollection::from_stored(
+                target_collection.to_string(),
+            ),
+            documents,
+            // A copied row whose key the target already holds is refused,
+            // as a VALUES row is.
+            if_absent: false,
+            surrogates,
+            // `INSERT ... SELECT` is batched across many of these writes, so
+            // no single batch owns the statement's answer; the clause is
+            // refused at planning rather than half-answered here.
+            returning: None,
+            rls_filters: Vec::new(),
+            resolved_sum_targets,
+            // Every batch applies on the target's own vShard, so a binding
+            // whose target is co-resident folds here; nothing is deferred to
+            // a sibling task.
+            deferred_sum_targets: Vec::new(),
+        });
+        // Each batch lands on the target's owner and every replica.
+        let resp = apply_orchestrated_write(
+            state,
+            tenant_id,
+            database_id,
+            target_collection,
+            plan,
+            identity.role_names(),
+        )
+        .await?;
+        if resp.status != Status::Ok {
+            // Atomic batch failure (e.g. constraint violation): the batch's
+            // rows did not land. Surface the DP error verbatim.
+            return Ok(resp);
         }
-        cursor = next_cursor;
+        total_inserted += decode_inserted(&resp.payload)?;
+        if resp.watermark_lsn > max_lsn {
+            max_lsn = resp.watermark_lsn;
+        }
     }
 
     let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "inserted": total_inserted }))
@@ -228,15 +197,36 @@ pub(crate) async fn run_insert_select(
     })
 }
 
-/// Read the `"inserted"` count from a `BatchInsert` response payload.
-fn decode_inserted(payload: &[u8]) -> Option<usize> {
-    if payload.is_empty() {
-        return None;
-    }
-    let json: serde_json::Value = nodedb_types::json_from_msgpack(payload)
-        .ok()
-        .or_else(|| sonic_rs::from_slice(payload).ok())?;
+/// Read the `"inserted"` count from a `BatchInsert` response payload. A
+/// payload without the count is an error: the statement tag would otherwise
+/// report rows the write never confirmed.
+fn decode_inserted(payload: &[u8]) -> crate::Result<usize> {
+    let malformed = || crate::Error::Internal {
+        detail: "INSERT ... SELECT: batch insert answered without an 'inserted' count".into(),
+    };
+    let json = nodedb_types::json_from_msgpack(payload).map_err(|_| malformed())?;
     json.get("inserted")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(malformed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_inserted_count_is_read_from_the_payload() {
+        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "inserted": 3 }))
+            .expect("encode payload");
+        assert_eq!(decode_inserted(&payload).expect("count"), 3);
+    }
+
+    #[test]
+    fn a_payload_without_the_count_is_an_error() {
+        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "affected": 3 }))
+            .expect("encode payload");
+        assert!(decode_inserted(&payload).is_err());
+        assert!(decode_inserted(&[]).is_err());
+    }
 }

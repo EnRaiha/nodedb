@@ -124,8 +124,22 @@ pub(super) fn wal_append_timeseries_op(
                 resolved_now_ms: None,
             }
         }
-        // Reads / read-only resolve pass — no engine mutation here.
-        TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => TimeseriesAppendOutcome {
+        // A refresh cut writes no row, and every replica applies it at its
+        // log position, so no forward record replays it: a cut replayed after
+        // later records would cut at different rows. A replicated proposal's
+        // apply records its key in a payload-free marker, so a second
+        // committed copy is skipped after a restart. The Data Plane skips a
+        // repeated `refresh_id` on its own as well.
+        TimeseriesOp::RefreshAggregate { .. } => TimeseriesAppendOutcome {
+            lsn: wal.append_proposal_applied(tenant_id, vshard_id, database_id)?,
+            resolved_now_ms: None,
+        },
+        // Reads / read-only resolve pass, and partition maintenance, which
+        // changes no row — no engine mutation here.
+        TimeseriesOp::Scan { .. }
+        | TimeseriesOp::ResolveIngest(_)
+        | TimeseriesOp::Partitions { .. }
+        | TimeseriesOp::ReadAggregate { .. } => TimeseriesAppendOutcome {
             lsn: None,
             resolved_now_ms: None,
         },
@@ -492,6 +506,8 @@ mod tests {
             rls_filters: vec![],
             system_time: Default::default(),
             valid_at_ms: None,
+            having: vec![],
+            tiering: None,
         });
 
         let outcome = super::super::wal_append_if_write(

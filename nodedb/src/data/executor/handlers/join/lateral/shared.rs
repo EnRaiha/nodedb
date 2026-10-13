@@ -16,26 +16,45 @@ pub(super) const MAX_RESULT_ROWS: usize = 100_000;
 /// (`id`) lives at the top level; all other fields live inside `data`. This
 /// function checks both levels so that correlation predicates referencing the
 /// primary key (e.g. `WHERE e.user_id = u.id`) work correctly.
-pub(super) fn extract_outer_field(outer_bytes: &[u8], field: &str) -> Option<nodedb_types::Value> {
+///
+/// `Ok(None)` when neither level has the field. A field whose bytes do not
+/// decode is an error, never a missing field: a missing correlation value
+/// drops the predicate it binds.
+pub(super) fn extract_outer_field(
+    outer_bytes: &[u8],
+    field: &str,
+) -> crate::Result<Option<nodedb_types::Value>> {
+    let decode = |bytes: &[u8]| {
+        nodedb_types::value_from_msgpack(bytes).map_err(|e| crate::Error::Codec {
+            detail: format!("LATERAL outer field '{field}': {e}"),
+        })
+    };
     // Prefer the `data` sub-map (user-visible document fields, including the
     // user-provided primary key). The wrapper-level `id` is the internal hex
     // surrogate and must not shadow the user-visible `id` stored in `data`.
     if let Some((s, e)) = msgpack_scan::extract_field(outer_bytes, 0, "data") {
         let data_bytes = &outer_bytes[s..e];
-        if let Some((start, end)) = msgpack_scan::extract_field(data_bytes, 0, field)
-            && let Ok(v) = nodedb_types::value_from_msgpack(&data_bytes[start..end])
-        {
-            return Some(v);
+        if let Some((start, end)) = msgpack_scan::extract_field(data_bytes, 0, field) {
+            return decode(&data_bytes[start..end]).map(Some);
         }
     }
     // Fall back to the top-level wrapper (covers non-`data` wrapper fields
     // that have no user-data counterpart).
-    if let Some((start, end)) = msgpack_scan::extract_field(outer_bytes, 0, field)
-        && let Ok(v) = nodedb_types::value_from_msgpack(&outer_bytes[start..end])
-    {
-        return Some(v);
+    if let Some((start, end)) = msgpack_scan::extract_field(outer_bytes, 0, field) {
+        return decode(&outer_bytes[start..end]).map(Some);
     }
-    None
+    Ok(None)
+}
+
+/// The correlation value `outer_col` supplies for an equality with an inner
+/// column. `Ok(None)` when the outer value is missing or NULL: `inner = NULL`
+/// is never true, so no inner row matches.
+pub(super) fn correlation_value(
+    outer_bytes: &[u8],
+    outer_col: &str,
+) -> crate::Result<Option<nodedb_types::Value>> {
+    Ok(extract_outer_field(outer_bytes, outer_col)?
+        .filter(|v| !matches!(v, nodedb_types::Value::Null)))
 }
 
 /// Walk `filters` and substitute any `*Column` filter whose column reference
@@ -52,7 +71,7 @@ pub(super) fn bind_outer_values(
     filters: Vec<ScanFilter>,
     outer_bytes: &[u8],
     outer_alias: &str,
-) -> Vec<ScanFilter> {
+) -> crate::Result<Vec<ScanFilter>> {
     filters
         .into_iter()
         .map(|f| bind_filter_outer(f, outer_bytes, outer_alias))
@@ -83,7 +102,7 @@ pub(super) fn bind_filter_outer(
     f: ScanFilter,
     outer_bytes: &[u8],
     outer_alias: &str,
-) -> ScanFilter {
+) -> crate::Result<ScanFilter> {
     let literal_op = match f.op {
         FilterOp::EqColumn => Some(FilterOp::Eq),
         FilterOp::GtColumn => Some(FilterOp::Gt),
@@ -110,25 +129,25 @@ pub(super) fn bind_filter_outer(
                     clause
                         .into_iter()
                         .map(|sf| bind_filter_outer(sf, outer_bytes, outer_alias))
-                        .collect()
+                        .collect::<crate::Result<Vec<_>>>()
                 })
-                .collect();
-            return ScanFilter {
+                .collect::<crate::Result<Vec<_>>>()?;
+            return Ok(ScanFilter {
                 field: unqualified,
                 clauses: bound_clauses,
                 ..f
-            };
+            });
         }
-        return ScanFilter {
+        return Ok(ScanFilter {
             field: unqualified,
             ..f
-        };
+        });
     };
 
     // The column reference is stored as a string in `value`.
     let col_ref = match &f.value {
         nodedb_types::Value::String(s) => s.clone(),
-        _ => return f,
+        _ => return Ok(f),
     };
 
     // Resolve: strip the outer alias prefix if present (e.g. "u.created_at" → "created_at").
@@ -141,7 +160,7 @@ pub(super) fn bind_filter_outer(
         col_ref.clone()
     };
 
-    if let Some(val) = extract_outer_field(outer_bytes, &bare) {
+    if let Some(val) = extract_outer_field(outer_bytes, &bare)? {
         // Also strip any table-alias qualifier from the left-side field name
         // (e.g. "e.log_time" → "log_time") so the inner scan can find it.
         let unqualified_field = f
@@ -149,16 +168,16 @@ pub(super) fn bind_filter_outer(
             .find('.')
             .map_or(f.field.as_str(), |dot| &f.field[dot + 1..])
             .to_string();
-        ScanFilter {
+        Ok(ScanFilter {
             field: unqualified_field,
             op: lit_op,
             value: val,
             clauses: Vec::new(),
             expr: None,
-        }
+        })
     } else {
         // Column not found in outer row — leave filter unchanged (will fail at scan time).
-        f
+        Ok(f)
     }
 }
 
@@ -171,7 +190,9 @@ pub(super) fn build_scan_plan(
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Scan {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_string()),
-        limit: limit.min(100_000),
+        // One row past the result cap, so an inner result the cap cuts
+        // overflows it and errors instead of being cut silently.
+        limit: limit.min(MAX_RESULT_ROWS + 1),
         offset: 0,
         sort_keys: order_by.to_vec(),
         filters: filter_bytes,
