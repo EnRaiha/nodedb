@@ -5,6 +5,7 @@
 use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
+use crate::control::constraint_install::{ConstraintTarget, constraint_targets};
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::server::shared::session::ddl_buffer;
 use crate::control::state::SharedState;
@@ -74,10 +75,14 @@ pub async fn propose_catalog_batch_async(
 
     // The guards drop before the authorization barrier below, as on the
     // single-entry path.
-    let Some((log_index, entries)) = propose_replicated(shared, handle.as_ref(), plan).await?
+    let Some((log_index, entries, constraint_targets)) =
+        propose_replicated(shared, handle.as_ref(), plan).await?
     else {
         return Ok(CatalogBatch::empty());
     };
+    // A changed constraint set is live on the collection's data log before
+    // the batch returns, so the first CRDT apply after it is not fenced.
+    crate::control::constraint_install::install_constraints(shared, &constraint_targets).await?;
     if entries.iter().any(CatalogEntry::bears_authorization) {
         crate::control::security::auth_lease::authorization_barrier(
             shared,
@@ -96,19 +101,23 @@ pub async fn propose_catalog_batch_async(
     })
 }
 
+/// A replicated batch: its log index, its stamped entries, and the
+/// collections whose constraint version it changed.
+type ReplicatedBatch = (u64, Vec<CatalogEntry>, Vec<ConstraintTarget>);
+
 /// Plan, drain, stamp, and propose a batch under the preparation lock and
-/// lease, and wait until this node applied it. Returns its log index and its
-/// stamped entries, or `None` for a plan with no entries. Both guards are
-/// released before it returns.
+/// lease, and wait until this node applied it. Returns the
+/// [`ReplicatedBatch`], or `None` for a plan with no entries. Both guards
+/// are released before it returns.
 async fn propose_replicated(
     shared: &SharedState,
     handle: &dyn MetadataRaftHandle,
     plan: impl FnOnce(&SystemCatalog) -> crate::Result<Vec<CatalogEntry>>,
-) -> Result<Option<(u64, Vec<CatalogEntry>)>, Error> {
+) -> Result<Option<ReplicatedBatch>, Error> {
     let _local_ddl_guard = lock_ddl_preparation_async(shared).await;
     let lease = acquire_ddl_prepare_lease_async(shared, handle).await?;
-    let proposed: Result<Option<(u64, Vec<CatalogEntry>)>, Error> = async {
-        let Some(entries) = plan_drain_and_stamp(shared, plan).await? else {
+    let proposed: Result<Option<ReplicatedBatch>, Error> = async {
+        let Some((entries, targets)) = plan_drain_and_stamp(shared, plan).await? else {
             return Ok::<_, Error>(None);
         };
         let mut wrapped = Vec::with_capacity(entries.len());
@@ -125,22 +134,23 @@ async fn propose_replicated(
                 .instant(),
         )
         .await?;
-        Ok::<_, Error>(Some((log_index, entries)))
+        Ok::<_, Error>(Some((log_index, entries, targets)))
     }
     .await;
     lease.release().await;
     proposed
 }
 
-/// Plan, drain, and stamp a batch. The caller holds the DDL preparation lock
-/// and lease. `None` is a plan with no entries.
+/// Plan, drain, and stamp a batch, and name the collections whose constraint
+/// version the stamped batch changes. The caller holds the DDL preparation
+/// lock and lease. `None` is a plan with no entries.
 ///
 /// The batch's apply ends every drain it started. A failure before the batch
 /// is proposed ends them here: a drain has no wall-clock expiry.
 async fn plan_drain_and_stamp(
     shared: &SharedState,
     plan: impl FnOnce(&SystemCatalog) -> crate::Result<Vec<CatalogEntry>>,
-) -> Result<Option<Vec<CatalogEntry>>, Error> {
+) -> Result<Option<(Vec<CatalogEntry>, Vec<ConstraintTarget>)>, Error> {
     let catalog = shared.credentials.catalog();
     let entries = plan(catalog)?;
     if entries.is_empty() {
@@ -149,8 +159,13 @@ async fn plan_drain_and_stamp(
     if let Err(error) = drain_batch(shared, &entries).await {
         return Err(end_batch_drains(shared, &entries, error).await);
     }
-    match catalog_entry::descriptor_stamp::stamp_batch(entries.clone(), &shared.hlc_clock, catalog)
-    {
+    let stamped =
+        catalog_entry::descriptor_stamp::stamp_batch(entries.clone(), &shared.hlc_clock, catalog)
+            .and_then(|stamped| {
+                let targets = constraint_targets(catalog, &stamped)?;
+                Ok((stamped, targets))
+            });
+    match stamped {
         Ok(stamped) => Ok(Some(stamped)),
         Err(error) => Err(end_batch_drains(shared, &entries, error).await),
     }

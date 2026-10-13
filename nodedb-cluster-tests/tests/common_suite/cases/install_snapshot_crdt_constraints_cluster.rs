@@ -7,7 +7,7 @@
 //! ## What this guards
 //!
 //! `CREATE UNIQUE INDEX` bumps the collection's `constraint_version` in the
-//! catalog and (once the metadata-leader reconcile loop runs) installs the
+//! catalog and, before it returns, installs the
 //! translated `Constraint` into the hosting node's per-core CRDT validator
 //! for that collection. U6 made `MetaOp::CreateTenantSnapshot` (`create.rs`)
 //! carry the validator's installed constraint set into the snapshot's

@@ -14,6 +14,7 @@ pub mod checkpoint_task;
 pub mod clone;
 pub mod cluster;
 pub mod cold_tier;
+pub mod constraint_install;
 pub mod crdt_admission;
 pub mod crdt_post_image_policy;
 pub mod custom_type;

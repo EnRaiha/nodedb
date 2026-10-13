@@ -9,6 +9,9 @@
 //! same `draft -> active` update, each forked from the base. The session
 //! without `approver` is refused and the row stays `draft`. The session with
 //! `approver` is admitted and the row reads `active`.
+//!
+//! Every push is sent once. CREATE and ALTER install the collection's CRDT
+//! constraint version before they return, so no push is fenced with `Gap`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -35,12 +38,6 @@ const AUDIENCE: &str = "nodedb-sync";
 /// How long the test waits for the server's verdict on one delta.
 const FRAME_WAIT: Duration = Duration::from_secs(10);
 
-/// How long a client keeps re-pushing a delta the server answers with `Gap`.
-const GAP_RETRY_WINDOW: Duration = Duration::from_secs(30);
-
-/// Pause between re-pushes of a delta answered with `Gap`.
-const GAP_RETRY_PAUSE: Duration = Duration::from_millis(100);
-
 const COLL: &str = "sync_role_flow";
 const ROW: &str = "a";
 
@@ -53,8 +50,10 @@ enum Verdict {
     Applied,
     Refused(String),
     NoAnswer,
-    /// The server answered `Gap` for the whole retry window.
-    StillGapped,
+    /// The server answered `Gap`: the apply was fenced and nothing applied.
+    /// A collection whose constraint version is not installed on the
+    /// applying replica answers this way.
+    Gap,
 }
 
 struct Harness {
@@ -168,42 +167,14 @@ async fn next_frame(ws: &mut Ws) -> Option<SyncFrame> {
     }
 }
 
-/// One answer to one push of a delta.
-enum Answer {
-    Final(Verdict),
-    /// Retryable: nothing applied, and the client re-pushes the same delta.
-    /// A collection whose constraints this core has not installed yet
-    /// answers this way.
-    Gap,
-}
-
-/// Push the updates `doc` holds past `base` as a Lite client does, and wait
-/// for the server's final verdict on it. A `Gap` answer is re-pushed, as a
-/// Lite client re-pushes it, until the server gives a final verdict.
+/// Push the updates `doc` holds past `base` once, as a Lite client does, and
+/// wait for the server's answer to it.
 async fn push(
     ws: &mut Ws,
     doc: &loro::LoroDoc,
     base: &loro::VersionVector,
     mutation_id: u64,
 ) -> Verdict {
-    let deadline = tokio::time::Instant::now() + GAP_RETRY_WINDOW;
-    loop {
-        match push_once(ws, doc, base, mutation_id).await {
-            Answer::Final(verdict) => return verdict,
-            Answer::Gap if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(GAP_RETRY_PAUSE).await;
-            }
-            Answer::Gap => return Verdict::StillGapped,
-        }
-    }
-}
-
-async fn push_once(
-    ws: &mut Ws,
-    doc: &loro::LoroDoc,
-    base: &loro::VersionVector,
-    mutation_id: u64,
-) -> Answer {
     let delta = doc
         .export(loro::ExportMode::updates(base))
         .expect("export loro updates");
@@ -227,7 +198,7 @@ async fn push_once(
             SyncMessageType::DeltaReject => {
                 let reject: DeltaRejectMsg = frame.decode_body().expect("reject decodes");
                 if reject.mutation_id == mutation_id {
-                    return Answer::Final(Verdict::Refused(reject.reason));
+                    return Verdict::Refused(reject.reason);
                 }
             }
             SyncMessageType::DeltaAck => {
@@ -236,17 +207,32 @@ async fn push_once(
                     continue;
                 }
                 match ack.status {
-                    AckStatus::Applied => return Answer::Final(Verdict::Applied),
+                    AckStatus::Applied => return Verdict::Applied,
                     // Provisional: the durable apply has not answered yet.
                     AckStatus::Accepted => continue,
-                    AckStatus::Gap { .. } => return Answer::Gap,
-                    other => return Answer::Final(Verdict::Refused(format!("{other:?}"))),
+                    AckStatus::Gap { .. } => return Verdict::Gap,
+                    other => return Verdict::Refused(format!("{other:?}")),
                 }
             }
             _ => continue,
         }
     }
-    Answer::Final(Verdict::NoAnswer)
+    Verdict::NoAnswer
+}
+
+/// A document holding row `a` in `draft`, and the empty version it was
+/// written from.
+fn draft_base() -> (loro::LoroDoc, loro::VersionVector) {
+    let doc = loro::LoroDoc::new();
+    let empty = doc.oplog_vv();
+    let row = doc
+        .get_map(COLL)
+        .insert_container(ROW, loro::LoroMap::new())
+        .expect("row container");
+    row.insert("id", ROW).expect("id field");
+    row.insert("status", "draft").expect("status field");
+    doc.commit();
+    (doc, empty)
 }
 
 /// A fork of `base_doc` that moves the row to `next`.
@@ -276,19 +262,6 @@ async fn synced_update_judges_the_session_role() {
         ))
         .await
         .unwrap();
-    // The `PRIMARY KEY` makes the collection's CRDT constraint version 1. A
-    // synced delta is fenced until that version is installed on the core
-    // that applies it, and answers `Gap` meanwhile. The server's
-    // constraint-reconcile loop installs it. This harness starts no
-    // background loops, so the test runs one reconcile pass itself.
-    let mut delivered = HashMap::new();
-    let installed =
-        nodedb::bootstrap::constraint_reconcile::reconcile_once(&h.server.shared, &mut delivered)
-            .await;
-    assert!(
-        installed >= 1,
-        "the reconcile pass must install the collection's constraints"
-    );
 
     let mut approver = h
         .session("sync_role_approver", &["readwrite", "approver"])
@@ -297,15 +270,7 @@ async fn synced_update_judges_the_session_role() {
 
     // The base: row `a` in `draft`. An insert has no prior row, so no
     // transition is judged.
-    let doc = loro::LoroDoc::new();
-    let empty = doc.oplog_vv();
-    let row = doc
-        .get_map(COLL)
-        .insert_container(ROW, loro::LoroMap::new())
-        .expect("row container");
-    row.insert("id", ROW).expect("id field");
-    row.insert("status", "draft").expect("status field");
-    doc.commit();
+    let (doc, empty) = draft_base();
     assert_eq!(push(&mut approver, &doc, &empty, 1).await, Verdict::Applied);
     assert_eq!(h.status().await, "draft");
 
@@ -316,9 +281,6 @@ async fn synced_update_judges_the_session_role() {
         ))
         .await
         .unwrap();
-    // Install any CRDT constraint version the ALTER changed, as the
-    // reconcile loop does.
-    nodedb::bootstrap::constraint_reconcile::reconcile_once(&h.server.shared, &mut delivered).await;
     let base = doc.oplog_vv();
 
     let refused = push(&mut clerk, &status_fork(&doc, "active"), &base, 2).await;
@@ -343,4 +305,28 @@ async fn synced_update_judges_the_session_role() {
         "active",
         "an admitted delta must store active"
     );
+}
+
+/// CREATE installs the collection's CRDT constraint version before it
+/// returns. The `PRIMARY KEY` gives the collection constraint version 1, so
+/// a delta pushed right after CREATE is fenced unless that version is live.
+/// No reconcile pass runs in this harness, so only the DDL can install it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delta_pushed_right_after_create_applies() {
+    let h = Harness::start().await;
+    let mut session = h.session("sync_create_writer", &["readwrite"]).await;
+    h.server
+        .exec(&format!(
+            "CREATE COLLECTION {COLL} (id TEXT PRIMARY KEY, status TEXT) WITH (crdt='true')"
+        ))
+        .await
+        .unwrap();
+
+    let (doc, empty) = draft_base();
+    assert_eq!(
+        push(&mut session, &doc, &empty, 1).await,
+        Verdict::Applied,
+        "the first delta after CREATE must apply, not answer Gap"
+    );
+    assert_eq!(h.status().await, "draft");
 }

@@ -12,12 +12,14 @@
 //! actually changes (not on every catalog descriptor bump), so an unrelated
 //! ALTER never re-proposes.
 //!
-//! Why a recurring reconcile rather than a one-shot DDL hook: leadership can
-//! move (election, crash). A new metadata leader re-derives and re-delivers
-//! the current catalog state, so a collection created or altered under a
-//! previous leader still converges on every surviving replica without the
-//! original proposer being alive. Delivery is idempotent — the per-collection
-//! version fence makes re-proposing the same set a no-op on every replica.
+//! The DDL that changes a constraint set installs it before it returns
+//! (`control::constraint_install`). This loop is the safety net: leadership
+//! can move (election, crash) between a DDL's commit and its install. A new
+//! metadata leader re-derives and re-delivers the current catalog state, so a
+//! collection created or altered under a previous leader still converges on
+//! every surviving replica without the original proposer being alive.
+//! Delivery is idempotent — the per-collection version fence makes
+//! re-proposing the same set a no-op on every replica.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,13 +28,9 @@ use std::time::Duration;
 use nodedb_types::{DatabaseId, TenantId};
 use tracing::{debug, warn};
 
-use crate::control::security::catalog::{
-    ReadOnlySystemCatalog, StoredCollection, SystemCatalog, collection_constraints,
-};
+use crate::control::security::catalog::{ReadOnlySystemCatalog, StoredCollection, SystemCatalog};
 use crate::control::state::SharedState;
-use crate::control::wal_replication::{
-    ConstraintChangeOp, ReplicatedEntry, ReplicatedWrite, propose_replicated_entry,
-};
+use crate::control::wal_replication::propose_replicated_entry;
 
 /// Maximum number of constraint deliveries proposed in a single reconcile
 /// pass. Remaining changed collections are delivered on subsequent ticks so a
@@ -133,41 +131,19 @@ pub async fn reconcile_once(
             continue;
         }
 
-        let constraints = collection_constraints(&stored);
-        let mut blobs = Vec::with_capacity(constraints.len());
-        let mut encode_failed = false;
-        for constraint in &constraints {
-            match zerompk::to_msgpack_vec(constraint) {
-                Ok(bytes) => blobs.push(bytes),
+        let entry =
+            match crate::control::constraint_install::constraint_change_entry(database_id, &stored)
+            {
+                Ok(entry) => entry,
                 Err(e) => {
                     warn!(
                         collection = %stored.name,
                         error = %e,
                         "constraint reconcile: encode failed; skipping collection"
                     );
-                    encode_failed = true;
-                    break;
+                    continue;
                 }
-            }
-        }
-        if encode_failed {
-            continue;
-        }
-
-        let vshard_id = nodedb_cluster::routing::vshard_for_collection(
-            nodedb_types::CollectionKey::from_bare(database_id, &stored.name),
-        );
-        let entry = ReplicatedEntry::new(
-            stored.tenant_id,
-            database_id.as_u64(),
-            vshard_id,
-            ReplicatedWrite::ConstraintChange {
-                collection: stored.name.clone(),
-                op: ConstraintChangeOp::Set,
-                constraint_version: stored.constraint_version,
-                constraints: blobs,
-            },
-        );
+            };
 
         let deadline =
             crate::control::server::shared::session::StatementDeadline::of_statement(shared)
