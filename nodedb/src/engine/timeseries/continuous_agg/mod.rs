@@ -5,6 +5,7 @@ pub mod definition;
 pub mod fold;
 pub mod image;
 pub mod manager;
+pub mod merge_names;
 pub mod partial;
 pub mod persist;
 pub mod refresh;

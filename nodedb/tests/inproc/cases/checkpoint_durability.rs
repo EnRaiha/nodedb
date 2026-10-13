@@ -254,15 +254,25 @@ fn regen_certs_writes_are_durable() {
 /// partition_dir)`) have the same durability gap as file-level tmp+rename:
 /// the directory entries can reach disk before the contents of the newly
 /// renamed-in directory. The swap helper must fsync both parent directories.
+///
+/// A timeseries partition merge renames its staged partition into place and
+/// removes its sources. The commit manifest that makes it durable is one
+/// atomic file write, and so is the merged partition's rewritten meta.
 #[test]
 fn timeseries_merge_directory_swap_is_durable() {
-    let src = read("nodedb/src/engine/timeseries/merge/o3.rs");
+    let src = read("nodedb/src/data/executor/handlers/timeseries/merge_commit.rs");
     assert!(
         src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
         "timeseries merge directory swap must fsync the parent directory \
          after renames — otherwise the new partition dir's inode can be \
          visible before its contents are on stable storage."
     );
+    for rel in [
+        "nodedb/src/data/executor/handlers/timeseries/merge_commit.rs",
+        "nodedb/src/data/executor/handlers/timeseries/partition_merge.rs",
+    ] {
+        assert_durable_checkpoint_writer(rel);
+    }
 }
 
 #[test]

@@ -51,6 +51,16 @@ impl CoreLoop {
                 },
             );
         }
+        // A committed merge finishes first: until it does, its sources are
+        // still on disk beside the merged partition.
+        let merge_key = (
+            task.request.database_id,
+            task.request.tenant_id,
+            collection.to_string(),
+        );
+        if let Err(e) = self.roll_forward_ts_merge(&merge_key) {
+            return self.response_error(task, e);
+        }
         let now_ms = now_ms();
         let cutoff = now_ms - max_age_ms;
         let mut deleted = 0usize;
@@ -180,7 +190,8 @@ mod tests {
     use crate::data::executor::core_loop::CoreLoop;
     use crate::data::executor::core_loop::tests::make_core_with_dir;
     use crate::data::executor::handlers::timeseries::cagg_test_support::{
-        COLLECTION, ROWS_A, TENANT, flush, host_def, image_path, ingest, register, task_at, totals,
+        COLLECTION, ROWS_A, ROWS_B, TENANT, flush, host_def, image_path, ingest, register, task_at,
+        totals,
     };
     use crate::data::executor::task::ExecutionTask;
     use crate::engine::timeseries::continuous_agg::RefreshPolicy;
@@ -320,6 +331,42 @@ mod tests {
             (3, 111),
             "the expiring rows folded first"
         );
+    }
+
+    /// A merged partition expires like any other. The aggregate folded its
+    /// sources and keeps their rows.
+    #[test]
+    fn retention_after_a_merge_keeps_the_aggregate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let mut config = crate::engine::document::store::CollectionConfig::new(COLLECTION);
+        config.timeseries = Some(Box::new(nodedb_physical::physical_plan::TimeseriesSchema {
+            time_key: "timestamp".into(),
+            columns: Vec::new(),
+            partition_interval: "1h".into(),
+        }));
+        core.doc_configs.insert(
+            (
+                DatabaseId::DEFAULT,
+                TenantId::new(TENANT),
+                COLLECTION.to_string(),
+            ),
+            config,
+        );
+        core.ts_tuning.merge_quiet_ms = 0;
+        register(&mut core, host_def("by_host", RefreshPolicy::OnFlush));
+        core.fold_pending_cagg_partitions(0);
+        assert_eq!(ingest(&mut core, ROWS_A, 1), Status::Ok);
+        flush(&mut core);
+        assert_eq!(ingest(&mut core, ROWS_B, 2), Status::Ok);
+        flush(&mut core);
+        assert_eq!(core.merge_ts_partitions(false).merged, 1);
+        assert_eq!(partitions(&core), 1);
+
+        let resp = core.meta_enforce_timeseries_retention(&retention_task(), COLLECTION, 1, &[]);
+        assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+        assert_eq!(partitions(&core), 0);
+        assert_eq!(totals(&core, "by_host"), (5, 11_111));
     }
 
     /// The bitemporal audit purge removes timeseries partitions too, so it

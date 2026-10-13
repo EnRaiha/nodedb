@@ -58,6 +58,9 @@ impl CoreLoop {
     ) -> crate::Result<u64> {
         self.ensure_ts_registry(tid, database_id, collection)?;
         let key = (database_id, tid, collection.to_string());
+        // A committed merge finishes first, so its sources are gone before
+        // the partitions are listed.
+        self.roll_forward_ts_merge(&key)?;
         let ts_dir = super::paths::ts_collection_dir(
             &self.data_dir,
             database_id.as_u64(),

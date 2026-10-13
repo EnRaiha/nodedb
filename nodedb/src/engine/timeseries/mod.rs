@@ -23,7 +23,6 @@ pub mod install_outcome;
 pub mod interval_split;
 pub mod last_value_cache;
 pub mod merge;
-pub mod o3_buffer;
 pub mod packed_partition;
 pub mod partition_registry;
 pub mod projection;

@@ -44,7 +44,8 @@ pub(super) struct TuningOverrides {
     /// chunked-streaming scan path without seeding 1000 rows.
     pub(super) stream_chunk_size: Option<usize>,
     /// Overrides `[tuning.timeseries] memtable_budget_bytes` so a test can
-    /// observe timeseries partition flushes on a handful of rows.
+    /// observe timeseries partition flushes on a handful of rows. It also
+    /// sets `merge_groups_per_tick = 0`, so those partitions do not merge.
     pub(super) timeseries_memtable_budget_bytes: Option<usize>,
     /// Overrides `[tuning.vector] seal_threshold` so a test can observe HNSW
     /// segment builds on a few hundred vectors.
@@ -144,9 +145,12 @@ pub(super) fn write_config(dir: &Path, auth_mode: AuthMode, tuning: TuningOverri
     if let Some(rows) = tuning.stream_chunk_size {
         toml.push_str(&format!("\n[tuning.query]\nstream_chunk_size = {rows}\n"));
     }
+    // Partitions do not merge under this override: a test that flushes every
+    // ingest reads the partition layout of its flushes, not of a merge the
+    // maintenance tick ran in between.
     if let Some(bytes) = tuning.timeseries_memtable_budget_bytes {
         toml.push_str(&format!(
-            "\n[tuning.timeseries]\nmemtable_budget_bytes = {bytes}\n"
+            "\n[tuning.timeseries]\nmemtable_budget_bytes = {bytes}\nmerge_groups_per_tick = 0\n"
         ));
     }
     if let Some(vectors) = tuning.vector_seal_threshold {

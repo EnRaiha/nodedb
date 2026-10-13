@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Partition state transitions: delete, merge begin/commit/rollback, purge.
+//! Partition state transitions: delete, merge install, purge.
 
-use nodedb_types::timeseries::{PartitionMeta, PartitionState};
+use nodedb_types::timeseries::PartitionState;
 
 use super::entry::PartitionEntry;
 use super::registry::PartitionRegistry;
@@ -18,38 +18,15 @@ impl PartitionRegistry {
         }
     }
 
-    /// Mark a partition as merging.
-    pub fn mark_merging(&mut self, start_ts: i64) -> bool {
-        if let Some(entry) = self.partitions.get_mut(&start_ts)
-            && entry.meta.state == PartitionState::Sealed
-        {
-            entry.meta.state = PartitionState::Merging;
-            return true;
-        }
-        false
-    }
-
-    /// Insert a merged partition and mark sources as deleted.
-    pub fn commit_merge(
-        &mut self,
-        merged_meta: PartitionMeta,
-        merged_dir: String,
-        source_starts: &[i64],
-    ) {
-        // Mark sources as deleted first (before inserting merged, in case
-        // the merged partition's start_ts overlaps a source key).
-        for &src in source_starts {
-            self.mark_deleted(src);
-        }
-        // Insert (or overwrite) the merged partition.
-        let start_ts = merged_meta.min_ts;
-        self.partitions.insert(
-            start_ts,
-            PartitionEntry {
-                meta: merged_meta,
-                dir_name: merged_dir,
-            },
-        );
+    /// Install a committed merge: every partition named in `sources` leaves
+    /// the registry and `merged` joins it. `merged` goes through
+    /// [`PartitionRegistry::insert_partition`], so a partition that shares
+    /// its `min_ts` and is not a source stays reachable. Returns the key
+    /// `merged` is filed under.
+    pub fn install_merge(&mut self, merged: PartitionEntry, sources: &[String]) -> i64 {
+        self.partitions
+            .retain(|_, entry| !sources.contains(&entry.dir_name));
+        self.insert_partition(merged)
     }
 
     /// Remove deleted partitions from the registry (after physical cleanup).
@@ -68,68 +45,64 @@ impl PartitionRegistry {
         }
         dirs
     }
-
-    /// Roll back a partition from Merging to Sealed (merge failure recovery).
-    pub fn rollback_merging(&mut self, start_ts: i64) {
-        if let Some(entry) = self.partitions.get_mut(&start_ts)
-            && entry.meta.state == PartitionState::Merging
-        {
-            entry.meta.state = PartitionState::Sealed;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::timeseries::{PartitionInterval, TieredPartitionConfig};
+    use nodedb_types::timeseries::{PartitionInterval, PartitionMeta, TieredPartitionConfig};
 
     use super::*;
 
     fn test_config() -> TieredPartitionConfig {
         let mut cfg = TieredPartitionConfig::origin_defaults();
         cfg.partition_by = PartitionInterval::Duration(86_400_000); // 1d
-        cfg.merge_after_ms = 7 * 86_400_000;
-        cfg.merge_count = 3;
-        cfg.retention_period_ms = 30 * 86_400_000;
         cfg
     }
 
+    fn entry(dir: &str, min_ts: i64, state: PartitionState) -> PartitionEntry {
+        PartitionEntry {
+            meta: PartitionMeta {
+                min_ts,
+                max_ts: min_ts + 10,
+                row_count: 10,
+                size_bytes: 100,
+                schema_version: 1,
+                state,
+                interval_ms: 86_400_000,
+                last_flushed_wal_lsn: 1,
+                column_stats: std::collections::HashMap::new(),
+                max_system_ts: 0,
+            },
+            dir_name: dir.to_string(),
+        }
+    }
+
+    /// The sources leave, the merged partition joins, and a partition that
+    /// shares the merged `min_ts` but is no source stays reachable.
     #[test]
-    fn commit_merge_and_purge() {
+    fn install_merge_replaces_only_the_sources() {
         let mut reg = PartitionRegistry::new(test_config());
-        let day_ms = 86_400_000i64;
+        reg.insert_partition(entry("ts-a", 100, PartitionState::Sealed));
+        reg.insert_partition(entry("ts-b", 105, PartitionState::Sealed));
+        reg.insert_partition(entry("ts-other", 100, PartitionState::Sealed));
 
-        let starts: Vec<i64> = (1..=3).map(|d| d * day_ms).collect();
-        for &s in &starts {
-            reg.get_or_create_partition(s);
-            reg.seal_partition(s);
-        }
+        reg.install_merge(
+            entry("ts-merged", 100, PartitionState::Merged),
+            &["ts-a".to_string(), "ts-b".to_string()],
+        );
 
-        // Merge.
-        for &s in &starts {
-            reg.mark_merging(s);
-        }
+        let mut names: Vec<&str> = reg.iter().map(|(_, e)| e.dir_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["ts-merged", "ts-other"]);
+    }
 
-        let merged_meta = PartitionMeta {
-            min_ts: starts[0],
-            max_ts: starts[2] + day_ms - 1,
-            row_count: 3000,
-            size_bytes: 1024,
-            schema_version: 1,
-            state: PartitionState::Merged,
-            interval_ms: 3 * day_ms as u64,
-            last_flushed_wal_lsn: 100,
-            column_stats: std::collections::HashMap::new(),
-            max_system_ts: 0,
-        };
-        reg.commit_merge(merged_meta, "ts-merged".into(), &starts);
-
-        // Sources are deleted, merged exists. The merged partition's min_ts
-        // equals starts[0], so it overwrites one deleted entry → 3 total
-        // (1 merged at starts[0], 2 deleted at starts[1] and starts[2]).
-        assert_eq!(reg.partition_count(), 3);
-        let dirs = reg.purge_deleted();
-        assert_eq!(dirs.len(), 2); // starts[1] and starts[2]
-        assert_eq!(reg.partition_count(), 1); // only the merged partition
+    #[test]
+    fn purge_removes_deleted_entries() {
+        let mut reg = PartitionRegistry::new(test_config());
+        reg.insert_partition(entry("ts-a", 100, PartitionState::Sealed));
+        reg.insert_partition(entry("ts-b", 200, PartitionState::Sealed));
+        reg.mark_deleted(200);
+        assert_eq!(reg.purge_deleted(), vec!["ts-b".to_string()]);
+        assert_eq!(reg.partition_count(), 1);
     }
 }

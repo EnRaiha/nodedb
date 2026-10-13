@@ -105,6 +105,12 @@ impl CoreLoop {
         crate::data::executor::handlers::timeseries::flush_commit::recover_interrupted_flushes(
             &ts_dir,
         )?;
+        // A merge a crash interrupted is finished if it committed, so its
+        // sources are gone before the registry lists the merged partition,
+        // and removed if it did not.
+        crate::data::executor::handlers::timeseries::merge_commit::recover_interrupted_merges(
+            &ts_dir,
+        )?;
         let registry = read_registry(&ts_dir, self.segment_keks.ts_segment_kek.as_ref())?;
         let stamp = super::stamp::read_collection_ts_stamp(&ts_dir, &registry)?;
         let merged = match self.ts_replay_stamps.get(&key) {

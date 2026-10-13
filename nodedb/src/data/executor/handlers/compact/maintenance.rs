@@ -199,6 +199,20 @@ impl CoreLoop {
             }
         }
 
+        // Timeseries partitions of one interval merge into one. Runs after
+        // the fold, so groups whose sources the fold just completed merge in
+        // the same call. Bounded per call by `merge_groups_per_tick`.
+        {
+            let pass = self.merge_ts_partitions(false);
+            if pass.merged > 0 {
+                tracing::debug!(
+                    core = self.core_id,
+                    merged = pass.merged,
+                    "timeseries partitions merged"
+                );
+            }
+        }
+
         // KV expiry wheel tick: process expired keys on every maintenance call.
         // Bounded by the per-tick reap budget internally — safe for the reactor.
         // Expired keys are emitted as structured log events for CDC visibility.

@@ -9,7 +9,6 @@
 mod tests {
     use crate::engine::timeseries::columnar_memtable::*;
     use crate::engine::timeseries::columnar_segment::*;
-    use crate::engine::timeseries::o3_buffer::*;
     use crate::engine::timeseries::partition_registry::*;
     use crate::engine::timeseries::schema_evolution::*;
     use nodedb_types::timeseries::*;
@@ -51,52 +50,6 @@ mod tests {
         // Verify we can look them back up.
         assert_eq!(catalog.get(id1), Some(&k1));
         assert_eq!(catalog.get(id2), Some(&k2));
-    }
-
-    // ── Data Integrity: O3 correctness ──────────────────────────────
-
-    #[test]
-    fn o3_ingest_and_query_correctness() {
-        // Ingest 1000 rows out of order, query back, verify sorted result.
-        let mut buf = O3Buffer::new(10_000);
-
-        // Generate shuffled timestamps.
-        let mut timestamps: Vec<i64> = (0..1000).map(|i| i * 100).collect();
-        // Deterministic shuffle (swap each element with a "random" earlier one).
-        for i in (1..timestamps.len()).rev() {
-            let j = (i * 7 + 13) % (i + 1);
-            timestamps.swap(i, j);
-        }
-
-        for &ts in &timestamps {
-            buf.insert(O3Row {
-                timestamp_ms: ts,
-                series_id: 1,
-                value: ts as f64,
-                target_partition_start: 0,
-            });
-        }
-        assert_eq!(buf.len(), 1000);
-
-        // Query all rows.
-        let results = buf.query_range(0, 100_000);
-        assert_eq!(results.len(), 1000);
-
-        // Verify sorted order.
-        for w in results.windows(2) {
-            assert!(
-                w[0].timestamp_ms <= w[1].timestamp_ms,
-                "O3 query not sorted: {} > {}",
-                w[0].timestamp_ms,
-                w[1].timestamp_ms
-            );
-        }
-
-        // Verify all original values present.
-        let result_ts: Vec<i64> = results.iter().map(|r| r.timestamp_ms).collect();
-        let mut expected: Vec<i64> = (0..1000).map(|i| i * 100).collect();
-        expected.sort();
-        assert_eq!(result_ts, expected);
     }
 
     // ── Data Integrity: Mixed-width partition query ──────────────────
@@ -517,7 +470,9 @@ mod tests {
 
         // Step 4: Start merge, "crash" mid-merge (state = Merging).
         let mut registry = recovered;
-        registry.mark_merging(day_ms);
+        if let Some(entry) = registry.get_mut(day_ms) {
+            entry.meta.state = PartitionState::Merging;
+        }
         registry
             .persist(tmp.path(), "partition_manifest.json")
             .unwrap();
@@ -545,11 +500,13 @@ mod tests {
             column_stats: std::collections::HashMap::new(),
             max_system_ts: 0,
         };
-        registry.commit_merge(
-            merged_meta,
-            "ts-merged".into(),
-            &[day_ms, 2 * day_ms, 3 * day_ms],
-        );
+        for start in [day_ms, 2 * day_ms, 3 * day_ms] {
+            registry.mark_deleted(start);
+        }
+        registry.insert_partition(PartitionEntry {
+            meta: merged_meta,
+            dir_name: "ts-merged".into(),
+        });
         registry
             .persist(tmp.path(), "partition_manifest.json")
             .unwrap();
