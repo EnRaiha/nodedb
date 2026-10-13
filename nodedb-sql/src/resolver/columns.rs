@@ -378,11 +378,16 @@ impl TableScope {
         from: &[sqlparser::ast::TableWithJoins],
     ) -> Result<Self> {
         let mut scope = Self::new();
-        for table_with_joins in from {
-            scope.resolve_table_factor(catalog, functions, temporal, &table_with_joins.relation)?;
-            for join in &table_with_joins.joins {
-                scope.resolve_table_factor(catalog, functions, temporal, &join.relation)?;
-            }
+        let from_names = crate::resolver::derived::from_relation_names(from);
+        let factors = from.iter().flat_map(|twj| {
+            std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+        });
+        for factor in factors {
+            scope
+                .resolve_table_factor(catalog, functions, temporal, factor)
+                .map_err(|e| {
+                    crate::resolver::derived::refuse_correlated_derived(e, factor, &from_names)
+                })?;
         }
         Ok(scope)
     }

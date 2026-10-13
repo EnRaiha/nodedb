@@ -237,6 +237,58 @@ fn synthetic_column(name: &str) -> ColumnInfo {
     }
 }
 
+/// The names the relations of a FROM clause are referenced by: each table's
+/// alias, else its name, and each derived table's alias.
+pub fn from_relation_names(from: &[ast::TableWithJoins]) -> Vec<String> {
+    let mut names = Vec::new();
+    let factors = from.iter().flat_map(|twj| {
+        std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+    });
+    for factor in factors {
+        match factor {
+            ast::TableFactor::Table { name, alias, .. } => match alias {
+                Some(alias) => names.push(normalize_ident(&alias.name)),
+                None => {
+                    if let Ok(name) = normalize_object_name_checked(name) {
+                        names.push(name);
+                    }
+                }
+            },
+            ast::TableFactor::Derived {
+                alias: Some(alias), ..
+            } => names.push(normalize_ident(&alias.name)),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The refusal for a derived table without `LATERAL` that refers to
+/// another relation of the same FROM clause.
+///
+/// The body is planned on its own, so such a reference fails to resolve.
+/// PostgreSQL refuses it and points to `LATERAL`, and so does this. Any
+/// other error passes through unchanged.
+pub fn refuse_correlated_derived(
+    err: SqlError,
+    factor: &ast::TableFactor,
+    from_names: &[String],
+) -> SqlError {
+    let ast::TableFactor::Derived { lateral: false, .. } = factor else {
+        return err;
+    };
+    match err {
+        SqlError::UnknownTable { name } if from_names.contains(&name) => SqlError::Unsupported {
+            detail: format!(
+                "invalid reference to FROM-clause entry for table \"{name}\": a subquery \
+                     in FROM cannot refer to other relations of the same query level; write \
+                     JOIN LATERAL (SELECT ...) to correlate it"
+            ),
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

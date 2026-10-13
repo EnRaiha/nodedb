@@ -27,6 +27,7 @@ use crate::control::server::response_shape::types::DdlColType;
 use super::super::columns::{
     column_types_for, declared_key_for, ordered_columns_for, schema_from_projection,
 };
+use super::super::cte_types::{CatalogRef, CteTypesCatalog};
 use super::super::returning::build_returning_schema;
 use super::aggregate::{AggregateShape, aggregate_schema, timeseries_group_schema};
 use super::constant::constant_schema;
@@ -211,32 +212,46 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
             cp_computed: Vec::new(),
             declared_key: None,
         },
-        // The outer query determines the final projected shape; the CTE
-        // definitions themselves are only inputs to it.
-        SqlPlan::Cte(CtePlan { outer, .. }) => build_output_schema(
-            std::slice::from_ref(outer.as_ref()),
-            catalog,
-            database_id,
-            returning,
-        )?,
-        // A post-processor's projected shape is its outer projection; an empty
-        // projection (SELECT *) inherits the body's columns. (Synthesized during
-        // conversion, so this is normally unreached — the schema is derived from
-        // the pre-inline `Cte` above — but the arm keeps derivation correct if a
-        // `Subquery` is ever schema-derived directly.)
+        // The outer query determines the final projected shape. It reads each
+        // definition by name, and each name resolves to the columns its body
+        // announces, so a column read through a CTE or a derived table keeps
+        // the body's type.
+        SqlPlan::Cte(CtePlan { definitions, outer }) => {
+            let stored = CatalogRef(catalog);
+            let overlay = CteTypesCatalog::build(&stored, definitions, database_id)?;
+            build_output_schema(
+                std::slice::from_ref(outer.as_ref()),
+                &overlay,
+                database_id,
+                returning,
+            )?
+        }
+        // A post-processor's projected shape is its outer projection over the
+        // body's announced columns. An empty projection (SELECT *) inherits
+        // the body's columns.
         SqlPlan::Subquery {
             input, projection, ..
         } => {
+            let body = build_output_schema(
+                std::slice::from_ref(input.as_ref()),
+                catalog,
+                database_id,
+                returning,
+            )?;
             if projection.is_empty() {
-                build_output_schema(
-                    std::slice::from_ref(input.as_ref()),
-                    catalog,
-                    database_id,
-                    returning,
-                )?
+                body
             } else {
-                let types = HashMap::new();
-                schema_from_projection(projection, &types, &[])
+                // The tail names a body column by its output name or by the
+                // key the body emits it under. A name announced twice keeps
+                // its first type.
+                let mut types = HashMap::new();
+                for column in &body.columns {
+                    types
+                        .entry(column.display_name.clone())
+                        .or_insert(column.ty);
+                    types.entry(column.lookup_key.clone()).or_insert(column.ty);
+                }
+                schema_from_projection(projection, &types, &body.columns)
             }
         }
         SqlPlan::LateralTopK(LateralTopKPlan { projection, .. })
@@ -520,5 +535,70 @@ mod tests {
         // Boolean comparison expression -> Bool.
         assert_eq!(schema.columns[1].display_name, "positive");
         assert_eq!(schema.columns[1].ty, DdlColType::Bool);
+    }
+
+    fn columns(names: &[&str]) -> Vec<Projection> {
+        names
+            .iter()
+            .map(|name| Projection::Column((*name).to_string()))
+            .collect()
+    }
+
+    fn types_of(schema: &OutputSchema) -> Vec<DdlColType> {
+        schema.columns.iter().map(|c| c.ty).collect()
+    }
+
+    /// A column read through a CTE carries the type its definition body
+    /// announces. A later definition reads an earlier one with its types.
+    #[test]
+    fn a_cte_reference_takes_its_body_types() {
+        let plans = vec![SqlPlan::Cte(nodedb_sql::types::CtePlan {
+            definitions: vec![
+                (
+                    "c".to_string(),
+                    scan_plan("metrics", columns(&["n", "amount", "region"])),
+                ),
+                ("d".to_string(), scan_plan("c", columns(&["amount", "n"]))),
+            ],
+            outer: Box::new(scan_plan("d", columns(&["n", "amount"]))),
+        })];
+        let schema = build_output_schema(
+            &plans,
+            &TypedCatalog,
+            nodedb_types::DatabaseId::DEFAULT,
+            None,
+        )
+        .expect("schema derives");
+        assert_eq!(types_of(&schema), [DdlColType::Int8, DdlColType::Float8]);
+        assert_eq!(schema.declared_key, None);
+    }
+
+    /// A post-processor tail types its projection from the body it reads.
+    #[test]
+    fn a_subquery_tail_takes_its_body_types() {
+        let plans = vec![SqlPlan::Subquery {
+            input: Box::new(scan_plan("metrics", columns(&["n", "region"]))),
+            filters: Vec::new(),
+            projection: vec![
+                Projection::Column("region".to_string()),
+                Projection::Computed {
+                    expr: metrics_column("n"),
+                    alias: "count".to_string(),
+                },
+            ],
+            window_functions: Vec::new(),
+            sort_keys: Vec::new(),
+            offset: 0,
+            distinct: false,
+            limit: None,
+        }];
+        let schema = build_output_schema(
+            &plans,
+            &TypedCatalog,
+            nodedb_types::DatabaseId::DEFAULT,
+            None,
+        )
+        .expect("schema derives");
+        assert_eq!(types_of(&schema), [DdlColType::Text, DdlColType::Int8]);
     }
 }

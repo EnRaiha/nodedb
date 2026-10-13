@@ -221,9 +221,11 @@ pub(super) fn convert_cte(
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     // Inline CTE definitions: replace scans on CTE names with the
-    // CTE's actual subquery plan.
+    // CTE's actual subquery plan. A definition can read the ones before it,
+    // so the last one inlines first: each body brought in can still name an
+    // earlier definition, and the passes that follow resolve that name.
     let mut resolved = outer.clone();
-    for (name, cte_plan) in definitions {
+    for (name, cte_plan) in definitions.iter().rev() {
         resolved = inline_cte(&resolved, name, cte_plan);
     }
     convert_one(&resolved, tenant_id, ctx)

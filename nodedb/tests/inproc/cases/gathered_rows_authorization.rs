@@ -4,8 +4,8 @@
 //! came from.
 //!
 //! The coordinator replaces a join's build side, a post-processed body, an
-//! aggregate's input or a nested join's input with a scan of its gathered
-//! rows, then authorizes the task again. A user whose role reads nothing,
+//! aggregate's input, a nested join's input or a derived join side with a
+//! scan of its gathered rows, then authorizes the task again. A user whose role reads nothing,
 //! granted Read on exactly the two collections a query reads, runs every
 //! such shape. The same user without the grant on one of them is refused.
 
@@ -31,18 +31,23 @@ const POST_PROCESSED: &str =
 /// A three-way join. The converter plans the inner join as the outer
 /// join's input and wraps it in `Exchange{Broadcast}`, because the inner
 /// join reads sharded collections. The coordinator gathers it and embeds
-/// its rows into the outer join. A derived table cannot be a JOIN target,
-/// so this is the SQL shape that reaches the broadcast join input.
+/// its rows into the outer join.
 const BROADCAST_JOIN: &str = "SELECT o.id, v.name FROM gr_orders o \
                               JOIN gr_users u ON o.user_id = u.id \
                               JOIN gr_users v ON v.id = u.id";
 
+/// A derived table as a join side. Its body reads a sharded collection, so
+/// the coordinator gathers the body and embeds its rows as the join input.
+const DERIVED_JOIN: &str = "SELECT o.id, t.name FROM gr_orders o \
+                            JOIN (SELECT id, name FROM gr_users) t ON o.user_id = t.id";
+
 /// Every shape and the rows it returns.
-const SHAPES: [(&str, usize); 4] = [
+const SHAPES: [(&str, usize); 5] = [
     (JOIN, 3),
     (AGGREGATE_OVER_JOIN, 2),
     (POST_PROCESSED, 2),
     (BROADCAST_JOIN, 3),
+    (DERIVED_JOIN, 3),
 ];
 
 async fn seed(srv: &TestServer) {

@@ -2,6 +2,7 @@
 
 pub mod build;
 pub mod columns;
+pub mod cte_types;
 pub mod join_types;
 pub mod returning;
 

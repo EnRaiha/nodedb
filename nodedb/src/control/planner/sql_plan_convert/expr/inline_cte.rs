@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use nodedb_sql::types::{Filter, Projection, SortKey, SqlPlan, WindowSpec};
+use nodedb_sql::types::{CtePlan, Filter, Projection, SortKey, SqlPlan, WindowSpec};
 
 /// Replace scans on `cte_name` with the CTE's actual subquery plan.
 ///
@@ -83,8 +83,8 @@ pub(in crate::control::planner::sql_plan_convert) fn inline_cte(
             projection,
             filters,
         } => SqlPlan::Join {
-            left: Box::new(inline_cte(left, cte_name, cte_plan)),
-            right: Box::new(inline_cte(right, cte_name, cte_plan)),
+            left: Box::new(inline_cte_join_side(left, cte_name, cte_plan)),
+            right: Box::new(inline_cte_join_side(right, cte_name, cte_plan)),
             on: on.clone(),
             join_type: *join_type,
             condition: condition.clone(),
@@ -181,8 +181,45 @@ pub(in crate::control::planner::sql_plan_convert) fn inline_cte(
             limit: *limit,
         },
 
+        // A nested CTE, such as a derived JOIN side. Its definition bodies
+        // see the enclosing CTE. Its outer query sees it unless a definition
+        // of the same name shadows it.
+        SqlPlan::Cte(nested) => {
+            let shadowed = nested.definitions.iter().any(|(name, _)| name == cte_name);
+            SqlPlan::Cte(CtePlan {
+                definitions: nested
+                    .definitions
+                    .iter()
+                    .map(|(name, body)| (name.clone(), inline_cte(body, cte_name, cte_plan)))
+                    .collect(),
+                outer: Box::new(if shadowed {
+                    nested.outer.as_ref().clone()
+                } else {
+                    inline_cte(&nested.outer, cte_name, cte_plan)
+                }),
+            })
+        }
+
         // No CTE reference — return as-is.
         _ => plan.clone(),
+    }
+}
+
+/// One side of a join, with `cte_name` resolved.
+///
+/// A side that scans the CTE by name becomes a one-definition CTE, the shape
+/// a derived JOIN side plans to. The join qualifies that side's columns by
+/// the CTE name or its alias, the names the join's ON keys and projection
+/// use. Replaced by the bare body, the side would be qualified by the body's
+/// own collection, and every column read through the CTE name would miss.
+/// Any other side resolves the CTE inside it as usual.
+fn inline_cte_join_side(side: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> SqlPlan {
+    match side {
+        SqlPlan::Scan { collection, .. } if collection == cte_name => SqlPlan::Cte(CtePlan {
+            definitions: vec![(cte_name.to_string(), cte_plan.clone())],
+            outer: Box::new(side.clone()),
+        }),
+        other => inline_cte(other, cte_name, cte_plan),
     }
 }
 
@@ -789,6 +826,44 @@ mod tests {
                 assert_eq!(projection.len(), 1);
             }
             other => panic!("expected Subquery, got {other:?}"),
+        }
+    }
+
+    /// A join side that scans the CTE stays a one-definition CTE over that
+    /// scan, so the join still qualifies its columns by the CTE name. The
+    /// other side is untouched.
+    #[test]
+    fn a_cte_join_side_keeps_the_cte_name() {
+        let mut other_side = scan_on_cte(Vec::new(), None);
+        if let SqlPlan::Scan { collection, .. } = &mut other_side {
+            *collection = "orders".to_string();
+        }
+        let join = SqlPlan::Join {
+            left: Box::new(other_side),
+            right: Box::new(scan_on_cte(Vec::new(), None)),
+            on: vec![("orders.id".to_string(), "knn.id".to_string())],
+            join_type: nodedb_sql::types::query::JoinType::Inner,
+            condition: None,
+            limit: None,
+            projection: Vec::new(),
+            filters: Vec::new(),
+        };
+        let SqlPlan::Join { left, right, .. } = inline_cte(&join, "knn", &vector_search_body())
+        else {
+            panic!("expected Join");
+        };
+        assert!(matches!(&*left, SqlPlan::Scan { collection, .. } if collection == "orders"));
+        match *right {
+            SqlPlan::Cte(CtePlan { definitions, outer }) => {
+                assert_eq!(definitions.len(), 1);
+                assert_eq!(definitions[0].0, "knn");
+                assert!(matches!(definitions[0].1, SqlPlan::VectorSearch { .. }));
+                assert!(matches!(
+                    outer.as_ref(),
+                    SqlPlan::Scan { collection, .. } if collection == "knn"
+                ));
+            }
+            other => panic!("expected Cte, got {other:?}"),
         }
     }
 }

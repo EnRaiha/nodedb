@@ -14,20 +14,22 @@ use std::collections::HashMap;
 use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::{
-    DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, RangeScanPlan,
+    CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, RangeScanPlan,
     RecursiveScanPlan, SqlPlan, TextSearchPlan, TimeseriesScanPlan,
 };
 
 use crate::control::server::response_shape::types::DdlColType;
 
 use super::columns::column_types_for;
+use super::cte_types::{CatalogRef, CteTypesCatalog};
 
-/// One join side: the collection it reads and the alias qualifying its
-/// columns in the merged row. `None` means the columns are qualified by the
-/// collection name.
+/// One join side: the relation it reads, the alias qualifying its columns
+/// in the merged row, and the relation's column types. `None` means the
+/// columns are qualified by the relation name.
 struct JoinSide {
     collection: String,
     alias: Option<String>,
+    types: HashMap<String, DdlColType>,
 }
 
 /// Column types of every side of a join, keyed by qualified name.
@@ -42,9 +44,10 @@ pub(super) fn join_column_types<C: SqlCatalog + ?Sized>(
     catalog: &C,
     database_id: nodedb_types::DatabaseId,
 ) -> Result<HashMap<String, DdlColType>, SqlError> {
+    let stored = CatalogRef(catalog);
     let mut sides = Vec::new();
-    collect_sides(left, &mut sides);
-    collect_sides(right, &mut sides);
+    collect_sides(left, &stored, database_id, &mut sides)?;
+    collect_sides(right, &stored, database_id, &mut sides)?;
 
     let mut qualified: HashMap<String, DdlColType> = HashMap::new();
     // Bare names seen so far, and whether one side still owns the name. A
@@ -54,8 +57,7 @@ pub(super) fn join_column_types<C: SqlCatalog + ?Sized>(
     let mut ambiguous: Vec<String> = Vec::new();
 
     for side in &sides {
-        let types = column_types_for(catalog, database_id, &side.collection)?;
-        for (column, ty) in &types {
+        for (column, ty) in &side.types {
             qualified.insert(format!("{}.{column}", side.collection), *ty);
             if let Some(alias) = &side.alias {
                 qualified.insert(format!("{alias}.{column}"), *ty);
@@ -84,16 +86,27 @@ pub(super) fn join_column_types<C: SqlCatalog + ?Sized>(
     Ok(qualified)
 }
 
-/// Collect the scan-like leaves of one join side.
+/// Collect the scan-like leaves of one join side, each typed from `catalog`.
 ///
-/// A nested join contributes both of its own sides. A plan shape with no
-/// single source collection contributes none, so every column it projects
-/// stays `Text`.
-fn collect_sides(plan: &SqlPlan, out: &mut Vec<JoinSide>) {
+/// A nested join contributes both of its own sides. A CTE plan, which is
+/// what a derived table plans to, contributes the leaves of its outer query,
+/// typed against its definitions' output schemas. A plan shape with no
+/// single source relation contributes none, so every column it projects
+/// stays `Text`. A catalog lookup error is returned.
+fn collect_sides(
+    plan: &SqlPlan,
+    catalog: &dyn SqlCatalog,
+    database_id: nodedb_types::DatabaseId,
+    out: &mut Vec<JoinSide>,
+) -> Result<(), SqlError> {
     match plan {
         SqlPlan::Join { left, right, .. } => {
-            collect_sides(left, out);
-            collect_sides(right, out);
+            collect_sides(left, catalog, database_id, out)?;
+            collect_sides(right, catalog, database_id, out)?;
+        }
+        SqlPlan::Cte(CtePlan { definitions, outer }) => {
+            let overlay = CteTypesCatalog::build(catalog, definitions, database_id)?;
+            collect_sides(outer, &overlay, database_id, out)?;
         }
         // The three read shapes that carry a FROM-clause alias.
         SqlPlan::Scan {
@@ -107,6 +120,7 @@ fn collect_sides(plan: &SqlPlan, out: &mut Vec<JoinSide>) {
         }) => out.push(JoinSide {
             collection: collection.clone(),
             alias: alias.clone(),
+            types: column_types_for(catalog, database_id, collection)?,
         }),
         // Reads over one collection that carry no alias slot: the merged row
         // qualifies their columns by the collection name.
@@ -122,11 +136,12 @@ fn collect_sides(plan: &SqlPlan, out: &mut Vec<JoinSide>) {
         | SqlPlan::RecursiveScan(RecursiveScanPlan { collection, .. }) => out.push(JoinSide {
             collection: collection.clone(),
             alias: None,
+            types: column_types_for(catalog, database_id, collection)?,
         }),
-        // No single source collection to attribute a column to: set
-        // operations, aggregates, CTE/subquery bodies, lateral shapes,
-        // constant and recursive-value rows, every write, and the whole
-        // array and index DDL family.
+        // No single source relation to attribute a column to: set
+        // operations, aggregates, subquery bodies, lateral shapes, constant
+        // and recursive-value rows, every write, and the whole array and
+        // index DDL family.
         SqlPlan::ConstantResult { .. }
         | SqlPlan::Insert { .. }
         | SqlPlan::KvInsert { .. }
@@ -143,7 +158,6 @@ fn collect_sides(plan: &SqlPlan, out: &mut Vec<JoinSide>) {
         | SqlPlan::Intersect { .. }
         | SqlPlan::Except { .. }
         | SqlPlan::RecursiveValue { .. }
-        | SqlPlan::Cte { .. }
         | SqlPlan::Subquery { .. }
         | SqlPlan::CreateArray { .. }
         | SqlPlan::DropArray { .. }
@@ -165,6 +179,7 @@ fn collect_sides(plan: &SqlPlan, out: &mut Vec<JoinSide>) {
         | SqlPlan::CreateIndex { .. }
         | SqlPlan::DropIndex { .. } => {}
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -283,5 +298,47 @@ mod tests {
         assert_eq!(types.get("id"), Some(&DdlColType::Text));
         assert_eq!(types.get("events.id"), Some(&DdlColType::Int8));
         assert_eq!(types.get("hosts.id"), Some(&DdlColType::Text));
+    }
+
+    /// A derived side plans to a one-definition CTE. Its columns carry the
+    /// types the body announces, under the derived alias.
+    #[test]
+    fn a_derived_side_takes_its_body_types() {
+        let body = SqlPlan::Scan {
+            collection: "events".to_string(),
+            alias: None,
+            engine: EngineType::DocumentStrict,
+            filters: Vec::new(),
+            projection: vec![
+                nodedb_sql::types::query::Projection::Column("ts".to_string()),
+                nodedb_sql::types::query::Projection::Computed {
+                    expr: nodedb_sql::types_expr::SqlExpr::Column {
+                        table: None,
+                        name: "id".to_string(),
+                    },
+                    alias: "event_id".to_string(),
+                },
+            ],
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+            window_functions: Vec::new(),
+            temporal: nodedb_sql::temporal::TemporalScope::default(),
+        };
+        let derived = SqlPlan::Cte(CtePlan {
+            definitions: vec![("d".to_string(), body)],
+            outer: Box::new(scan("d", Some("d"))),
+        });
+        let types = join_column_types(
+            &scan("hosts", Some("h")),
+            &derived,
+            &TwoSideCatalog,
+            nodedb_types::DatabaseId::DEFAULT,
+        )
+        .expect("types derive");
+        assert_eq!(types.get("d.ts"), Some(&DdlColType::Timestamp));
+        assert_eq!(types.get("d.event_id"), Some(&DdlColType::Int8));
+        assert_eq!(types.get("h.id"), Some(&DdlColType::Text));
     }
 }

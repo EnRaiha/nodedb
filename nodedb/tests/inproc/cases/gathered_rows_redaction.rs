@@ -2,8 +2,9 @@
 
 //! Column redaction reaches rows the coordinator gathers.
 //!
-//! A join's build side, a post-processed body and a nested join's input reach
-//! the client as rows the coordinator gathered from another plan. A role with
+//! A join's build side, a post-processed body, a nested join's input and a
+//! derived join side reach the client as rows the coordinator gathered from
+//! another plan. A role with
 //! a rule on `ssn` reads `ssn` through each of them and gets the mask. An
 //! aggregate over a join reading `ssn` is refused. The owner reads the stored
 //! values.
@@ -31,12 +32,22 @@ const BROADCAST_JOIN: &str = "SELECT o.id, v.ssn FROM gr_orders o \
                               JOIN gr_users u ON o.user_id = u.id \
                               JOIN gr_users v ON v.id = u.id";
 
+/// A derived table as a join side. The coordinator gathers its body and
+/// embeds the rows as the join input, qualified by the derived alias.
+const DERIVED_JOIN: &str = "SELECT o.id, t.ssn FROM gr_orders o \
+                            JOIN (SELECT id, ssn FROM gr_users) t ON o.user_id = t.id";
+
 /// An aggregate over the join reading the ruled column.
 const AGGREGATE_OVER_JOIN: &str = "SELECT u.name, MIN(u.ssn) AS s FROM gr_orders o \
                                    JOIN gr_users u ON o.user_id = u.id GROUP BY u.name";
 
 /// Every shape that returns the ruled column, and the rows it returns.
-const MASKED_SHAPES: [(&str, usize); 3] = [(JOIN, 3), (POST_PROCESSED, 2), (BROADCAST_JOIN, 3)];
+const MASKED_SHAPES: [(&str, usize); 4] = [
+    (JOIN, 3),
+    (POST_PROCESSED, 2),
+    (BROADCAST_JOIN, 3),
+    (DERIVED_JOIN, 3),
+];
 
 async fn seed(srv: &TestServer) {
     for collection in ["gr_orders", "gr_users"] {

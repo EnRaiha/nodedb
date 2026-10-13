@@ -7,6 +7,7 @@ use sqlparser::ast::{self, Select};
 
 use super::array_arm;
 use super::constraint::extract_join_spec;
+use super::derived_side::plan_derived_side;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::lateral::plan::{LateralJoinArgs, plan_lateral_join};
@@ -41,9 +42,13 @@ pub fn plan_join_from_select(
         &join_row_scope
     };
 
-    // Left side: either an ARRAY_* TVF or a named table.
+    // Left side: an ARRAY_* TVF, a derived table, or a named table.
     let left_plan =
         if let Some(plan) = array_arm::try_plan_relation(&from.relation, catalog, temporal)? {
+            plan
+        } else if let Some(plan) =
+            plan_derived_side(&from.relation, scope, catalog, functions, temporal)?
+        {
             plan
         } else {
             scan_for_relation(&from.relation, scope, temporal)?
@@ -81,9 +86,13 @@ pub fn plan_join_from_select(
             })?));
         }
 
-        // Right side: array TVF or named table.
+        // Right side: array TVF, derived table, or named table.
         let right_plan = if let Some(plan) =
             array_arm::try_plan_relation(&join_item.relation, catalog, temporal)?
+        {
+            plan
+        } else if let Some(plan) =
+            plan_derived_side(&join_item.relation, scope, catalog, functions, temporal)?
         {
             plan
         } else {
@@ -196,14 +205,29 @@ fn right_side_identifiers(factor: &ast::TableFactor) -> Result<Vec<String>> {
             ids.push(alias);
         }
         ids.push(name);
+    } else if let Some(alias) = derived_alias(factor)? {
+        ids.push(alias);
     }
     Ok(ids)
 }
 
-/// Extract an alias (or table name) from a named-table `TableFactor`.
+/// Extract an alias (or table name) from a named-table `TableFactor`, or the
+/// alias of a derived table.
 fn scan_alias_from_relation(factor: &ast::TableFactor) -> Result<Option<String>> {
-    crate::parser::normalize::table_name_from_factor(factor)
-        .map(|relation| relation.map(|(name, alias)| alias.unwrap_or(name)))
+    match crate::parser::normalize::table_name_from_factor(factor)? {
+        Some((name, alias)) => Ok(Some(alias.unwrap_or(name))),
+        None => derived_alias(factor),
+    }
+}
+
+/// The alias of a derived-table `TableFactor`, `None` for any other factor.
+fn derived_alias(factor: &ast::TableFactor) -> Result<Option<String>> {
+    match factor {
+        ast::TableFactor::Derived {
+            alias: Some(alias), ..
+        } => crate::reserved::check_ast_identifier(&alias.name).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// True when the join operator represents a LEFT join variant.

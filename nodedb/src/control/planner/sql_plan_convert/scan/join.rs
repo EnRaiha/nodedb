@@ -47,6 +47,12 @@ fn serialize_join_condition(
 /// An `ARRAY_*` table function side names no relation in its plan, so its
 /// columns stay unqualified, and the planner leaves references to it bare.
 fn side_qualifier(plan: &SqlPlan) -> Option<String> {
+    // A derived table side is a one-definition CTE whose outer query scans
+    // the derived alias. Its rows come from the body, embedded as the join
+    // input, and its columns are qualified by the alias.
+    if let SqlPlan::Cte(cte) = plan {
+        return side_qualifier(&cte.outer);
+    }
     extract_scan_alias(plan).or_else(|| super::super::aggregate::extract_collection_name(plan))
 }
 

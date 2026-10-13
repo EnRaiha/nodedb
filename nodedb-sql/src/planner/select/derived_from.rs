@@ -5,6 +5,7 @@
 use sqlparser::ast::{self, Select};
 
 use super::cte_catalog::CteCatalog;
+use super::derived_output::rekey_join_output;
 use super::entry::plan_query;
 use super::query_tail::QueryTail;
 use super::select_stmt::{PlannedSelect, plan_select};
@@ -102,7 +103,8 @@ pub(in crate::planner::select) fn try_plan_derived_from(
 
     Ok(Some(PlannedSelect {
         plan: SqlPlan::Cte(CtePlan {
-            definitions: vec![(alias_name, inner_plan)],
+            // The outer query reads the body by its output names.
+            definitions: vec![(alias_name, rekey_join_output(inner_plan))],
             outer: Box::new(outer.plan),
         }),
         scope: outer.scope,

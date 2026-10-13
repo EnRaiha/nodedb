@@ -9,6 +9,7 @@ use sqlparser::ast::{Query, SetExpr};
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::select::cte_catalog::CteCatalog;
+use crate::planner::select::rekey_join_output;
 use crate::reserved::check_ast_identifier;
 use crate::resolver::derived::{infer_subquery_relation, rename_output_columns};
 use crate::temporal::TemporalScope;
@@ -72,7 +73,9 @@ fn plan_query_at(
             pipe_operators: query.pipe_operators.clone(),
         };
 
-        // Plan each CTE subquery and infer the relation it exposes.
+        // Plan each CTE subquery and infer the relation it exposes. A
+        // definition reads the definitions before it, as in PostgreSQL:
+        // `WITH c AS (...), d AS (SELECT ... FROM c)`.
         let mut definitions = Vec::new();
         let mut relations = Vec::new();
         for cte in &with.cte_tables {
@@ -83,16 +86,21 @@ fn plan_query_at(
                 .iter()
                 .map(|column| check_ast_identifier(&column.name))
                 .collect::<Result<_>>()?;
-            let cte_plan = plan_query(&cte.query, catalog, functions, temporal)?;
+            let earlier = CteCatalog {
+                inner: catalog,
+                relations: relations.clone(),
+            };
+            let cte_plan = plan_query(&cte.query, &earlier, functions, temporal)?;
             let info = infer_subquery_relation(
-                catalog,
+                &earlier,
                 &name,
                 &cte.query,
                 Some(&cte_plan),
                 functions,
                 temporal,
             )?;
-            definitions.push((name.clone(), cte_plan));
+            // The outer query reads the body by its output names.
+            definitions.push((name.clone(), rekey_join_output(cte_plan)));
             relations.push((name, rename_output_columns(info, &declared)));
         }
 
