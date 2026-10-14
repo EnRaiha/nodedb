@@ -51,9 +51,18 @@ jobs:
             dictionary: fuzz/dictionaries/sql.dict
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # A pinned nightly keeps the build cache key stable across days. Move
+      # the pin forward on purpose, not by the calendar.
       - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-10-01
+      # A cold ASan build takes most of the job's time limit. One cache per
+      # target, keyed on the toolchain and fuzz/Cargo.lock. The weekly run on
+      # main warms it for every pull request.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          key: ${{ matrix.target.name }}
       # All six matrix jobs install the same pinned binary; build it once.
       - name: Cache cargo-fuzz
         id: cache-cargo-fuzz
