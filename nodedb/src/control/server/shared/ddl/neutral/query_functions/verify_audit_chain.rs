@@ -11,13 +11,15 @@
 //! Superuser only, for the same reason `SHOW AUDIT LOG` is: the audit log is a
 //! single node-wide record covering every tenant on the node.
 
+use nodedb_sql::parser::query_function::VerifyAuditChainArgs;
+
 use crate::control::security::audit::entry::hash_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::helpers::{clean_arg, err, extract_function_args, single_result};
+use super::helpers::{err, single_result};
 
 /// `SELECT VERIFY_AUDIT_CHAIN(from_seq, to_seq)`
 ///
@@ -41,7 +43,7 @@ pub async fn verify_audit_chain(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     _database_id: DatabaseId,
-    sql: &str,
+    args: &VerifyAuditChainArgs,
 ) -> Result<Vec<DdlResult>, DdlError> {
     if !identity.is_superuser {
         return Err(err(
@@ -50,22 +52,20 @@ pub async fn verify_audit_chain(
         ));
     }
 
-    let args = extract_function_args(sql, "VERIFY_AUDIT_CHAIN")?;
-
-    let from_seq: u64 = if !args.is_empty() {
-        clean_arg(args[0])
-            .parse()
-            .map_err(|_| err("22023", "from_seq must be an integer"))?
-    } else {
-        1
-    };
-    let to_seq: u64 = if args.len() >= 2 {
-        clean_arg(args[1])
-            .parse()
-            .map_err(|_| err("22023", "to_seq must be an integer"))?
-    } else {
-        u64::MAX
-    };
+    let from_seq: u64 = args
+        .from_seq
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| err("22023", "from_seq must be an integer"))?
+        .unwrap_or(1);
+    let to_seq: u64 = args
+        .to_seq
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| err("22023", "to_seq must be an integer"))?
+        .unwrap_or(u64::MAX);
 
     // Try the durable audit WAL first.
     let audit_entries = state

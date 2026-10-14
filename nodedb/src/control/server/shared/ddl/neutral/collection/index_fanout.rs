@@ -127,6 +127,7 @@ pub(super) async fn backfill_on_peers(
             txn_id: None,
             vshard_id: None,
             read_groups: Vec::new(),
+            user_roles: Vec::new(),
         });
         joins.push(tokio::spawn(async move {
             let outcome = transport.send_rpc(node_id, req).await;

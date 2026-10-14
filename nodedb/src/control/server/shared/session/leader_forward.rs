@@ -109,6 +109,8 @@ pub(crate) async fn forward_to_leader(
         txn_id: forward_task.txn_id,
         // A staged write or overlay drop, never a read.
         linearizable: false,
+        // A staged write is judged at COMMIT against the record's roles.
+        user_roles: &[],
     })
     .await?;
 

@@ -18,12 +18,14 @@ use super::create::emit_trigger_put;
 
 /// Existence check used by the `DROP TRIGGER IF EXISTS` guard in the neutral
 /// router. Returns `false` when the catalog is unavailable or the read errors.
-pub fn trigger_exists(state: &SharedState, identity: &AuthenticatedIdentity, name: &str) -> bool {
+pub fn trigger_exists(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
+    name: &str,
+) -> bool {
     let catalog = state.credentials.catalog();
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     matches!(
         catalog.get_trigger_in_database(database_id, tenant_id, name),
         Ok(Some(_))
@@ -34,15 +36,13 @@ pub fn trigger_exists(state: &SharedState, identity: &AuthenticatedIdentity, nam
 pub async fn drop_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop triggers")?;
 
     let (name, if_exists) = parse_drop_trigger(parts)?;
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
@@ -103,6 +103,7 @@ pub async fn drop_trigger(
 pub async fn alter_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     name: &str,
     action: &str,
     new_owner: Option<&str>,
@@ -110,7 +111,7 @@ pub async fn alter_trigger(
     require_tenant_admin(identity, "alter triggers")?;
 
     if action == "OWNER" {
-        return alter_trigger_owner(state, identity, name, new_owner).await;
+        return alter_trigger_owner(state, identity, database_id, name, new_owner).await;
     }
 
     let enabled = match action {
@@ -125,9 +126,6 @@ pub async fn alter_trigger(
     };
 
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     let catalog = state.credentials.catalog();
 
     let mut trigger = catalog
@@ -154,6 +152,7 @@ pub async fn alter_trigger(
 async fn alter_trigger_owner(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     name: &str,
     new_owner: Option<&str>,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -163,9 +162,6 @@ async fn alter_trigger_owner(
         .to_string();
 
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     let catalog = state.credentials.catalog();
 
     let mut trigger = catalog

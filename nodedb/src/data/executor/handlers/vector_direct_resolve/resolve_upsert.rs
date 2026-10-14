@@ -12,7 +12,9 @@ use nodedb_types::{RlsWriteCheck, StorageKey, Surrogate, Value};
 
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::returning_rows::vector_stored_rows_payload;
+use crate::data::executor::handlers::returning_rows::{
+    VectorRowColumns, vector_stored_rows_payload,
+};
 use crate::data::executor::handlers::vector_direct_row::{VectorDirectIndexSpec, encode_sidecar};
 use crate::data::executor::handlers::vector_upsert::{
     VectorUpsertPatch, decode_payload_lowercased,
@@ -126,8 +128,11 @@ impl CoreLoop {
                 vector_stored_rows_payload(
                     spec,
                     rls_filters,
-                    &identity_column,
-                    &[(&key, sidecar.as_slice())],
+                    VectorRowColumns {
+                        identity: &identity_column,
+                        vector: field,
+                    },
+                    &[(&key, sidecar.as_slice(), vector)],
                 )
                 .map_err(ErrorCode::from)?
             }

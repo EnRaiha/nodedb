@@ -85,6 +85,8 @@ pub(super) fn apply_meta(ctx: &PermCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         | MetaOp::RegisterContinuousAggregate { .. }
         | MetaOp::UnregisterContinuousAggregate { .. }
         | MetaOp::ListContinuousAggregates
+        | MetaOp::ContinuousAggregatesRegistered
+        | MetaOp::AwaitContinuousAggregateRefresh { .. }
         | MetaOp::ConvertCollection { .. }
         | MetaOp::RestoreTenantSnapshot { .. }
         | MetaOp::PurgeTenant { .. }

@@ -117,6 +117,7 @@ pub(super) async fn scatter_round_zero(
                 version_set: &version_set,
                 txn_id,
                 linearizable,
+                user_roles: &[],
             })
             .await?;
             let mut log = ShardReadLog::new();

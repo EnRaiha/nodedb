@@ -17,8 +17,7 @@ pub use config::{ArchiveCompression, ConfigValidationError, TieredPartitionConfi
 pub use continuous_agg::{AggFunction, AggregateExpr, ContinuousAggregateDef, RefreshPolicy};
 pub use ingest::{IngestResult, LogEntry, MetricSample, SymbolDictionary, TimeRange};
 pub use partition::{
-    FlushedKind, FlushedSeries, IntervalParseError, PartitionInterval, PartitionMeta,
-    PartitionState, SegmentKind, SegmentRef,
+    IntervalParseError, PartitionInterval, PartitionMeta, PartitionState, SegmentKind, SegmentRef,
 };
 pub use series::{BatteryState, LiteId, ResolvedSeries, SeriesCatalog, SeriesId, SeriesKey};
-pub use sync::{LogWalBatch, TimeseriesDelta, TimeseriesWalBatch};
+pub use sync::{LogWalBatch, TimeseriesDelta};

@@ -208,6 +208,10 @@ pub(super) async fn try_typed(
             )
         }
 
+        NodedbStatement::StreamView(StreamViewStmt::RefreshContinuousAggregate { name }) => Some(
+            continuous_agg::refresh_continuous_aggregate(state, identity, database_id, name).await,
+        ),
+
         _ => None,
     }
 }

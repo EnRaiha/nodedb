@@ -96,6 +96,7 @@ pub(super) fn response(request_id: RequestId, payload: Vec<u8>) -> Response {
 pub(super) fn preview_payload(digest: [u8; 32]) -> Vec<u8> {
     zerompk::to_msgpack_vec(&CrdtPreviewResult {
         post_image_msgpack: vec![0xc0],
+        pre_image_msgpack: vec![0xc0],
         imported_ops: 1,
         trimmed_ops: 0,
         frontier_digest: digest,

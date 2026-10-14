@@ -32,6 +32,7 @@ pub(super) fn restore_collection_indexes(
             collection,
             field: &field_index.field,
             field_position: field_index.field_position,
+            coverage: field_index.coverage,
             entries: &field_index.entries,
         });
     }
@@ -43,6 +44,7 @@ pub(super) fn restore_collection_indexes(
             collection,
             fields: &composite.fields,
             field_positions: &composite.field_positions,
+            coverage: composite.coverage,
             entries: &composite.entries,
         });
     }
@@ -219,11 +221,12 @@ mod tests {
         put(&mut engine, b"p1", row("alice", 100, "us", "active"), 11);
 
         let tkey = table_key_of(&engine, COLL);
-        engine
-            .indexes
-            .entry(tkey)
-            .or_default()
-            .add_composite_index(composite_fields(), vec![0, 1]);
+        engine.indexes.entry(tkey).or_default().add_composite_index(
+            composite_fields(),
+            vec![0, 1],
+            // Registered over p1 without filing it.
+            crate::engine::kv::index::IndexCoverage::SinceRegistration,
+        );
 
         engine.register_index(RegisterIndexParams {
             database_id: DB,
@@ -243,7 +246,18 @@ mod tests {
     }
 
     fn lookup_name(engine: &KvEngine, name: &str) -> Vec<Vec<u8>> {
-        engine.index_lookup_eq(DB, TID, COLL, "name", name.as_bytes())
+        engine.index_lookup_eq(
+            DB,
+            TID,
+            COLL,
+            "name",
+            &nodedb_types::Value::String(name.into()),
+        )
+    }
+
+    /// The index key a text field value is filed under.
+    fn text_key(text: &str) -> Vec<u8> {
+        crate::engine::kv::index::kv_index_key(&nodedb_types::Value::String(text.into()))
     }
 
     /// Every index kind must come back from disk answering the queries it answered
@@ -308,11 +322,20 @@ mod tests {
             .get_composite_index(&composite_fields())
             .expect("the composite registration must survive");
         assert_eq!(
-            composite.lookup_eq(&[b"eu", b"active"]),
+            composite.coverage(),
+            crate::engine::kv::index::IndexCoverage::SinceRegistration,
+            "a partial index must come back partial, or it would answer equalities"
+        );
+        assert_eq!(
+            set.get_index("name").map(|index| index.coverage()),
+            Some(crate::engine::kv::index::IndexCoverage::Complete)
+        );
+        assert_eq!(
+            composite.lookup_eq(&[&text_key("eu"), &text_key("active")]),
             vec![b"p3".as_slice()]
         );
         assert_eq!(
-            composite.lookup_prefix(&[b"us"]),
+            composite.lookup_prefix(&[&text_key("us")]),
             vec![b"p2".as_slice()],
             "content is restored verbatim: p1 predates the composite registration \
              and was never in it"
@@ -341,7 +364,7 @@ mod tests {
             .and_then(|s| s.get_composite_index(&composite_fields()))
             .expect("composite registration");
         assert_eq!(
-            composite.lookup_eq(&[b"us", b"active"]),
+            composite.lookup_eq(&[&text_key("us"), &text_key("active")]),
             vec![b"p2".as_slice(), b"p4".as_slice()]
         );
     }

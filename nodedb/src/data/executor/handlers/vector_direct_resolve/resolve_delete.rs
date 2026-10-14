@@ -11,7 +11,9 @@ use nodedb_types::{StorageKey, Surrogate, Value};
 
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::returning_rows::vector_stored_rows_payload;
+use crate::data::executor::handlers::returning_rows::{
+    VectorRowColumns, vector_stored_rows_payload,
+};
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::handlers::vector_direct_delete::VectorDirectDeleteParams;
 use crate::data::executor::response_codec;
@@ -68,13 +70,32 @@ impl CoreLoop {
                     .iter()
                     .map(|(surrogate, _)| StorageKey::for_surrogate(*surrogate))
                     .collect();
-                let stored: Vec<(&StorageKey, &[u8])> = keys
+                // The pre-image vectors, read before the delete applies.
+                let vectors: Vec<Vec<f32>> = rows
+                    .iter()
+                    .map(|(surrogate, _)| {
+                        self.committed_primary_vector(
+                            database_id,
+                            tid,
+                            collection,
+                            field,
+                            *surrogate,
+                        )
+                    })
+                    .collect::<crate::Result<_>>()
+                    .map_err(ErrorCode::from)?;
+                let stored: Vec<(&StorageKey, &[u8], &[f32])> = keys
                     .iter()
                     .zip(rows.iter())
-                    .map(|(key, (_, bytes))| (key, bytes.as_slice()))
+                    .zip(vectors.iter())
+                    .map(|((key, (_, bytes)), vector)| (key, bytes.as_slice(), vector.as_slice()))
                     .collect();
                 let identity_column = self.identity_column(database_id, tid, collection);
-                vector_stored_rows_payload(spec, rls_filters, &identity_column, &stored)
+                let columns = VectorRowColumns {
+                    identity: &identity_column,
+                    vector: field,
+                };
+                vector_stored_rows_payload(spec, rls_filters, columns, &stored)
                     .map_err(ErrorCode::from)?
             }
             None => response_codec::encode_affected(rows.len() as u64),

@@ -24,13 +24,14 @@ pub(super) enum ProposeOutcome {
 }
 
 /// Propose `plan` — a resolved write — through the live Raft proposer and
-/// await commit + apply.
+/// await commit + apply. The entry carries `user_roles`.
 pub(super) async fn propose_resolved(
     state: &SharedState,
     ctx: WriteResolveContext,
     collection: &str,
     vshard_id: VShardId,
     plan: PhysicalPlan,
+    user_roles: &[String],
 ) -> crate::Result<ProposeOutcome> {
     let proposer = state.async_raft_proposer()?;
     // The resolved op stamps `DecidedEarlierInRequest`, so this never refuses.
@@ -40,7 +41,8 @@ pub(super) async fn propose_resolved(
             detail: format!(
                 "write-resolve: resolved plan for '{collection}' did not map to a replicated write"
             ),
-        })?;
+        })?
+        .with_user_roles(user_roles.to_vec());
 
     let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
         .tokio_instant();

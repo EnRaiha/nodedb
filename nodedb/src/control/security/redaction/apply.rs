@@ -206,8 +206,24 @@ impl RedactionStore {
         }
 
         if let [(_, rules)] = sources.as_slice() {
+            // Every column comes from the one source, so a qualified key
+            // (`a.ssn`, as a self-join or a gathered join body carries) is
+            // that source's column too and matches by its column part.
+            let qualified: Vec<(String, RedactionMode)> = row
+                .keys()
+                .filter_map(|key| {
+                    let (_, column) = key.rsplit_once('.')?;
+                    rules
+                        .iter()
+                        .find(|rule| rule.field == column)
+                        .map(|rule| (key.to_owned(), rule.mode.clone()))
+                })
+                .collect();
             for rule in rules {
                 row.redact_key(&rule.field, &rule.mode);
+            }
+            for (key, mode) in qualified {
+                row.redact_key(&key, &mode);
             }
             return;
         }
@@ -284,6 +300,24 @@ mod tests {
         );
         assert_eq!(r["email"], "***");
         assert_eq!(r["name"], "Alice");
+    }
+
+    /// A self-join, or a gathered join body, names one source while its row
+    /// keys carry qualifiers. Each qualified copy of the ruled column is
+    /// masked.
+    #[test]
+    fn single_source_matches_qualified_keys_by_column() {
+        let store = store_with("users", "support", vec![mask("ssn", "***")]);
+        let mut r = row(json!({"a.ssn": "1", "b.ssn": "2", "a.name": "Alice"}));
+        store.apply_flat_row(
+            1,
+            &["support".into()],
+            &[(String::new(), "users".into())],
+            &mut r,
+        );
+        assert_eq!(r["a.ssn"], "***");
+        assert_eq!(r["b.ssn"], "***");
+        assert_eq!(r["a.name"], "Alice");
     }
 
     #[test]

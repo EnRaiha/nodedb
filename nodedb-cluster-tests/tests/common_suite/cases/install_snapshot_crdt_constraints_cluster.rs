@@ -7,7 +7,7 @@
 //! ## What this guards
 //!
 //! `CREATE UNIQUE INDEX` bumps the collection's `constraint_version` in the
-//! catalog and (once the metadata-leader reconcile loop runs) installs the
+//! catalog and, before it returns, installs the
 //! translated `Constraint` into the hosting node's per-core CRDT validator
 //! for that collection. U6 made `MetaOp::CreateTenantSnapshot` (`create.rs`)
 //! carry the validator's installed constraint set into the snapshot's
@@ -27,8 +27,9 @@
 //! Instead this test drives the two U6-changed handlers directly, on one
 //! node, deterministically:
 //!
-//! 1. Install a UNIQUE(email) constraint on `users` (via one on-demand
-//!    reconcile pass, with the background reconcile loop held off).
+//! 1. Install a UNIQUE(email) constraint on `users` (via on-demand reconcile
+//!    passes until one delivers, with the background reconcile loop held
+//!    off), then wait until every node applied every committed entry.
 //! 2. CAPTURE a tenant snapshot (`create_tenant_snapshot` ->
 //!    `MetaOp::CreateTenantSnapshot`) and assert its `crdt_constraints`
 //!    field carries the installed constraint — proving `create.rs`.
@@ -83,11 +84,26 @@ async fn crdt_constraint_survives_snapshot_capture_and_restore() {
         .await
         .expect("CREATE UNIQUE INDEX users_email_uniq");
 
-    // Install the constraint deterministically: drive one reconcile pass on
-    // every node (only the metadata leader actually proposes; the rest
-    // no-op), then poll node 0's validator until UNIQUE(email) is installed.
-    for node in &cluster.nodes {
-        node.run_constraint_reconcile_once().await;
+    // Install the constraint deterministically: drive a reconcile pass on
+    // every node until one delivers. Only the metadata leader proposes; the
+    // rest no-op. A pass that delivers nothing leaves its proposal free to
+    // commit later, after the drop below, so the test waits for a delivery.
+    let reconcile_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut delivered = 0usize;
+        for node in &cluster.nodes {
+            delivered += node.run_constraint_reconcile_once().await;
+        }
+        if delivered > 0 {
+            break;
+        }
+        if Instant::now() >= reconcile_deadline {
+            panic!(
+                "no node delivered the constraint set of '{COLLECTION}' through a reconcile \
+                 pass within 15s"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -139,6 +155,16 @@ async fn crdt_constraint_survives_snapshot_capture_and_restore() {
 
     // CLEAR: drop the validator's constraint set directly so restore is the
     // only possible source of reinstallation.
+    //
+    // The drop is local to node 0 and rides no Raft log. Every `SetConstraints`
+    // at version 1 that the DDL and the reconcile pass committed must apply on
+    // node 0 first. One applied later passes the `>=` version fence and
+    // reinstalls the set. The delivery above returned once the group's leader
+    // applied it, so its entry is committed, and so is every entry before it.
+    // The drop stays at version 1, the version restore installs at.
+    cluster
+        .wait_for_full_apply_convergence(Duration::from_secs(15))
+        .await;
     assert!(
         cluster.nodes[0]
             .crdt_drop_constraints(TenantId::new(TENANT), COLLECTION, 1)

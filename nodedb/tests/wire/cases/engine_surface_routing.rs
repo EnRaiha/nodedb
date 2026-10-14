@@ -75,10 +75,20 @@ async fn engine_spatial_accepted() {
 #[tokio::test]
 async fn engine_vector_accepted() {
     let srv = TestServer::start().await;
-    // engine='vector' must map to document_schemaless without error.
-    srv.exec("CREATE COLLECTION route_vec WITH (engine='vector')")
-        .await
-        .unwrap();
+    // engine='vector' is a vector-primary collection: it names its vector
+    // field and dimension.
+    srv.exec(
+        "CREATE COLLECTION route_vec (id STRING PRIMARY KEY, emb VECTOR(3)) \
+         WITH (engine='vector', vector_field='emb', dim=3)",
+    )
+    .await
+    .unwrap();
+    // Without them it is refused, never created as a document collection.
+    srv.expect_error(
+        "CREATE COLLECTION route_vec_bare WITH (engine='vector')",
+        "42601",
+    )
+    .await;
 }
 
 // ── Rejected engine names ─────────────────────────────────────────────────────

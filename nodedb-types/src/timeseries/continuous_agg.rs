@@ -13,9 +13,14 @@ use serde::{Deserialize, Serialize};
 /// Map-encoded so fields (e.g. `database_id`) can be added with
 /// `#[msgpack(default)]` and older persisted definitions still decode
 /// without a migration.
+///
+/// `Default` gives an empty definition whose `incarnation` is `Hlc::ZERO`.
+/// No CREATE stamps that incarnation, and Origin never installs persisted
+/// state into, or from, a definition that carries it.
 #[derive(
     Debug,
     Clone,
+    Default,
     PartialEq,
     Serialize,
     Deserialize,
@@ -51,6 +56,12 @@ pub struct ContinuousAggregateDef {
     pub retention_period_ms: u64,
     /// Whether this aggregate is currently stale (schema change invalidation).
     pub stale: bool,
+    /// Identity of the CREATE that made this definition. A re-created
+    /// aggregate of the same name never loads the persisted buckets of a
+    /// dropped one.
+    #[msgpack(default)]
+    #[serde(default)]
+    pub incarnation: crate::Hlc,
 }
 
 /// An aggregate expression: function + source column → result column.

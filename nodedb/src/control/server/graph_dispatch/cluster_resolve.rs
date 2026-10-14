@@ -104,6 +104,7 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
             // This resolve path carries no session-transaction context.
             txn_id: None,
             linearizable,
+            user_roles: &[],
         })
         .await?;
         let read_versions = outcome.read_versions;

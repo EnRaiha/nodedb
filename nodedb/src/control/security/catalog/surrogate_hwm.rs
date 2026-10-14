@@ -23,7 +23,7 @@ pub const SURROGATE_RESERVE_INDEX: redb::TableDefinition<&str, u64> =
     redb::TableDefinition::new("_system.surrogate_reserve_index");
 
 /// Singleton row key (shared by both surrogate-state tables).
-const HWM_KEY: &str = "global";
+pub(super) const HWM_KEY: &str = "global";
 
 impl SystemCatalog {
     /// Persist the surrogate allocator high-watermark. Overwrites the

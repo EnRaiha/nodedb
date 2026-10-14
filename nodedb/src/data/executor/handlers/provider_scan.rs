@@ -123,7 +123,7 @@ impl CoreLoop {
         if !sort_keys.is_empty()
             && let Err(e) = sort_msgpack_rows(&mut rows, sort_keys)
         {
-            return self.response_error(task, crate::Error::from(e));
+            return self.response_error(task, e);
         }
 
         // ── 5. Distinct (on the would-be projected row). ──────────────────────

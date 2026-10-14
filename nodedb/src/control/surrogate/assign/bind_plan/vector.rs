@@ -5,7 +5,7 @@
 
 use nodedb_physical::physical_plan::{VectorOp, VectorResolvedMutation};
 
-use super::binder::IdentityBinder;
+use super::binder::{BindSlot, IdentityBinder};
 
 pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Result<()> {
     match op {
@@ -27,13 +27,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             surrogates,
             ..
         } => {
-            for surrogate in surrogates.iter_mut() {
-                binder.resolve_self_keyed_in_place(
-                    binder.plan_key(collection.as_str())?,
-                    surrogate,
-                )?;
-            }
-            Ok(())
+            let key = binder.plan_key(collection.as_str())?;
+            let slots = surrogates
+                .iter_mut()
+                .map(|surrogate| BindSlot::self_keyed(key, surrogate))
+                .collect();
+            binder.resolve_slots_in_place(slots)
         }
         VectorOp::MultiVectorInsert {
             collection,
@@ -74,30 +73,37 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             pk_bytes,
             surrogate,
         ),
+        VectorOp::DirectBatchWrite {
+            collection, rows, ..
+        } => {
+            let key = binder.plan_key(collection.as_str())?;
+            let slots = rows
+                .iter_mut()
+                .map(|row| keyed_or_self_slot(key, &row.pk_bytes, &mut row.surrogate))
+                .collect();
+            binder.resolve_slots_in_place(slots)
+        }
         VectorOp::ResolveDirectWrite(inner) => bind(binder, inner),
         VectorOp::ResolvedDirectWrite {
             collection,
             mutations,
             ..
         } => {
+            let key = binder.plan_key(collection.as_str())?;
+            let mut slots = Vec::with_capacity(mutations.len());
             for mutation in mutations.iter_mut() {
                 match mutation {
                     VectorResolvedMutation::Upsert {
                         surrogate,
                         pk_bytes,
                         ..
-                    } => bind_keyed_or_self(
-                        binder,
-                        binder.plan_key(collection.as_str())?,
-                        pk_bytes,
-                        surrogate,
-                    )?,
+                    } => slots.push(keyed_or_self_slot(key, pk_bytes, surrogate)),
                     // Named by a surrogate bound when the row was inserted.
                     VectorResolvedMutation::Delete { .. }
                     | VectorResolvedMutation::Update { .. } => {}
                 }
             }
-            Ok(())
+            binder.resolve_slots_in_place(slots)
         }
         // Deletes and updates name an existing surrogate; searches, sparse
         // rows (keyed by doc id in their own store) and index maintenance
@@ -134,4 +140,17 @@ fn bind_keyed_or_self(
         return binder.resolve_self_keyed_in_place(key, surrogate);
     }
     binder.resolve_in_place(key, pk_bytes, surrogate)
+}
+
+/// The bind slot of one row: keyed by `pk_bytes`, or self-keyed when it is
+/// empty (a headless row).
+fn keyed_or_self_slot<'k, 's>(
+    key: nodedb_types::CollectionKey<'k>,
+    pk_bytes: &'s [u8],
+    surrogate: &'s mut nodedb_types::Surrogate,
+) -> BindSlot<'k, 's> {
+    if pk_bytes.is_empty() {
+        return BindSlot::self_keyed(key, surrogate);
+    }
+    BindSlot::keyed(key, pk_bytes, surrogate)
 }

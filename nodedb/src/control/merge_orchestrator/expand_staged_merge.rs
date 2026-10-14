@@ -19,7 +19,9 @@
 use nodedb_types::TenantId;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
+use crate::control::maintenance::clone_materializer::dispatch_local;
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::source_read::{SourceReadContext, read_source_rows};
 use crate::control::state::SharedState;
 use crate::types::VShardId;
 use nodedb_physical::physical_plan::DocumentOp;
@@ -41,6 +43,7 @@ use crate::control::target_identity::{
 /// stages + buffers each returned op.
 pub(crate) async fn resolve_and_emit_merge_ops(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
@@ -58,7 +61,7 @@ pub(crate) async fn resolve_and_emit_merge_ops(
     let target_collection = target_collection.clone();
     let rls_write_check = rls_write_check.clone();
 
-    let arms = resolve_merge_arms(state, tenant_id, task).await?;
+    let arms = resolve_merge_arms(state, identity, tenant_id, task).await?;
 
     // Gate every resolved arm on the target's write policy (post-image for
     // UPDATE/INSERT, pre-image for DELETE): this expansion rewrites the
@@ -116,12 +119,13 @@ pub(crate) async fn resolve_and_emit_merge_ops(
 /// classifier for both this path and autocommit `run_merge`.
 async fn resolve_merge_arms(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     task: &PhysicalTask,
 ) -> crate::Result<ResolvedMergeArms> {
     let PhysicalPlan::Document(DocumentOp::Merge {
         target_collection,
-        source_collection,
+        source,
         source_alias,
         target_join_col,
         source_join_col,
@@ -137,15 +141,18 @@ async fn resolve_merge_arms(
         });
     };
 
-    // Phase 0: read the SOURCE where it lives (a different core than the
-    // target's) and ship the rows into the plan; threading `txn_id` folds
-    // the source's own staging overlay too.
-    let source_rows = read_all_source_rows(
-        state,
-        tenant_id,
-        task.database_id,
-        source_collection.as_str(),
-        task.txn_id,
+    // Phase 0: read the source relation like a SELECT and ship the rows into
+    // the plan; threading `txn_id` folds the source's own staging overlay
+    // too.
+    let source_rows = read_source_rows(
+        &SourceReadContext {
+            state,
+            identity,
+            tenant_id,
+            database_id: task.database_id,
+            txn_id: task.txn_id,
+        },
+        source,
     )
     .await?;
 
@@ -153,7 +160,7 @@ async fn resolve_merge_arms(
     let resolve_plan =
         PhysicalPlan::Document(DocumentOp::ResolveWrite(Box::new(DocumentOp::Merge {
             target_collection: target_collection.clone(),
-            source_collection: source_collection.clone(),
+            source: source.clone(),
             source_alias: source_alias.clone(),
             target_join_col: target_join_col.clone(),
             source_join_col: source_join_col.clone(),

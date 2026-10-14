@@ -8,16 +8,21 @@ use nodedb_types::{CollectionKey, Surrogate, TenantId, extract_pk_value};
 use super::pk::TargetPk;
 use crate::control::state::SharedState;
 
-/// The surrogate of one written row that names no key on the TARGET's
-/// primary key. `target` is the target collection's canonical key. A fresh
-/// surrogate binds on this node under its own identity, and a row keyless on
-/// a declared primary key is refused.
-async fn keyless_target_surrogate(
+/// The surrogates of `count` written rows that name no key on the TARGET's
+/// primary key. `target` is the target collection's canonical key. Each row
+/// takes a fresh surrogate bound on this node under its own identity, all in
+/// one catalog transaction. A row keyless on a declared primary key is
+/// refused.
+async fn keyless_target_surrogates(
     state: &SharedState,
     target: CollectionKey<'_>,
     tenant_id: TenantId,
     target_pk: &TargetPk,
-) -> crate::Result<Surrogate> {
+    count: usize,
+) -> crate::Result<Vec<Surrogate>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     // No usable key value on a DDL-declared PRIMARY KEY: NOT NULL is implied,
     // so refuse rather than mint a surrogate for a row that plain INSERT
     // already rejects.
@@ -36,18 +41,18 @@ async fn keyless_target_surrogate(
     // value: a fresh unique surrogate, never one shared binding for every
     // keyless row. The row's identity is its document storage key, so the
     // allocator binds that form.
-    let (surrogate, _) = state
+    let drawn = state
         .surrogate_assigner
-        .assign_fresh(target, tenant_id)
+        .assign_fresh_many(target, tenant_id, count)
         .await?;
-    Ok(surrogate)
+    Ok(drawn.into_iter().map(|(surrogate, _)| surrogate).collect())
 }
 
 /// A fresh, registered surrogate for every written row of one target, in
 /// `bodies` order, on the TARGET's primary key. Every row that names its key
 /// resolves in one batch at the target's collection home, through the async
-/// exchange. The empty string is a key like any other. A keyless row follows
-/// [`keyless_target_surrogate`].
+/// exchange. The empty string is a key like any other. Keyless rows follow
+/// [`keyless_target_surrogates`].
 pub(crate) async fn assign_target_surrogates(
     state: &SharedState,
     target: CollectionKey<'_>,
@@ -72,14 +77,19 @@ pub(crate) async fn assign_target_surrogates(
     )
     .await?
     .into_iter();
+    let keyless_count = keys.iter().filter(|key| key.is_none()).count();
+    let mut keyless = keyless_target_surrogates(state, target, tenant_id, target_pk, keyless_count)
+        .await?
+        .into_iter();
     let mut surrogates = Vec::with_capacity(bodies.len());
     for key in &keys {
-        surrogates.push(match key {
-            Some(_) => bound.next().ok_or_else(|| crate::Error::Internal {
-                detail: format!("a keyed row of '{}' got no surrogate", target.name()),
-            })?,
-            None => keyless_target_surrogate(state, target, tenant_id, target_pk).await?,
-        });
+        let next = match key {
+            Some(_) => bound.next(),
+            None => keyless.next(),
+        };
+        surrogates.push(next.ok_or_else(|| crate::Error::Internal {
+            detail: format!("a row of '{}' got no surrogate", target.name()),
+        })?);
     }
     Ok(surrogates)
 }

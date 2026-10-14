@@ -4,8 +4,11 @@
 //! schemaless collections.
 //!
 //! The get/put collection, schemaless check, duplicate pre-checks,
-//! `type_guards` mutation, and `schema_version.bump()` run here. The result is
-//! the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! `type_guards` mutation, Data Plane re-registration and
+//! `schema_version.bump()` run here. The result is the protocol-neutral
+//! [`DdlResult`] / [`DdlError`].
+//!
+//! Every handler resolves the collection in the session's database.
 //!
 //! Syntax:
 //! ```sql
@@ -28,11 +31,12 @@
 //! ```
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, TypeGuardFieldDef};
 
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::catalog_entry::persist_collection_replicated;
+use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -50,12 +54,83 @@ fn status(command: &str) -> Vec<DdlResult> {
     }]
 }
 
+/// Read `coll_name` from the session database.
+fn load_collection(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    coll_name: &str,
+) -> Result<StoredCollection, DdlError> {
+    state
+        .credentials
+        .catalog()
+        .get_collection(database_id, identity.tenant_id.as_u64(), coll_name)
+        .map_err(|e| DdlError::from_error(&e))?
+        .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))
+}
+
+/// Refuse a collection that is not schemaless.
+fn require_schemaless(coll: &StoredCollection, coll_name: &str) -> Result<(), DdlError> {
+    if coll.collection_type.is_schemaless() {
+        return Ok(());
+    }
+    Err(err(
+        "0A000",
+        &format!(
+            "TYPEGUARD is only supported on schemaless collections; '{coll_name}' is not schemaless"
+        ),
+    ))
+}
+
+/// Refuse a guard DEFAULT or VALUE on a CRDT collection.
+///
+/// Every replica merges the CRDT state on its own, so the server cannot inject
+/// a field without diverging from the replica that produced the delta.
+/// REQUIRED, type and CHECK stay accepted: they only validate.
+fn refuse_crdt_injection(
+    coll: &StoredCollection,
+    guard: &TypeGuardFieldDef,
+) -> Result<(), DdlError> {
+    if !coll.crdt {
+        return Ok(());
+    }
+    let clause = if guard.value_expr.is_some() {
+        "VALUE"
+    } else if guard.default_expr.is_some() {
+        "DEFAULT"
+    } else {
+        return Ok(());
+    };
+    Err(err(
+        "0A000",
+        &format!(
+            "field '{}': typeguard {clause} is not supported on a CRDT collection; its state is \
+             merged by every replica",
+            guard.field
+        ),
+    ))
+}
+
+/// Replicate the changed guards, register them on this node's Data Plane, and
+/// bump the schema version.
+async fn persist_guards(state: &SharedState, coll: &StoredCollection) -> Result<(), DdlError> {
+    let outcome = persist_collection_replicated(state, coll)
+        .await
+        .map_err(|e| DdlError::from_error(&e))?;
+    super::super::collection::register_proposed_collection(state, outcome, coll)
+        .await
+        .map_err(|e| DdlError::from_error(&e))?;
+    state.schema_version.bump();
+    Ok(())
+}
+
 // ── CREATE TYPEGUARD ──────────────────────────────────────────────────────────
 
 /// Handle `CREATE [OR REPLACE] TYPEGUARD ON <collection> ( field TYPE [REQUIRED] [CHECK (expr)], ... )`.
 pub async fn create_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let or_replace = find_ascii_case_insensitive(sql, "OR REPLACE").is_some();
@@ -71,21 +146,10 @@ pub async fn create_typeguard(
         ));
     }
 
-    let catalog = state.credentials.catalog();
-
-    let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| DdlError::from_error(&e))?
-        .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
-
-    if !coll.collection_type.is_schemaless() {
-        return Err(err(
-            "0A000",
-            &format!(
-                "TYPEGUARD is only supported on schemaless collections; '{coll_name}' is not schemaless"
-            ),
-        ));
+    let mut coll = load_collection(state, identity, database_id, &coll_name)?;
+    require_schemaless(&coll, &coll_name)?;
+    for guard in &guards {
+        refuse_crdt_injection(&coll, guard)?;
     }
 
     if !or_replace && !coll.type_guards.is_empty() {
@@ -98,11 +162,7 @@ pub async fn create_typeguard(
     }
 
     coll.type_guards = guards;
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_guards(state, &coll).await?;
 
     Ok(status("CREATE TYPEGUARD"))
 }
@@ -113,6 +173,7 @@ pub async fn create_typeguard(
 pub async fn alter_typeguard_add(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_name(sql)?;
@@ -123,22 +184,9 @@ pub async fn alter_typeguard_add(
 
     let guard = parse_single_field(after_add)?;
 
-    let catalog = state.credentials.catalog();
-
-    let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| DdlError::from_error(&e))?
-        .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
-
-    if !coll.collection_type.is_schemaless() {
-        return Err(err(
-            "0A000",
-            &format!(
-                "TYPEGUARD is only supported on schemaless collections; '{coll_name}' is not schemaless"
-            ),
-        ));
-    }
+    let mut coll = load_collection(state, identity, database_id, &coll_name)?;
+    require_schemaless(&coll, &coll_name)?;
+    refuse_crdt_injection(&coll, &guard)?;
 
     if coll.type_guards.iter().any(|g| g.field == guard.field) {
         return Err(err(
@@ -151,11 +199,7 @@ pub async fn alter_typeguard_add(
     }
 
     coll.type_guards.push(guard);
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_guards(state, &coll).await?;
 
     Ok(status("ALTER TYPEGUARD"))
 }
@@ -164,6 +208,7 @@ pub async fn alter_typeguard_add(
 pub async fn alter_typeguard_drop(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_name(sql)?;
@@ -176,13 +221,7 @@ pub async fn alter_typeguard_drop(
         return Err(err("42601", "ALTER TYPEGUARD DROP requires a field name"));
     }
 
-    let catalog = state.credentials.catalog();
-
-    let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| DdlError::from_error(&e))?
-        .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
+    let mut coll = load_collection(state, identity, database_id, &coll_name)?;
 
     let before_len = coll.type_guards.len();
     coll.type_guards.retain(|g| g.field != field_name);
@@ -194,11 +233,7 @@ pub async fn alter_typeguard_drop(
         ));
     }
 
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_guards(state, &coll).await?;
 
     Ok(status("ALTER TYPEGUARD"))
 }
@@ -207,13 +242,14 @@ pub async fn alter_typeguard_drop(
 pub async fn alter_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
     if upper.contains(" ADD ") {
-        alter_typeguard_add(state, identity, sql).await
+        alter_typeguard_add(state, identity, database_id, sql).await
     } else if upper.contains(" DROP ") {
-        alter_typeguard_drop(state, identity, sql).await
+        alter_typeguard_drop(state, identity, database_id, sql).await
     } else {
         Err(err(
             "42601",
@@ -228,6 +264,7 @@ pub async fn alter_typeguard(
 pub async fn drop_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let upper = sql.to_uppercase();
@@ -235,13 +272,7 @@ pub async fn drop_typeguard(
 
     let coll_name = extract_collection_name(sql)?;
 
-    let catalog = state.credentials.catalog();
-
-    let tenant_id = identity.tenant_id.as_u64();
-    let mut coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| DdlError::from_error(&e))?
-        .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
+    let mut coll = load_collection(state, identity, database_id, &coll_name)?;
 
     if coll.type_guards.is_empty() {
         if if_exists {
@@ -254,11 +285,7 @@ pub async fn drop_typeguard(
     }
 
     coll.type_guards.clear();
-    persist_collection_replicated(state, &coll)
-        .await
-        .map_err(|e| DdlError::from_error(&e))?;
-
-    state.schema_version.bump();
+    persist_guards(state, &coll).await?;
 
     Ok(status("DROP TYPEGUARD"))
 }
@@ -269,17 +296,12 @@ pub async fn drop_typeguard(
 pub fn show_typeguard(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let coll_name = extract_collection_name(sql)?;
 
-    let catalog = state.credentials.catalog();
-
-    let tenant_id = identity.tenant_id.as_u64();
-    let coll = catalog
-        .get_collection(DatabaseId::DEFAULT, tenant_id, &coll_name)
-        .map_err(|e| DdlError::from_error(&e))?
-        .ok_or_else(|| err("42P01", &format!("collection '{coll_name}' not found")))?;
+    let coll = load_collection(state, identity, database_id, &coll_name)?;
 
     let columns = vec![
         "field".to_string(),
@@ -312,13 +334,14 @@ pub fn show_typeguard(
 pub fn show_typeguards(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     _sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let catalog = state.credentials.catalog();
 
     let tenant_id = identity.tenant_id.as_u64();
     let collections = catalog
-        .load_collections_for_tenant(DatabaseId::DEFAULT, tenant_id)
+        .load_collections_for_tenant(database_id, tenant_id)
         .map_err(|e| DdlError::from_error(&e))?;
 
     let columns = vec!["collection".to_string(), "fields".to_string()];

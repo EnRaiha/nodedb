@@ -76,6 +76,7 @@ pub(super) async fn export_legs(
         version_set: &GatewayVersionSet::from_pairs(Vec::new()),
         txn_id: None,
         linearizable,
+        user_roles: &[],
     })
     .await?;
     reads.note([vshard], &outcome.read_versions);

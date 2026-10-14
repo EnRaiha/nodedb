@@ -25,6 +25,11 @@ pub struct AggregateSpec {
     pub field: String,
     /// Optional expression to evaluate per-document before aggregating.
     pub expr: Option<nodedb_query::expr::SqlExpr>,
+    /// The constant parameter of a parameterized aggregate (see
+    /// [`super::PARAMETERIZED_AGGREGATE_FUNCTIONS`]); `None` for every other
+    /// function.
+    #[serde(default)]
+    pub param: Option<super::AggregateParam>,
 }
 
 #[derive(
@@ -55,23 +60,30 @@ pub enum QueryOp {
     /// Coordinator-resolved data-movement wrapper. Defensive error if it reaches a core.
     Exchange(crate::physical_plan::ExchangeOp),
 
-    /// Pre-materialized rows. `provider: Some(name)` => filled per-request
-    /// (identity-scoped catalog table); `None` => `rows` is final (constant
-    /// SELECT or gathered broadcast child). `rows` is a canonical msgpack array
-    /// of map values (the `encode_binary_rows` shape).
+    /// Pre-materialized rows. `provider: Some(name)` => a named relation (an
+    /// identity-scoped catalog table or a continuous aggregate) whose rows
+    /// the coordinator fills per request; `None` => `rows` is final
+    /// (constant SELECT or a gathered child). `rows` is a canonical msgpack
+    /// array of map values (the `encode_binary_rows` shape).
     ///
     /// The executor applies predicate, offset, sort, distinct, projection, and
     /// limit in that order over the rows before emitting the response. Empty
     /// `filters`/`projection` and `None` limit are no-ops (all rows emitted
     /// unchanged through those stages).
     ProviderScan {
-        /// Catalog provider name for deferred materialization by the coordinator.
-        /// `Some(name)` is replaced with `None` after `materialize_providers`
-        /// fills `rows`. Data-Plane cores must never see `Some`.
+        /// Named relation the coordinator materializes. The name stays after
+        /// the coordinator fills `rows`, so the authorization of the filled
+        /// plan demands Read on it. The Data Plane reads only `rows`.
         provider: Option<String>,
         /// Msgpack array of plain map rows. Filled by the coordinator from the
-        /// catalog producer or from a gathered broadcast child.
+        /// catalog producer or from a gathered child.
         rows: Vec<u8>,
+        /// What a gathered child read to produce `rows`. The authorization
+        /// of the plan that embeds these rows demands each source's
+        /// requirement. Empty for a named provider and for constant rows,
+        /// which `provider` and the tenant-wide fallback cover.
+        #[serde(default)]
+        sources: Vec<crate::physical_plan::GatheredSource>,
         /// Serialized `Vec<ScanFilter>` (MessagePack). Empty = no predicate.
         #[serde(default)]
         filters: Vec<u8>,
@@ -252,10 +264,6 @@ pub enum QueryOp {
         on: Vec<(String, String)>,
         join_type: String,
         limit: usize,
-        /// Post-join GROUP BY columns (empty = no aggregation).
-        post_group_by: Vec<String>,
-        /// Post-join aggregates: (op, field) pairs (empty = no aggregation).
-        post_aggregates: Vec<(String, String)>,
         /// Post-join projection: column names to keep (empty = all).
         projection: Vec<JoinProjection>,
         /// MessagePack-encoded computed projection expressions. When present,
@@ -379,6 +387,13 @@ pub enum QueryOp {
         left_rls_filters: Vec<u8>,
         /// Row-level-security filters for rows scanned from `right_collection`.
         right_rls_filters: Vec<u8>,
+        /// Resolved rows for the left side, set by the coordinator inside a
+        /// transaction so the side reads its staged writes. `None` means the
+        /// side is scanned locally by `left_collection`. When set, the child
+        /// carries the side's read policy and `left_rls_filters` is empty.
+        left_input: Option<Box<crate::physical_plan::PhysicalPlan>>,
+        /// Resolved rows for the right side. Same semantics as `left_input`.
+        right_input: Option<Box<crate::physical_plan::PhysicalPlan>>,
     },
 
     /// Sort-merge join: both sides pre-sorted by join key.
@@ -396,6 +411,11 @@ pub enum QueryOp {
         left_rls_filters: Vec<u8>,
         /// Row-level-security filters for rows scanned from `right_collection`.
         right_rls_filters: Vec<u8>,
+        /// Resolved rows for the left side. Same semantics as
+        /// `QueryOp::NestedLoopJoin::left_input`.
+        left_input: Option<Box<crate::physical_plan::PhysicalPlan>>,
+        /// Resolved rows for the right side. Same semantics as `left_input`.
+        right_input: Option<Box<crate::physical_plan::PhysicalPlan>>,
     },
 
     /// Multi-facet aggregation: compute facet counts for multiple fields

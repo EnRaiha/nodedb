@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Aggregate mode: GROUP BY / time-bucket across memtable + partitions.
+//! Aggregate mode: GROUP BY / time-bucket across memtable, partitions,
+//! staged rows, and AUTO_TIER downsample buckets.
 //!
 //! Uses the grouped_scan engine with SIMD bitmask filters, direct-index Vec
 //! for low-cardinality symbol GROUP BY, parallel partition processing via
@@ -40,6 +41,17 @@ pub(in crate::data::executor) struct TsAggregateParams<'a> {
     /// `ORDER BY` keys as `(output column, ascending)`, applied to the encoded
     /// group rows before `limit`.
     pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
+    /// HAVING predicates over the finalized group rows.
+    pub having: &'a [crate::bridge::scan_filter::ScanFilter],
+    /// The transaction's staged rows, folded into the groups so the
+    /// aggregate reads its own writes. `None` outside a transaction.
+    pub staged: Option<crate::data::executor::handlers::transaction::overlay::StagedTsRows>,
+    /// The part of `time_range` flushed partitions serve. `None` when
+    /// downsample tiers serve all of it.
+    pub raw_range: Option<(i64, i64)>,
+    /// AUTO_TIER buckets of the part of `time_range` raw partitions no
+    /// longer serve, already grouped like the result.
+    pub tier_partials: Option<GroupedAggResult>,
 }
 
 impl CoreLoop {
@@ -61,13 +73,20 @@ impl CoreLoop {
             gap_fill,
             needed_columns,
             sort_keys,
+            having,
+            staged,
+            raw_range,
+            tier_partials,
         } = params;
 
         let key = (task.request.database_id, tid, collection.to_string());
         let num_aggs = aggregates.len();
+        // A transaction that truncated the collection sees no committed row.
+        let committed_visible = !staged.as_ref().is_some_and(|s| s.truncated);
 
         // Phase 1: Aggregate memtable (on TPC core).
-        let mut merged = if let Some(mt) = self.columnar_memtables.get(&key)
+        let mut merged = if committed_visible
+            && let Some(mt) = self.columnar_memtables.get(&key)
             && !mt.is_empty()
         {
             match aggregate_memtable(
@@ -85,8 +104,12 @@ impl CoreLoop {
             GroupedAggResult::new(num_aggs)
         };
 
-        // Phase 2: Aggregate disk partitions (parallel).
-        if let Some(registry) = self.ts_registries.get(&key) {
+        // Phase 2: Aggregate disk partitions (parallel), over the raw part
+        // of the range only.
+        if committed_visible
+            && let Some(time_range) = raw_range
+            && let Some(registry) = self.ts_registries.get(&key)
+        {
             let query_range = nodedb_types::timeseries::TimeRange::new(time_range.0, time_range.1);
             let entries: Vec<_> = registry.query_partitions(&query_range);
 
@@ -120,6 +143,7 @@ impl CoreLoop {
                             uring_reader: self.uring_reader.as_mut(),
                             io_priority,
                             io_metrics: Some(io_metrics),
+                            kek: self.segment_keks.ts_segment_kek.as_ref(),
                         }) {
                             Ok(Some(part_result)) => merged.merge(&part_result),
                             Ok(None) => {}
@@ -133,6 +157,7 @@ impl CoreLoop {
                     let filters_owned: Vec<crate::bridge::scan_filter::ScanFilter> =
                         filter_predicates.to_vec();
                     let needed_owned: Vec<String> = needed_columns.to_vec();
+                    let kek = self.segment_keks.ts_segment_kek.as_ref();
 
                     let available = std::thread::available_parallelism()
                         .map(|n| n.get())
@@ -165,6 +190,7 @@ impl CoreLoop {
                                                     uring_reader: None,
                                                     io_priority: None,
                                                     io_metrics: None,
+                                                    kek,
                                                 })?
                                             {
                                                 local.merge(&r);
@@ -202,6 +228,31 @@ impl CoreLoop {
             }
         }
 
+        // Phase 2b: Fold the transaction's staged rows.
+        if let Some(staged) = &staged
+            && let Err(e) = self.fold_staged_ts_rows(
+                &mut merged,
+                super::staged_fold::StagedFold {
+                    database_id: task.request.database_id,
+                    tid,
+                    collection,
+                    rows: &staged.rows,
+                    group_by,
+                    aggregates,
+                    filter_predicates,
+                    time_range,
+                    bucket_interval_ms,
+                },
+            )
+        {
+            return self.response_error(task, e);
+        }
+
+        // Phase 2c: Merge the downsample tiers' buckets.
+        if committed_visible && let Some(tiers) = &tier_partials {
+            merged.merge(tiers);
+        }
+
         // Phase 3: Apply gap-fill if requested (bucketed results only).
         let merged = if !gap_fill.is_empty() && bucket_interval_ms > 0 {
             super::super::timeseries_gap_fill::apply_gap_fill_to_grouped(
@@ -226,9 +277,12 @@ impl CoreLoop {
             &merged,
             group_by,
             aggregates,
-            limit,
-            bucket_interval_ms,
-            sort_keys,
+            super::encode::GroupedOutputShape {
+                limit,
+                bucket_interval_ms,
+                sort_keys,
+                having,
+            },
             super::encode::GroupedKeyTypes {
                 group_key_kinds: &group_key_kinds,
                 bucket_kind,

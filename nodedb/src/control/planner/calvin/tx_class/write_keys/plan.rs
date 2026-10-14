@@ -317,6 +317,7 @@ mod tests {
         let batch = PhysicalPlan::Document(DocumentOp::BatchInsert {
             collection: qualified(DOCS),
             documents: vec![("w".to_owned(), Vec::new()), ("x".to_owned(), Vec::new())],
+            if_absent: false,
             surrogates: vec![Surrogate::new(16), Surrogate::new(17)],
             returning: None,
             rls_filters: Vec::new(),

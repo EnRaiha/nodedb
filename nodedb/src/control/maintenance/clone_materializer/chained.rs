@@ -241,6 +241,8 @@ fn relink_payload(
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes,
+            // The materializer writes as the system, which holds no role.
+            user_roles: Vec::new(),
         },
         collections: vec![stored.to_string()],
         sum_targets: Vec::new(),

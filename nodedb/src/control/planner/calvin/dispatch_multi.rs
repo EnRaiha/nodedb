@@ -45,16 +45,21 @@ pub(crate) struct TxnProvenance {
     /// applies, with the vShard the request addresses. `None` for any other
     /// transaction.
     pub applied_key: Option<(Vec<u8>, u32)>,
+    /// The roles of the identity whose writes the transaction commits. Every
+    /// replica judges a role-guarded state transition against them.
+    pub user_roles: Vec<String>,
 }
 
 impl TxnProvenance {
-    /// A client transaction no trigger body joined.
-    pub(crate) fn client() -> Self {
+    /// A client transaction no trigger body joined, written by an identity
+    /// holding `user_roles`.
+    pub(crate) fn client(user_roles: Vec<String>) -> Self {
         Self {
             event_source: EventSource::User,
             body_tasks: Vec::new(),
             publishes: Vec::new(),
             applied_key: None,
+            user_roles,
         }
     }
 }
@@ -90,6 +95,7 @@ pub(crate) async fn dispatch_strict_atomic_tasks_to_calvin(
     tx_class.set_event_source(provenance.event_source.wal_code());
     tx_class.set_body_plans(provenance.body_tasks);
     tx_class.set_publishes(provenance.publishes);
+    tx_class.set_user_roles(provenance.user_roles);
     if let Some((applied_key, vshard)) = provenance.applied_key {
         tx_class.set_applied_key(applied_key, vshard);
     }
@@ -141,6 +147,12 @@ fn admit_legacy_multi_shard_dispatch(
 }
 
 /// Drive the authorized strict Calvin multi-shard path.
+///
+/// This API serves multi-shard dispatch only. Its strict branch delegates to
+/// [`dispatch_strict_atomic_tasks_to_calvin`], while best-effort remains
+/// rejected because this helper has no non-atomic dispatch implementation.
+/// The transaction carries the roles of the identity the tasks were
+/// authorized for.
 pub async fn dispatch_authorized_tasks_to_calvin(
     state: &SharedState,
     authorized: AuthorizedTaskSet,
@@ -150,50 +162,27 @@ pub async fn dispatch_authorized_tasks_to_calvin(
     reads: &[ReadSetEntry],
     lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
 ) -> crate::Result<Option<Response>> {
+    let authorized = authorized.into_tasks();
+    let user_roles = authorized
+        .first()
+        .map(|task| task.identity().role_names())
+        .unwrap_or_default();
     let tasks: Vec<PhysicalTask> = authorized
-        .into_tasks()
         .into_iter()
         .map(|task| task.into_physical_task())
         .collect();
-    dispatch_tasks_to_calvin(
-        state,
-        &tasks,
-        tenant_id,
-        cross_shard_mode,
-        position,
-        reads,
-        lock_owner,
-    )
-    .await
-}
-
-/// Drive the legacy trusted-internal strict Calvin multi-shard path for `tasks`.
-///
-/// This API serves multi-shard dispatch only.
-/// Its strict branch delegates to [`dispatch_strict_atomic_tasks_to_calvin`],
-/// while best-effort remains rejected because this helper has no non-atomic
-/// dispatch implementation.
-pub(crate) async fn dispatch_tasks_to_calvin(
-    state: &SharedState,
-    tasks: &[PhysicalTask],
-    tenant_id: TenantId,
-    cross_shard_mode: CrossShardTxnMode,
-    position: TxnDispatchPosition,
-    reads: &[ReadSetEntry],
-    lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
-) -> crate::Result<Option<Response>> {
     let read_vshards = read_vshards_of(reads)?;
-    match classify_dispatch(tasks, &read_vshards) {
+    match classify_dispatch(&tasks, &read_vshards) {
         DispatchClass::MultiShard { .. } => {
             admit_legacy_multi_shard_dispatch(cross_shard_mode, position)?;
             dispatch_strict_atomic_tasks_to_calvin(
                 state,
-                tasks,
+                &tasks,
                 tenant_id,
                 position,
                 reads,
                 lock_owner,
-                TxnProvenance::client(),
+                TxnProvenance::client(user_roles),
             )
             .await
         }

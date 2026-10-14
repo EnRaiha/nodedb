@@ -22,6 +22,13 @@ impl EngineRules for ArrayRules {
         ))
     }
 
+    fn plan_insert_select(&self, _p: InsertSelectParams) -> Result<Vec<SqlPlan>> {
+        Err(unsupported(
+            "INSERT ... SELECT",
+            "use INSERT INTO ARRAY for array engine mutations",
+        ))
+    }
+
     fn plan_upsert(&self, _p: UpsertParams) -> Result<Vec<SqlPlan>> {
         Err(unsupported("UPSERT", "arrays do not support UPSERT"))
     }

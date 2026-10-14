@@ -14,8 +14,10 @@ use super::super::change_stream;
 use super::super::consumer_group;
 use super::super::schedule;
 use super::super::stream_select;
+use super::super::timeseries;
 use super::super::topic;
 use super::super::topic_subscribe;
+use super::route_tokens::RouteTokens;
 
 pub(super) async fn try_string(
     state: &SharedState,
@@ -81,8 +83,7 @@ pub(super) async fn try_string(
     // `SHOW CONSUMER GROUPS` parses into a typed
     // `StreamViewStmt::ShowConsumerGroups`, but string dispatch claims it
     // before any typed arm runs; `SHOW PARTITIONS` and `COMMIT OFFSET(S)`
-    // parse into no typed variant at all. (`SHOW PARTITIONS ` also shadows the
-    // timeseries `show_partitions` handler.)
+    // parse into no typed variant at all.
     if upper.starts_with("SHOW CONSUMER GROUPS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(consumer_group::show_consumer_groups(
@@ -92,14 +93,27 @@ pub(super) async fn try_string(
             &parts,
         ));
     }
+    // `SHOW PARTITIONS` has two grammars, told apart by the token after
+    // PARTITIONS: `ON <stream>` lists a stream's consumer partitions, and
+    // `FOR <timeseries>` lists a timeseries collection's partitions.
     if upper.starts_with("SHOW PARTITIONS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(consumer_group::show_partitions(
-            state,
-            identity,
-            database_id,
-            &parts,
-        ));
+        let form = parts.get(2).copied().unwrap_or_default();
+        if form.eq_ignore_ascii_case("ON") {
+            return Some(consumer_group::show_partitions(
+                state,
+                identity,
+                database_id,
+                &parts,
+            ));
+        }
+        if form.eq_ignore_ascii_case("FOR") {
+            return Some(timeseries::show_partitions(state, identity, database_id, &parts).await);
+        }
+        return Some(Err(DdlError::new(
+            "42601",
+            "syntax: SHOW PARTITIONS ON <stream> | SHOW PARTITIONS FOR <timeseries>",
+        )));
     }
     if upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
@@ -128,12 +142,10 @@ pub(super) async fn try_string(
 
     // Stream consumption: `SELECT * FROM STREAM <name> CONSUMER GROUP <group>
     // [PARTITION <p>] [LIMIT <n>]`. Parses into no typed AST variant — the
-    // router recognizes it by string prefix from the raw token slice, before
+    // router recognizes it by its leading words and the clause after the name,
+    // before
     // the parse gate.
-    if upper.starts_with("SELECT ")
-        && upper.contains("FROM STREAM ")
-        && upper.contains("CONSUMER GROUP")
-    {
+    if is_consumer_group_read(sql, "STREAM") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(stream_select::select_from_stream(state, identity, database_id, &parts).await);
     }
@@ -142,10 +154,7 @@ pub(super) async fn try_string(
     // <group> [LIMIT <n>]`. Topics use "topic:<name>" buffer keys; the router
     // rewrites the token slice (TOPIC → STREAM, name → "topic:<name>") and
     // delegates to the stream-consume handler, before the parse gate.
-    if upper.starts_with("SELECT ")
-        && upper.contains("FROM TOPIC ")
-        && upper.contains("CONSUMER GROUP")
-    {
+    if is_consumer_group_read(sql, "TOPIC") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         if parts.len() < 8
             || !parts[3].eq_ignore_ascii_case("TOPIC")
@@ -188,4 +197,42 @@ pub(super) async fn try_string(
     }
 
     None
+}
+
+/// `SELECT * FROM <kind> <name> CONSUMER GROUP <group> ...`, where `kind` is
+/// `STREAM` or `TOPIC`. The consumer-group clause follows the name.
+fn is_consumer_group_read(sql: &str, kind: &str) -> bool {
+    let tokens = RouteTokens::new(sql);
+    tokens.leads_with(&["SELECT", "*", "FROM", kind])
+        && tokens.phrase_at(tokens.skip_name(4), &["CONSUMER", "GROUP"])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consumer_group_reads_are_routed_by_kind() {
+        let stream = "SELECT * FROM STREAM orders_cdc CONSUMER GROUP analytics LIMIT 10";
+        assert!(is_consumer_group_read(stream, "STREAM"));
+        assert!(!is_consumer_group_read(stream, "TOPIC"));
+        assert!(is_consumer_group_read(
+            "select * from topic alerts consumer group ops",
+            "TOPIC"
+        ));
+    }
+
+    /// A plain SELECT whose literal or column names the clause is no stream
+    /// read.
+    #[test]
+    fn a_plain_select_is_not_a_consumer_group_read() {
+        assert!(!is_consumer_group_read(
+            "SELECT * FROM events WHERE note = 'FROM STREAM s CONSUMER GROUP g'",
+            "STREAM"
+        ));
+        assert!(!is_consumer_group_read(
+            "SELECT * FROM stream_log WHERE consumer = 'x'",
+            "STREAM"
+        ));
+    }
 }

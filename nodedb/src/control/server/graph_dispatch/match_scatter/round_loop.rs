@@ -109,6 +109,7 @@ fn push_dispatch_fut<'f>(
                     version_set: &version_set,
                     txn_id: read.txn_id,
                     linearizable: read.linearizable,
+                    user_roles: &[],
                 })
                 .await?
                 .payloads;

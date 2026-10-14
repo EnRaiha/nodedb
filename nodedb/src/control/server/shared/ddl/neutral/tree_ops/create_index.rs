@@ -280,12 +280,13 @@ pub async fn create_graph_index(
         });
         // The shard's Raft entry carries the batch, and its apply appends
         // the records on every replica.
-        match dispatch_edge_batch(state, tenant_id, shard, plan).await {
+        match dispatch_edge_batch(state, tenant_id, database_id, shard, plan).await {
             Ok(_) => committed_shards.push((shard, edges)),
             Err(e) => {
                 return surface_failure(
                     state,
                     tenant_id,
+                    database_id,
                     &committed_shards,
                     &format!("edge-insert dispatch failed on shard {shard:?}"),
                     &e,
@@ -315,13 +316,14 @@ pub async fn create_graph_index(
 async fn dispatch_edge_batch(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     shard: VShardId,
     plan: PhysicalPlan,
 ) -> crate::Result<crate::bridge::envelope::Response> {
     crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
         state,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         shard,
         plan,
         crate::event::EventSource::User,
@@ -345,6 +347,7 @@ async fn dispatch_edge_batch(
 async fn surface_failure(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     committed: &[(VShardId, Vec<BatchEdge>)],
     context: &str,
     cause: &crate::Error,
@@ -358,7 +361,7 @@ async fn surface_failure(
         async move {
             (
                 shard,
-                dispatch_edge_batch(state, tenant_id, shard, plan).await,
+                dispatch_edge_batch(state, tenant_id, database_id, shard, plan).await,
             )
         }
     });

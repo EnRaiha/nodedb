@@ -66,23 +66,31 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             rls_filters,
             rls_write_check,
             ..
+        } => {
+            ctx.set_post_filters(collection, rls_filters)?;
+            ctx.set_write_check(collection, rls_write_check)
         }
-        // Source is read, but every row returned/written belongs to TARGET,
-        // so the target's policy gates both halves.
-        | DocumentOp::UpdateFromJoin {
+
+        // Every row returned or written belongs to the TARGET, so the
+        // target's policy gates both halves. The source is a read like any
+        // SELECT: its own read policy narrows the rows the join sees.
+        DocumentOp::UpdateFromJoin {
             target_collection: collection,
+            source,
             rls_filters,
             rls_write_check,
             ..
         }
         | DocumentOp::Merge {
             target_collection: collection,
+            source,
             rls_filters,
             rls_write_check,
             ..
         } => {
             ctx.set_post_filters(collection, rls_filters)?;
-            ctx.set_write_check(collection, rls_write_check)
+            ctx.set_write_check(collection, rls_write_check)?;
+            inject_row_source(ctx, source)
         }
 
         // Refuse: returns index entries rather than rows, so there is no row
@@ -156,20 +164,32 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             rls_write_check,
             rls_filters,
             ..
+        }
+        | DocumentOp::BatchUpsert {
+            collection,
+            rls_write_check,
+            rls_filters,
+            ..
         } => {
             ctx.set_write_check(collection, rls_write_check)?;
             ctx.set_post_filters(collection, rls_filters)
         }
 
-        // Refuse: the rows come from a scan resolved after this pass, so the
-        // plan carries no image to evaluate.
+        // Refuse a target write policy: the rows come from a read resolved
+        // after this pass, so the plan carries no image to evaluate. Inject
+        // the source's read policy: the copy reads only rows a SELECT by the
+        // same identity would return.
         DocumentOp::InsertSelect {
-            target_collection, ..
-        } => ctx.refuse_if_write_policy(
             target_collection,
-            "the inserted rows are produced by a scan resolved after planning, so the plan carries \
-             no row image",
-        ),
+            source,
+        } => {
+            ctx.refuse_if_write_policy(
+                target_collection,
+                "the inserted rows are produced by a read resolved after planning, so the plan \
+                 carries no row image",
+            )?;
+            inject_row_source(ctx, source)
+        }
 
         // Refuse: removes every row without reading one, so no image the
         // policy can be evaluated against exists.
@@ -197,6 +217,22 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
     }
 }
 
+/// Inject the read policy of an orchestrated write's source: into a page
+/// source's filter slot, or through the whole query plan, as for any read.
+fn inject_row_source(
+    ctx: &RlsCtx<'_>,
+    source: &mut nodedb_physical::physical_plan::RowSource,
+) -> crate::Result<()> {
+    match source {
+        nodedb_physical::physical_plan::RowSource::DocumentPages(page) => {
+            ctx.merge_into(&page.collection, &mut page.filters)
+        }
+        nodedb_physical::physical_plan::RowSource::Query(query) => {
+            super::plan::walk(ctx, &mut query.plan)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nodedb_physical::physical_plan::DocumentOp;
@@ -208,6 +244,60 @@ mod tests {
     use crate::bridge::envelope::PhysicalPlan;
     use crate::control::security::predicate::{CompareOp, PredicateValue, RlsPredicate};
     use crate::control::security::rls::PolicyType;
+
+    fn page_source(collection: &str) -> nodedb_physical::physical_plan::RowSource {
+        nodedb_physical::physical_plan::RowSource::DocumentPages(
+            nodedb_physical::physical_plan::DocumentPageSource {
+                collection: nodedb_types::QualifiedCollection::new(
+                    nodedb_types::DatabaseId::DEFAULT,
+                    collection,
+                ),
+                filters: Vec::new(),
+                system_as_of_ms: None,
+                offset: 0,
+                limit: None,
+                column_map: Vec::new(),
+            },
+        )
+    }
+
+    /// The source of an INSERT ... SELECT carries its read policy, so the
+    /// copy reads only the rows a SELECT by the same identity returns.
+    #[test]
+    fn insert_select_page_source_receives_the_source_read_policy() {
+        let store = store_with_read_policy("source");
+        let mut plan = PhysicalPlan::Document(DocumentOp::InsertSelect {
+            target_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "target",
+            ),
+            source: page_source("source"),
+        });
+        inject(&mut plan, &store).expect("inject source read policy");
+        let PhysicalPlan::Document(DocumentOp::InsertSelect {
+            source: nodedb_physical::physical_plan::RowSource::DocumentPages(page),
+            ..
+        }) = plan
+        else {
+            panic!("plan shape changed");
+        };
+        assert!(!page.filters.is_empty(), "source filters must carry RLS");
+    }
+
+    /// A target write policy refuses INSERT ... SELECT: the plan carries no
+    /// row image to admit.
+    #[test]
+    fn insert_select_is_refused_under_a_target_write_policy() {
+        let store = store_with_write_policy("target");
+        let mut plan = PhysicalPlan::Document(DocumentOp::InsertSelect {
+            target_collection: nodedb_types::QualifiedCollection::new(
+                nodedb_types::DatabaseId::DEFAULT,
+                "target",
+            ),
+            source: page_source("source"),
+        });
+        assert_write_refused(inject(&mut plan, &store), "target");
+    }
 
     /// `alice` in the shared fixture has user id 42, so this row satisfies
     /// `owner_id = $auth.id` and that one does not.
@@ -299,6 +389,7 @@ mod tests {
                 "orders",
             ),
             documents: vec![("d1".into(), body("42")), ("d2".into(), body("99"))],
+            if_absent: false,
             surrogates: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),
@@ -377,10 +468,7 @@ mod tests {
                 nodedb_types::DatabaseId::DEFAULT,
                 "target",
             ),
-            source_collection: nodedb_types::QualifiedCollection::new(
-                nodedb_types::DatabaseId::DEFAULT,
-                "source",
-            ),
+            source: page_source("source"),
             source_alias: "s".into(),
             target_join_col: "id".into(),
             source_join_col: "id".into(),
@@ -640,10 +728,7 @@ mod tests {
                 nodedb_types::DatabaseId::DEFAULT,
                 "target",
             ),
-            source_collection: nodedb_types::QualifiedCollection::new(
-                nodedb_types::DatabaseId::DEFAULT,
-                "source",
-            ),
+            source: page_source("source"),
             source_alias: "s".into(),
             target_join_col: "id".into(),
             source_join_col: "id".into(),

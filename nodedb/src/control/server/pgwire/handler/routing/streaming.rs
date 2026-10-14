@@ -140,7 +140,12 @@ impl NodeDbPgHandler {
                     let response = if payload.is_empty() {
                         Response::Execution(Tag::new("OK"))
                     } else {
-                        let redaction = QueryRedaction::for_plan(task.tenant_id, auth, &child_plan);
+                        let redaction = QueryRedaction::for_plan(
+                            task.tenant_id,
+                            task.database_id,
+                            auth,
+                            &child_plan,
+                        );
                         // The gate above admits no Control-Plane computed
                         // column, so no session sequence access is needed.
                         match compose::shape_payload_no_plan(
@@ -202,7 +207,12 @@ impl NodeDbPgHandler {
         // stream actually reads, and handed to every batch's shaping call
         // below. Deriving it per batch will let an early batch ship before
         // the policy was consulted.
-        let redaction = Some(QueryRedaction::for_plan(task.tenant_id, auth, &child_plan));
+        let redaction = Some(QueryRedaction::for_plan(
+            task.tenant_id,
+            task.database_id,
+            auth,
+            &child_plan,
+        ));
 
         // The streaming fast path bypasses the dispatch loop's own metering
         // call, so without this every pgwire autocommit SELECT that streams

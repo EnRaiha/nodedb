@@ -18,6 +18,7 @@ mod ddl_flush;
 pub mod ddl_rollback;
 pub mod deadline;
 pub mod ephemeral_sequence;
+pub mod expand_pages;
 pub mod expander_stage;
 mod hot_key;
 mod leader_forward;

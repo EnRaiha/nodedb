@@ -171,7 +171,7 @@ async fn execute_and_collect(
     let redaction = QueryRedaction::for_plans(
         identity.tenant_id,
         scope.auth(),
-        tasks.iter().map(|task| &task.plan),
+        tasks.iter().map(|task| (&task.plan, task.database_id)),
     );
 
     let mut all_rows: Vec<serde_json::Value> = Vec::new();

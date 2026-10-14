@@ -109,9 +109,9 @@ pub(super) fn inject_query(ctx: &RlsCtx<'_>, op: &mut QueryOp) -> crate::Result<
             Ok(())
         }
 
-        // Inject: neither variant takes a resolved child input, so both
-        // collections are read directly by the handler and both slots are
-        // always populated.
+        // Inject: planning sets neither variant's resolved input. The
+        // coordinator sets one inside a transaction, after this pass, and
+        // moves the side's policy onto it. Both slots are populated here.
         QueryOp::NestedLoopJoin {
             left_collection,
             right_collection,
@@ -149,10 +149,21 @@ pub(super) fn inject_query(ctx: &RlsCtx<'_>, op: &mut QueryOp) -> crate::Result<
             ctx.merge_into(inner_collection, inner_filters)
         }
 
-        // No-op: `ProviderScan` emits rows the coordinator already
-        // materialized — an identity-scoped catalog table or a constant SELECT
-        // — and names no collection a policy could be keyed on.
-        QueryOp::ProviderScan { .. } => Ok(()),
+        // A named provider is a relation the coordinator materializes: a
+        // catalog table or a continuous aggregate. A read policy keyed on its
+        // name joins the provider's filters. A catalog table carries no
+        // policy, so this is a no-op there.
+        QueryOp::ProviderScan {
+            provider: Some(name),
+            filters,
+            ..
+        } => ctx.merge_into(
+            &nodedb_types::QualifiedCollection::new(ctx.database_id, name),
+            filters,
+        ),
+        // No-op: a constant SELECT names no relation a policy could be keyed
+        // on.
+        QueryOp::ProviderScan { provider: None, .. } => Ok(()),
 
         // No-op: pure expression evaluation over its own anchor and step
         // expressions; it reads no stored rows and names no collection.
@@ -248,8 +259,6 @@ mod tests {
             on: Vec::new(),
             join_type: "inner".into(),
             limit: 0,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),

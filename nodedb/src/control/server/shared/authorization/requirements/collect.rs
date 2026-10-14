@@ -23,29 +23,38 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
     while let Some(plan) = pending.pop() {
         let initial_len = out.len();
         match plan {
+            // The target takes `Write`. A paged source takes `Read`; a query
+            // source takes whatever its own plan requires.
             PhysicalPlan::Document(DocumentOp::InsertSelect {
                 target_collection,
-                source_collection,
+                source,
                 ..
             })
             | PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection,
-                source_collection,
+                source,
                 ..
             })
             | PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection,
-                source_collection,
+                source,
                 ..
             }) => {
                 out.push(AuthorizationRequirement::collection(
                     target_collection.as_str(),
                     Permission::Write,
                 ));
-                out.push(AuthorizationRequirement::collection(
-                    source_collection.as_str(),
-                    Permission::Read,
-                ));
+                match source {
+                    nodedb_physical::physical_plan::RowSource::DocumentPages(page) => {
+                        out.push(AuthorizationRequirement::collection(
+                            page.collection.as_str(),
+                            Permission::Read,
+                        ));
+                    }
+                    nodedb_physical::physical_plan::RowSource::Query(query) => {
+                        pending.push(&query.plan);
+                    }
+                }
             }
             PhysicalPlan::Kv(KvOp::TransferItem {
                 source_collection,
@@ -101,6 +110,12 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | MetaOp::VerifyHashChain { collection }
                 | MetaOp::RebuildIndex { collection, .. },
             ) => add_collection_requirement(collection.as_str(), required_permission(plan), out),
+            // A refresh wait reads the root source's aggregate state. The
+            // aggregate's ownership is checked by the REFRESH handler before
+            // dispatch.
+            PhysicalPlan::Meta(MetaOp::AwaitContinuousAggregateRefresh { collection, .. }) => {
+                add_collection_requirement(collection.as_str(), Permission::Read, out)
+            }
             PhysicalPlan::Meta(
                 MetaOp::UnregisterCollection { name, .. }
                 | MetaOp::UnregisterMaterializedView { name, .. }
@@ -127,21 +142,33 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
             PhysicalPlan::Document(DocumentOp::ResolveWrite(inner)) => match inner.as_ref() {
                 DocumentOp::UpdateFromJoin {
                     target_collection,
-                    source_collection,
+                    source,
                     ..
                 }
                 | DocumentOp::Merge {
                     target_collection,
-                    source_collection,
+                    source,
                     ..
                 } => {
                     add_collection_requirement(target_collection.as_str(), Permission::Read, out);
-                    add_collection_requirement(source_collection.as_str(), Permission::Read, out);
+                    match source {
+                        nodedb_physical::physical_plan::RowSource::DocumentPages(page) => {
+                            add_collection_requirement(
+                                page.collection.as_str(),
+                                Permission::Read,
+                                out,
+                            );
+                        }
+                        nodedb_physical::physical_plan::RowSource::Query(query) => {
+                            pending.push(&query.plan);
+                        }
+                    }
                 }
                 // Point/bulk writes read exactly the collection they'd write.
                 DocumentOp::PointUpdate { collection, .. }
                 | DocumentOp::PointDelete { collection, .. }
                 | DocumentOp::Upsert { collection, .. }
+                | DocumentOp::BatchUpsert { collection, .. }
                 | DocumentOp::BulkUpdate { collection, .. }
                 | DocumentOp::BulkDelete { collection, .. } => {
                     add_collection_requirement(collection.as_str(), Permission::Read, out);
@@ -246,8 +273,16 @@ fn requires_tenant_fallback(plan: &PhysicalPlan) -> bool {
     use nodedb_physical::physical_plan::{MetaOp, QueryOp};
 
     match plan {
+        // A post-processor and an input-sourced aggregate read only their
+        // input, and a set operation only its branches. Each nested plan
+        // carries its own requirements, and a nested plan that names no
+        // relation falls back to the tenant-wide check itself.
         PhysicalPlan::Query(QueryOp::Exchange(_))
+        | PhysicalPlan::Query(QueryOp::PostProcess { .. })
+        | PhysicalPlan::Query(QueryOp::Aggregate { input: Some(_), .. })
+        | PhysicalPlan::Query(QueryOp::PartialAggregateState { input: Some(_), .. })
         | PhysicalPlan::Meta(MetaOp::StageWrite { .. }) => false,
+        PhysicalPlan::Query(QueryOp::SetOp { inputs, .. }) => inputs.is_empty(),
         PhysicalPlan::Meta(
             MetaOp::TransactionBatch { plans, .. }
             | MetaOp::ResolveTxn { plans, .. }

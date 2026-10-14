@@ -2,18 +2,21 @@
 
 //! `USE DATABASE <name>`.
 
+use crate::ddl_ast::parse::clause::ClauseCursor;
 use crate::ddl_ast::statement::{DatabaseStmt, NodedbStatement};
 use crate::error::SqlError;
 
-pub(super) fn parse_use_database(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
-    let name = parts
-        .get(2)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "USE DATABASE requires a name".into(),
-        })?
-        .trim_matches('"')
-        .to_string();
+use super::dispatch::db_name;
+
+/// Read `<name>` after `USE DATABASE`.
+pub(super) fn parse_use_database(
+    c: &mut ClauseCursor<'_, '_>,
+) -> Result<NodedbStatement, SqlError> {
+    if c.at_end() {
+        return Err(c.error("USE DATABASE requires a name"));
+    }
+    let name = db_name(c, "database name")?;
+    c.finish()?;
     Ok(NodedbStatement::Database(DatabaseStmt::UseDatabase {
         name,
     }))

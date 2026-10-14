@@ -8,6 +8,7 @@ use nodedb_query::msgpack_scan;
 
 use super::hash::{HashIndex, ProbeParams, probe_hash_index};
 use super::params::HashJoinParams;
+use super::support::row_qualifier;
 
 /// One locally-scanned join side: the collection to read and the two predicate
 /// sets its rows must pass before the join sees them.
@@ -113,6 +114,15 @@ impl CoreLoop {
             };
         let scan_limit =
             crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
+
+        // A timeseries side reads its flushed partitions through a registry
+        // that loads lazily.
+        for collection in [left_collection, right_collection] {
+            let did = join.task.request.database_id.as_u64();
+            if let Err(e) = self.prepare_collection_scan(did, tid, collection) {
+                return self.response_error(join.task, ErrorCode::from(e));
+            }
+        }
 
         // Gating predicate for the memory-bounded (grace-hash spill) completion
         // path: BOTH sides must be plain local scans — no Exchange sub-plan and
@@ -346,8 +356,10 @@ impl CoreLoop {
             }
         };
 
-        let left_prefix = left_alias.unwrap_or(left_collection);
-        let right_prefix = right_alias.unwrap_or(right_collection);
+        let database_id = join.task.request.database_id;
+        let left_prefix = left_alias.unwrap_or_else(|| row_qualifier(left_collection, database_id));
+        let right_prefix =
+            right_alias.unwrap_or_else(|| row_qualifier(right_collection, database_id));
 
         let left_keys: Vec<&str> = left_key_strs.iter().map(|s| s.as_str()).collect();
         let right_keys: Vec<&str> = join.on.iter().map(|(_, r)| r.as_str()).collect();

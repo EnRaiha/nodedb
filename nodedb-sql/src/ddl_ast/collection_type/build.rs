@@ -60,7 +60,14 @@ pub fn build_collection_type(
         }
         Some("timeseries") => {
             reject_reserved_columns(columns)?;
+            // The collection type's interval is the one source a flush reads.
+            // Undeclared, it is one hour. A declared one must parse.
             let partition_by = opt_val("partition_by").unwrap_or_else(|| "1h".to_string());
+            nodedb_types::timeseries::PartitionInterval::parse(&partition_by).map_err(|e| {
+                SqlError::DataException {
+                    detail: format!("invalid partition_by '{partition_by}': {e}"),
+                }
+            })?;
             let time_key = resolve_time_key(columns)?;
             Ok((
                 nodedb_types::CollectionType::timeseries(time_key, partition_by),

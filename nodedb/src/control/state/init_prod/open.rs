@@ -289,7 +289,6 @@ impl SharedState {
                 crate::control::maintenance::MaintenanceBudgetTracker::new(),
             ),
             producer_registry,
-            ts_partition_registries: Some(Mutex::new(std::collections::HashMap::new())),
             cold_storage: None,
             snapshot_storage: Arc::new(object_store::memory::InMemory::new()),
             pitr: Default::default(),

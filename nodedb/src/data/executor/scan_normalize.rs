@@ -9,11 +9,11 @@
 //! - Schemaless document → msgpack (already standard or legacy JSON)
 //! - Strict document → Binary Tuple → decode → msgpack
 //! - Key-Value → zerompk Value → transcode → msgpack
-//! - Columnar → memtable/engine rows → JSON → msgpack
+//! - Columnar → segment and memtable rows → msgpack
+//! - Timeseries → memtable and partition rows → msgpack
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::engine::kv::KvScanParams;
-use nodedb_query::msgpack_scan;
 
 impl CoreLoop {
     /// [`Self::scan_collection`] with row-level-security filters applied.
@@ -90,9 +90,10 @@ impl CoreLoop {
     /// returns `(doc_id, msgpack_bytes)` pairs in standard msgpack map format.
     ///
     /// Routing order:
-    /// 1. KV engine (if collection has KV entries)
-    /// 2. Columnar storage (timeseries memtable or plain/spatial engine)
-    /// 3. Sparse/document engine (default)
+    /// 1. Timeseries (by identity): memtable rows, then flushed partitions
+    /// 2. KV engine (if collection has KV entries)
+    /// 3. Columnar storage (plain/spatial engine)
+    /// 4. Sparse/document engine (default)
     ///
     /// All results are normalized to standard msgpack maps so callers
     /// (aggregate, join, sort, filter) never need engine-specific code.
@@ -103,19 +104,24 @@ impl CoreLoop {
         collection: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        // 1. KV engine
+        // 1. Timeseries
+        if self.is_timeseries_collection(did, tid, collection) {
+            return self.scan_timeseries_docs(did, tid, collection, limit);
+        }
+
+        // 2. KV engine
         let kv_docs = self.scan_kv(did, tid, collection, limit);
         if !kv_docs.is_empty() {
             return Ok(kv_docs);
         }
 
-        // 2. Columnar memtable
+        // 3. Columnar engine
         let col_docs = self.scan_columnar(did, tid, collection, limit)?;
         if !col_docs.is_empty() {
             return Ok(col_docs);
         }
 
-        // 3. Sparse/document engine (schemaless + strict)
+        // 4. Sparse/document engine (schemaless + strict)
         self.scan_sparse(did, tid, collection, limit)
     }
 
@@ -123,8 +129,8 @@ impl CoreLoop {
     /// in `collection` without an upper-row cap.
     ///
     /// Routing follows the same priority order as [`scan_collection`]:
-    /// KV → Columnar → Sparse/document. All rows are normalized to standard
-    /// msgpack maps before being passed to `f`.
+    /// Timeseries → KV → Columnar → Sparse/document. All rows are normalized
+    /// to standard msgpack maps before being passed to `f`.
     ///
     /// The callback receives shared references to the data; it must copy any
     /// bytes it wants to retain beyond the call. If `f` returns `Err`, iteration
@@ -145,6 +151,14 @@ impl CoreLoop {
     where
         F: FnMut(&str, &[u8]) -> crate::Result<()>,
     {
+        // Timeseries — read by identity from memtable and partitions.
+        if self.is_timeseries_collection(did, tid, collection) {
+            for (id, bytes) in &self.scan_timeseries_docs(did, tid, collection, usize::MAX)? {
+                f(id, bytes)?;
+            }
+            return Ok(());
+        }
+
         // 1. KV engine — TRULY streams row-at-a-time via `scan_for_each`.
         //    Mirrors the materializing path's `if !kv_docs.is_empty()`
         //    early-return: a KV collection with zero live rows falls through.
@@ -231,10 +245,8 @@ impl CoreLoop {
         results
     }
 
-    /// Scan columnar rows → standard msgpack.
-    ///
-    /// A timeseries memtable's time cells are typed by their column kind.
-    /// `Err` when a stored time cell cannot be read as its column's instant.
+    /// Scan plain/spatial columnar rows → standard msgpack: flushed
+    /// segments, then the live memtable.
     fn scan_columnar(
         &self,
         database_id: u64,
@@ -247,45 +259,6 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection.to_string(),
         );
-        if let Some(mt) = self.columnar_memtables.get(&columnar_key) {
-            let schema = mt.schema();
-            let row_count = (mt.row_count() as usize).min(limit);
-            let col_meta: Vec<_> = schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, (name, ty))| (i, name.clone(), *ty))
-                .collect();
-
-            let mut results = Vec::with_capacity(row_count);
-            for idx in 0..row_count {
-                // Build msgpack map directly — no serde_json intermediary.
-                let mut mp = Vec::with_capacity(col_meta.len() * 32);
-                msgpack_scan::write_map_header(&mut mp, col_meta.len());
-                let mut id = String::new();
-                for (col_idx, col_name, col_type) in &col_meta {
-                    msgpack_scan::write_str(&mut mp, col_name);
-                    let col_data = mt.column(*col_idx);
-                    // Check for "id" column to extract the id string.
-                    if col_name == "id"
-                        && let crate::engine::timeseries::columnar_memtable::ColumnData::Symbol(ids) =
-                            col_data
-                    {
-                        let sym_id = ids[idx];
-                        if let Some(s) = mt.symbol_dict(*col_idx).and_then(|dict| dict.get(sym_id))
-                        {
-                            id = s.to_string();
-                        }
-                    }
-                    super::handlers::columnar_read::emit_column_value(
-                        &mut mp, mt, *col_idx, col_type, col_data, idx,
-                    )?;
-                }
-                results.push((id, mp));
-            }
-            return Ok(results);
-        }
-
         let Some(engine) = self.columnar_engines.get(&columnar_key) else {
             return Ok(Vec::new());
         };

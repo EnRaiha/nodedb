@@ -8,13 +8,23 @@ use super::{KvEngine, ScanResult};
 use crate::engine::kv::engine_helpers::table_key;
 use crate::engine::kv::scan::{KvScanParams, matches_pattern_pub};
 
+/// The candidate position an index-scan cursor names. An index-scan cursor
+/// is the 8-byte big-endian position of the next candidate; any other
+/// cursor starts at the first candidate.
+fn index_cursor_position(cursor: &[u8]) -> usize {
+    <[u8; 8]>::try_from(cursor)
+        .map(u64::from_be_bytes)
+        .map_or(0, |pos| usize::try_from(pos).unwrap_or(usize::MAX))
+}
+
 impl KvEngine {
     /// SCAN: cursor-based iteration with optional key pattern matching and
     /// index-accelerated predicate pushdown.
     ///
-    /// If `filter_field` and `filter_value` are provided AND a secondary index
-    /// exists for that field, the scan uses the index to narrow candidates
-    /// (O(log n) + O(k) where k = matching keys) instead of full table scan.
+    /// If `filter_field` and `filter_value` are provided AND a complete
+    /// secondary index covers that field, the scan returns only the index's
+    /// candidates (O(log n) + O(k) where k = matching keys), none on a miss.
+    /// Without a complete index it reads every row.
     ///
     /// Returns `(entries, next_cursor_bytes)`. `next_cursor_bytes` is empty
     /// when the scan is complete. Each entry is `(key, value)`.
@@ -47,39 +57,39 @@ impl KvEngine {
             }
         };
 
-        // Index-accelerated path: if we have an equality filter and an index, use it.
-        // Also checks composite indexes for prefix matches.
+        // Index-accelerated path: a complete index answers the equality, an
+        // empty answer included. Without one, the scan reads every row.
         if let Some(field) = filter_field
             && let Some(value) = filter_value
-            && let Some(idx_set) = self.indexes.get(&tkey)
+            && let Some(candidate_keys) = self
+                .indexes
+                .get(&tkey)
+                .and_then(|idx_set| idx_set.complete_eq_candidates(field, value))
         {
-            // Try single-field index first.
-            let candidate_keys = if idx_set.get_index(field).is_some() {
-                idx_set.lookup_eq(field, value)
-            } else if let Some(ci) = idx_set.find_composite_with_prefix(field) {
-                // Composite index prefix match: use leading field.
-                ci.lookup_prefix(&[value])
-            } else {
-                Vec::new() // No index available — will fall through to full scan.
-            };
-
-            if !candidate_keys.is_empty() {
-                let mut results = Vec::with_capacity(count.min(candidate_keys.len()));
-
-                for pk in candidate_keys {
-                    if results.len() >= count {
-                        break;
-                    }
-                    if let Some((val, surrogate)) = table.get_with_surrogate(pk, now_ms)
-                        && (match_pattern.is_none() || matches_pattern_pub(pk, match_pattern))
-                        && surrogate_visible(surrogate.as_u32())
-                    {
-                        results.push((pk.to_vec(), val.to_vec()));
-                    }
+            // The cursor of an index scan is the position of the next
+            // candidate, so a caller paging with `count` reads every
+            // candidate exactly once.
+            let start = index_cursor_position(cursor).min(candidate_keys.len());
+            let mut results = Vec::with_capacity(count.min(candidate_keys.len() - start));
+            let mut next = candidate_keys.len();
+            for (pos, pk) in candidate_keys.iter().enumerate().skip(start) {
+                if results.len() >= count {
+                    next = pos;
+                    break;
                 }
-
-                return (results, Vec::new());
+                if let Some((val, surrogate)) = table.get_with_surrogate(pk, now_ms)
+                    && (match_pattern.is_none() || matches_pattern_pub(pk, match_pattern))
+                    && surrogate_visible(surrogate.as_u32())
+                {
+                    results.push((pk.to_vec(), val.to_vec()));
+                }
             }
+            let next_cursor = if next < candidate_keys.len() {
+                (next as u64).to_be_bytes().to_vec()
+            } else {
+                Vec::new()
+            };
+            return (results, next_cursor);
         }
 
         // Full scan fallback: iterate hash table slots.
@@ -161,38 +171,30 @@ impl KvEngine {
             }
         };
 
-        // Index-accelerated path: if we have an equality filter and an index, use it.
-        // Also checks composite indexes for prefix matches.
+        // Index-accelerated path: a complete index answers the equality, an
+        // empty answer included. Without one, the scan reads every row.
         if let Some(field) = filter_field
             && let Some(value) = filter_value
-            && let Some(idx_set) = self.indexes.get(&tkey)
+            && let Some(candidate_keys) = self
+                .indexes
+                .get(&tkey)
+                .and_then(|idx_set| idx_set.complete_eq_candidates(field, value))
         {
-            // Try single-field index first.
-            let candidate_keys = if idx_set.get_index(field).is_some() {
-                idx_set.lookup_eq(field, value)
-            } else if let Some(ci) = idx_set.find_composite_with_prefix(field) {
-                // Composite index prefix match: use leading field.
-                ci.lookup_prefix(&[value])
-            } else {
-                Vec::new() // No index available — will fall through to full scan.
-            };
-
-            if !candidate_keys.is_empty() {
-                let mut emitted = 0usize;
-                for pk in candidate_keys {
-                    if emitted >= count {
-                        break;
-                    }
-                    if let Some((val, surrogate)) = table.get_with_surrogate(pk, now_ms)
-                        && (match_pattern.is_none() || matches_pattern_pub(pk, match_pattern))
-                        && surrogate_visible(surrogate.as_u32())
-                    {
-                        f(pk, val)?;
-                        emitted += 1;
-                    }
+            let start = index_cursor_position(cursor);
+            let mut emitted = 0usize;
+            for pk in candidate_keys.into_iter().skip(start) {
+                if emitted >= count {
+                    break;
                 }
-                return Ok(());
+                if let Some((val, surrogate)) = table.get_with_surrogate(pk, now_ms)
+                    && (match_pattern.is_none() || matches_pattern_pub(pk, match_pattern))
+                    && surrogate_visible(surrogate.as_u32())
+                {
+                    f(pk, val)?;
+                    emitted += 1;
+                }
             }
+            return Ok(());
         }
 
         // Full scan fallback: iterate hash table slots.
@@ -240,6 +242,12 @@ mod tests {
             .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect();
         nodedb_types::json_to_msgpack(&serde_json::Value::Object(obj)).unwrap()
+    }
+
+    /// The index key an equality on `'us-east'` probes.
+    fn us_east_probe() -> Vec<u8> {
+        crate::engine::kv::index::kv_probe_key(&nodedb_types::Value::String("us-east".into()))
+            .expect("text probes")
     }
 
     /// Build the full-visibility, no-filter scan params used by the normalizer.
@@ -367,12 +375,18 @@ mod tests {
         })
         .expect("a bound row writes");
 
+        let probe = us_east_probe();
         let indexed_params = || KvScanParams {
             filter_field: Some("region"),
-            filter_value: Some(b"us-east"),
+            filter_value: Some(&probe),
             ..scan_params("sessions", usize::MAX, n)
         };
         let (materialized, _next) = e.scan(indexed_params());
+        assert_eq!(
+            materialized.len(),
+            2,
+            "the index path returns both us-east rows"
+        );
 
         let mut streamed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         e.scan_for_each(indexed_params(), |k, v| {
@@ -382,6 +396,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn index_scan_pages_through_every_candidate() {
+        // An index scan cut at `count` returned an empty cursor, so a
+        // caller paging to the end saw only the first page.
+        let mut e = make_engine();
+        let n = now();
+        e.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sessions",
+            field: "region",
+            field_position: 0,
+            backfill: false,
+            now_ms: n,
+        });
+        for i in 0..5u8 {
+            let key = [b's', i];
+            e.put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "sessions",
+                key: &key,
+                value: &mp_obj(&[("region", "us-east")]),
+                ttl_ms: 0,
+                now_ms: n,
+                surrogate: row_surrogate(&key),
+            })
+            .expect("a bound row writes");
+        }
+
+        let probe = us_east_probe();
+        let mut cursor: Vec<u8> = Vec::new();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let (page, next) = e.scan(KvScanParams {
+                cursor: &cursor,
+                filter_field: Some("region"),
+                filter_value: Some(&probe),
+                ..scan_params("sessions", 2, n)
+            });
+            assert!(page.len() <= 2);
+            seen.extend(page.into_iter().map(|(k, _)| k));
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 5);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "no candidate is read twice");
     }
 
     #[test]

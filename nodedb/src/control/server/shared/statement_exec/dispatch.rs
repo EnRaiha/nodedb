@@ -87,7 +87,7 @@ pub(crate) async fn dispatch_statement_task(
     // Autocommit `MERGE` orchestrates on the Control Plane.
     if let PhysicalPlan::Document(DocumentOp::Merge {
         target_collection: _,
-        source_collection: _,
+        source: _,
         source_alias: _,
         target_join_col: _,
         source_join_col: _,
@@ -113,7 +113,7 @@ pub(crate) async fn dispatch_statement_task(
     // different core.
     if let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
         target_collection: _,
-        source_collection: _,
+        source: _,
         source_alias: _,
         target_join_col: _,
         source_join_col: _,

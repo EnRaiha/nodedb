@@ -6,14 +6,15 @@ use sqlparser::ast;
 
 use super::super::dml_helpers::{
     KvInsertParams, VectorPrimaryInsertParams, bind_insert_select_columns, build_kv_insert_plan,
-    build_vector_primary_insert_plan, is_vector_primary, resolve_insert_columns,
+    build_vector_primary_insert_plan, insert_select_targets, is_vector_primary,
+    name_insert_select_outputs, refuse_vector_primary_shape, resolve_insert_columns,
 };
 use super::target::{
     OnConflict, classify_on_conflict, column_schema, insert_columns, resolve_target, target_scope,
     typed_rows, values_rows,
 };
 use super::upsert::plan_upsert_with_on_conflict;
-use crate::engine_rules::{self, InsertParams};
+use crate::engine_rules::{self, InsertParams, InsertSelectParams};
 use crate::error::Result;
 use crate::types::*;
 
@@ -44,15 +45,18 @@ pub fn plan_insert(
     if let Some(source) = &ins.source
         && let ast::SetExpr::Select(select) = &*source.body
     {
-        let column_map =
-            bind_insert_select_columns(catalog, functions, temporal, &columns, select, &info)?;
-        let source_plan = super::super::select::plan_query(source, catalog, functions, temporal)?;
-        return Ok(vec![SqlPlan::InsertSelect {
-            target: table_name,
-            source: Box::new(source_plan),
-            limit: 0,
-            column_map,
-        }]);
+        return plan_insert_select(
+            InsertSelectTarget {
+                table_name,
+                info: &info,
+                columns: &columns,
+            },
+            source,
+            select,
+            catalog,
+            functions,
+            temporal,
+        );
     }
 
     let rows_ast = values_rows(ins, "INSERT")?;
@@ -120,6 +124,51 @@ pub fn plan_insert(
         if_absent,
         column_schema,
         primary_key: info.primary_key.clone(),
+    })
+}
+
+/// The target side of an `INSERT ... SELECT`.
+struct InsertSelectTarget<'a> {
+    table_name: String,
+    info: &'a CollectionInfo,
+    /// The explicit target column list, empty when the statement gives none.
+    columns: &'a [String],
+}
+
+/// Plan an `INSERT ... SELECT`.
+///
+/// The source SELECT plans as an ordinary query, with every output column
+/// named so the copy can pair it with its target column. The target engine
+/// decides through `EngineRules::plan_insert_select` whether it accepts the
+/// copy. A vector-primary target is refused: the copy writes document
+/// bodies, which its vector index never reads.
+fn plan_insert_select(
+    target: InsertSelectTarget<'_>,
+    source: &ast::Query,
+    select: &ast::Select,
+    catalog: &dyn SqlCatalog,
+    functions: &crate::functions::registry::FunctionRegistry,
+    temporal: crate::TemporalScope,
+) -> Result<Vec<SqlPlan>> {
+    refuse_vector_primary_shape(target.info, "INSERT ... SELECT")?;
+    let names = insert_select_targets(target.columns, select, target.info)?;
+    let (named_source, source_columns) = name_insert_select_outputs(source, &names)?;
+    let source_plan =
+        super::super::select::plan_query(&named_source, catalog, functions, temporal)?;
+    // A plain document scan is read as stored rows, so each target column
+    // is bound as an expression over the stored row as well.
+    let column_map = match &source_plan {
+        SqlPlan::Scan {
+            engine: EngineType::DocumentSchemaless | EngineType::DocumentStrict,
+            ..
+        } => bind_insert_select_columns(catalog, functions, temporal, &names, select)?,
+        _ => Vec::new(),
+    };
+    engine_rules::resolve_engine_rules(target.info.engine).plan_insert_select(InsertSelectParams {
+        collection: target.table_name,
+        source: Box::new(source_plan),
+        column_map,
+        source_columns,
     })
 }
 
@@ -275,6 +324,156 @@ mod tests {
         );
         assert_eq!(cell(&rows[0], "host"), &SqlValue::String("h0".into()));
         assert_eq!(cell(&rows[0], "v"), &SqlValue::Float(1.0));
+    }
+
+    /// A catalog with a target `t` and a source `s`.
+    struct TwoCollections {
+        target: CollectionInfo,
+        source: CollectionInfo,
+    }
+
+    impl SqlCatalog for TwoCollections {
+        fn get_collection(
+            &self,
+            _: nodedb_types::DatabaseId,
+            name: &str,
+        ) -> std::result::Result<Option<CollectionInfo>, SqlCatalogError> {
+            Ok(match name {
+                "t" => Some(self.target.clone()),
+                "s" => Some(self.source.clone()),
+                _ => None,
+            })
+        }
+    }
+
+    fn copy_catalog(target: EngineType, source: EngineType) -> TwoCollections {
+        let mut id = column("id", SqlDataType::String, None);
+        id.is_primary_key = true;
+        let columns = vec![id, column("v", SqlDataType::String, None)];
+        let mut source = collection(source, columns.clone());
+        source.name = "s".into();
+        TwoCollections {
+            target: collection(target, columns),
+            source,
+        }
+    }
+
+    fn source_columns(plan: &SqlPlan) -> &[(String, String)] {
+        let SqlPlan::InsertSelect { source_columns, .. } = plan else {
+            panic!("expected SqlPlan::InsertSelect, got {plan:?}");
+        };
+        source_columns
+    }
+
+    /// Every unaliased SELECT-list item gets an output name the copy reads
+    /// back, paired with its target column. A document scan source also
+    /// binds each target column over the stored row.
+    #[test]
+    fn insert_select_names_every_output_column() {
+        let catalog = copy_catalog(
+            EngineType::DocumentSchemaless,
+            EngineType::DocumentSchemaless,
+        );
+        let plan = plan("INSERT INTO t (id, v) SELECT id, v FROM s", &catalog).expect("plans");
+        assert_eq!(
+            source_columns(&plan),
+            [
+                ("id".to_string(), "__nodedb_insert_select_0".to_string()),
+                ("v".to_string(), "__nodedb_insert_select_1".to_string()),
+            ]
+        );
+        let SqlPlan::InsertSelect { column_map, .. } = &plan else {
+            unreachable!()
+        };
+        assert_eq!(column_map.len(), 2);
+    }
+
+    /// An aliased item keeps its alias, so an ORDER BY over the alias keeps
+    /// its meaning.
+    #[test]
+    fn insert_select_keeps_a_user_alias() {
+        let catalog = copy_catalog(
+            EngineType::DocumentSchemaless,
+            EngineType::DocumentSchemaless,
+        );
+        let plan = plan(
+            "INSERT INTO t (id, v) SELECT id, v AS score FROM s ORDER BY score",
+            &catalog,
+        )
+        .expect("plans");
+        assert_eq!(
+            source_columns(&plan)[1],
+            ("v".to_string(), "score".to_string())
+        );
+    }
+
+    #[test]
+    fn insert_select_with_a_repeated_alias_is_refused() {
+        let catalog = copy_catalog(
+            EngineType::DocumentSchemaless,
+            EngineType::DocumentSchemaless,
+        );
+        let err = plan(
+            "INSERT INTO t (id, v) SELECT id AS x, v AS x FROM s",
+            &catalog,
+        )
+        .expect_err("two outputs named x");
+        assert!(matches!(err, crate::SqlError::Unsupported { .. }), "{err}");
+    }
+
+    /// A key-value source plans as a query: no stored-row binding, only the
+    /// output pairing.
+    #[test]
+    fn insert_select_from_a_kv_source_pairs_outputs_only() {
+        let catalog = copy_catalog(EngineType::DocumentSchemaless, EngineType::KeyValue);
+        let plan = plan("INSERT INTO t (id, v) SELECT id, v FROM s", &catalog).expect("plans");
+        let SqlPlan::InsertSelect {
+            column_map,
+            source_columns,
+            ..
+        } = &plan
+        else {
+            panic!("expected SqlPlan::InsertSelect, got {plan:?}");
+        };
+        assert!(column_map.is_empty());
+        assert_eq!(source_columns.len(), 2);
+    }
+
+    /// The target engine refuses at plan time, before any row is read.
+    #[test]
+    fn insert_select_into_a_non_document_target_is_refused() {
+        for engine in [
+            EngineType::KeyValue,
+            EngineType::Columnar,
+            EngineType::Spatial,
+            EngineType::Timeseries,
+        ] {
+            let catalog = copy_catalog(engine, EngineType::DocumentSchemaless);
+            let err = plan("INSERT INTO t (id, v) SELECT id, v FROM s", &catalog)
+                .expect_err("a non-document target refuses the copy");
+            assert!(
+                matches!(err, crate::SqlError::Unsupported { .. }),
+                "{engine:?}: {err}"
+            );
+        }
+    }
+
+    /// A vector-primary target is refused: the copy writes document bodies
+    /// its vector index never reads.
+    #[test]
+    fn insert_select_into_a_vector_primary_target_is_refused() {
+        let mut catalog = copy_catalog(
+            EngineType::DocumentSchemaless,
+            EngineType::DocumentSchemaless,
+        );
+        catalog.target.primary = nodedb_types::PrimaryEngine::Vector;
+        catalog.target.vector_primary = Some(nodedb_types::VectorPrimaryConfig::default());
+        let err = plan("INSERT INTO t (id, v) SELECT id, v FROM s", &catalog)
+            .expect_err("a vector-primary target refuses the copy");
+        assert!(
+            matches!(err, crate::SqlError::Unsupported { ref detail } if detail.contains("vector-primary")),
+            "{err}"
+        );
     }
 
     /// A volatile DEFAULT marks the plan so the plan cache never replays it.

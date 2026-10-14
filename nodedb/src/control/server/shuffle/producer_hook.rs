@@ -119,6 +119,8 @@ impl RegistryShuffleProducer {
             // The coordinator's linearizable-read groups: the executor
             // confirms them before this scan reads.
             read_groups: req.read_groups.clone(),
+            // A shuffle produce scan writes nothing, so no role is judged.
+            user_roles: Vec::new(),
         };
 
         let executor = LocalPlanExecutor::new(Arc::clone(&self.state));

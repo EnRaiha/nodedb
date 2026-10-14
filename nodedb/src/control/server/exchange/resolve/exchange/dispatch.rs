@@ -14,7 +14,8 @@ use super::entry::Resolved;
 use super::hash_join_arm::HashJoinFields;
 use super::post_process_arm::PostProcessFields;
 use super::{
-    aggregate_input_arm, gather_arm, hash_join_arm, post_process_arm, set_op_arm, shuffle_arm,
+    aggregate_input_arm, by_name_join_arm, gather_arm, hash_join_arm, post_process_arm, set_op_arm,
+    shuffle_arm,
 };
 
 /// Resolve any `Exchange` nodes in `plan`.
@@ -69,7 +70,7 @@ pub(super) async fn resolve_exchange(
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
             child,
             mode: ExchangeMode::Shuffle { keys, num_parts },
-        })) => shuffle_arm::resolve_shuffle(state, ctx, *child, keys, num_parts).await,
+        })) => shuffle_arm::resolve_shuffle(state, ctx, captures, *child, keys, num_parts).await,
 
         // Root-level ShuffleAggregate: orchestrate a real cross-node distributed
         // GROUP BY shuffle. The child must be a `QueryOp::Aggregate` (shuffle
@@ -79,7 +80,10 @@ pub(super) async fn resolve_exchange(
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
             child,
             mode: ExchangeMode::ShuffleAggregate { keys, num_parts },
-        })) => shuffle_arm::resolve_shuffle_aggregate(state, ctx, *child, keys, num_parts).await,
+        })) => {
+            shuffle_arm::resolve_shuffle_aggregate(state, ctx, captures, *child, keys, num_parts)
+                .await
+        }
 
         // HashJoin: resolve Broadcast children embedded in left_input / right_input.
         PhysicalPlan::Query(QueryOp::HashJoin {
@@ -90,8 +94,6 @@ pub(super) async fn resolve_exchange(
             on,
             join_type,
             limit,
-            post_group_by,
-            post_aggregates,
             projection,
             computed_projection,
             join_filters,
@@ -117,8 +119,6 @@ pub(super) async fn resolve_exchange(
                     on,
                     join_type,
                     limit,
-                    post_group_by,
-                    post_aggregates,
                     projection,
                     computed_projection,
                     join_filters,
@@ -215,6 +215,12 @@ pub(super) async fn resolve_exchange(
         PhysicalPlan::Query(QueryOp::SetOp { inputs, op }) => {
             set_op_arm::resolve_set_op(state, ctx, captures, inputs, op).await
         }
+
+        // Nested-loop and sort-merge joins: inside a transaction each
+        // by-name side reads through its gathered engine scan.
+        join @ PhysicalPlan::Query(
+            QueryOp::NestedLoopJoin { .. } | QueryOp::SortMergeJoin { .. },
+        ) => by_name_join_arm::resolve_by_name_join(state, ctx, captures, join).await,
 
         // All other plan variants: pass through unchanged.
         other => Ok(Resolved::Plan(Box::new(other))),

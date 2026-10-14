@@ -297,6 +297,7 @@ pub(super) fn convert_plan(
             let sentinel = PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: None,
                 rows: Vec::new(),
+                sources: Vec::new(),
                 filters: Vec::new(),
                 projection: Vec::new(),
                 computed_columns: Vec::new(),

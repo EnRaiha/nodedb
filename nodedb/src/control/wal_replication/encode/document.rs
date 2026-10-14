@@ -165,19 +165,57 @@ pub(super) fn upsert(
     }
 }
 
+/// The rows of a page record: `(document_id, value)` pairs and one surrogate
+/// per row.
+pub(super) struct PageRows<'a> {
+    pub documents: &'a [(String, Vec<u8>)],
+    pub surrogates: &'a [Surrogate],
+}
+
+pub(super) fn batch_upsert(
+    collection: &str,
+    rows: PageRows<'_>,
+    on_conflict_updates: &[(String, UpdateValue)],
+    resolved_sum_targets: &[ResolvedSumTarget],
+    returning: WireReturning<'_>,
+) -> ReplicatedWrite {
+    ReplicatedWrite::DocBatchUpsert {
+        collection: collection.to_owned(),
+        documents: rows.documents.to_vec(),
+        surrogates: rows.surrogates.iter().map(|s| s.as_u32()).collect(),
+        on_conflict_updates: on_conflict_updates.to_vec(),
+        resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
+    }
+}
+
+/// The rows of a batch insert record and how a present key is judged.
+pub(super) struct BatchRows<'a> {
+    pub documents: &'a [(String, Vec<u8>)],
+    pub surrogates: &'a [Surrogate],
+    pub if_absent: bool,
+}
+
 pub(super) fn batch_insert(
     collection: &str,
-    documents: &[(String, Vec<u8>)],
-    surrogates: &[Surrogate],
+    rows: BatchRows<'_>,
     resolved_sum_targets: &[ResolvedSumTarget],
     deferred_sum_targets: &[String],
     returning: Option<Vec<u8>>,
     rls_filters: &[u8],
 ) -> ReplicatedWrite {
+    let BatchRows {
+        documents,
+        surrogates,
+        if_absent,
+    } = rows;
     ReplicatedWrite::DocBatchInsert {
         collection: collection.to_owned(),
         documents: documents.to_vec(),
         surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
+        if_absent,
         resolved_sum_targets: wire_targets(resolved_sum_targets),
         resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
         deferred_sum_targets: deferred_sum_targets.to_vec(),
@@ -247,24 +285,6 @@ pub(super) fn bulk_update(
         returning,
         rls_filters: rls_filters.to_vec(),
         declared_primary_key: declared_primary_key.map(str::to_owned),
-    }
-}
-
-/// Replicates as a plain `InsertSelect` entry: each replica re-scans the source
-/// at the committed log position and copies matches, reusing each row's surrogate/doc_id.
-pub(super) fn insert_select(
-    target_collection: &str,
-    source_collection: &str,
-    source_filters: &[u8],
-    source_limit: usize,
-    column_map: &[u8],
-) -> ReplicatedWrite {
-    ReplicatedWrite::InsertSelect {
-        target_collection: target_collection.to_owned(),
-        source_collection: source_collection.to_owned(),
-        source_filters: source_filters.to_vec(),
-        source_limit,
-        column_map: column_map.to_vec(),
     }
 }
 

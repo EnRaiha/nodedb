@@ -92,7 +92,15 @@ impl CoreLoop {
             .cloned()
             .unwrap_or_default();
 
-        'seg_loop: for (seg_idx, seg_bytes) in flushed.iter().enumerate() {
+        // A memtable cursor (`start_segment == 0`) resumes past every flushed
+        // segment, so the segment phase reads nothing. Reading them again
+        // would emit each flushed row once per page.
+        let segments_to_scan = if start_segment == 0 {
+            &flushed[..0]
+        } else {
+            &flushed[..]
+        };
+        'seg_loop: for (seg_idx, seg_bytes) in segments_to_scan.iter().enumerate() {
             let seg_id = (seg_idx as u32) + 1; // 1-based
 
             // Skip segments already fully consumed by a prior page.
@@ -196,80 +204,62 @@ impl CoreLoop {
         }
 
         // ── Phase 2: active memtable rows ────────────────────────────────────
-        // Memtable rows are scanned only after all flushed segments are
-        // consumed (or resumed from a memtable cursor position).
+        // The segment loop stops early only when the page is full, so a page
+        // with room left has read every flushed segment. The memtable then
+        // starts at the cursor's row for a memtable cursor, else at its first
+        // row. A run of tombstoned rows at the end of the segments does not
+        // hold the scan back from the memtable.
         if entries.len() < count {
-            let all_flushed_done = last_segment == 0 || (last_segment as usize) >= flushed.len();
-
-            // Only enter memtable phase when cursor is past all segments
-            // (i.e. start_segment == 0 from the start, OR we finished
-            // all segments in this call).
             let memtable_start_row = if start_segment == 0 {
                 start_row as usize
-            } else if all_flushed_done {
-                // We just finished segments; start memtable from beginning.
-                0
             } else {
-                // Still in segment phase but entries buffer not yet full —
-                // can't happen with the break above. Guard defensively.
-                usize::MAX
+                0
             };
 
-            if memtable_start_row != usize::MAX {
-                let Some(engine) = self.columnar_engines.get(&columnar_key) else {
-                    // Engine was confirmed to exist above; reaching here is
-                    // unexpected but safe to return what we have so far.
-                    return build_response(self, task, entries, Vec::new());
+            let rows_with_surrogates: Vec<(Option<nodedb_types::Surrogate>, Vec<Value>)> =
+                match engine
+                    .scan_memtable_rows_with_surrogates()
+                    .skip(memtable_start_row)
+                    .collect::<Result<_, _>>()
+                {
+                    Ok(rows) => rows,
+                    Err(e) => return self.response_error(task, crate::Error::from(e)),
                 };
-                let schema = engine.schema().clone();
-                let ts_system_idx = schema.columns.iter().position(|c| c.name == TS_SYSTEM);
 
-                let rows_with_surrogates: Vec<(Option<nodedb_types::Surrogate>, Vec<Value>)> =
-                    match engine
-                        .scan_memtable_rows_with_surrogates()
-                        .skip(memtable_start_row)
-                        .collect::<Result<_, _>>()
-                    {
-                        Ok(rows) => rows,
-                        Err(e) => return self.response_error(task, crate::Error::from(e)),
-                    };
+            for (mt_idx, (row_surrogate, row)) in rows_with_surrogates.iter().enumerate() {
+                // Bitemporal system-time filter.
+                if let (Some(ts_idx), Some(cutoff)) = (ts_system_idx, system_as_of_ms)
+                    && let Some(Value::Integer(ts)) = row.get(ts_idx)
+                    && *ts > cutoff
+                {
+                    continue;
+                }
 
-                for (mt_idx, (row_surrogate, row)) in rows_with_surrogates.iter().enumerate() {
-                    // Bitemporal system-time filter.
-                    if let (Some(ts_idx), Some(cutoff)) = (ts_system_idx, system_as_of_ms)
-                        && let Some(Value::Integer(ts)) = row.get(ts_idx)
-                        && *ts > cutoff
-                    {
-                        continue;
+                // Build Value::Object.
+                let mut map = std::collections::HashMap::new();
+                for (col_idx, col_def) in schema.columns.iter().enumerate() {
+                    if col_idx < row.len() {
+                        map.insert(col_def.name.clone(), row[col_idx].clone());
                     }
+                }
+                let value_bytes = match encode_row(&Value::Object(map)) {
+                    Ok(b) => b,
+                    Err(e) => return self.response_error(task, e),
+                };
 
-                    // Build Value::Object.
-                    let mut map = std::collections::HashMap::new();
-                    for (col_idx, col_def) in schema.columns.iter().enumerate() {
-                        if col_idx < row.len() {
-                            map.insert(col_def.name.clone(), row[col_idx].clone());
-                        }
-                    }
-                    let value_bytes = match encode_row(&Value::Object(map)) {
-                        Ok(b) => b,
-                        Err(e) => return self.response_error(task, e),
-                    };
+                let abs_row = memtable_start_row + mt_idx;
+                let surrogate_u32: u32 = row_surrogate.map(|s| s.as_u32()).unwrap_or_else(|| {
+                    // No recorded surrogate — use a hash-based synthetic value.
+                    // segment_id=0 (memtable), row position in lower 24 bits.
+                    (abs_row as u32) | 0x8000_0000
+                });
 
-                    let abs_row = memtable_start_row + mt_idx;
-                    let surrogate_u32: u32 =
-                        row_surrogate.map(|s| s.as_u32()).unwrap_or_else(|| {
-                            // No recorded surrogate — use a hash-based synthetic value.
-                            // segment_id=0 (memtable), row position in lower 24 bits.
-                            (abs_row as u32) | 0x8000_0000
-                        });
+                entries.push((surrogate_u32, value_bytes));
+                last_segment = 0;
+                last_row = (abs_row + 1) as u32;
 
-                    entries.push((surrogate_u32, value_bytes));
-                    last_segment = 0;
-                    last_row = (abs_row + 1) as u32;
-
-                    if entries.len() >= count {
-                        break;
-                    }
+                if entries.len() >= count {
+                    break;
                 }
             }
         }
@@ -571,5 +561,46 @@ mod tests {
         assert_ne!(emitted_surrogates[0], synthetic_row0);
         assert_ne!(emitted_surrogates[1], synthetic_row1);
         assert_ne!(emitted_surrogates[2], synthetic_row2);
+    }
+
+    /// Paging across flushed segments and the memtable emits every row once.
+    /// A memtable cursor re-read every flushed segment, so each later page
+    /// repeated the flushed rows.
+    #[test]
+    fn memtable_cursor_does_not_reread_flushed_segments() {
+        let (mut core, _dir) = make_core();
+        let coll = "mat_cursor_test";
+        let key = insert_and_flush(
+            &mut core,
+            coll,
+            &[
+                (1, 100, Surrogate::new(10)),
+                (2, 200, Surrogate::new(20)),
+                (3, 300, Surrogate::new(30)),
+            ],
+        );
+        let engine = core.columnar_engines.get_mut(&key).expect("engine");
+        for (id, surr) in [(4, 40), (5, 50)] {
+            engine
+                .insert_with_surrogate(
+                    &[Value::Integer(id), Value::Integer(id * 100)],
+                    Surrogate::new(surr),
+                )
+                .expect("memtable insert");
+        }
+
+        let task = make_task();
+        let mut cursor: Vec<u8> = Vec::new();
+        let mut seen: Vec<u32> = Vec::new();
+        for _page in 0..10 {
+            let resp = core.execute_columnar_materialize_scan(&task, coll, &cursor, 2, None);
+            let (page, next) = parse_response(resp.payload.as_bytes());
+            seen.extend(page);
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen, vec![10, 20, 30, 40, 50]);
     }
 }

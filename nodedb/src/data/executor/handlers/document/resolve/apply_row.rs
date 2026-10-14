@@ -111,6 +111,14 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: resolved_sum_targets,
+                // An insert is judged whole here. A merge or update body is a
+                // post-image the resolve pass already judged on its assigned
+                // fields, so its guards only inject again.
+                guards: if precondition.is_none() {
+                    crate::data::executor::enforcement::typeguard::GuardScope::Document
+                } else {
+                    crate::data::executor::enforcement::typeguard::GuardScope::InjectOnly
+                },
             },
         ) {
             Ok(outcome) => outcome,

@@ -158,22 +158,31 @@ async fn wal_replay_restart_keeps_governor_accounting_sane() {
     .await
     .unwrap();
 
-    for i in 0..300u32 {
+    // Seed in multi-row statements: replay covers each engine's batch
+    // records, and the seed pays one durable commit per chunk.
+    for start in (0..300u32).step_by(50) {
+        let rows = start..start + 50;
+        let kv: Vec<String> = rows.clone().map(|i| format!("('k{i}', 'v{i}')")).collect();
         srv.exec(&format!(
-            "INSERT INTO replay_kv (k, v) VALUES ('k{i}', 'v{i}')"
+            "INSERT INTO replay_kv (k, v) VALUES {}",
+            kv.join(", ")
         ))
         .await
         .unwrap();
+        let ts: Vec<String> = rows
+            .clone()
+            .map(|i| format!("('s{}', {}, {}.5)", i % 8, 1_000_000 + i as i64, i))
+            .collect();
         srv.exec(&format!(
-            "INSERT INTO replay_ts (id, ts, val) VALUES ('s{}', {}, {}.5)",
-            i % 8,
-            1_000_000 + i as i64,
-            i
+            "INSERT INTO replay_ts (id, ts, val) VALUES {}",
+            ts.join(", ")
         ))
         .await
         .unwrap();
+        let doc: Vec<String> = rows.map(|i| format!("('d{i}', 'payload-{i}')")).collect();
         srv.exec(&format!(
-            "INSERT INTO replay_doc (id, payload) VALUES ('d{i}', 'payload-{i}')"
+            "INSERT INTO replay_doc (id, payload) VALUES {}",
+            doc.join(", ")
         ))
         .await
         .unwrap();

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Query-side partition selection: overlap pruning, merge candidate selection,
-//! retention expiry scan.
+//! Query-side partition selection: overlap pruning and the retention expiry
+//! scan.
 
 use nodedb_types::timeseries::{PartitionState, TimeRange};
 
@@ -15,32 +15,6 @@ impl PartitionRegistry {
             .values()
             .filter(|e| e.meta.is_queryable() && e.meta.overlaps(range))
             .collect()
-    }
-
-    /// Find partitions eligible for merging.
-    ///
-    /// Returns groups of `merge_count` consecutive sealed partitions
-    /// that are all older than `merge_after` relative to `now_ms`.
-    pub fn find_mergeable(&self, now_ms: i64) -> Vec<Vec<i64>> {
-        let merge_after = self.config.merge_after_ms as i64;
-        let merge_count = self.config.merge_count as usize;
-
-        let sealed: Vec<i64> = self
-            .partitions
-            .iter()
-            .filter(|(_, e)| {
-                e.meta.state == PartitionState::Sealed && (now_ms - e.meta.max_ts) > merge_after
-            })
-            .map(|(&start, _)| start)
-            .collect();
-
-        let mut groups = Vec::new();
-        let mut i = 0;
-        while i + merge_count <= sealed.len() {
-            groups.push(sealed[i..i + merge_count].to_vec());
-            i += merge_count;
-        }
-        groups
     }
 
     /// Find partitions eligible for retention drop.
@@ -97,28 +71,6 @@ mod tests {
         let range = TimeRange::new(3 * day_ms, 5 * day_ms + day_ms - 1);
         let results = reg.query_partitions(&range);
         assert_eq!(results.len(), 3);
-    }
-
-    #[test]
-    fn find_mergeable() {
-        let mut reg = PartitionRegistry::new(test_config());
-        let day_ms = 86_400_000i64;
-
-        // Create and seal 6 partitions.
-        for d in 1..=6 {
-            reg.get_or_create_partition(d * day_ms);
-            reg.seal_partition(d * day_ms);
-        }
-
-        // None mergeable yet (merge_after = 7d, data is "today").
-        let now = 7 * day_ms;
-        assert!(reg.find_mergeable(now).is_empty());
-
-        // 15 days later, all are old enough. merge_count=3 → 2 groups.
-        let now = 22 * day_ms;
-        let groups = reg.find_mergeable(now);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].len(), 3);
     }
 
     #[test]

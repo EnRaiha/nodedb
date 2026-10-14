@@ -62,8 +62,8 @@ pub(crate) struct DecodedBatchRecord {
     pub collection: String,
     pub payload: Vec<u8>,
     pub provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
-    /// Present in the six-element timeseries tuple. The legacy shapes carry
-    /// none and use the UTF-8 heuristic.
+    /// Present in the six-element timeseries tuple. The shorter tuple shapes
+    /// carry none, and replay refuses a timeseries record without one.
     pub format: Option<String>,
     /// Non-empty only for map-shaped columnar records.
     pub surrogates: Vec<nodedb_types::Surrogate>,

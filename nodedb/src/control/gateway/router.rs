@@ -35,9 +35,9 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 
 use crate::Result;
 
+use super::home_collection::home_collection;
 use super::key_extractor::KeyExtractor;
 use super::route::{RouteDecision, TaskRoute};
-use super::version_set::touched_collections;
 
 /// Compute routing decisions for a single `PhysicalPlan`.
 ///
@@ -151,7 +151,7 @@ fn route_single_collection(
     strategy_fn: &impl Fn(&str) -> PartitionStrategy,
     extractor: &dyn KeyExtractor,
 ) -> Result<Vec<TaskRoute>> {
-    let primary_name: Option<String> = touched_collections(&plan).into_iter().next();
+    let primary_name: Option<String> = home_collection(&plan);
 
     let strategy = primary_name.as_deref().map(strategy_fn).unwrap_or_default(); // CollectionHomed for plans with no named collection
 
@@ -314,7 +314,7 @@ pub fn is_task_vshard_scoped(plan: &PhysicalPlan) -> bool {
 /// path homes the collection to. Falls back to vShard 0 for plans that have
 /// no named collection (Meta ops).
 fn primary_vshard(plan: &PhysicalPlan, database_id: DatabaseId) -> Result<u32> {
-    match touched_collections(plan).into_iter().next() {
+    match home_collection(plan) {
         Some(name) => Ok(vshard_for_collection(CollectionKey::from_qualified_str(
             database_id,
             &name,

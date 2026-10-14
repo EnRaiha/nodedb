@@ -137,7 +137,7 @@ async fn vector_search_over_shadowed_clone_is_refused() {
         &[
             "CREATE DATABASE crs_vec_src",
             "USE DATABASE crs_vec_src",
-            "CREATE COLLECTION vecs WITH (engine='vector')",
+            "CREATE COLLECTION vecs WITH (engine='document_schemaless')",
             "CREATE INDEX ON vecs (embedding)",
             "INSERT INTO vecs { id: 'v1', embedding: [1.0,0.0,0.0,0.0] }",
             "INSERT INTO vecs { id: 'v2', embedding: [0.0,1.0,0.0,0.0] }",

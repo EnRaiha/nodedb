@@ -92,6 +92,7 @@ fn moves_cross_shard_sum(state: &SharedState, task: &PhysicalTask) -> bool {
         | DocumentOp::PointDelete { .. }
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }

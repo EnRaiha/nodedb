@@ -130,7 +130,16 @@ impl CoreLoop {
         } = args;
         debug!(core = self.core_id, %collection, %field, limit, "range scan");
 
-        // Try index-backed range scan first.
+        // Try index-backed range scan first. The index returns rows in key
+        // order, so an explicit limit reads exactly that many. Without one,
+        // every row is read under the scan byte budget.
+        let budget = self.query_tuning.max_scan_result_bytes;
+        let unbounded = limit == usize::MAX;
+        let index_limit = if unbounded {
+            super::super::scan_budget::fetch_limit_for(usize::MAX, 0, budget)
+        } else {
+            limit
+        };
         let results =
             match self
                 .sparse
@@ -141,8 +150,13 @@ impl CoreLoop {
                     field,
                     lower,
                     upper,
-                    limit,
+                    limit: index_limit,
                 }) {
+                Ok(r)
+                    if unbounded && super::super::scan_budget::scan_bytes_exceeded(&r, budget) =>
+                {
+                    return self.response_error(task, ErrorCode::ResourcesExhausted);
+                }
                 Ok(r) => {
                     let mut kept = Vec::with_capacity(r.len());
                     for (id, bytes) in r {
@@ -164,14 +178,25 @@ impl CoreLoop {
 
         // If the index returned nothing, fall back to full scan + sort.
         // This handles collections without a secondary index on `field`.
+        // The sort needs every row: a read cut at a row count would sort a
+        // prefix and silently return the wrong rows. The read is bounded by
+        // the scan byte budget alone, and a collection past it fails loudly.
         if results.is_empty() {
-            let scan_result = self.scan_collection_with_rls(
+            let scan_limit = super::super::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
+            let scanned = match self.scan_collection(
                 task.request.database_id.as_u64(),
                 tid,
                 collection,
-                limit.max(1000),
-                rls_filters,
-            );
+                scan_limit,
+            ) {
+                Ok(docs) => docs,
+                Err(e) => return self.response_error(task, ErrorCode::from(e)),
+            };
+            if super::super::scan_budget::scan_bytes_exceeded(&scanned, budget) {
+                return self.response_error(task, ErrorCode::ResourcesExhausted);
+            }
+            let scan_result =
+                self.retain_rows_matching(scanned, rls_filters, "RLS filter (range scan)");
             match scan_result {
                 Ok(mut docs) => {
                     let sort_keys = [nodedb_physical::physical_plan::SortKeySpec::column(

@@ -102,6 +102,14 @@ impl CoreLoop {
             series_catalog,
         );
         reinstall(&mut self.ts_replay_stamps, &collection_key, replay_stamp);
+        // The directory back in place carries the aggregates' image. Reset
+        // them so the maintenance tick reloads it and folds what it lacks.
+        let (database_id, tenant_id, collection) = &collection_key;
+        self.continuous_agg_mgr.reset_for_source(
+            database_id.as_u64(),
+            tenant_id.as_u64(),
+            collection,
+        );
         Ok(())
     }
 }

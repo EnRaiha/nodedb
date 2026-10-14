@@ -288,6 +288,50 @@ impl CoreLoop {
                 returning: returning.as_ref(),
                 rls_filters,
             }),
+            KvOp::InsertIfAbsent {
+                collection,
+                key,
+                value,
+                ttl_ms,
+                surrogate,
+                returning,
+                rls_filters,
+            } => self.resolve_kv_insert_if_absent(
+                task,
+                super::batch_ops::ResolveKvPoint {
+                    did,
+                    tid,
+                    collection: collection.as_str(),
+                    key,
+                    value,
+                    ttl_ms: *ttl_ms,
+                    surrogate: *surrogate,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                },
+            ),
+            KvOp::BatchPut {
+                collection,
+                entries,
+                ttl_ms,
+                intent,
+                surrogates,
+                returning,
+                rls_filters,
+            } => self.resolve_kv_batch_put(
+                task,
+                super::batch_ops::ResolveKvBatch {
+                    did,
+                    tid,
+                    collection: collection.as_str(),
+                    entries,
+                    ttl_ms: *ttl_ms,
+                    intent,
+                    surrogates,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                },
+            ),
             // Every other op is unwrapped by `resolver_for_plan` already.
             other => Err(ErrorCode::Internal {
                 detail: format!(

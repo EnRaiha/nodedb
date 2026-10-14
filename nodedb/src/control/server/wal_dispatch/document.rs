@@ -220,6 +220,7 @@ pub(super) fn wal_append_document_op(
         // post-apply redo journals each one.
         DocumentOp::PointUpdate { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }

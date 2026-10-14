@@ -127,6 +127,7 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. }
         | DocumentOp::BulkUpdate { collection, .. }
         | DocumentOp::BulkDelete { collection, .. }
         | DocumentOp::Truncate { collection, .. }
@@ -235,6 +236,7 @@ fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
         | VectorOp::DirectUpsert { collection, .. }
         | VectorOp::DirectInsert { collection, .. }
         | VectorOp::DirectInsertIfAbsent { collection, .. }
+        | VectorOp::DirectBatchWrite { collection, .. }
         | VectorOp::DirectDelete { collection, .. }
         | VectorOp::DirectTruncate { collection, .. }
         | VectorOp::DirectUpdate { collection, .. } => collection_routing(database_id, collection),
@@ -323,12 +325,17 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
 
 fn timeseries_routing(op: &TimeseriesOp, database_id: DatabaseId) -> PlanRouting {
     match op {
-        TimeseriesOp::Ingest { collection, .. } | TimeseriesOp::Truncate { collection, .. } => {
+        TimeseriesOp::Ingest { collection, .. }
+        | TimeseriesOp::Truncate { collection, .. }
+        | TimeseriesOp::RefreshAggregate { collection, .. } => {
             collection_routing(database_id, collection)
         }
         // Read-only: it reports the lines the wrapped ingest will store and
-        // mutates nothing.
-        TimeseriesOp::ResolveIngest(_) | TimeseriesOp::Scan { .. } => PlanRouting::NotAWrite,
+        // mutates nothing. Partition maintenance changes no row.
+        TimeseriesOp::ResolveIngest(_)
+        | TimeseriesOp::Scan { .. }
+        | TimeseriesOp::Partitions { .. }
+        | TimeseriesOp::ReadAggregate { .. } => PlanRouting::NotAWrite,
     }
 }
 
@@ -692,7 +699,9 @@ mod tests {
     fn document_merge_is_unroutable() {
         let plan = PhysicalPlan::Document(DocumentOp::Merge {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+            source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+            ),
             source_alias: "s".to_owned(),
             target_join_col: "id".to_owned(),
             source_join_col: "id".to_owned(),
@@ -738,7 +747,9 @@ mod tests {
     fn document_update_from_join_is_unroutable() {
         let plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+            source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+            ),
             source_alias: "s".to_owned(),
             target_join_col: "id".to_owned(),
             source_join_col: "id".to_owned(),

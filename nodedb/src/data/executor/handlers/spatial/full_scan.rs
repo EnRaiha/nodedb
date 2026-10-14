@@ -52,7 +52,13 @@ impl CoreLoop {
         } = params;
         debug!(core = self.core_id, %collection, "spatial full scan (no R-tree index yet)");
 
-        let scan_limit = limit * 10;
+        // The predicate is evaluated after the read, so the read cannot stop
+        // at a multiple of the limit: a match past that prefix would be
+        // silently missed. Every row is read under the scan byte budget, and
+        // a collection past it fails loudly.
+        let budget = self.query_tuning.max_scan_result_bytes;
+        let scan_limit =
+            crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
         let entries = match self.scan_collection(
             task.request.database_id.as_u64(),
             tid,
@@ -64,6 +70,9 @@ impl CoreLoop {
                 return self.response_error(task, ErrorCode::from(e));
             }
         };
+        if crate::data::executor::handlers::scan_budget::scan_bytes_exceeded(&entries, budget) {
+            return self.response_error(task, ErrorCode::ResourcesExhausted);
+        }
 
         let identity_column =
             self.identity_column(task.request.database_id.as_u64(), tid, collection);

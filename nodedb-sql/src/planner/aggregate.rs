@@ -1,298 +1,122 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! GROUP BY and aggregate planning.
+//! GROUP BY and aggregate planning over a single collection.
 
-use sqlparser::ast::{self, GroupByExpr};
+use sqlparser::ast;
 
-use crate::engine_rules::{self, AggregateParams};
+use crate::engine_rules::{self, AggregateParams, TimeBucketKey};
 use crate::error::Result;
 use crate::functions::registry::{FunctionRegistry, SearchTrigger};
 use crate::parser::normalize::normalize_ident;
-use crate::planner::group_by::{convert_group_by_with_projection, group_by_output_aliases};
-use crate::planner::grouping_sets::expand_group_by;
+use crate::planner::aggregate_clauses::plan_aggregate_clauses;
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::{ResolvedTable, TableScope};
 use crate::resolver::expr::convert_expr;
 use crate::temporal::TemporalScope;
 use crate::types::*;
 
+/// The inputs of one aggregate query.
+pub struct AggregateQuery<'a> {
+    pub select: &'a ast::Select,
+    pub order_by: Option<&'a ast::OrderBy>,
+    /// The single collection the aggregate reads.
+    pub table: &'a ResolvedTable,
+    /// The WHERE clause, already converted against `scope`.
+    pub filters: &'a [Filter],
+    pub scope: &'a TableScope,
+    pub temporal: &'a TemporalScope,
+    /// Set when semi or anti subquery joins must filter the input rows below
+    /// the aggregate. The engine then plans an aggregate over an input plan
+    /// the caller can wrap.
+    pub input_joins: bool,
+}
+
+/// The aggregate's row limit without a `LIMIT` clause: every group. An
+/// explicit `LIMIT n` overwrites it in `apply_limit`.
+pub const AGGREGATE_NO_LIMIT: usize = usize::MAX;
+
 /// Plan an aggregate query (GROUP BY + aggregate functions).
-pub fn plan_aggregate(
-    select: &ast::Select,
-    table: &ResolvedTable,
-    filters: &[Filter],
-    scope: &TableScope,
-    functions: &FunctionRegistry,
-    temporal: &TemporalScope,
-) -> Result<SqlPlan> {
-    // Detect ROLLUP / CUBE / GROUPING SETS before falling through to plain convert.
-    let grouping_expansion = expand_group_by(&select.group_by, scope)?;
-
-    let (group_by_exprs, grouping_sets) = if let Some(exp) = grouping_expansion {
-        (exp.canonical_keys, Some(exp.grouping_sets))
-    } else {
-        (
-            convert_group_by_with_projection(
-                &select.group_by,
-                &select.projection,
-                &table.info.columns,
-                scope,
-            )?,
-            None,
-        )
-    };
-
-    let mut aggregates = extract_aggregates_from_projection(&select.projection, functions, scope)?;
-    // HAVING is bound to the aggregates' computed output columns, and any
-    // aggregate it alone introduces is added to `aggregates` so it is actually
-    // computed.
-    let having = match &select.having {
-        Some(expr) => {
-            super::having::plan_having(expr, &select.projection, &mut aggregates, functions, scope)?
-        }
-        None => Vec::new(),
-    };
-
-    // When grouping sets are present, detect GROUPING(col) in the projection and
-    // synthesize AggregateExpr entries so the executor can compute them per-set.
-    if grouping_sets.is_some() {
-        let grouping_aggs = extract_grouping_calls(&select.projection, &group_by_exprs, scope)?;
-        aggregates.extend(grouping_aggs);
-    }
-
-    // Records the SELECT-list interleaving of GROUP BY keys and aggregates so
-    // output columns follow the user's SELECT order. Computed after the full
-    // aggregate list (including any GROUPING pseudo-aggregates) is assembled so
-    // grouping slots index correctly.
-    let output_order = super::aggregate_order::compute_output_order(
-        &select.projection,
-        &group_by_exprs,
-        functions,
+pub fn plan_aggregate(query: AggregateQuery<'_>, functions: &FunctionRegistry) -> Result<SqlPlan> {
+    let AggregateQuery {
+        select,
+        order_by,
+        table,
+        filters,
         scope,
-    )?;
-
-    // Extract timeseries-specific params (bucket interval, group columns) if applicable.
-    let (bucket_interval_ms, group_columns) =
-        extract_timeseries_params(&select.group_by, &select.projection, functions)?;
+        temporal,
+        input_joins,
+    } = query;
+    let clauses = plan_aggregate_clauses(select, order_by, &table.info.columns, scope, functions)?;
+    let time_bucket = time_bucket_key(&clauses.group_by, functions);
 
     let rules = engine_rules::resolve_engine_rules(table.info.engine);
-    let mut base_plan = rules.plan_aggregate(AggregateParams {
+    let mut plan = rules.plan_aggregate(AggregateParams {
         collection: table.name.clone(),
         alias: table.alias.clone(),
         filters: filters.to_vec(),
-        group_by: group_by_exprs.clone(),
-        aggregates: aggregates.clone(),
-        having: having.clone(),
-        limit: 10000,
-        bucket_interval_ms,
-        group_columns,
+        group_by: clauses.group_by,
+        aggregates: clauses.aggregates,
+        having: clauses.having,
+        limit: AGGREGATE_NO_LIMIT,
+        time_bucket,
+        grouping_sets: clauses.grouping_sets,
+        columns: table.info.columns.clone(),
         has_auto_tier: table.info.has_auto_tier,
         bitemporal: table.info.bitemporal,
         temporal: *temporal,
+        hidden_aggregates: clauses.hidden_aggregates,
+        input_joins,
     })?;
 
     // The engine rules build the Aggregate node without a projection in scope,
     // so the SELECT-list output aliases for the GROUP BY keys are attached here
     // (Postgres: `SELECT k AS label ... GROUP BY k` yields output column
     // `label`, not `k`).
-    let group_by_aliases = group_by_output_aliases(&select.projection, &group_by_exprs);
     if let SqlPlan::Aggregate {
-        group_by_aliases: alias_slot,
-        output_order: order_slot,
+        group_by_aliases,
+        output_order,
         ..
-    } = &mut base_plan
+    } = &mut plan
     {
-        *alias_slot = group_by_aliases.clone();
-        *order_slot = output_order.clone();
+        *group_by_aliases = clauses.group_by_aliases;
+        *output_order = clauses.output_order;
     }
-
-    // Wrap the plan to attach grouping sets if present.
-    if let Some(sets) = grouping_sets {
-        return Ok(attach_grouping_sets(
-            base_plan,
-            group_by_exprs,
-            group_by_aliases,
-            output_order,
-            aggregates,
-            having,
-            sets,
-        ));
-    }
-
-    Ok(base_plan)
+    Ok(plan)
 }
 
-/// Attach `grouping_sets` to an existing `SqlPlan::Aggregate` node, or wrap it
-/// in a new one when the engine rules returned a non-Aggregate plan.
-fn attach_grouping_sets(
-    base_plan: SqlPlan,
-    group_by: Vec<SqlExpr>,
-    group_by_aliases: Vec<Option<String>>,
-    output_order: Vec<AggOutputSlot>,
-    aggregates: Vec<AggregateExpr>,
-    having: Vec<Filter>,
-    grouping_sets: Vec<Vec<usize>>,
-) -> SqlPlan {
-    match base_plan {
-        SqlPlan::Aggregate {
-            input,
-            limit,
-            grouping_sets: _,
-            sort_keys,
-            ..
-        } => SqlPlan::Aggregate {
-            input,
-            group_by,
-            group_by_aliases,
-            output_order,
-            aggregates,
-            having,
-            limit,
-            grouping_sets: Some(grouping_sets),
-            sort_keys,
-        },
-        other => {
-            // Engine returned something other than Aggregate (e.g. TimeseriesIngest).
-            // Wrap it so grouping sets are not silently dropped.
-            SqlPlan::Aggregate {
-                input: Box::new(other),
-                group_by,
-                group_by_aliases,
-                output_order,
-                aggregates,
-                having,
-                limit: 10000,
-                grouping_sets: Some(grouping_sets),
-                sort_keys: Vec::new(),
-            }
-        }
-    }
-}
-
-/// Extract timeseries-specific parameters from GROUP BY (bucket interval, group columns).
-///
-/// Returns `(Some(interval_ms), group_columns)` if a `time_bucket()` call is found,
-/// or `(None, empty)` otherwise. Non-timeseries engines ignore these values.
-fn extract_timeseries_params(
-    raw_group_by: &GroupByExpr,
-    select_items: &[ast::SelectItem],
-    functions: &FunctionRegistry,
-) -> Result<(Option<i64>, Vec<String>)> {
-    let mut bucket_interval_ms: Option<i64> = None;
-    let mut group_columns = Vec::new();
-
-    if let GroupByExpr::Expressions(exprs, _) = raw_group_by {
-        for expr in exprs {
-            let resolved = resolve_group_by_expr(expr, select_items);
-            let check_expr = resolved.unwrap_or(expr);
-
-            if let Some(interval) = try_extract_time_bucket(check_expr, functions)? {
-                bucket_interval_ms = Some(interval);
-                continue;
-            }
-
-            if let ast::Expr::Identifier(ident) = expr {
-                group_columns.push(normalize_ident(ident));
-            }
-        }
-    }
-
-    Ok((bucket_interval_ms, group_columns))
-}
-
-/// Check if an expression is a time_bucket() call and extract the interval.
-fn try_extract_time_bucket(expr: &ast::Expr, functions: &FunctionRegistry) -> Result<Option<i64>> {
-    if let ast::Expr::Function(func) = expr {
-        let name = func
-            .name
-            .0
-            .iter()
-            .map(|p| match p {
-                ast::ObjectNamePart::Identifier(ident) => normalize_ident(ident),
-                _ => String::new(),
-            })
-            .collect::<Vec<_>>()
-            .join(".");
-        if functions.search_trigger(&name) == SearchTrigger::TimeBucket {
-            return Ok(Some(extract_bucket_interval(func)?));
-        }
-    }
-    Ok(None)
-}
-
-/// Resolve a GROUP BY expression that references a SELECT alias or ordinal.
-///
-/// `GROUP BY b` where `b` is an alias → returns the aliased expression.
-/// `GROUP BY 1` → returns the 1st SELECT expression (0-indexed).
-fn resolve_group_by_expr<'a>(
-    expr: &ast::Expr,
-    select_items: &'a [ast::SelectItem],
-) -> Option<&'a ast::Expr> {
-    match expr {
-        ast::Expr::Identifier(ident) => {
-            let alias_name = normalize_ident(ident);
-            select_items.iter().find_map(|item| {
-                if let ast::SelectItem::ExprWithAlias { expr, alias } = item
-                    && normalize_ident(alias) == alias_name
-                {
-                    Some(expr)
-                } else {
-                    None
-                }
-            })
-        }
-        ast::Expr::Value(v) => {
-            if let ast::Value::Number(n, _) = &v.value
-                && let Ok(idx) = n.parse::<usize>()
-                && idx >= 1
-                && idx <= select_items.len()
+/// The `time_bucket(...)` key among the GROUP BY keys, with its interval.
+fn time_bucket_key(group_by: &[SqlExpr], functions: &FunctionRegistry) -> Option<TimeBucketKey> {
+    group_by
+        .iter()
+        .enumerate()
+        .find_map(|(group_index, key)| match key {
+            SqlExpr::Function { name, args, .. }
+                if functions.search_trigger(name) == SearchTrigger::TimeBucket =>
             {
-                match &select_items[idx - 1] {
-                    ast::SelectItem::UnnamedExpr(e) => Some(e),
-                    ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
-                    _ => None,
-                }
-            } else {
-                None
+                Some(TimeBucketKey {
+                    group_index,
+                    interval_ms: bucket_interval_ms(args),
+                })
             }
-        }
-        _ => None,
-    }
+            _ => None,
+        })
 }
 
-/// Extract the bucket interval from a time_bucket() call.
+/// The bucket width a `time_bucket` call names, in milliseconds.
 ///
-/// Handles both argument orders:
-/// - `time_bucket('1 hour', timestamp)` — interval first
-/// - `time_bucket(timestamp, '1 hour')` — timestamp first
-/// - `time_bucket(3600, timestamp)` — integer seconds
-fn extract_bucket_interval(func: &ast::Function) -> Result<i64> {
-    let args = match &func.args {
-        ast::FunctionArguments::List(args) => &args.args,
-        _ => return Ok(0),
-    };
-    // Try each argument position for the interval literal.
-    for arg in args {
-        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Value(v))) = arg {
-            match &v.value {
-                ast::Value::SingleQuotedString(s) => {
-                    let ms = parse_interval_to_ms(s);
-                    if ms > 0 {
-                        return Ok(ms);
-                    }
-                }
-                ast::Value::Number(n, _) => {
-                    if let Ok(secs) = n.parse::<i64>()
-                        && secs > 0
-                    {
-                        return Ok(secs * 1000);
-                    }
-                }
-                _ => {}
+/// Both argument orders are accepted: `time_bucket('1 hour', ts)`,
+/// `time_bucket(ts, '1 hour')`, and integer seconds `time_bucket(3600, ts)`.
+/// 0 when no argument is a readable positive interval literal.
+fn bucket_interval_ms(args: &[SqlExpr]) -> i64 {
+    args.iter()
+        .find_map(|arg| match arg {
+            SqlExpr::Literal(SqlValue::String(s)) => {
+                Some(parse_interval_to_ms(s)).filter(|ms| *ms > 0)
             }
-        }
-    }
-    Ok(0)
+            SqlExpr::Literal(SqlValue::Int(secs)) if *secs > 0 => secs.checked_mul(1000),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Parse an interval string to milliseconds.
@@ -310,7 +134,7 @@ fn parse_interval_to_ms(s: &str) -> i64 {
 /// For `GROUPING(col)`, the canonical index of `col` in `canonical_keys` is
 /// encoded into the `field` of the resulting `AggregateExpr` (as a decimal string).
 /// The executor reads this index and checks the grouping-set bitmask at run time.
-fn extract_grouping_calls(
+pub(super) fn extract_grouping_calls(
     items: &[ast::SelectItem],
     canonical_keys: &[SqlExpr],
     scope: &TableScope,
@@ -353,6 +177,8 @@ fn collect_grouping_from_expr(
                         alias: alias.to_string(),
                         distinct: false,
                         grouping_col_index: Some(canonical_idx),
+                        filter_text: None,
+                        arg_text: None,
                     });
                 }
             }
@@ -444,66 +270,60 @@ mod tests {
         assert_eq!(parse_interval_to_ms("5 min"), 300_000);
     }
 
-    /// Helper: parse a SQL SELECT and return the select body + projection.
-    fn parse_select(sql: &str) -> ast::Select {
-        use sqlparser::dialect::GenericDialect;
-        use sqlparser::parser::Parser;
-        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-        match stmts.into_iter().next().unwrap() {
-            ast::Statement::Query(q) => match *q.body {
-                ast::SetExpr::Select(s) => *s,
-                _ => panic!("expected SELECT"),
-            },
-            _ => panic!("expected query"),
+    fn column(name: &str) -> SqlExpr {
+        SqlExpr::Column {
+            table: None,
+            name: name.into(),
+        }
+    }
+
+    fn time_bucket(interval: SqlValue) -> SqlExpr {
+        SqlExpr::Function {
+            name: "time_bucket".into(),
+            args: vec![SqlExpr::Literal(interval), column("ts")],
+            distinct: false,
         }
     }
 
     #[test]
-    fn resolve_group_by_alias_to_time_bucket() {
-        let select = parse_select(
-            "SELECT time_bucket('1 hour', timestamp) AS b, COUNT(*) FROM t GROUP BY b",
+    fn time_bucket_key_finds_the_bucket_among_plain_keys() {
+        let functions = FunctionRegistry::new();
+        let keys = vec![
+            column("host"),
+            time_bucket(SqlValue::String("1 hour".into())),
+        ];
+        assert_eq!(
+            time_bucket_key(&keys, &functions),
+            Some(TimeBucketKey {
+                group_index: 1,
+                interval_ms: 3_600_000,
+            })
         );
-        let functions = FunctionRegistry::new();
-
-        if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
-            let resolved = resolve_group_by_expr(&exprs[0], &select.projection);
-            assert!(resolved.is_some(), "alias 'b' should resolve");
-            let interval = try_extract_time_bucket(resolved.unwrap(), &functions).unwrap();
-            assert_eq!(interval, Some(3_600_000));
-        } else {
-            panic!("expected GROUP BY expressions");
-        }
     }
 
     #[test]
-    fn resolve_group_by_ordinal_to_time_bucket() {
-        let select =
-            parse_select("SELECT time_bucket('5 minutes', timestamp), COUNT(*) FROM t GROUP BY 1");
+    fn time_bucket_key_reads_integer_seconds() {
         let functions = FunctionRegistry::new();
-
-        if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
-            let resolved = resolve_group_by_expr(&exprs[0], &select.projection);
-            assert!(resolved.is_some(), "ordinal 1 should resolve");
-            let interval = try_extract_time_bucket(resolved.unwrap(), &functions).unwrap();
-            assert_eq!(interval, Some(300_000));
-        } else {
-            panic!("expected GROUP BY expressions");
-        }
+        let keys = vec![time_bucket(SqlValue::Int(300))];
+        assert_eq!(
+            time_bucket_key(&keys, &functions).map(|k| k.interval_ms),
+            Some(300_000)
+        );
     }
 
     #[test]
-    fn resolve_group_by_plain_column_not_time_bucket() {
-        let select = parse_select("SELECT qtype, COUNT(*) FROM t GROUP BY qtype");
+    fn time_bucket_key_is_absent_for_plain_columns() {
         let functions = FunctionRegistry::new();
+        assert_eq!(time_bucket_key(&[column("qtype")], &functions), None);
+    }
 
-        if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
-            let resolved = resolve_group_by_expr(&exprs[0], &select.projection);
-            // 'qtype' is not an alias in SELECT, so resolve returns None.
-            assert!(resolved.is_none());
-            let interval = try_extract_time_bucket(&exprs[0], &functions).unwrap();
-            assert_eq!(interval, None);
-        } else {
-            panic!("expected GROUP BY expressions");
-        }
+    #[test]
+    fn unreadable_interval_is_zero() {
+        let functions = FunctionRegistry::new();
+        let keys = vec![time_bucket(SqlValue::String("soon".into()))];
+        assert_eq!(
+            time_bucket_key(&keys, &functions).map(|k| k.interval_ms),
+            Some(0)
+        );
     }
 }

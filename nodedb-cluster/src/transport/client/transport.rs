@@ -757,6 +757,7 @@ pub(super) mod tests {
             txn_id: None,
             vshard_id: None,
             read_groups: Vec::new(),
+            user_roles: Vec::new(),
         });
 
         let stream = client.send_rpc_stream(1, req).await.unwrap();

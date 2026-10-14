@@ -48,7 +48,7 @@ impl Gateway {
     ) -> Result<ResultStream, Error> {
         // Every streamed plan is an unordered scan (`streamable_gather_child`),
         // so it carries no write lease to hold for the stream's lifetime.
-        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
+        let (plan, _user_roles, _lease) = authorized_plan_for_context(ctx, checked)?;
         self.execute_stream_internal(ctx, plan).await
     }
 

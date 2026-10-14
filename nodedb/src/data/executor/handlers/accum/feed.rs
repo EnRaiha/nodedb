@@ -4,7 +4,7 @@
 
 use std::collections::hash_map::Entry;
 
-use super::state::{ARRAY_AGG_CAP, AggAccum};
+use super::state::AggAccum;
 use nodedb_physical::physical_plan::AggregateSpec;
 
 impl AggAccum {
@@ -76,50 +76,42 @@ impl AggAccum {
                     hll.add(fnv1a(&bytes));
                 }
             }
-            AggAccum::TDigest { digest } => {
-                let actual = field_after_colon(&agg.field);
-                if let Some(v) = ah::extract_f64(doc, actual, agg.expr.as_ref())? {
+            AggAccum::TDigest { digest, .. } => {
+                if let Some(v) = ah::extract_f64(doc, &agg.field, agg.expr.as_ref())? {
                     digest.add(v);
                 }
             }
             AggAccum::TopK { ss, .. } => {
-                let actual = field_after_colon(&agg.field);
-                if let Some(bytes) = ah::extract_bytes(doc, actual, agg.expr.as_ref())?
+                if let Some(bytes) = ah::extract_bytes(doc, &agg.field, agg.expr.as_ref())?
                     && bytes != [0xc0u8]
                 {
                     ss.add(fnv1a(&bytes));
                 }
             }
             AggAccum::ArrayAgg { values } => {
-                if values.len() < ARRAY_AGG_CAP
-                    && let Some(v) = ah::extract_value(doc, &agg.field, agg.expr.as_ref())?
+                if let Some(v) = ah::extract_value(doc, &agg.field, agg.expr.as_ref())?
                     && !v.is_null()
                 {
                     values.push(v);
                 }
             }
             AggAccum::ArrayAggDistinct { seen, values } => {
-                if values.len() < ARRAY_AGG_CAP
-                    && let Some(bytes) = ah::extract_bytes(doc, &agg.field, agg.expr.as_ref())?
+                if let Some(bytes) = ah::extract_bytes(doc, &agg.field, agg.expr.as_ref())?
                     && bytes != [0xc0u8]
-                    && seen.insert(bytes)
+                    && !seen.contains(&bytes)
                     && let Some(v) = ah::extract_value(doc, &agg.field, agg.expr.as_ref())?
                 {
-                    values.push(v);
+                    seen.insert(bytes.clone());
+                    values.push((bytes, v));
                 }
             }
             AggAccum::PercentileCont { values, .. } => {
-                let actual = field_after_colon(&agg.field);
-                if values.len() < ARRAY_AGG_CAP
-                    && let Some(v) = ah::extract_f64(doc, actual, agg.expr.as_ref())?
-                {
+                if let Some(v) = ah::extract_f64(doc, &agg.field, agg.expr.as_ref())? {
                     values.push(v);
                 }
             }
             AggAccum::StringAgg { parts } => {
-                if parts.len() < ARRAY_AGG_CAP
-                    && let Some(s) = ah::extract_str(doc, &agg.field, agg.expr.as_ref())?
-                {
+                if let Some(s) = ah::extract_str(doc, &agg.field, agg.expr.as_ref())? {
                     parts.push(s);
                 }
             }
@@ -156,10 +148,4 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
-}
-
-/// Extract the actual field name from "prefix:field" format (e.g. "0.95:latency").
-#[inline]
-fn field_after_colon(field: &str) -> &str {
-    field.find(':').map(|i| &field[i + 1..]).unwrap_or(field)
 }

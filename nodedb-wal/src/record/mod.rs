@@ -14,6 +14,8 @@ pub mod restore_point;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod surrogate;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod surrogate_bind;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod sync_seq;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod types;
@@ -37,7 +39,9 @@ pub use padding::{MIN_PADDING_RECORD_SIZE, padding_record, padding_span};
 #[cfg(not(target_arch = "wasm32"))]
 pub use restore_point::{RESTORE_POINT_PAYLOAD_SIZE, RestorePointPayload};
 #[cfg(not(target_arch = "wasm32"))]
-pub use surrogate::{SURROGATE_PAYLOAD_SIZE, SurrogateAllocPayload, SurrogateBindPayload};
+pub use surrogate::{SURROGATE_PAYLOAD_SIZE, SurrogateAllocPayload};
+#[cfg(not(target_arch = "wasm32"))]
+pub use surrogate_bind::{SURROGATE_BIND_PAYLOAD_MAX, SurrogateBindBatchPayload};
 #[cfg(not(target_arch = "wasm32"))]
 pub use sync_seq::{SYNC_SEQ_ADVANCE_PAYLOAD_SIZE, SyncSeqAdvancePayload};
 #[cfg(not(target_arch = "wasm32"))]

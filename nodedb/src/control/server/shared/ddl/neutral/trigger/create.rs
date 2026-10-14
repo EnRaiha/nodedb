@@ -37,6 +37,7 @@ pub struct CreateTriggerRequest<'a> {
 pub async fn create_trigger(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     req: CreateTriggerRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let CreateTriggerRequest {
@@ -57,9 +58,6 @@ pub async fn create_trigger(
     require_tenant_admin(identity, "create triggers")?;
 
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 

@@ -56,6 +56,7 @@ impl CoreLoop {
             unique,
             wal_lsn,
             resolved_targets,
+            guards,
         } = params;
         let config_key = (
             crate::types::DatabaseId::new(database_id),
@@ -92,6 +93,7 @@ impl CoreLoop {
             sys_from_ms,
             valid_from_ms,
             valid_until_ms,
+            guards,
         })?;
         let stored = body.stored;
         let value: &[u8] = &body.value;
@@ -584,6 +586,7 @@ mod tests {
                 unique: UniqueJudge::Row,
                 wal_lsn: None,
                 resolved_targets: &[],
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::Document,
             },
         );
 
@@ -626,6 +629,7 @@ mod tests {
                 unique: UniqueJudge::Row,
                 wal_lsn: None,
                 resolved_targets: &[],
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::Document,
             },
         );
 

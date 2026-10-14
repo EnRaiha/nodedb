@@ -74,6 +74,7 @@ impl CoreLoop {
                     | DocumentOp::PointDelete { .. }
                     | DocumentOp::PointUpdate { .. }
                     | DocumentOp::Upsert { .. }
+                    | DocumentOp::BatchUpsert { .. }
                     | DocumentOp::BatchInsert { .. }
                     | DocumentOp::Scan { .. }
                     | DocumentOp::RangeScan { .. }

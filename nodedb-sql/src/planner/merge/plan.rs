@@ -130,6 +130,7 @@ fn plan_merge_source(factor: &ast::TableFactor, catalog: &dyn SqlCatalog) -> Res
                 indexes: Vec::new(),
                 temporal: TemporalScope::default(),
                 bitemporal: source_info.bitemporal,
+                has_auto_tier: source_info.has_auto_tier,
             })
         }
         ast::TableFactor::Derived {

@@ -155,8 +155,9 @@ mod tests {
     }
 
     // ---- Pinned non-replicated shapes: `to_replicated_entry` returns `None`
-    // on purpose. An unresolved MERGE / `UPDATE ... FROM` is intercepted by
-    // its orchestrator, which proposes the resolved shape instead;
+    // on purpose. An unresolved `INSERT ... SELECT` / MERGE / `UPDATE ... FROM`
+    // is intercepted by its orchestrator, which proposes the resolved shape
+    // instead;
     // `Crdt::RestoreToVersion` has no `ReplicatedWrite` shape yet. Each
     // assertion is a tripwire — wiring one must fail loudly and update this list.
 
@@ -165,12 +166,25 @@ mod tests {
         let tenant = TenantId::new(1);
         let vshard = VShardId::new(0);
 
+        let staging = || {
+            nodedb_physical::physical_plan::RowSource::whole_collection(QualifiedCollection::new(
+                DatabaseId::DEFAULT,
+                "staging",
+            ))
+        };
         let gaps: Vec<(&str, PhysicalPlan)> = vec![
+            (
+                "Document::InsertSelect (unresolved)",
+                PhysicalPlan::Document(DocumentOp::InsertSelect {
+                    target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
+                    source: staging(),
+                }),
+            ),
             (
                 "Document::Merge (unresolved)",
                 PhysicalPlan::Document(DocumentOp::Merge {
                     target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
-                    source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+                    source: staging(),
                     source_alias: "s".into(),
                     target_join_col: "id".into(),
                     source_join_col: "id".into(),
@@ -189,7 +203,7 @@ mod tests {
                 "Document::UpdateFromJoin (unresolved)",
                 PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                     target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
-                    source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "staging"),
+                    source: staging(),
                     source_alias: "s".into(),
                     target_join_col: "id".into(),
                     source_join_col: "id".into(),

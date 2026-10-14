@@ -22,6 +22,15 @@ impl EngineRules for StrictRules {
         })])
     }
 
+    fn plan_insert_select(&self, p: InsertSelectParams) -> Result<Vec<SqlPlan>> {
+        Ok(vec![SqlPlan::InsertSelect {
+            target: p.collection,
+            source: p.source,
+            column_map: p.column_map,
+            source_columns: p.source_columns,
+        }])
+    }
+
     fn plan_upsert(&self, p: UpsertParams) -> Result<Vec<SqlPlan>> {
         Ok(vec![SqlPlan::Upsert(UpsertPlan {
             collection: p.collection,
@@ -92,6 +101,7 @@ impl EngineRules for StrictRules {
             collection: p.collection,
             engine: EngineType::DocumentStrict,
             source: p.source,
+            source_alias: p.source_alias,
             target_join_col: p.target_join_col,
             source_join_col: p.source_join_col,
             assignments: p.assignments,
@@ -152,7 +162,7 @@ impl EngineRules for StrictRules {
             aggregates: p.aggregates,
             having: p.having,
             limit: p.limit,
-            grouping_sets: None,
+            grouping_sets: p.grouping_sets,
             sort_keys: Vec::new(),
         })
     }

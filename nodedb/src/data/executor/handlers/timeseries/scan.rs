@@ -44,6 +44,11 @@ pub(in crate::data::executor) struct TimeseriesScanParams<'a> {
     pub system_time: nodedb_types::SystemTimeScope,
     /// Bitemporal valid-time point. `None` skips valid-time filtering.
     pub valid_at_ms: Option<i64>,
+    /// HAVING predicates (MessagePack `Vec<ScanFilter>`) over the finalized
+    /// group rows of the aggregate branch. Empty on a raw scan.
+    pub having: &'a [u8],
+    /// AUTO_TIER layout of the collection's retention policy, if any.
+    pub tiering: Option<&'a nodedb_physical::physical_plan::TieringPlan>,
 }
 
 impl CoreLoop {
@@ -73,6 +78,8 @@ impl CoreLoop {
             computed_columns,
             system_time,
             valid_at_ms,
+            having,
+            tiering,
         } = params;
 
         let all_versions = system_time.is_all_versions();
@@ -103,6 +110,11 @@ impl CoreLoop {
             Ok(p) => p,
             Err(e) => return self.response_error(task, e),
         };
+        let having_predicates: Vec<ScanFilter> =
+            match decode_scan_filters(having, "timeseries HAVING") {
+                Ok(p) => p,
+                Err(e) => return self.response_error(task, e),
+            };
         // Bitemporal cutoffs: translate to column-level predicates on
         // `_ts_system` / `_ts_valid_from` / `_ts_valid_until`. The
         // segment reader's block-skip infrastructure applies these
@@ -142,17 +154,119 @@ impl CoreLoop {
         );
 
         let has_filters = !filter_predicates.is_empty();
-        let is_aggregate = !aggregates.is_empty();
+        let is_aggregate = !aggregates.is_empty() || bucket_interval_ms > 0;
         let has_time_range = time_range.0 > 0 || time_range.1 < i64::MAX;
 
-        // Fast path: COUNT(*) with no GROUP BY, no filters, no read policy.
-        // The metadata count covers every stored row, so a governed read
-        // takes the grouped scan, where the policy excludes rows first.
+        // In-transaction read-your-own-writes covers current-version reads:
+        // audit-log (`all_versions`) and `AS OF SYSTEM TIME` reads are
+        // committed-only.
+        let overlay_txn = if all_versions || system_as_of_ms.is_some() {
+            None
+        } else {
+            task.request.txn_id
+        };
+
+        // AUTO_TIER: the part of the range raw rows serve, and the parts
+        // downsample tiers serve.
+        let now_ms = i64::try_from(
+            task.request
+                .resolved_now_ms
+                .unwrap_or_else(crate::engine::kv::current_ms),
+        )
+        .unwrap_or(i64::MAX);
+        let split = match super::tier_route::split_tiers(tiering, time_range, now_ms) {
+            Ok(split) => split,
+            Err(e) => return self.response_error(task, e),
+        };
+        if !is_aggregate
+            && let Err(e) = super::tier_route::refuse_raw_read_of_tiers(collection, &split)
+        {
+            return self.response_error(task, e);
+        }
+        // A tiered aggregate reads each tier's buckets for the tier's part
+        // of the range, after checking the buckets merge exactly.
+        let tier_partials = if is_aggregate && !split.tiers.is_empty() {
+            let row_predicates: Vec<ScanFilter> = filter_predicates
+                .iter()
+                .chain(&rls_predicates)
+                .cloned()
+                .collect();
+            for span in &split.tiers {
+                let shape = super::tier_route::TierMergeShape {
+                    group_by,
+                    aggregates,
+                    bucket_interval_ms,
+                    filter_predicates: &row_predicates,
+                    time_key: &time_key,
+                    temporal: all_versions || system_as_of_ms.is_some() || valid_at_ms.is_some(),
+                };
+                if let Err(e) = super::tier_route::refuse_unmergeable(collection, span, shape) {
+                    return self.response_error(task, e);
+                }
+            }
+            match self.fold_tier_buckets(super::tier_fold::TierFold {
+                database_id: task.request.database_id,
+                tid,
+                collection,
+                spans: &split.tiers,
+                aggregates,
+                bucket_interval_ms,
+                now_ms,
+            }) {
+                Ok(partials) => Some(partials),
+                Err(e) => return self.response_error(task, e),
+            }
+        } else {
+            None
+        };
+        // Flushed partitions serve only the raw part of the range. The
+        // memtable and the transaction's staged rows serve the whole range:
+        // a tier folds rows only when their partition is flushed.
+        let raw_range = split.raw_range;
+        let time_range = if is_aggregate {
+            time_range
+        } else {
+            raw_range.unwrap_or(time_range)
+        };
+
+        // The transaction's staged rows, for the grouped scan. The raw scan
+        // folds them itself.
+        let staged = match overlay_txn {
+            Some(txn_id) if is_aggregate => {
+                let coll_key = (task.request.database_id, tid, collection.to_string());
+                match self.staged_timeseries_rows(
+                    crate::data::executor::handlers::transaction::overlay::TimeseriesOverlayMergeParams {
+                        txn_id,
+                        coll_key: &coll_key,
+                        time_range,
+                        filter_predicates: &filter_predicates,
+                        has_filters,
+                        rls_predicates: &rls_predicates,
+                        limit: usize::MAX,
+                    },
+                ) {
+                    Ok(staged) => Some(staged),
+                    Err(e) => return self.response_error(task, e),
+                }
+            }
+            Some(_) | None => None,
+        };
+        let has_staged = staged
+            .as_ref()
+            .is_some_and(|s| s.truncated || !s.rows.is_empty());
+
+        // Fast path: COUNT(*) with no GROUP BY, no filters, no read policy,
+        // no HAVING, and no staged rows. The metadata count covers every
+        // stored row, so a governed read takes the grouped scan, where the
+        // policy excludes rows first.
         if is_aggregate
             && bucket_interval_ms == 0
             && group_by.is_empty()
             && !has_filters
             && rls_predicates.is_empty()
+            && having_predicates.is_empty()
+            && !has_staged
+            && tier_partials.is_none()
             && !has_time_range
             && aggregates.len() == 1
             && aggregates[0].0 == "count"
@@ -162,7 +276,7 @@ impl CoreLoop {
         }
 
         // Determine needed columns (projection pushdown).
-        let needed_columns: Vec<String> = if is_aggregate || bucket_interval_ms > 0 {
+        let needed_columns: Vec<String> = if is_aggregate {
             // The aggregate pipeline always needs the time column: it is the
             // bucketing key and the ordering key.
             let mut needed: Vec<String> = vec![time_key.clone()];
@@ -187,7 +301,7 @@ impl CoreLoop {
         };
 
         // Mode dispatch.
-        if is_aggregate || bucket_interval_ms > 0 {
+        if is_aggregate {
             // The policy joins the WHERE predicates so the grouped scan
             // excludes governed rows before any accumulator sees them. The
             // grouped scan fails on a predicate it cannot lower, so a policy
@@ -211,17 +325,12 @@ impl CoreLoop {
                 gap_fill,
                 needed_columns: &needed_columns,
                 sort_keys,
+                having: &having_predicates,
+                staged,
+                raw_range,
+                tier_partials,
             })
         } else {
-            // In-transaction read-your-own-writes is confined to the RAW scan
-            // branch and to current-version reads: audit-log (`all_versions`)
-            // and `AS OF SYSTEM TIME` reads are committed-only, so the overlay
-            // merge is pre-gated out here rather than in the raw handler.
-            let overlay_txn = if all_versions || system_as_of_ms.is_some() {
-                None
-            } else {
-                task.request.txn_id
-            };
             self.execute_ts_raw_scan(raw_scan::RawScanParams {
                 task,
                 tid,

@@ -30,6 +30,29 @@ pub enum VectorDirectWriteIntent {
     Upsert,
 }
 
+/// One row of a [`VectorOp::DirectBatchWrite`](super::VectorOp::DirectBatchWrite)
+/// page. The fields mean what the same-named fields of
+/// [`VectorOp::DirectUpsert`](super::VectorOp::DirectUpsert) mean.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub struct VectorDirectRow {
+    /// Global surrogate the Control Plane bound to `pk_bytes`.
+    pub surrogate: Surrogate,
+    /// UTF-8 of the declared primary-key value.
+    pub pk_bytes: Vec<u8>,
+    /// FP32 vector values.
+    pub vector: Vec<f32>,
+    /// Pre-encoded MessagePack of every non-vector column the row supplied.
+    pub payload: Vec<u8>,
+}
+
 /// The rows a vector-primary `DELETE` / `UPDATE` targets.
 #[derive(
     Debug,

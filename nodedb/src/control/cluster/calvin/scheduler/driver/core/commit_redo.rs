@@ -91,6 +91,9 @@ impl Scheduler {
             position: txn_id.position,
             vshard_id: self.vshard_id,
         });
+        // Every replica judges a role-guarded state transition against the
+        // roles of the identity whose writes the transaction commits.
+        redo.user_roles = tx_class.user_roles.clone();
         // The participants whose records carry the messages and the applied
         // key. A class whose write vShards cannot be derived fails.
         let publish_home = tx_class

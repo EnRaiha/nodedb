@@ -388,7 +388,8 @@ mod tests {
         let params = ColumnarScanParams {
             collection,
             projection: &[],
-            limit: 0,
+            // No LIMIT. `0` is `LIMIT 0`, which returns no rows.
+            limit: usize::MAX,
             filters: &[],
             rls_filters: &[],
             sort_keys: &[],

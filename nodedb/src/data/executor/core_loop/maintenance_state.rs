@@ -5,6 +5,8 @@
 use std::sync::Arc;
 
 use crate::data::executor::handlers::control::reindex::{PendingReindex, ReindexWaiter};
+use crate::data::executor::handlers::timeseries::cagg_cut::CaggRefreshWaiter;
+use crate::data::executor::handlers::timeseries::read_aggregate::CaggReadWaiter;
 
 /// Compaction pacing, the maintenance CPU budget, and in-flight index
 /// rebuilds.
@@ -39,6 +41,15 @@ pub(in crate::data::executor) struct MaintenanceState {
     /// Plain REINDEX requests waiting for their rebuilds to cut over. The
     /// tick answers each one when they have, or at its deadline.
     pub(in crate::data::executor) reindex_waiters: Vec<ReindexWaiter>,
+
+    /// `REFRESH CONTINUOUS AGGREGATE` requests waiting for their cut to
+    /// fold. The tick answers each one when it has, or at its deadline.
+    pub(in crate::data::executor) cagg_refresh_waiters: Vec<CaggRefreshWaiter>,
+
+    /// Reads of continuous aggregates whose root still owes folding. The
+    /// tick answers each one once the fold pass caught up, or at its
+    /// deadline.
+    pub(in crate::data::executor) cagg_read_waiters: Vec<CaggReadWaiter>,
 }
 
 impl MaintenanceState {
@@ -51,6 +62,8 @@ impl MaintenanceState {
             maintenance_budget: None,
             pending_reindex: Vec::new(),
             reindex_waiters: Vec::new(),
+            cagg_refresh_waiters: Vec::new(),
+            cagg_read_waiters: Vec::new(),
         }
     }
 }

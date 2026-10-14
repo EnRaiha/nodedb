@@ -115,6 +115,7 @@ impl RetryableSchemaChange for Error {
             | Error::UndefinedFunction { .. }
             | Error::UndefinedObject { .. }
             | Error::ObjectNotInPrerequisiteState { .. }
+            | Error::WrongObjectType { .. }
             | Error::UndefinedColumn { .. }
             | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }

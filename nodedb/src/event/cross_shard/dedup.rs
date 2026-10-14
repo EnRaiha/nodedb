@@ -349,6 +349,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         wal.appender(crate::wal::manager::NO_APPLY_KEY)
             .with_event_source(crate::event::EventSource::Trigger)

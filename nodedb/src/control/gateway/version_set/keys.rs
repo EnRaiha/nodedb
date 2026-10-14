@@ -24,6 +24,24 @@ pub fn rls_version_key(tenant_id: u64) -> String {
     format!("{RLS_VERSION_KEY_PREFIX}{tenant_id}")
 }
 
+/// Prefix for the synthetic entry carrying a continuous aggregate's version.
+const CONTINUOUS_AGGREGATE_VERSION_KEY_PREFIX: &str = "\0__continuous_aggregate::";
+
+/// The synthetic pseudo-collection key a continuous aggregate's catalog
+/// version is folded into the set under, so a plan that reads the aggregate
+/// as a relation stops matching once the aggregate is dropped or
+/// re-created.
+pub fn continuous_aggregate_version_key(database_id: u64, tenant_id: u64, name: &str) -> String {
+    format!("{CONTINUOUS_AGGREGATE_VERSION_KEY_PREFIX}{database_id}:{tenant_id}:{name}")
+}
+
+/// The aggregate name a [`continuous_aggregate_version_key`] names, when
+/// `key` is one of `database_id` / `tenant_id`.
+pub fn continuous_aggregate_of_key(key: &str, database_id: u64, tenant_id: u64) -> Option<&str> {
+    key.strip_prefix(CONTINUOUS_AGGREGATE_VERSION_KEY_PREFIX)?
+        .strip_prefix(&format!("{database_id}:{tenant_id}:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

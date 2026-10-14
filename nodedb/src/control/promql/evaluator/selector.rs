@@ -18,7 +18,7 @@ pub fn eval_vector_selector(
     let min_ts = eval_ts - ctx.lookback_ms;
 
     let mut result = Vec::new();
-    for series in &ctx.series {
+    for series in ctx.series.iter() {
         if let Some(n) = name
             && series.metric_name() != n
         {
@@ -28,11 +28,14 @@ pub fn eval_vector_selector(
             continue;
         }
 
-        let sample = series
+        // Samples are ascending by timestamp: the latest one at or before
+        // `eval_ts` is the last one of the prefix that ends there.
+        let end = series
             .samples
-            .iter()
-            .rev()
-            .find(|s| s.timestamp_ms >= min_ts && s.timestamp_ms <= eval_ts);
+            .partition_point(|s| s.timestamp_ms <= eval_ts);
+        let sample = series.samples[..end]
+            .last()
+            .filter(|s| s.timestamp_ms >= min_ts);
 
         if let Some(s) = sample {
             result.push(InstantSample {
@@ -65,7 +68,7 @@ pub fn eval_matrix_selector(
     let range_start = eval_ts - range.ms();
 
     let mut result = Vec::new();
-    for series in &ctx.series {
+    for series in ctx.series.iter() {
         if let Some(n) = name
             && series.metric_name() != n
         {
@@ -75,12 +78,15 @@ pub fn eval_matrix_selector(
             continue;
         }
 
-        let window: Vec<Sample> = series
+        // Samples are ascending by timestamp: the window is the slice in
+        // `(range_start, eval_ts]`.
+        let lo = series
             .samples
-            .iter()
-            .filter(|s| s.timestamp_ms > range_start && s.timestamp_ms <= eval_ts)
-            .copied()
-            .collect();
+            .partition_point(|s| s.timestamp_ms <= range_start);
+        let hi = series
+            .samples
+            .partition_point(|s| s.timestamp_ms <= eval_ts);
+        let window: Vec<Sample> = series.samples[lo..hi].to_vec();
 
         if !window.is_empty() {
             result.push(RangeSeries {

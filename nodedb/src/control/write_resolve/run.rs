@@ -23,22 +23,25 @@ pub async fn run_authorized_write_resolve(
     authorized: AuthorizedTask,
     resolver: Box<dyn EngineWriteResolver>,
 ) -> crate::Result<Response> {
+    let user_roles = authorized.identity().role_names();
     let task = authorized.into_physical_task();
     let ctx = WriteResolveContext {
         tenant_id: task.tenant_id,
         database_id: task.database_id,
     };
-    run_write_resolve(state, ctx, &*resolver)
+    run_write_resolve(state, ctx, &*resolver, &user_roles)
         .await
         .map_err(|e| surface_policy_refusal(e, ctx.tenant_id))
 }
 
 /// Drive `resolver` through resolve -> apply -> propose, re-resolving on
-/// concurrent drift up to [`MAX_WRITE_RESOLVE_RETRIES`].
+/// concurrent drift up to [`MAX_WRITE_RESOLVE_RETRIES`]. The proposed entry
+/// carries `user_roles`, the roles of the identity that wrote the write.
 pub async fn run_write_resolve(
     state: &SharedState,
     ctx: WriteResolveContext,
     resolver: &dyn EngineWriteResolver,
+    user_roles: &[String],
 ) -> crate::Result<Response> {
     let mut attempt: u32 = 0;
     loop {
@@ -47,7 +50,16 @@ pub async fn run_write_resolve(
         let resolved_plan = resolver.apply(resolved)?;
 
         let vshard_id = resolver.vshard(ctx.database_id)?;
-        match propose_resolved(state, ctx, resolver.collection(), vshard_id, resolved_plan).await? {
+        match propose_resolved(
+            state,
+            ctx,
+            resolver.collection(),
+            vshard_id,
+            resolved_plan,
+            user_roles,
+        )
+        .await?
+        {
             ProposeOutcome::Applied(response) => return Ok(response),
             ProposeOutcome::RetryRequired => {
                 attempt += 1;

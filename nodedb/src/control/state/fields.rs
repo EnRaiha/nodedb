@@ -335,15 +335,6 @@ pub struct SharedState {
     /// system catalog is unavailable (in-memory / test configurations).
     pub producer_registry:
         Option<Arc<crate::control::sync_producer::registry::SyncProducerRegistry>>,
-    /// Timeseries partition registries.
-    pub ts_partition_registries: Option<
-        Mutex<
-            std::collections::HashMap<
-                String,
-                crate::engine::timeseries::partition_registry::PartitionRegistry,
-            >,
-        >,
-    >,
     /// L2 cold storage client (None when not configured).
     pub cold_storage: Option<Arc<crate::storage::cold::ColdStorage>>,
     /// Warm-tier snapshot object store (defaults to local FS).

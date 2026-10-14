@@ -13,9 +13,10 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
-use crate::data::executor::enforcement::{
-    append_only, period_lock, state_transition, transition_check,
+use crate::data::executor::enforcement::update_transitions::{
+    UpdateTransitionRules, check_update_transitions,
 };
+use crate::data::executor::enforcement::{append_only, period_lock};
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::ResolvedSumTarget;
 
@@ -94,31 +95,14 @@ impl CoreLoop {
         // goes through the storage-mode-aware decoder because a strict
         // collection stores it as a Binary Tuple, which the schemaless
         // decoder cannot read at all.
+        let rules = UpdateTransitionRules::of(&config.enforcement);
         if let Some(old_bytes) = old_value.as_ref()
-            && (!config.enforcement.state_constraints.is_empty()
-                || !config.enforcement.transition_checks.is_empty())
+            && !rules.is_empty()
         {
             let old_doc = self.decode_stored_document(config, old_bytes)?;
             let new_doc = doc_format::decode_document(value)?;
-            if !config.enforcement.state_constraints.is_empty() {
-                state_transition::check_state_transitions(
-                    collection,
-                    &config.enforcement.state_constraints,
-                    &old_doc,
-                    &new_doc,
-                    user_roles,
-                )
+            check_update_transitions(collection, rules, &old_doc, &new_doc, user_roles)
                 .map_err(map_enforcement_error)?;
-            }
-            if !config.enforcement.transition_checks.is_empty() {
-                transition_check::check_transition_predicates(
-                    collection,
-                    &config.enforcement.transition_checks,
-                    &old_doc,
-                    &new_doc,
-                )
-                .map_err(map_enforcement_error)?;
-            }
         }
         Ok(())
     }

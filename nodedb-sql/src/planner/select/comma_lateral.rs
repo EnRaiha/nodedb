@@ -44,6 +44,7 @@ pub(super) fn try_plan_comma_lateral(
         .ok_or_else(|| SqlError::UnknownTable {
             name: outer_collection.clone(),
         })?;
+    temporal.require_bitemporal(&outer_collection, outer_info.bitemporal)?;
     let outer_scan = SqlPlan::Scan {
         collection: outer_collection,
         alias: outer_alias.clone(),

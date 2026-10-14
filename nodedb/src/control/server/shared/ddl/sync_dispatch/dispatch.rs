@@ -114,9 +114,10 @@ pub(crate) async fn dispatch_authorized(
     let task = authorized.into_physical_task();
     let vshard_id = nodedb_types::CollectionKey::from_bare(task.database_id, collection).vshard();
     let tenant_id = task.tenant_id;
-    // A read runs where the collection's owning group serves it: here when
-    // this node replicates the group, on its leader otherwise. A linearizable
-    // read is confirmed where it runs (`dispatch_utils::owner_read`).
+    // A read, and a refresh wait, run where the collection's owning group
+    // serves them: here when this node replicates the group, on its leader
+    // otherwise. A linearizable read is confirmed where it runs
+    // (`dispatch_utils::owner_read`).
     let plan = if plan_is_write(&task.plan) {
         task.plan
     } else {

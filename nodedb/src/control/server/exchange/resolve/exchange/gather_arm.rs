@@ -45,6 +45,13 @@ pub(super) async fn resolve_gather(
         Resolved::Stream(s) => return Ok(Resolved::Stream(s)),
     };
 
+    // Inside a transaction a per-shard aggregate reads its own staged
+    // writes through the collection's engine scan.
+    let child = match super::txn_source_arm::txn_aggregate(state, ctx, captures, child).await? {
+        super::txn_source_arm::TxnRewrite::Resolved(resolved) => return Ok(resolved),
+        super::txn_source_arm::TxnRewrite::Unchanged(plan) => *plan,
+    };
+
     // Streaming fast path: a non-aggregate, unordered scan can stream
     // straight to the client without coordinator-side materialization.
     //

@@ -33,8 +33,8 @@
 //! retryable rather than terminal.
 //!
 //! The sibling retryable refusal, a delta admitted against a constraint version
-//! the accepting replica has not installed yet, is covered by
-//! `sync_constraint_version_fence.rs`.
+//! the accepting replica has not installed yet, is covered by the Data Plane
+//! unit test `a_delta_ahead_of_the_installed_constraint_version_is_fenced`.
 
 use crate::common;
 use common::cluster_harness::TestCluster;

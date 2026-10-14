@@ -99,9 +99,14 @@ impl TestCluster {
     /// After the DDL is accepted, blocks until every node applied the
     /// metadata group through its commit index. Followers apply
     /// asynchronously, so a later visibility check otherwise races their
-    /// appliers. Panics with every node's positions after 10 s.
+    /// appliers. Panics with every node's positions after 10 s. Then blocks
+    /// until every node holds an authorization lease, and panics naming the
+    /// node that holds none after 15 s.
     pub async fn exec_ddl_on_any_leader(&self, sql: &str) -> Result<usize, String> {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // The first error names why the statement was refused at all. A
+        // later retry can only report what the first attempt left behind.
+        let mut first_err: Option<String> = None;
         let mut last_err = String::new();
         while std::time::Instant::now() < deadline {
             for (idx, node) in self.nodes.iter().enumerate() {
@@ -109,15 +114,26 @@ impl TestCluster {
                     Ok(()) => {
                         self.wait_for_metadata_apply_convergence(Duration::from_secs(10))
                             .await;
+                        // An authorization-bearing DDL is acknowledged once
+                        // each lease holder covered it or its lease expired.
+                        // A node whose lease expired plans again only after
+                        // its next granted renewal.
+                        self.wait_for_authorization_leases().await;
                         return Ok(idx);
                     }
-                    Err(e) => last_err = e,
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(format!("node {idx}: {e}"));
+                        }
+                        last_err = e;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(format!(
-            "no node accepted DDL within 10s; last error: {last_err}"
+            "no node accepted DDL within 10s; first error: {}; last error: {last_err}",
+            first_err.unwrap_or_default()
         ))
     }
 

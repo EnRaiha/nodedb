@@ -231,6 +231,16 @@ impl CoreLoop {
     /// last idle window in a memory-only memtable while the checkpoint deleted
     /// the `TimeseriesBatch` records that were their only copy.
     pub(super) fn checkpoint_ts_durable_lsn(&mut self) -> Lsn {
+        let lsn = self.checkpoint_ts_memtables_durable_lsn();
+        // Continuous-aggregate images are not part of the reported LSN: the
+        // partitions are their source, and retention writes an image before
+        // it removes one. Writing them here bounds the refold work after a
+        // restart. A failed write keeps its root dirty and files a report.
+        self.persist_dirty_cagg_images();
+        lsn
+    }
+
+    fn checkpoint_ts_memtables_durable_lsn(&mut self) -> Lsn {
         match self.checkpoint_timeseries_memtables() {
             Ok(lsn) => {
                 self.floors.ts_durable_lsn = lsn;
@@ -624,13 +634,14 @@ mod tests {
         let db = nodedb_types::DatabaseId::DEFAULT;
         let tid = nodedb_types::TenantId::new(1);
         let mut mt = ColumnarMemtable::new_metric(ColumnarMemtableConfig::default());
-        mt.ingest_metric(
+        mt.ingest_row(
             1,
-            nodedb_types::timeseries::MetricSample {
-                timestamp_ms: 1_000,
-                value: 42.0,
-            },
-        );
+            &[
+                crate::engine::timeseries::columnar_memtable::ColumnValue::Timestamp(1_000),
+                crate::engine::timeseries::columnar_memtable::ColumnValue::Float64(42.0),
+            ],
+        )
+        .expect("metric row");
         core.columnar_memtables
             .insert((db, tid, TS_COLLECTION.to_string()), mt);
         (db, tid, TS_COLLECTION)

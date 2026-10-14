@@ -23,15 +23,13 @@ use super::parse::parse_function_header;
 pub async fn create_wasm_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create WASM functions")?;
 
     let parsed = parse_wasm_create(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 

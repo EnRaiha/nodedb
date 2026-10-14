@@ -20,6 +20,7 @@ use super::layout::{
 use super::metrics;
 use super::mode::DwbMode;
 use super::raw_io::{full_capacity_slice, pwrite_all, zero_tail};
+use super::staging::StagedRing;
 use super::status::{DwbMirror, DwbSkipReason};
 
 /// Double-write buffer file.
@@ -37,9 +38,11 @@ pub struct DoubleWriteBuffer {
     next_seq: Option<u64>,
     /// Whether there are deferred writes that haven't been fsynced.
     pub(super) dirty: bool,
-    /// Single-slot aligned staging buffer (Direct mode only). One slot is
-    /// serialized here, then pwrite'd at the slot offset.
-    slot_buf: Option<AlignedBuf>,
+    /// Slot images staged since the last flush. Allocated on the first
+    /// staged record.
+    stage: Option<StagedRing>,
+    /// Slots written to disk by this buffer since it was opened.
+    slots_written: u64,
     /// Aligned header block (Direct mode only). Written on `flush()`.
     header_buf: Option<AlignedBuf>,
 }
@@ -77,13 +80,10 @@ impl DoubleWriteBuffer {
             WalError::Io(e)
         })?;
 
-        let (slot_buf, header_buf) = if mode == DwbMode::Direct {
-            (
-                Some(AlignedBuf::new(DWB_SLOT_STRIDE, DEFAULT_ALIGNMENT)?),
-                Some(AlignedBuf::new(DWB_HEADER_STRIDE, DEFAULT_ALIGNMENT)?),
-            )
+        let header_buf = if mode == DwbMode::Direct {
+            Some(AlignedBuf::new(DWB_HEADER_STRIDE, DEFAULT_ALIGNMENT)?)
         } else {
-            (None, None)
+            None
         };
 
         let mut dwb = Self {
@@ -94,7 +94,8 @@ impl DoubleWriteBuffer {
             count: 0,
             next_seq: None,
             dirty: false,
-            slot_buf,
+            stage: None,
+            slots_written: 0,
             header_buf,
         };
 
@@ -140,13 +141,12 @@ impl DoubleWriteBuffer {
         Ok(mirrored)
     }
 
-    /// Write a WAL record to the DWB without fsyncing.
+    /// Stage a WAL record in its ring slot without any disk write.
     ///
-    /// The data is written to the OS page cache (Buffered mode) or directly
-    /// to the block device (Direct mode) but not guaranteed durable until
-    /// `flush()` is called. Use this in batch mode: write all records in a
-    /// group commit batch, then call `flush()` once — reducing fsync calls
-    /// from N-per-batch to 1-per-batch.
+    /// The slot image stays in memory until `flush()` writes it and fsyncs
+    /// the file. Use this in batch mode: stage all records in a group commit
+    /// batch, then call `flush()` once. A flush writes at most
+    /// `DWB_CAPACITY` slots, however many records it covers.
     ///
     /// Returns [`DwbMirror::Skipped`] for a record that cannot be mirrored, so
     /// the caller can account for the lost protection instead of assuming the
@@ -170,46 +170,24 @@ impl DoubleWriteBuffer {
             }));
         }
 
+        if self.mode == DwbMode::Off {
+            return Err(WalError::DwbOffNotOpenable);
+        }
+
         let seq = self.take_slot_seq()?;
         let prefix = SlotPrefix { seq, total_size }.encode();
         let header_bytes = record.header.to_bytes();
-        let offset = slot_offset(self.write_pos);
 
-        match self.mode {
-            DwbMode::Off => return Err(WalError::DwbOffNotOpenable),
-            DwbMode::Buffered => {
-                self.file
-                    .seek(SeekFrom::Start(offset))
-                    .map_err(WalError::Io)?;
-                self.file.write_all(&prefix).map_err(WalError::Io)?;
-                self.file.write_all(&header_bytes).map_err(WalError::Io)?;
-                self.file.write_all(&record.payload).map_err(WalError::Io)?;
-                metrics::add_bytes_written(
-                    (prefix.len() + header_bytes.len() + record.payload.len()) as u64,
-                );
-            }
-            DwbMode::Direct => {
-                let Some(buf) = self.slot_buf.as_mut() else {
-                    return Err(WalError::AlignmentViolation {
-                        context: "DWB Direct mode without an aligned slot buffer",
-                        required: DWB_SLOT_STRIDE,
-                        actual: 0,
-                    });
-                };
-                buf.clear();
-                buf.write(&prefix);
-                buf.write(&header_bytes);
-                buf.write(&record.payload);
-                // Zero the tail so the full aligned slot can be written
-                // without leaking prior contents.
-                zero_tail(buf);
-                let slice = full_capacity_slice(buf);
-                debug_assert_eq!(slice.len(), DWB_SLOT_STRIDE);
-                debug_assert!(is_aligned(offset as usize, DEFAULT_ALIGNMENT));
-                pwrite_all(&self.file, slice, offset)?;
-                metrics::add_bytes_written(slice.len() as u64);
-            }
-        }
+        let stage = match self.stage.take() {
+            Some(stage) => stage,
+            None => StagedRing::new()?,
+        };
+        let stage = self.stage.insert(stage);
+        let image = stage.cleared_image(self.write_pos);
+        image.write(&prefix);
+        image.write(&header_bytes);
+        image.write(&record.payload);
+        stage.mark_staged();
 
         self.write_pos = self.write_pos.wrapping_add(1);
         self.count = self.count.saturating_add(1).min(DWB_CAPACITY as u32);
@@ -218,7 +196,54 @@ impl DoubleWriteBuffer {
         Ok(DwbMirror::Mirrored)
     }
 
-    /// Flush the DWB header and fsync the file.
+    /// Records staged since the last flush whose slots will reach disk at
+    /// the next flush. At most `DWB_CAPACITY`.
+    pub fn staged_slots(&self) -> u32 {
+        self.stage.as_ref().map_or(0, StagedRing::surviving)
+    }
+
+    /// Slots this buffer wrote to disk since it was opened.
+    pub fn slots_written(&self) -> u64 {
+        self.slots_written
+    }
+
+    /// Write the staged slots that survive in the ring, oldest first, with
+    /// no fsync. Returns the number of slots written.
+    ///
+    /// `flush()` calls this before writing the header. A caller that must
+    /// tell a failed slot write from a failed fsync calls it first.
+    pub fn write_staged(&mut self) -> Result<u32> {
+        let Some(stage) = self.stage.as_mut() else {
+            return Ok(0);
+        };
+        let surviving = stage.surviving();
+        let first = self.write_pos.wrapping_sub(surviving);
+        for step in 0..surviving {
+            let idx = first.wrapping_add(step);
+            let offset = slot_offset(idx);
+            let image = stage.image_mut(idx);
+            let bytes = match self.mode {
+                DwbMode::Off => return Err(WalError::DwbOffNotOpenable),
+                DwbMode::Buffered => image.as_slice(),
+                DwbMode::Direct => {
+                    // Zero the tail so the full aligned slot does not leak an
+                    // earlier image's bytes. Only surviving slots pay for it.
+                    zero_tail(image);
+                    let slice = full_capacity_slice(image);
+                    debug_assert_eq!(slice.len(), DWB_SLOT_STRIDE);
+                    debug_assert!(is_aligned(offset as usize, DEFAULT_ALIGNMENT));
+                    slice
+                }
+            };
+            pwrite_all(&self.file, bytes, offset)?;
+            metrics::add_bytes_written(bytes.len() as u64);
+            self.slots_written = self.slots_written.saturating_add(1);
+        }
+        stage.clear();
+        Ok(surviving)
+    }
+
+    /// Write the staged slots and the DWB header, then fsync the file.
     ///
     /// Must be called after one or more `write_record_deferred` calls to make
     /// the records durable. The single fsync covers all deferred writes since
@@ -227,6 +252,8 @@ impl DoubleWriteBuffer {
         if !self.dirty {
             return Ok(());
         }
+
+        self.write_staged()?;
 
         let mut header = [0u8; DWB_HEADER_FIELDS];
         header[0..4].copy_from_slice(&DWB_MAGIC.to_le_bytes());
@@ -396,6 +423,69 @@ mod tests {
             })
         );
         assert!(dwb.recover_record(11).unwrap().is_none());
+    }
+
+    /// More records than the ring holds within one flush write exactly one
+    /// ring of slots, and the ring keeps the newest records.
+    #[test]
+    fn flush_writes_at_most_one_ring_of_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ring.dwb");
+        let mut dwb = open_buffered(&path);
+
+        let total = DWB_CAPACITY as u64 * 3 + 7;
+        for lsn in 1..=total {
+            mirror_deferred(&mut dwb, &record(lsn, format!("rec-{lsn}").as_bytes()));
+        }
+        assert_eq!(dwb.slots_written(), 0, "staging writes nothing to disk");
+        assert_eq!(dwb.staged_slots(), DWB_CAPACITY as u32);
+        dwb.flush().unwrap();
+        assert_eq!(dwb.slots_written(), DWB_CAPACITY as u64);
+        assert_eq!(dwb.staged_slots(), 0);
+
+        let mut reopened = open_buffered(&path);
+        let newest_lost = total - DWB_CAPACITY as u64;
+        for lsn in (newest_lost + 1)..=total {
+            let recovered = reopened.recover_record(lsn).unwrap().expect("recoverable");
+            assert_eq!(recovered.payload, format!("rec-{lsn}").into_bytes());
+        }
+        assert!(reopened.recover_record(newest_lost).unwrap().is_none());
+    }
+
+    #[test]
+    fn flush_writes_one_slot_per_record_below_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dwb = open_buffered(&dir.path().join("few.dwb"));
+
+        for lsn in 1..=10u64 {
+            mirror_deferred(&mut dwb, &record(lsn, b"few"));
+        }
+        dwb.flush().unwrap();
+        assert_eq!(dwb.slots_written(), 10);
+
+        mirror_deferred(&mut dwb, &record(11, b"next batch"));
+        dwb.flush().unwrap();
+        assert_eq!(dwb.slots_written(), 11);
+        assert!(dwb.recover_record(11).unwrap().is_some());
+    }
+
+    /// A staged record is not on disk until the flush, and is recoverable
+    /// from the file once the flush returns.
+    #[test]
+    fn staged_record_is_recoverable_only_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.dwb");
+        let mut dwb = open_buffered(&path);
+
+        mirror_deferred(&mut dwb, &record(21, b"torn in the wal"));
+        assert!(open_buffered(&path).recover_record(21).unwrap().is_none());
+
+        dwb.flush().unwrap();
+        let recovered = open_buffered(&path)
+            .recover_record(21)
+            .unwrap()
+            .expect("recoverable after flush");
+        assert_eq!(recovered.payload, b"torn in the wal");
     }
 
     #[test]

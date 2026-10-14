@@ -102,6 +102,7 @@ fn provider_scan_plan(rows: &[&Row]) -> Vec<u8> {
     let plan = PhysicalPlan::Query(QueryOp::ProviderScan {
         provider: None,
         rows: msgpack_array(rows),
+        sources: Vec::new(),
         filters: Vec::new(),
         projection: Vec::new(),
         computed_columns: Vec::new(),

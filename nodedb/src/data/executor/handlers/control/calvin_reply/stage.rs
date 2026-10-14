@@ -22,7 +22,7 @@
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_types::{Surrogate, Value};
 
-use super::images::{RowLocation, StoredRow, staged_row_bytes};
+use super::images::{RowLocation, StoredRow, staged_row_image};
 use super::reply::{CalvinReply, CalvinStaging, InstalledTimeseries, PostImages};
 use super::target::{ReplyImage, ReturningTarget, RowEngine, returning_target};
 use crate::bridge::envelope::ErrorCode;
@@ -188,6 +188,7 @@ impl CoreLoop {
             database_id: database_id.as_u64(),
             tid,
             collection: target.collection,
+            vector_field: target.vector_field,
         };
         let written = slots.iter().filter_map(|slot| match slot.after {
             Some(Staged::Put(body)) => Some((slot, body.as_slice())),
@@ -215,10 +216,12 @@ impl CoreLoop {
             (ReplyImage::After, RowEngine::Kv | RowEngine::Vector) => {
                 let rows = written
                     .map(|(slot, body)| {
+                        let (bytes, vector) = staged_row_image(target.engine, body)?;
                         Ok(StoredRow {
                             identity: slot.doc_id.clone(),
                             surrogate: Surrogate::new(slot.surrogate),
-                            bytes: staged_row_bytes(target.engine, body)?,
+                            bytes,
+                            vector,
                         })
                     })
                     .collect::<Result<Vec<_>, ErrorCode>>()?;
@@ -276,18 +279,19 @@ impl CoreLoop {
             }
             let surrogate = Surrogate::new(slot.surrogate);
             let prior = match slot.before {
-                Some(Staged::Put(body)) => Some(staged_row_bytes(at.engine, body)?),
+                Some(Staged::Put(body)) => Some(staged_row_image(at.engine, body)?),
                 Some(Staged::Tombstone) => None,
-                None if base_visible => {
-                    self.calvin_removed_base_row(at, target, slot, surrogate)?
-                }
+                None if base_visible => self
+                    .calvin_removed_base_row(at, target, slot, surrogate)?
+                    .map(|bytes| (bytes, None)),
                 None => None,
             };
-            if let Some(bytes) = prior {
+            if let Some((bytes, vector)) = prior {
                 rows.push(StoredRow {
                     identity: slot.doc_id.clone(),
                     surrogate,
                     bytes,
+                    vector,
                 });
             }
         }
@@ -409,6 +413,8 @@ impl CoreLoop {
             database_id: database_id.as_u64(),
             tid,
             collection: &images.collection,
+            // Post-images are document and CRDT rows only.
+            vector_field: None,
         };
         let mut rows = Vec::with_capacity(images.rows.len());
         for (identity, surrogate) in &images.rows {
@@ -419,10 +425,12 @@ impl CoreLoop {
                 None => overlay.get(&coll_key, surrogate.as_u32()),
             };
             if let Some(Staged::Put(body)) = staged {
+                let (bytes, vector) = staged_row_image(images.engine, body)?;
                 rows.push(StoredRow {
                     identity: identity.clone(),
                     surrogate: *surrogate,
-                    bytes: staged_row_bytes(images.engine, body)?,
+                    bytes,
+                    vector,
                 });
             }
         }
@@ -709,6 +717,7 @@ mod tests {
                 ("o1".to_string(), object(&[("a", text("one"))])),
                 ("o2".to_string(), object(&[("a", text("two"))])),
             ],
+            if_absent: false,
             surrogates: vec![Surrogate::new(7), Surrogate::new(8)],
             returning: returning(&["a"]),
             rls_filters: Vec::new(),

@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 /// `native`, `http`, `sync`, `ilp`) are deliberately absent.
 const ALLOWED: &[&str] = &[
     // Retention and temporal enforcement, on their own timers.
-    "engine/timeseries/retention_policy/autowire.rs",
+    // `retention_policy/autowire.rs` is absent: a policy's downsample tiers
+    // register on every core of the node, not through the system door.
     "engine/timeseries/retention_policy/enforcement.rs",
     "engine/bitemporal/enforcement.rs",
     // `backup/restore/durable.rs` is absent: every restore re-issue proposes
@@ -42,8 +43,9 @@ const ALLOWED: &[&str] = &[
     "control/server/shared/ddl/neutral/convert/driver.rs",
     // `continuous_agg/create.rs`, `drop.rs` and `register.rs` are absent: a
     // continuous aggregate replicates as a catalog entry, and each node's
-    // post-apply lane registers or removes it on every core.
-    "control/server/shared/ddl/neutral/continuous_agg/show.rs",
+    // post-apply lane registers or removes it on every core. `show.rs` is
+    // absent too: SHOW CONTINUOUS AGGREGATES fans out to every core through
+    // the all-cores exchange.
     // `synonym_group/create.rs` and `synonym_group/drop.rs` are absent:
     // a synonym group replicates as a catalog entry, and each node's
     // post-apply lane installs it in that node's FTS backend.

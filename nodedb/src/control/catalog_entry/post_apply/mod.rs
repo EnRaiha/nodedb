@@ -63,7 +63,10 @@ pub(crate) use async_dispatch::collection::{
 pub(crate) use async_dispatch::continuous_aggregate::{
     RegisterFailure as ContinuousAggregateRegisterFailure,
     delete_async as unregister_continuous_aggregate,
+    finish_boot_registration_on_every_core as finish_continuous_aggregate_boot_registration,
+    register_def_on_every_core as register_continuous_aggregate_def_on_every_core,
     register_on_every_core as register_continuous_aggregate_on_every_core,
+    unregister_on_every_core as unregister_continuous_aggregate_on_every_core,
 };
 pub(crate) use async_dispatch::crdt_compact::{compact_async, drain_pending_compactions};
 pub use async_dispatch::run_post_apply_async_side_effects;

@@ -377,6 +377,20 @@ mod tests {
         assert!(parse("INSERT INTO users VALUES (1)").is_none());
     }
 
+    /// A family claims a statement by its leading keywords only. A family
+    /// word inside a literal never routes the statement to that family.
+    #[test]
+    fn keyword_inside_a_literal_does_not_pick_the_family() {
+        assert!(matches!(
+            ok("CREATE SCHEDULE s CRON '* * * * *' AS INSERT INTO log VALUES ('TRIGGER fired')"),
+            NodedbStatement::Automation(AutomationStmt::CreateSchedule { .. })
+        ));
+        assert!(matches!(
+            ok("CREATE USER u WITH PASSWORD 'a trigger b'"),
+            NodedbStatement::Auth(AuthStmt::CreateUser { .. })
+        ));
+    }
+
     #[test]
     fn create_function_returns_none() {
         // CREATE FUNCTION and CREATE PROCEDURE are handled by the text-based

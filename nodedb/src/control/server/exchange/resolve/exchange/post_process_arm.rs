@@ -4,7 +4,7 @@
 //! coordinator once, then lower to a `ProviderScan` for the relational tail.
 
 use nodedb_physical::physical_plan::{
-    ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp, SortKeySpec, TextOp, VectorOp,
+    ExchangeMode, ExchangeOp, GatheredSource, PhysicalPlan, QueryOp, SortKeySpec, TextOp, VectorOp,
     plan_contains_cluster_partitioned_leaf,
 };
 
@@ -16,6 +16,7 @@ use crate::control::server::exchange::owning_core::gather_single_owning_core;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::server::response_translate::hit_key::parse_surrogate_hex;
 use crate::control::server::response_translate::vector::resolve_surrogate_pk;
+use crate::control::server::shared::authorization::gathered_sources;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{
     flatten_hybrid_hits_to_relational_rows, flatten_to_relational_rows,
@@ -95,10 +96,13 @@ fn hit_collection_name(plan: &PhysicalPlan) -> Option<String> {
 /// A `ProviderScan` carrying final `rows` and an empty relational tail:
 /// no filter, projection, computed column, window, sort, limit, offset, or
 /// distinct. The shape every coordinator-materialized child is embedded as.
-pub(crate) fn provider_scan_of_rows(rows: Vec<u8>) -> PhysicalPlan {
+/// `sources` are the requirements of the child the rows came from (see
+/// [`gathered_sources`]).
+pub(crate) fn provider_scan_of_rows(rows: Vec<u8>, sources: Vec<GatheredSource>) -> PhysicalPlan {
     PhysicalPlan::Query(QueryOp::ProviderScan {
         provider: None,
         rows,
+        sources,
         filters: Vec::new(),
         projection: Vec::new(),
         computed_columns: Vec::new(),
@@ -113,8 +117,12 @@ pub(crate) fn provider_scan_of_rows(rows: Vec<u8>) -> PhysicalPlan {
 /// Rows of a materialized child, or a resolution the caller returns as-is.
 pub(super) enum ChildRows {
     /// The child's rows, flattened to the bare relational row shape a
-    /// `ProviderScan{provider: None}` consumes.
-    Rows(Vec<u8>),
+    /// `ProviderScan{provider: None}` consumes, and the requirements of the
+    /// child they came from.
+    Rows {
+        rows: Vec<u8>,
+        sources: Vec<GatheredSource>,
+    },
     /// The child resolved to a root `Gathered` / `Stream` result. The caller
     /// returns it unchanged.
     Passthrough(Resolved),
@@ -141,6 +149,10 @@ pub(super) async fn materialize_child_rows(
         txn_id,
         ..
     } = ctx;
+
+    // The rows replace `input` in the plan, so they carry its requirements
+    // into the authorization of the resolved plan.
+    let sources = gathered_sources(&input, database_id)?;
 
     // The converter wraps a sharded body in `Exchange{Gather}`; unwrap
     // it so the child is the real body plan (a plain body has no
@@ -255,7 +267,7 @@ pub(super) async fn materialize_child_rows(
         }),
         HitShape::None => flatten_to_relational_rows(&merged),
     };
-    Ok(ChildRows::Rows(rows))
+    Ok(ChildRows::Rows { rows, sources })
 }
 
 /// Resolve a `QueryOp::PostProcess` node: materialize the child's rows on the
@@ -281,14 +293,15 @@ pub(super) async fn resolve_post_process(
         distinct,
     } = fields;
 
-    let rows = match materialize_child_rows(state, ctx, captures, *input).await? {
-        ChildRows::Rows(rows) => rows,
+    let (rows, sources) = match materialize_child_rows(state, ctx, captures, *input).await? {
+        ChildRows::Rows { rows, sources } => (rows, sources),
         ChildRows::Passthrough(resolved) => return Ok(resolved),
     };
     Ok(Resolved::Plan(Box::new(PhysicalPlan::Query(
         QueryOp::ProviderScan {
             provider: None,
             rows,
+            sources,
             filters,
             projection,
             computed_columns,

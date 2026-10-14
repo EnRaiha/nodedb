@@ -10,3 +10,4 @@ pub(in crate::data::executor) mod dispatch;
 mod point;
 mod txn_rows;
 mod upsert;
+mod upsert_batch;

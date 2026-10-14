@@ -237,6 +237,7 @@ pub fn columnar_count(collection: &str) -> PhysicalPlan {
             user_alias: None,
             field: "*".into(),
             expr: None,
+            param: None,
         }],
         filters: Vec::new(),
         having: Vec::new(),
@@ -279,6 +280,8 @@ pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
         computed_columns: Vec::new(),
+        having: Vec::new(),
+        tiering: None,
     })
 }
 

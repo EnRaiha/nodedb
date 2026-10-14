@@ -42,13 +42,13 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
     // their rows per-request from the identity-scoped catalog producer.
     // `rows` is left empty here; the coordinator fills it post-cache via
     // `materialize_providers`. Using an empty-coordinator vshard (empty
-    // collection string) keeps the task coordinator-local.
+    // collection string) keeps the task coordinator-local. A continuous
+    // aggregate reads the same way: the coordinator fetches its finalized
+    // rows from the core that owns its root source.
     let computed_bytes = extract_computed_columns(projection, window_functions, false)?;
     let window_bytes = serialize_window_functions(window_functions, false)?;
 
-    if crate::control::server::pgwire::catalog::schema::catalog_collection_info(collection)
-        .is_some()
-    {
+    if is_provider_relation(collection, engine) {
         let filter_bytes = serialize_filters(filters)?;
         let proj_names = extract_projection_names(projection, window_functions);
         let sort = convert_sort_keys(sort_keys);
@@ -59,6 +59,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             plan: PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: Some(collection.to_string()),
                 rows: Vec::new(),
+                sources: Vec::new(),
                 filters: filter_bytes,
                 projection: proj_names,
                 computed_columns: computed_bytes,
@@ -98,8 +99,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 gap_fill: String::new(),
                 computed_columns: computed_bytes,
                 rls_filters: Vec::new(),
-                system_time: SystemTimeScope::Current,
-                valid_at_ms: None,
+                system_time: temporal.system_time,
+                valid_at_ms: valid_at_from_scope(temporal),
+                having: Vec::new(),
+                tiering: None,
             })
         }
         EngineType::Columnar => PhysicalPlan::Columnar(ColumnarOp::Scan {
@@ -114,15 +117,19 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
             prefilter: None,
             computed_columns: computed_bytes.clone(),
         }),
+        // A spatial collection stores its rows in the columnar engine, so its
+        // scan is the columnar scan: no LIMIT reads every row under the byte
+        // budget. The planner refuses `AS OF` on a spatial collection, so the
+        // scope carried here is always the current one.
         EngineType::Spatial => PhysicalPlan::Columnar(ColumnarOp::Scan {
             collection: qualified_collection.clone(),
             projection: proj_names,
-            limit: limit.unwrap_or(10000),
+            limit: limit.unwrap_or(usize::MAX),
             filters: filter_bytes,
             rls_filters: Vec::new(),
             sort_keys: sort.clone(),
-            system_time: SystemTimeScope::Current,
-            valid_at_ms: None,
+            system_time: temporal.system_time,
+            valid_at_ms: valid_at_from_scope(temporal),
             prefilter: None,
             computed_columns: computed_bytes.clone(),
         }),
@@ -149,10 +156,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 // A no-LIMIT document scan is unbounded by row count; the Data
                 // Plane bounds it by a memory budget (`max_scan_result_bytes`)
                 // and surfaces a deterministic error rather than silently
-                // truncating. KV, columnar, and timeseries now take the same
-                // budget-bounded `usize::MAX` path (their handlers enforce the
-                // memory budget). Spatial alone still caps at 10k — its R-tree
-                // scan path is not yet budget-aware (out of scope here).
+                // truncating. Every other engine's scan takes the same
+                // budget-bounded `usize::MAX` path.
                 limit: limit.unwrap_or(usize::MAX),
                 offset: *offset,
                 sort_keys: sort,
@@ -173,6 +178,15 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 ),
             });
         }
+        // `is_provider_relation` sends every continuous aggregate to the
+        // provider scan above.
+        EngineType::ContinuousAggregate => {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "scan on '{collection}': a continuous aggregate reads through its provider"
+                ),
+            });
+        }
     };
     Ok(vec![PhysicalTask {
         tenant_id,
@@ -182,6 +196,17 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
         post_set_op: PostSetOp::None,
         txn_id: None,
     }])
+}
+
+/// Whether a read of `collection` is a provider scan the coordinator
+/// materializes: a catalog table, or a continuous aggregate.
+pub(in crate::control::planner::sql_plan_convert) fn is_provider_relation(
+    collection: &str,
+    engine: &EngineType,
+) -> bool {
+    *engine == EngineType::ContinuousAggregate
+        || crate::control::server::pgwire::catalog::schema::catalog_collection_info(collection)
+            .is_some()
 }
 
 /// Map `SqlPlan::DocumentIndexLookup` to a `DocumentOp::IndexedFetch` task.
@@ -227,7 +252,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_look
         value: sql_value_to_string(value),
         filters: filter_bytes,
         projection: proj_names,
-        limit: limit.unwrap_or(10_000),
+        // No LIMIT fetches every matching row under the byte budget.
+        limit: limit.unwrap_or(usize::MAX),
         offset,
     });
     Ok(vec![PhysicalTask {
@@ -320,6 +346,15 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_point_get(
         EngineType::Array => {
             return Err(crate::Error::PlanError {
                 detail: format!("point get on '{collection}': array engine has no primary key"),
+            });
+        }
+        // nodedb-sql never rewrites a continuous-aggregate read into a
+        // point lookup.
+        EngineType::ContinuousAggregate => {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "point get on '{collection}': a continuous aggregate has no primary key"
+                ),
             });
         }
     };

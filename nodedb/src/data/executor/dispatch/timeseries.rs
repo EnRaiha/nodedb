@@ -34,6 +34,8 @@ impl CoreLoop {
                 rls_filters,
                 system_time,
                 valid_at_ms,
+                having,
+                tiering,
             } => self.execute_timeseries_scan(TimeseriesScanParams {
                 task,
                 tid: task.request.tenant_id,
@@ -50,6 +52,8 @@ impl CoreLoop {
                 computed_columns,
                 system_time: *system_time,
                 valid_at_ms: *valid_at_ms,
+                having,
+                tiering: tiering.as_ref(),
             }),
 
             TimeseriesOp::Ingest {
@@ -86,6 +90,19 @@ impl CoreLoop {
                 collection,
                 restart_identity: _,
             } => self.execute_timeseries_truncate(task, collection.as_str(), None),
+
+            TimeseriesOp::RefreshAggregate { collection, cut } => {
+                self.execute_cagg_refresh_cut(task, collection.as_str(), cut)
+            }
+
+            TimeseriesOp::Partitions { collection, action } => {
+                self.execute_ts_partitions(task, collection.as_str(), *action)
+            }
+
+            TimeseriesOp::ReadAggregate {
+                collection,
+                aggregate,
+            } => self.execute_ts_read_aggregate(task, collection.as_str(), aggregate),
         }
     }
 }
@@ -182,6 +199,8 @@ mod tests {
                 rls_filters,
                 system_time: nodedb_types::SystemTimeScope::Current,
                 valid_at_ms: None,
+                having: Vec::new(),
+                tiering: None,
             }),
             None,
         )

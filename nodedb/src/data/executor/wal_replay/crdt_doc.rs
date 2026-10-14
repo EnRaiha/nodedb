@@ -121,6 +121,8 @@ impl CoreLoop {
                         partial,
                         returning: None,
                         rls_filters: &[],
+                        // The write's commit already judged its typeguards.
+                        judge_guards: false,
                     },
                 );
                 (collection, document_id, response)

@@ -15,13 +15,13 @@
 //! The hooks that consume these inputs live in [`super::shapes`], one per wire
 //! shape a client-facing path can deliver.
 
-use nodedb_physical::physical_plan::QueryOp;
+use nodedb_physical::physical_plan::{GatheredSource, QueryOp};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::redaction::RedactionStore;
 use crate::control::server::shared::plan_util::extract_collection;
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, QualifiedCollection, TenantId};
 
 /// Everything the redaction hook needs to rewrite one query's result rows.
 pub struct RedactionCtx<'a> {
@@ -50,8 +50,17 @@ pub struct QueryRedaction {
 
 impl QueryRedaction {
     /// Resolve the redaction inputs for a statement reading `plan`.
-    pub fn for_plan(tenant_id: TenantId, auth: &AuthContext, plan: &PhysicalPlan) -> Self {
-        Self::for_collections(tenant_id, auth, plan_source_collections(plan))
+    ///
+    /// `database_id` is the statement's database: a provider relation (a
+    /// continuous aggregate or catalog table) is named bare on the plan, and
+    /// its rules are keyed on the name qualified for that database.
+    pub fn for_plan(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        auth: &AuthContext,
+        plan: &PhysicalPlan,
+    ) -> Self {
+        Self::for_collections(tenant_id, auth, plan_source_collections(plan, database_id))
     }
 
     /// Resolve the redaction inputs for a statement whose rows come from
@@ -59,13 +68,16 @@ impl QueryRedaction {
     ///
     /// The union of every branch's sources is used, so a column is redacted
     /// whichever branch produced the row it sits in.
+    ///
+    /// Each plan comes with the database its task runs in, which qualifies the
+    /// provider relations it reads.
     pub fn for_plans<'p, I>(tenant_id: TenantId, auth: &AuthContext, plans: I) -> Self
     where
-        I: IntoIterator<Item = &'p PhysicalPlan>,
+        I: IntoIterator<Item = (&'p PhysicalPlan, DatabaseId)>,
     {
         let mut collections: Vec<(String, String)> = Vec::new();
-        for plan in plans {
-            for source in plan_source_collections(plan) {
+        for (plan, database_id) in plans {
+            for source in plan_source_collections(plan, database_id) {
                 if !collections.contains(&source) {
                     collections.push(source);
                 }
@@ -154,9 +166,16 @@ impl QueryRedaction {
 /// This deliberately does NOT use `extract_collection` alone: that helper
 /// reports only the LEFT side of a join, which would leave every right-side
 /// column unredacted.
-pub fn plan_source_collections(plan: &PhysicalPlan) -> Vec<(String, String)> {
+///
+/// A named provider relation is a source too: its rows reach the result like
+/// a collection's, and its rules are keyed on its name qualified for
+/// `database_id`.
+pub fn plan_source_collections(
+    plan: &PhysicalPlan,
+    database_id: DatabaseId,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    collect_sources(plan, "", &mut out);
+    collect_sources(plan, database_id, "", &mut out);
     out
 }
 
@@ -166,9 +185,43 @@ pub fn plan_source_collections(plan: &PhysicalPlan) -> Vec<(String, String)> {
 /// qualifier; every other plan reads at most one collection, and resolving
 /// that is delegated to `extract_collection`, whose match over `PhysicalPlan`
 /// is exhaustive — so a new plan variant still forces a decision there.
-fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, String)>) {
+fn collect_sources(
+    plan: &PhysicalPlan,
+    db: DatabaseId,
+    qualifier: &str,
+    out: &mut Vec<(String, String)>,
+) {
     if let PhysicalPlan::Query(op) = plan {
         match op {
+            QueryOp::ProviderScan {
+                provider: Some(name),
+                ..
+            } => {
+                push_source(out, qualifier, QualifiedCollection::new(db, name).as_str());
+                return;
+            }
+            // Rows the coordinator gathered from a child plan come from the
+            // collections that child read, named qualified for the read's
+            // database. They are attributed to this scan's qualifier: under
+            // a join side that is the side's, and at the root the rows keep
+            // whatever keys the child gave them, which the masking pass
+            // matches by bare name when it cannot attribute them.
+            QueryOp::ProviderScan {
+                provider: None,
+                sources,
+                ..
+            } => {
+                for source in sources {
+                    match source {
+                        GatheredSource::Collection(collection) => {
+                            push_source(out, qualifier, collection)
+                        }
+                        // Constant rows carry no stored column to mask.
+                        GatheredSource::Tenant => {}
+                    }
+                }
+                return;
+            }
             // A join side's rows may come from a resolved child plan
             // (`*_input`) or from a local scan of `*_collection`. The side's
             // qualifier prefixes its columns either way, so the collection is
@@ -186,18 +239,18 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
                 let left = left_alias.as_deref().unwrap_or(left_collection.as_str());
                 push_source(out, left, left_collection.as_str());
                 if let Some(child) = left_input {
-                    collect_sources(child, left, out);
+                    collect_sources(child, db, left, out);
                 }
                 let right = right_alias.as_deref().unwrap_or(right_collection.as_str());
                 push_source(out, right, right_collection.as_str());
                 if let Some(child) = right_input {
-                    collect_sources(child, right, out);
+                    collect_sources(child, db, right, out);
                 }
                 return;
             }
-            // Neither variant takes a resolved child input: both sides are
-            // always scanned locally, and neither carries an alias, so the
-            // collection name is the qualifier.
+            // A resolved input reads the same collection as its side, and
+            // neither variant carries an alias, so the collection name is
+            // the qualifier.
             QueryOp::NestedLoopJoin {
                 left_collection,
                 right_collection,
@@ -226,23 +279,23 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
                 lateral_alias,
                 ..
             } => {
-                collect_sources(outer_plan, outer_alias, out);
+                collect_sources(outer_plan, db, outer_alias, out);
                 push_source(out, lateral_alias, inner_collection.as_str());
                 return;
             }
             QueryOp::Exchange(exchange) => {
-                collect_sources(&exchange.child, qualifier, out);
+                collect_sources(&exchange.child, db, qualifier, out);
                 return;
             }
             QueryOp::PostProcess { input, .. } => {
-                collect_sources(input, qualifier, out);
+                collect_sources(input, db, qualifier, out);
                 return;
             }
             // Every set-operation branch contributes rows under the same
             // derived-table qualifier.
             QueryOp::SetOp { inputs, .. } => {
                 for input in inputs {
-                    collect_sources(input, qualifier, out);
+                    collect_sources(input, db, qualifier, out);
                 }
                 return;
             }
@@ -254,7 +307,7 @@ fn collect_sources(plan: &PhysicalPlan, qualifier: &str, out: &mut Vec<(String, 
             } => {
                 push_source(out, qualifier, collection.as_str());
                 if let Some(child) = input {
-                    collect_sources(child, qualifier, out);
+                    collect_sources(child, db, qualifier, out);
                 }
                 return;
             }
@@ -358,8 +411,6 @@ mod tests {
             on: Vec::new(),
             join_type: "inner".into(),
             limit: 0,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),
@@ -378,7 +429,7 @@ mod tests {
     #[test]
     fn single_collection_plan_uses_an_empty_qualifier() {
         assert_eq!(
-            plan_source_collections(&scan("users")),
+            plan_source_collections(&scan("users"), DatabaseId::DEFAULT),
             vec![(String::new(), "users".to_string())]
         );
     }
@@ -388,7 +439,7 @@ mod tests {
     #[test]
     fn join_reports_both_sides_under_their_aliases() {
         assert_eq!(
-            plan_source_collections(&hash_join(Some("w"), Some("b"), None)),
+            plan_source_collections(&hash_join(Some("w"), Some("b"), None), DatabaseId::DEFAULT),
             vec![
                 ("w".to_string(), "workspaces".to_string()),
                 ("b".to_string(), "boards".to_string()),
@@ -400,7 +451,7 @@ mod tests {
     #[test]
     fn join_without_aliases_qualifies_by_collection_name() {
         assert_eq!(
-            plan_source_collections(&hash_join(None, None, None)),
+            plan_source_collections(&hash_join(None, None, None), DatabaseId::DEFAULT),
             vec![
                 ("workspaces".to_string(), "workspaces".to_string()),
                 ("boards".to_string(), "boards".to_string()),
@@ -412,8 +463,10 @@ mod tests {
     /// coordinator-resolved join side is still attributed.
     #[test]
     fn join_child_input_inherits_its_sides_qualifier() {
-        let sources =
-            plan_source_collections(&hash_join(Some("w"), Some("b"), Some(scan("audit"))));
+        let sources = plan_source_collections(
+            &hash_join(Some("w"), Some("b"), Some(scan("audit"))),
+            DatabaseId::DEFAULT,
+        );
         assert!(sources.contains(&("w".to_string(), "audit".to_string())));
         assert!(sources.contains(&("b".to_string(), "boards".to_string())));
     }
@@ -429,8 +482,95 @@ mod tests {
             },
         }));
         assert_eq!(
-            plan_source_collections(&plan),
+            plan_source_collections(&plan, DatabaseId::DEFAULT),
             vec![(String::new(), "users".to_string())]
         );
+    }
+
+    fn provider_scan(name: &str) -> PhysicalPlan {
+        PhysicalPlan::Query(QueryOp::ProviderScan {
+            provider: Some(name.into()),
+            rows: Vec::new(),
+            sources: Vec::new(),
+            filters: Vec::new(),
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+        })
+    }
+
+    /// A continuous aggregate or catalog relation is a source keyed by its
+    /// name qualified for the statement's database, alone and as an
+    /// embedded join side.
+    #[test]
+    fn a_named_provider_is_a_source_of_the_statements_database() {
+        let db = DatabaseId::new(7);
+        let qualified = QualifiedCollection::new(db, "salary_1h")
+            .as_str()
+            .to_string();
+        assert_eq!(
+            plan_source_collections(&provider_scan("salary_1h"), db),
+            vec![(String::new(), qualified.clone())]
+        );
+        let joined = plan_source_collections(
+            &hash_join(Some("w"), Some("s"), Some(provider_scan("salary_1h"))),
+            db,
+        );
+        assert!(joined.contains(&("w".to_string(), qualified)));
+    }
+
+    /// Rows the coordinator gathered keep the collections they came from as
+    /// sources, at the root and under a join side's qualifier, so a rule on
+    /// one of those collections still masks them.
+    #[test]
+    fn gathered_rows_are_attributed_to_their_source_collections() {
+        let gathered = PhysicalPlan::Query(QueryOp::ProviderScan {
+            provider: None,
+            rows: Vec::new(),
+            sources: vec![
+                GatheredSource::Collection("users".into()),
+                GatheredSource::Tenant,
+            ],
+            filters: Vec::new(),
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            sort_keys: Vec::new(),
+            limit: None,
+            offset: 0,
+            distinct: false,
+        });
+        assert_eq!(
+            plan_source_collections(&gathered, DatabaseId::DEFAULT),
+            vec![(String::new(), "users".to_string())]
+        );
+        let joined = plan_source_collections(
+            &hash_join(Some("w"), Some("b"), Some(gathered)),
+            DatabaseId::DEFAULT,
+        );
+        assert!(joined.contains(&("w".to_string(), "users".to_string())));
+
+        let store = store_with_mask("users", "support", "ssn");
+        let redaction = QueryRedaction::new(TenantId::new(1), vec!["support".to_string()], joined);
+        assert!(redaction.field_has_rule(&store, "ssn"));
+    }
+
+    /// A masked column of a provider relation is rewritten in a SELECT
+    /// result, as a collection's is.
+    #[test]
+    fn a_redacted_provider_column_is_masked() {
+        let store = store_with_mask("salary_1h", "support", "total");
+        let redaction = QueryRedaction::new(
+            TenantId::new(1),
+            vec!["support".to_string()],
+            plan_source_collections(&provider_scan("salary_1h"), DatabaseId::DEFAULT),
+        );
+        assert!(redaction.has_any_rule(&store));
+        assert!(redaction.field_has_rule(&store, "total"));
+        assert!(!redaction.field_has_rule(&store, "dept"));
     }
 }

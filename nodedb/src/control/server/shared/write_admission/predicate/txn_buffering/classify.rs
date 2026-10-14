@@ -23,7 +23,6 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::PointDelete { .. }
             | DocumentOp::PointUpdate { .. }
             | DocumentOp::Upsert { .. }
-            | DocumentOp::InsertSelect { .. }
             // A cross-shard materialized-sum move: staged as the target row's
             // post-image, which the transaction's redo record carries.
             | DocumentOp::ApplyBalanceDelta { .. },
@@ -62,13 +61,17 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::ResolvedWrite { .. },
         ) => false,
 
-        // `Merge`/`UpdateFromJoin` never reach this — staged as point ops instead.
-        // The session expander reshapes a `BatchInsert` page into point inserts,
-        // which stage like any other point write.
+        // `Merge`/`UpdateFromJoin`/`InsertSelect` never reach the log — the
+        // session expander stages them as point ops, and the log has no
+        // encoder for their unresolved form. The expander also reshapes a
+        // `BatchInsert` page into point inserts and a `BatchUpsert` page into
+        // point upserts, which stage like any other point write.
         PhysicalPlan::Document(
             DocumentOp::BatchInsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::Merge { .. }
-            | DocumentOp::UpdateFromJoin { .. },
+            | DocumentOp::UpdateFromJoin { .. }
+            | DocumentOp::InsertSelect { .. },
         ) => true,
 
         // `Truncate` is staged as an overlay marker and replays through the
@@ -109,6 +112,11 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | VectorOp::DirectTruncate { .. }
             | VectorOp::DirectUpdate { .. },
         ) => true,
+
+        // The session expander reshapes a page into the point writes of its
+        // intent, which stage like any other point write. The log has no
+        // encoder for the unresolved page.
+        PhysicalPlan::Vector(VectorOp::DirectBatchWrite { .. }) => true,
 
         // DDL/Alter, not encoded.
         PhysicalPlan::Vector(
@@ -273,13 +281,19 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         ) => false,
 
         // ---- Timeseries ----
-        PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. } | TimeseriesOp::Truncate { .. }) => {
-            true
-        }
+        PhysicalPlan::Timeseries(
+            TimeseriesOp::Ingest { .. }
+            | TimeseriesOp::Truncate { .. }
+            | TimeseriesOp::RefreshAggregate { .. },
+        ) => true,
         // Resolve pass is read-only; `to_replicated_entry` reports `None`.
-        PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_)) => {
-            false
-        }
+        // Partition maintenance changes no row, and reports `None` too.
+        PhysicalPlan::Timeseries(
+            TimeseriesOp::Scan { .. }
+                | TimeseriesOp::ResolveIngest(_)
+                | TimeseriesOp::Partitions { .. }
+                | TimeseriesOp::ReadAggregate { .. },
+        ) => false,
 
         // ---- Text: encoded (buffered) ----
         PhysicalPlan::Text(TextOp::FtsIndexDoc { .. } | TextOp::FtsDeleteDoc { .. }) => true,
@@ -330,6 +344,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | MetaOp::RegisterContinuousAggregate { .. }
             | MetaOp::UnregisterContinuousAggregate { .. }
             | MetaOp::ListContinuousAggregates
+            | MetaOp::ContinuousAggregatesRegistered
+            | MetaOp::AwaitContinuousAggregateRefresh { .. }
             | MetaOp::ConvertCollection { .. }
             | MetaOp::CreateTenantSnapshot { .. }
             | MetaOp::RestoreTenantSnapshot { .. }
@@ -466,12 +482,22 @@ mod tests {
         )
     }
 
-    /// A write whose rows a predicate names. It resolves to rows before it is
-    /// logged, so the log encoder refuses its raw form.
+    /// A write whose rows a predicate names, or whose rows depend on the rows
+    /// stored. It resolves to rows before it is logged, so the log encoder
+    /// refuses its raw form. Inside a transaction it stages into the overlay,
+    /// and COMMIT logs the redo record the overlay resolves to, never the raw
+    /// form.
     fn resolves_before_log(plan: &PhysicalPlan) -> bool {
+        if let PhysicalPlan::Kv(KvOp::BatchPut { intent, .. }) = plan {
+            return intent.depends_on_stored_rows();
+        }
         matches!(
             plan,
-            PhysicalPlan::Kv(KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. })
+            PhysicalPlan::Kv(
+                KvOp::PredicateUpdate { .. }
+                    | KvOp::PredicateDelete { .. }
+                    | KvOp::InsertIfAbsent { .. }
+            ) | PhysicalPlan::Vector(VectorOp::DirectBatchWrite { .. })
                 | PhysicalPlan::Vector(
                     VectorOp::DirectDelete {
                         targets: nodedb_physical::physical_plan::VectorWriteTargets::Predicate(_),
@@ -660,19 +686,22 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
             }),
-            PhysicalPlan::Document(DocumentOp::InsertSelect {
-                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
-                source_filters: Vec::new(),
-                source_limit: 0,
-                column_map: Vec::new(),
-            }),
             PhysicalPlan::Document(DocumentOp::Upsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 document_id: "d".into(),
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
                 surrogate: Surrogate::new(1),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                returning: None,
+                rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
+            }),
+            PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+                documents: vec![("d".into(), Vec::new()), ("e".into(), Vec::new())],
+                surrogates: vec![Surrogate::new(1), Surrogate::new(2)],
+                on_conflict_updates: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
@@ -783,6 +812,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 documents: Vec::new(),
+                if_absent: false,
                 surrogates: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -1348,6 +1378,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 entries: Vec::new(),
                 ttl_ms: 0,
+                intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
                 surrogates: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),
@@ -1535,6 +1566,8 @@ mod tests {
                 rls_filters: Vec::new(),
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
+                having: Vec::new(),
+                tiering: None,
             }),
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1677,6 +1710,7 @@ mod tests {
             PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: None,
                 rows: Vec::new(),
+                sources: Vec::new(),
                 filters: Vec::new(),
                 projection: Vec::new(),
                 computed_columns: Vec::new(),
@@ -1720,8 +1754,6 @@ mod tests {
                 on: Vec::new(),
                 join_type: "inner".into(),
                 limit: 0,
-                post_group_by: Vec::new(),
-                post_aggregates: Vec::new(),
                 projection: Vec::new(),
                 computed_projection: Vec::new(),
                 join_filters: Vec::new(),
@@ -1760,6 +1792,8 @@ mod tests {
                 limit: 0,
                 left_rls_filters: Vec::new(),
                 right_rls_filters: Vec::new(),
+                left_input: None,
+                right_input: None,
             }),
             PhysicalPlan::Query(QueryOp::SortMergeJoin {
                 left_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "l"),
@@ -1770,6 +1804,8 @@ mod tests {
                 pre_sorted: false,
                 left_rls_filters: Vec::new(),
                 right_rls_filters: Vec::new(),
+                left_input: None,
+                right_input: None,
             }),
             PhysicalPlan::Query(QueryOp::FacetCounts {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1852,10 +1888,17 @@ mod tests {
                     refresh_policy: RefreshPolicy::OnFlush,
                     retention_period_ms: 0,
                     stale: false,
+                    incarnation: Default::default(),
                 },
             }),
             PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: "agg".into() }),
             PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
+            PhysicalPlan::Meta(MetaOp::ContinuousAggregatesRegistered),
+            PhysicalPlan::Meta(MetaOp::AwaitContinuousAggregateRefresh {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "src"),
+                name: "agg".into(),
+                refresh_id: 1,
+            }),
             PhysicalPlan::Meta(MetaOp::ConvertCollection {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 target_type: "kv".into(),
@@ -1897,6 +1940,7 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::EnforceTimeseriesRetention {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 max_age_ms: 0,
+                aggregates: Vec::new(),
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeEdgeStore {
                 tenant_id: 1,
@@ -1912,6 +1956,7 @@ mod tests {
                 tenant_id: 1,
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 cutoff_system_ms: 0,
+                aggregates: Vec::new(),
             }),
             PhysicalPlan::Meta(MetaOp::TemporalPurgeCrdt {
                 tenant_id: 1,
@@ -2123,9 +2168,17 @@ mod tests {
     #[test]
     fn flipped_variants_are_buffered_and_unencoded() {
         let plans = vec![
+            PhysicalPlan::Document(DocumentOp::InsertSelect {
+                target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
+                source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                    QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                ),
+            }),
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                    QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                ),
                 source_alias: "s".into(),
                 target_join_col: "id".into(),
                 source_join_col: "id".into(),
@@ -2141,7 +2194,9 @@ mod tests {
             }),
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                    QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                ),
                 source_alias: "s".into(),
                 target_join_col: "id".into(),
                 source_join_col: "id".into(),

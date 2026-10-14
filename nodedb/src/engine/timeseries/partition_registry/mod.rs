@@ -11,13 +11,17 @@
 //! recorded here. On crash recovery, replay the manifest to reach a
 //! consistent state.
 
+pub mod boundary;
 pub mod entry;
 pub mod lifecycle;
+pub mod listing;
 pub mod persistence;
 pub mod query;
 pub mod rate;
 pub mod registry;
 
+pub use boundary::interval_bounds;
 pub use entry::{PartitionEntry, format_partition_dir};
+pub use listing::PartitionListing;
 pub use rate::RateEstimator;
 pub use registry::PartitionRegistry;

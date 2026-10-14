@@ -13,9 +13,7 @@ use nodedb_types::vector_ann::VectorQuantization;
 use nodedb_types::vector_distance::DistanceMetric;
 use nodedb_types::vector_dtype::VectorStorageDtype;
 
-use crate::parser::preprocess::lex::{
-    find_ascii_case_insensitive, find_ascii_case_insensitive_from, find_ascii_keyword,
-};
+use super::clause::{ClauseCursor, Tok, Token, tokenize};
 
 /// Known quantization codec names accepted in DDL.
 const VALID_QUANTIZATIONS: &[&str] = &[
@@ -24,87 +22,87 @@ const VALID_QUANTIZATIONS: &[&str] = &[
 
 /// Parse vector-primary options from raw CREATE COLLECTION SQL.
 ///
+/// The options are the pairs of the statement's top-level `WITH (...)`
+/// clause; a `WITH` or an option name inside the column list or a literal is
+/// never read. Values are lower-cased, and a `[...]` list value becomes its
+/// comma-joined items.
+///
 /// Returns `Ok(None)` if `primary` is absent or set to a non-vector value.
 /// Returns `Ok(Some(cfg))` if `primary = 'vector'` and all required options
 /// are present and valid.
-/// Returns `Err(NodeDbError)` for any validation failure.
+/// Returns `Err(NodeDbError)` for any validation failure, including a
+/// malformed WITH clause.
 pub fn parse_vector_primary_options(sql: &str) -> Result<Option<VectorPrimaryConfig>, NodeDbError> {
-    let primary_val = extract_with_str(sql, "primary");
+    let options = with_option_pairs(sql)
+        .map_err(|e| NodeDbError::bad_request(format!("WITH clause: {e}")))?;
+    parse_vector_primary_options_from_kvs(&options)
+}
 
-    match primary_val.as_deref() {
-        None
-        | Some("document_schemaless")
-        | Some("document_strict")
-        | Some("kv")
-        | Some("columnar")
-        | Some("timeseries")
-        | Some("spatial") => return Ok(None),
-        Some("vector") => {}
-        Some(other) => {
-            return Err(NodeDbError::bad_request(format!(
-                "unknown primary engine '{other}'; valid values: \
-                 document_schemaless, document_strict, kv, columnar, timeseries, spatial, vector"
-            )));
+/// Index of the first `WITH` token at parenthesis depth zero that opens a
+/// parenthesized list.
+fn top_level_with(toks: &[Token<'_>]) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, tok) in toks.iter().enumerate() {
+        match &tok.tok {
+            Tok::Punct('(') => depth += 1,
+            Tok::Punct(')') => depth -= 1,
+            Tok::Word(w)
+                if depth == 0
+                    && w.eq_ignore_ascii_case("WITH")
+                    && toks.get(i + 1).is_some_and(|t| t.tok == Tok::Punct('(')) =>
+            {
+                return Some(i);
+            }
+            _ => {}
         }
     }
+    None
+}
 
-    // primary = 'vector' — require vector_field.
-    let vector_field = extract_with_str(sql, "vector_field")
-        .ok_or_else(|| NodeDbError::bad_request("primary='vector' requires vector_field option"))?;
-    if vector_field.is_empty() {
-        return Err(NodeDbError::bad_request(
-            "vector_field must be a non-empty column name",
-        ));
-    }
-
-    // Require dim.
-    let dim = extract_with_u32(sql, "dim").ok_or_else(|| {
-        NodeDbError::bad_request("primary='vector' requires dim option (e.g. dim=1024)")
-    })?;
-
-    // Optional: quantization (default: None / Sq8).
-    let quantization = match extract_with_str(sql, "quantization").as_deref() {
-        None => VectorQuantization::default(),
-        Some(q) => parse_quantization(q)?,
+/// The `(key, value)` pairs of the top-level `WITH (...)` clause, values
+/// lower-cased. Empty when the statement has no such clause.
+fn with_option_pairs(sql: &str) -> Result<Vec<(String, String)>, crate::error::SqlError> {
+    let toks = tokenize(sql);
+    let Some(at) = top_level_with(&toks) else {
+        return Ok(Vec::new());
     };
-
-    // Optional: m (default 16).
-    let m: u8 = extract_with_u32(sql, "m")
-        .and_then(|v| u8::try_from(v).ok())
-        .unwrap_or(16);
-
-    // Optional: ef_construction (default 200).
-    let ef_construction: u16 = extract_with_u32(sql, "ef_construction")
-        .and_then(|v| u16::try_from(v).ok())
-        .unwrap_or(200);
-
-    // Optional: metric (default Cosine).
-    let metric = match extract_with_str(sql, "metric").as_deref() {
-        None => DistanceMetric::Cosine,
-        Some(m) => parse_metric(m)?,
-    };
-
-    // Optional: storage_dtype (default F32).
-    let storage_dtype = parse_storage_dtype(extract_with_str(sql, "storage_dtype").as_deref())?;
-
-    // Optional: payload_indexes (array of quoted strings). Parser emits
-    // names only; the DDL handler infers the kind from each column's type
-    // before storing the final config.
-    let payload_indexes = extract_payload_indexes(sql)
-        .into_iter()
-        .map(|f| (f, nodedb_types::PayloadIndexKind::Equality))
-        .collect();
-
-    Ok(Some(VectorPrimaryConfig {
-        vector_field,
-        dim,
-        quantization,
-        m,
-        ef_construction,
-        metric,
-        storage_dtype,
-        payload_indexes,
-    }))
+    let mut c = ClauseCursor::new(sql, &toks[at + 1..], "WITH");
+    c.paren_list("WITH options", |c| {
+        let key = c.word("option name")?.to_lowercase();
+        c.expect_punct('=')?;
+        let value = if c.eat_punct('[') {
+            let mut items = Vec::new();
+            if !c.eat_punct(']') {
+                loop {
+                    let item = match c.string("list item") {
+                        Ok(item) => item,
+                        Err(_) => c.name("list item")?,
+                    };
+                    items.push(item);
+                    if c.eat_punct(',') {
+                        continue;
+                    }
+                    c.expect_punct(']')?;
+                    break;
+                }
+            }
+            items.join(",")
+        } else {
+            match c.string(&key) {
+                Ok(value) => value,
+                Err(_) => {
+                    let run = c.raw_run(&key)?.trim_matches('"').to_string();
+                    // A call-shaped value such as `time(1h)` keeps its argument list.
+                    if c.peek_punct('(') {
+                        format!("{run}({})", c.raw_paren(&key)?)
+                    } else {
+                        run
+                    }
+                }
+            }
+        };
+        Ok((key, value.trim().to_lowercase()))
+    })
 }
 
 /// Validate that `vector_field` names a `VECTOR(n)` column in the provided
@@ -233,26 +231,37 @@ pub fn parse_vector_primary_options_from_kvs(
         ));
     }
 
-    let dim = get("dim")
-        .and_then(|v| v.parse::<u32>().ok())
-        .ok_or_else(|| {
-            NodeDbError::bad_request("primary='vector' requires dim option (e.g. dim=1024)")
-        })?;
+    let dim_raw = get("dim").ok_or_else(|| {
+        NodeDbError::bad_request("primary='vector' requires dim option (e.g. dim=1024)")
+    })?;
+    let dim = dim_raw.trim().parse::<u32>().map_err(|_| {
+        NodeDbError::bad_request(format!(
+            "dim must be a non-negative integer (e.g. dim=1024), got '{dim_raw}'"
+        ))
+    })?;
 
     let quantization = match get("quantization").as_deref() {
         None => VectorQuantization::default(),
         Some(q) => parse_quantization(q)?,
     };
 
-    let m: u8 = get("m")
-        .and_then(|v| v.parse::<u32>().ok())
-        .and_then(|v| u8::try_from(v).ok())
-        .unwrap_or(16);
+    // A value that does not parse or does not fit is refused, never replaced
+    // by the default.
+    let m: u8 = match get("m") {
+        None => 16,
+        Some(raw) => raw.trim().parse::<u8>().map_err(|_| {
+            NodeDbError::bad_request(format!("m must be an integer in 0..=255, got '{raw}'"))
+        })?,
+    };
 
-    let ef_construction: u16 = get("ef_construction")
-        .and_then(|v| v.parse::<u32>().ok())
-        .and_then(|v| u16::try_from(v).ok())
-        .unwrap_or(200);
+    let ef_construction: u16 = match get("ef_construction") {
+        None => 200,
+        Some(raw) => raw.trim().parse::<u16>().map_err(|_| {
+            NodeDbError::bad_request(format!(
+                "ef_construction must be an integer in 0..=65535, got '{raw}'"
+            ))
+        })?,
+    };
 
     let metric = match get("metric").as_deref() {
         None => DistanceMetric::Cosine,
@@ -293,129 +302,6 @@ pub fn parse_vector_primary_options_from_kvs(
         storage_dtype,
         payload_indexes,
     }))
-}
-
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-/// Find the substring inside the outermost `WITH (...)` clause, if any.
-/// Falls back to the whole SQL when no WITH clause is present.
-fn with_clause(sql: &str) -> &str {
-    let Some(pos) = find_ascii_keyword(sql, "WITH") else {
-        return sql;
-    };
-    // Whole-word check on WITH.
-    if pos > 0 {
-        let before = sql.as_bytes()[pos - 1];
-        if before.is_ascii_alphanumeric() || before == b'_' {
-            return sql;
-        }
-    }
-    let after = &sql[pos + 4..];
-    let Some(open) = after.find('(') else {
-        return sql;
-    };
-    let inner = &after[open + 1..];
-    let Some(close) = inner.rfind(')') else {
-        return inner;
-    };
-    &inner[..close]
-}
-
-/// Extract a `key = 'value'` or `key = "value"` string from SQL WITH options.
-fn extract_with_str(sql: &str, key: &str) -> Option<String> {
-    let scope = with_clause(sql);
-    // Find a whole-word, '='-followed occurrence; skip false matches like
-    // "m" inside "metric" or inside "dim".
-    let mut start = 0usize;
-    let pos = loop {
-        let abs = find_ascii_case_insensitive_from(scope, key, start)?;
-        let before_ok = abs == 0 || {
-            let b = scope.as_bytes()[abs - 1];
-            !(b.is_ascii_alphanumeric() || b == b'_')
-        };
-        let after_byte = scope
-            .as_bytes()
-            .get(abs + key.len())
-            .copied()
-            .unwrap_or(b' ');
-        let after_ok = !(after_byte.is_ascii_alphanumeric() || after_byte == b'_');
-        if before_ok && after_ok {
-            break abs;
-        }
-        start = abs + key.len();
-    };
-
-    let after = scope[pos + key.len()..].trim_start();
-    let after = after.strip_prefix('=')?;
-    let after = after.trim_start();
-
-    // Value may be quoted with single or double quotes.
-    if let Some(rest) = after.strip_prefix('\'') {
-        let end = rest.find('\'')?;
-        let v = rest[..end].trim().to_lowercase();
-        return if v.is_empty() { None } else { Some(v) };
-    }
-    if let Some(rest) = after.strip_prefix('"') {
-        let end = rest.find('"')?;
-        let v = rest[..end].trim().to_lowercase();
-        return if v.is_empty() { None } else { Some(v) };
-    }
-
-    // Bare value (numeric-looking or unquoted identifier).
-    let end = after
-        .find(|c: char| c == ',' || c == ')' || c.is_whitespace())
-        .unwrap_or(after.len());
-    let v = after[..end].trim().to_lowercase();
-    if v.is_empty() { None } else { Some(v) }
-}
-
-/// Extract a `key = <integer>` value from SQL WITH options.
-fn extract_with_u32(sql: &str, key: &str) -> Option<u32> {
-    let raw = extract_with_str(sql, key)?;
-    raw.parse::<u32>().ok()
-}
-
-/// Extract `payload_indexes = ['a', 'b', ...]` from SQL.
-///
-/// Returns an empty `Vec` if the key is absent.
-fn extract_payload_indexes(sql: &str) -> Vec<String> {
-    let scope = with_clause(sql);
-    let pos = match find_ascii_case_insensitive(scope, "PAYLOAD_INDEXES") {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
-
-    let after = scope[pos + "payload_indexes".len()..].trim_start();
-    let after = match after.strip_prefix('=') {
-        Some(a) => a.trim_start(),
-        None => return Vec::new(),
-    };
-
-    // Expect '[' ... ']'.
-    let after = match after.strip_prefix('[') {
-        Some(a) => a,
-        None => return Vec::new(),
-    };
-    let end = match after.find(']') {
-        Some(e) => e,
-        None => return Vec::new(),
-    };
-    let inner = &after[..end];
-
-    // Split by commas, strip quotes.
-    inner
-        .split(',')
-        .filter_map(|s| {
-            let s = s.trim();
-            let s = s
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-                .or_else(|| s.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-                .unwrap_or(s);
-            let s = s.trim().to_lowercase();
-            if s.is_empty() { None } else { Some(s) }
-        })
-        .collect()
 }
 
 /// Parse a quantization string to `VectorQuantization`.
@@ -472,28 +358,80 @@ fn parse_metric(m: &str) -> Result<DistanceMetric, NodeDbError> {
 mod tests {
     use super::*;
 
+    fn pairs(sql: &str) -> Vec<(String, String)> {
+        with_option_pairs(sql).expect("WITH parses")
+    }
+
     #[test]
     fn with_clause_after_unicode_schema_preserves_original_offsets() {
         assert_eq!(
-            with_clause("CREATE COLLECTION v (name ﬀﬀ) WITH (primary='vector')"),
-            "primary='vector'"
+            pairs("CREATE COLLECTION v (name ﬀﬀ) WITH (primary='vector')"),
+            vec![("primary".to_string(), "vector".to_string())]
         );
     }
 
     #[test]
     fn option_after_unicode_value_preserves_original_offsets() {
         assert_eq!(
-            extract_with_str("WITH (note='ﬀﬀ', metric='cosine')", "metric"),
-            Some("cosine".to_string())
+            pairs("CREATE COLLECTION v WITH (note='ﬀﬀ', metric='cosine')")[1],
+            ("metric".to_string(), "cosine".to_string())
         );
     }
 
     #[test]
-    fn payload_indexes_after_unicode_value_preserve_original_offsets() {
+    fn payload_indexes_list_is_comma_joined() {
         assert_eq!(
-            extract_payload_indexes("WITH (note='ﬀﬀ', payload_indexes=['category'])"),
-            vec!["category"]
+            pairs("CREATE COLLECTION v WITH (note='ﬀﬀ', payload_indexes=['category', \"Tag\"])")[1],
+            ("payload_indexes".to_string(), "category,tag".to_string())
         );
+    }
+
+    #[test]
+    fn option_name_inside_a_literal_or_column_list_is_not_read() {
+        // The old reader matched `dim` inside the column default and the
+        // literal, and so saw `dim=7`.
+        let sql = "CREATE COLLECTION v (note TEXT DEFAULT 'dim=7', vec VECTOR(64)) \
+            WITH (primary='vector', vector_field='vec', dim=64)";
+        let cfg = parse_vector_primary_options(sql)
+            .expect("parse ok")
+            .expect("should be Some");
+        assert_eq!(cfg.dim, 64);
+    }
+
+    #[test]
+    fn with_inside_column_list_is_not_the_options_clause() {
+        let toks = tokenize("CREATE COLLECTION v (a TEXT CHECK (a WITH (x))) WITH (dim=3)");
+        let at = top_level_with(&toks).expect("top-level WITH");
+        assert_eq!(toks[at + 2].tok, Tok::Word("dim"));
+    }
+
+    #[test]
+    fn call_shaped_value_keeps_its_arguments() {
+        assert_eq!(
+            pairs("CREATE COLLECTION v WITH (partition_by=time(1h), dim=3)")[0],
+            ("partition_by".to_string(), "time(1h)".to_string())
+        );
+    }
+
+    #[test]
+    fn malformed_with_clause_is_an_error() {
+        assert!(parse_vector_primary_options("CREATE COLLECTION v WITH (dim 3)").is_err());
+        assert!(parse_vector_primary_options("CREATE COLLECTION v WITH (dim=3").is_err());
+    }
+
+    #[test]
+    fn out_of_range_hnsw_options_are_refused() {
+        // The old reader replaced an out-of-range m or ef_construction with
+        // the default.
+        let base = "CREATE COLLECTION c (v VECTOR(64)) WITH (primary='vector', \
+            vector_field='v', dim=64";
+        for extra in [", m=300)", ", ef_construction=70000)", ", m=abc)"] {
+            let sql = format!("{base}{extra}");
+            assert!(parse_vector_primary_options(&sql).is_err(), "{sql}");
+        }
+        let bad_dim = "CREATE COLLECTION c (v VECTOR(64)) WITH (primary='vector', \
+            vector_field='v', dim=-1)";
+        assert!(parse_vector_primary_options(bad_dim).is_err());
     }
 
     // ── Happy path ────────────────────────────────────────────────────────

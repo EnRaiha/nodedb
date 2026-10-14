@@ -5,8 +5,8 @@
 
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ColumnarOp, CrdtOp, CrdtWriteVerb, DocumentOp, GraphOp, KvOp, SpatialOp, TimeseriesOp,
-    VectorOp,
+    ArrayOp, ColumnarOp, CrdtOp, CrdtWriteVerb, DocumentOp, GraphOp, KvBatchIntent, KvOp,
+    SpatialOp, TimeseriesOp, VectorOp,
 };
 
 /// Allow-list of plans the in-transaction path stages at statement time: Document
@@ -175,11 +175,22 @@ fn kv_write_shape(op: &KvOp) -> Option<StagedWriteShape> {
     match op {
         // The SQL `UPSERT` statement, tagged like its `DocumentOp::Upsert`
         // sibling and like the autocommit `describe_plan` arm.
-        KvOp::Put { .. } => Some(StagedWriteShape::Upsert),
-        KvOp::Insert { .. } | KvOp::InsertIfAbsent { .. } | KvOp::BatchPut { .. } => {
-            Some(StagedWriteShape::Insert)
-        }
-        KvOp::InsertOnConflictUpdate { .. } => Some(StagedWriteShape::ConflictUpsert),
+        KvOp::Put { .. }
+        | KvOp::BatchPut {
+            intent: KvBatchIntent::Upsert,
+            ..
+        } => Some(StagedWriteShape::Upsert),
+        KvOp::Insert { .. }
+        | KvOp::InsertIfAbsent { .. }
+        | KvOp::BatchPut {
+            intent: KvBatchIntent::Put | KvBatchIntent::Insert | KvBatchIntent::InsertIfAbsent,
+            ..
+        } => Some(StagedWriteShape::Insert),
+        KvOp::InsertOnConflictUpdate { .. }
+        | KvOp::BatchPut {
+            intent: KvBatchIntent::Merge { .. },
+            ..
+        } => Some(StagedWriteShape::ConflictUpsert),
         KvOp::Delete { .. } => Some(StagedWriteShape::Delete),
         // Predicate DML: the row set resolves against BASE ∪ OVERLAY at
         // statement time, the same shapes as Document `BulkUpdate`/`BulkDelete`.
@@ -559,6 +570,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
+            intent: KvBatchIntent::Put,
             surrogates: vec![nodedb_types::Surrogate::new(1)],
             returning: None,
             rls_filters: Vec::new(),
@@ -633,17 +645,33 @@ mod tests {
     #[test]
     fn kv_write_shape_batch_put_is_insert() {
         let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "inserted": 2 })).unwrap();
-        let op = KvOp::BatchPut {
+        let batch = |intent| KvOp::BatchPut {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
             entries: vec![(b"k".to_vec(), b"v".to_vec())],
             ttl_ms: 0,
+            intent,
             surrogates: vec![nodedb_types::Surrogate::new(1)],
             returning: None,
             rls_filters: Vec::new(),
         };
+        for intent in [
+            KvBatchIntent::Put,
+            KvBatchIntent::Insert,
+            KvBatchIntent::InsertIfAbsent,
+        ] {
+            assert_eq!(
+                kv_write_shape(&batch(intent))
+                    .expect("stageable")
+                    .tag_kind(&payload),
+                StagedTagKind::Insert
+            );
+        }
+        // A multi-row SQL `UPSERT` tags like the single-row `Put`.
         assert_eq!(
-            kv_write_shape(&op).expect("stageable").tag_kind(&payload),
-            StagedTagKind::Insert
+            kv_write_shape(&batch(KvBatchIntent::Upsert))
+                .expect("stageable")
+                .tag_kind(&payload),
+            StagedTagKind::Upsert
         );
     }
 

@@ -4,7 +4,7 @@
 
 use super::super::types::ReplicatedWrite;
 use super::entry::{encode_provenance, encode_returning};
-use nodedb_physical::physical_plan::{KvCounterShape, ReturningSpec, UpdateValue};
+use nodedb_physical::physical_plan::{KvBatchIntent, KvCounterShape, ReturningSpec, UpdateValue};
 use nodedb_types::Surrogate;
 use nodedb_types::sync::wire::SyncProvenance;
 
@@ -96,26 +96,6 @@ pub(super) fn insert(
     }
 }
 
-pub(super) fn insert_if_absent(
-    collection: &str,
-    key: &[u8],
-    value: &[u8],
-    ttl_ms: u64,
-    surrogate: u32,
-    returning: WireReturning<'_>,
-) -> ReplicatedWrite {
-    ReplicatedWrite::KvInsertIfAbsent {
-        collection: collection.to_owned(),
-        key: key.to_vec(),
-        value: value.to_vec(),
-        ttl_ms,
-        surrogate,
-        resolved_now_ms: resolve_now_ms(ttl_ms),
-        returning: encode_returning(returning.returning),
-        rls_filters: returning.rls_filters.to_vec(),
-    }
-}
-
 pub(super) fn insert_on_conflict_update(
     collection: &str,
     key: &[u8],
@@ -142,6 +122,7 @@ pub(super) fn batch_put(
     collection: &str,
     entries: &[(Vec<u8>, Vec<u8>)],
     ttl_ms: u64,
+    intent: KvBatchIntent,
     surrogates: &[Surrogate],
     returning: WireReturning<'_>,
 ) -> ReplicatedWrite {
@@ -149,6 +130,7 @@ pub(super) fn batch_put(
         collection: collection.to_owned(),
         entries: entries.to_vec(),
         ttl_ms,
+        intent,
         surrogates: surrogates.iter().map(|s| s.as_u32()).collect(),
         resolved_now_ms: resolve_now_ms(ttl_ms),
         returning: encode_returning(returning.returning),

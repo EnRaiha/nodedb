@@ -145,6 +145,10 @@ fn entry_scope(decoded: &mut Option<ReplicatedEntry>) -> EntryScope {
             .as_mut()
             .map(|e| std::mem::take(&mut e.incarnations))
             .unwrap_or_default(),
+        user_roles: decoded
+            .as_mut()
+            .map(|e| std::mem::take(&mut e.user_roles))
+            .unwrap_or_default(),
     }
 }
 
@@ -309,6 +313,13 @@ fn prepare_replicated<'a>(
             epoch,
             position,
         )),
+        // A refresh cut flushes the collection's memtable at its log
+        // position. It applies with nothing else of its group in flight, so
+        // the group's applied floor never passes a cut whose apply has not
+        // finished, and a re-delivery after a restart cuts at the same rows.
+        ReplicatedWrite::TimeseriesAggregateRefresh { .. } => {
+            prepare_generic_entry(ctx, pos, entry, scope, true)
+        }
         _ => prepare_generic_entry(ctx, pos, entry, scope, false),
     }
 }

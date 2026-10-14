@@ -2,7 +2,7 @@
 
 //! RLS resolution for key-value engine operations.
 
-use nodedb_physical::physical_plan::KvOp;
+use nodedb_physical::physical_plan::{KvBatchIntent, KvOp};
 
 use super::context::RlsCtx;
 
@@ -95,11 +95,30 @@ pub(super) fn inject_kv(ctx: &RlsCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.set_post_filters(collection, rls_filters)
         }
 
+        // Ship the predicate for a merge: a stored row's merged body exists
+        // only where it is persisted. `RETURNING` output is a read.
+        KvOp::BatchPut {
+            collection,
+            intent: KvBatchIntent::Merge {
+                rls_write_check, ..
+            },
+            rls_filters,
+            ..
+        } => {
+            ctx.set_write_check(collection, rls_write_check)?;
+            ctx.set_post_filters(collection, rls_filters)
+        }
+
         // Admit every entry: a silently dropped row will report a write
         // that never happened.
         KvOp::BatchPut {
             collection,
             entries,
+            intent:
+                KvBatchIntent::Put
+                | KvBatchIntent::Upsert
+                | KvBatchIntent::Insert
+                | KvBatchIntent::InsertIfAbsent,
             rls_filters,
             ..
         } => {
@@ -391,6 +410,7 @@ mod tests {
             ),
             entries: vec![(b"k1".to_vec(), body("42")), (b"k2".to_vec(), body("99"))],
             ttl_ms: 0,
+            intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
             surrogates: Vec::new(),
             returning: None,
             rls_filters: Vec::new(),

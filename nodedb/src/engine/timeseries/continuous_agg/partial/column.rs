@@ -23,14 +23,14 @@ use super::super::definition::AggFunction;
 use crate::util::fnv1a_hash;
 
 /// A cell at its timestamp, for FIRST / LAST.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct TimedCell {
     pub ts: i64,
     pub value: Value,
 }
 
 /// Partial aggregate state of one source column.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct ColumnPartial {
     /// Exact SUM / AVG state. Its count is the number of cells added.
     pub sum: ExactSum,
@@ -81,8 +81,12 @@ impl ColumnPartial {
         );
     }
 
-    /// Add one float cell at timestamp `ts`.
+    /// Add one float cell at timestamp `ts`. A NaN cell is how a timeseries
+    /// column stores NULL, so it feeds no part of the state.
     pub fn add_float(&mut self, ts: i64, v: f64) {
+        if v.is_nan() {
+            return;
+        }
         self.sum.add_f64(v);
         self.add_cell(
             ts,
@@ -200,6 +204,29 @@ mod tests {
         assert_eq!(b.max, single.max);
         assert_eq!(b.first, single.first);
         assert_eq!(b.last, single.last);
+    }
+
+    #[test]
+    fn nan_cells_feed_no_part_of_the_state() {
+        let mut c = ColumnPartial::with_sketches(&[
+            AggFunction::CountDistinct,
+            AggFunction::Percentile(0.5),
+            AggFunction::TopK(3),
+        ]);
+        c.add_float(1, f64::NAN);
+        c.add_float(2, 4.0);
+        c.add_float(3, f64::NAN);
+        assert_eq!(c.sum.count(), 1);
+        assert_eq!(c.sum.sum().unwrap(), Value::Float(4.0));
+        assert_eq!(c.min, Some(Value::Float(4.0)));
+        assert_eq!(c.max, Some(Value::Float(4.0)));
+        assert_eq!(c.first.as_ref().map(|f| f.ts), Some(2));
+        assert_eq!(c.last.as_ref().map(|l| l.ts), Some(2));
+        let hll = c.hll.as_ref().map_or(0.0, HyperLogLog::estimate);
+        assert!(hll < 1.5, "one distinct value, estimate {hll}");
+        let median = c.tdigest.as_ref().map_or(f64::NAN, |t| t.quantile(0.5));
+        assert_eq!(median, 4.0);
+        assert_eq!(c.topk.as_ref().map_or(0, |s| s.top_k().len()), 1);
     }
 
     #[test]

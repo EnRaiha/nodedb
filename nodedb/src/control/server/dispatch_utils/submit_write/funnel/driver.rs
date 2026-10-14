@@ -51,6 +51,7 @@ pub(crate) async fn enqueue_write(
         event_source,
         txn_id,
         user_id,
+        user_roles,
         mut durability,
         ordering,
         change_feed,
@@ -237,6 +238,7 @@ pub(crate) async fn enqueue_write(
                 vshard_id,
                 plan,
                 event_source,
+                user_roles,
             )
             .await;
             if let Some(superseded) = superseded {
@@ -389,6 +391,7 @@ pub(crate) async fn enqueue_write(
             trace_id,
             event_source,
             user_id,
+            user_roles,
             txn_id,
             wal_lsn,
             resolved_now_ms,

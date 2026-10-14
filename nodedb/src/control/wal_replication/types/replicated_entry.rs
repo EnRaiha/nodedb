@@ -57,6 +57,10 @@ pub struct ReplicatedEntry {
     /// proposer planned against. A replica applies the write only while each
     /// collection still holds that incarnation.
     pub incarnations: Vec<CollectionIncarnation>,
+    /// The roles of the identity that wrote the write. Every replica judges a
+    /// role-guarded state transition against this set, so each reaches the
+    /// same verdict. Empty for a write no user made.
+    pub user_roles: Vec<String>,
 }
 
 /// A user collection a replicated write names, and the incarnation its
@@ -100,7 +104,14 @@ impl ReplicatedEntry {
             event_source: ReplicatedEventSource::User,
             restore_id: 0,
             incarnations: Vec::new(),
+            user_roles: Vec::new(),
         }
+    }
+
+    /// Stamp the roles of the identity that wrote the write.
+    pub fn with_user_roles(mut self, user_roles: Vec<String>) -> Self {
+        self.user_roles = user_roles;
+        self
     }
 
     /// Stamp the source every replica gives the write's events.

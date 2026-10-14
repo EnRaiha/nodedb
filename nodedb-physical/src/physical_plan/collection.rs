@@ -31,6 +31,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Vector(VectorOp::DirectUpsert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::DirectInsert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::DirectInsertIfAbsent { collection, .. })
+            | PhysicalPlan::Vector(VectorOp::DirectBatchWrite { collection, .. })
             | PhysicalPlan::Vector(VectorOp::DirectDelete { collection, .. })
             | PhysicalPlan::Vector(VectorOp::DirectTruncate { collection, .. })
             | PhysicalPlan::Vector(VectorOp::DirectUpdate { collection, .. })
@@ -66,6 +67,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })
             | PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. })
             | PhysicalPlan::Document(DocumentOp::Upsert { collection, .. })
+            | PhysicalPlan::Document(DocumentOp::BatchUpsert { collection, .. })
             | PhysicalPlan::Document(DocumentOp::InsertSelect {
                 target_collection: collection,
                 ..
@@ -82,6 +84,9 @@ impl PhysicalPlan {
             | PhysicalPlan::Timeseries(TimeseriesOp::Scan { collection, .. })
             | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { collection, .. })
             | PhysicalPlan::Timeseries(TimeseriesOp::Truncate { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::Partitions { collection, .. })
+            | PhysicalPlan::Timeseries(TimeseriesOp::ReadAggregate { collection, .. })
             | PhysicalPlan::Spatial(SpatialOp::Scan { collection, .. })
             | PhysicalPlan::Document(DocumentOp::Register { collection, .. })
             | PhysicalPlan::Document(DocumentOp::IndexLookup { collection, .. })
@@ -94,7 +99,10 @@ impl PhysicalPlan {
             PhysicalPlan::Timeseries(TimeseriesOp::ResolveIngest(inner)) => match &inner.ingest {
                 TimeseriesOp::Scan { collection, .. }
                 | TimeseriesOp::Ingest { collection, .. }
-                | TimeseriesOp::Truncate { collection, .. } => Some(collection.as_str()),
+                | TimeseriesOp::Truncate { collection, .. }
+                | TimeseriesOp::RefreshAggregate { collection, .. }
+                | TimeseriesOp::Partitions { collection, .. }
+                | TimeseriesOp::ReadAggregate { collection, .. } => Some(collection.as_str()),
                 TimeseriesOp::ResolveIngest(_) => None,
             },
             // Same shape on the graph side, and `EdgeDelete` itself reports

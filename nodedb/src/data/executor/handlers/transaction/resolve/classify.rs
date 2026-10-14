@@ -116,8 +116,9 @@ pub(super) fn classify_document_op(
         // A balance write stages like any other point write: one target row,
         // one absolute post-image, keyed by the row's own surrogate.
         | DocumentOp::ApplyBalanceDelta { collection, .. }
-        // A Calvin batch insert stages each row as a point put.
-        | DocumentOp::BatchInsert { collection, .. } => {
+        // A Calvin batch insert or upsert stages each row as a point write.
+        | DocumentOp::BatchInsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. } => {
             collections.insert(collection.to_string());
             Ok(())
         }

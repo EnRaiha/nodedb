@@ -40,8 +40,7 @@ impl CoreLoop {
         };
         // Same single-equality pushdown the read scan uses, so an indexed
         // predicate narrows the candidate set instead of walking the table.
-        let (filter_field, filter_value) =
-            crate::data::executor::handlers::kv::scan::extract_eq_filter(filters);
+        let probe = crate::data::executor::handlers::kv::scan::eq_index_probe(&predicates);
 
         let mut cursor: Vec<u8> = Vec::new();
         let mut matched: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -54,8 +53,8 @@ impl CoreLoop {
                 count: KV_PREDICATE_SCAN_BATCH,
                 now_ms,
                 match_pattern: None,
-                filter_field: filter_field.as_deref(),
-                filter_value: filter_value.as_deref(),
+                filter_field: probe.as_ref().map(|(field, _)| *field),
+                filter_value: probe.as_ref().map(|(_, key)| key.as_slice()),
                 surrogate_ceiling: None,
             });
             for (key, value) in entries {

@@ -26,12 +26,16 @@ use crate::types::RequestId;
 /// back as an error `Response` carrying that code, the same shape a local
 /// dispatch returns, so a caller reads `OllpRetryRequired` the one way on
 /// both paths.
+///
+/// The entry carries `user_roles`, the roles of the statement's identity, so
+/// every replica judges a role-guarded state transition alike.
 pub(crate) async fn apply_orchestrated_write(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     collection: &str,
     plan: PhysicalPlan,
+    user_roles: Vec<String>,
 ) -> crate::Result<Response> {
     let proposer = state.async_raft_proposer()?;
 
@@ -39,15 +43,14 @@ pub(crate) async fn apply_orchestrated_write(
     let vshard_id =
         nodedb_types::CollectionKey::from_qualified_str(database_id, collection)?.vshard();
     let replicable = ReplicableWrite::decide_for_replication(&plan)?;
-    let entry =
-        to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)?.ok_or_else(|| {
-            crate::Error::Internal {
-                detail: format!(
-                    "orchestrated write on '{collection}' did not map to a replicated write; the \
+    let entry = to_replicated_entry(tenant_id, database_id, vshard_id, &replicable)?
+        .ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "orchestrated write on '{collection}' did not map to a replicated write; the \
                  orchestrator must propose its resolved shape"
-                ),
-            }
-        })?;
+            ),
+        })?
+        .with_user_roles(user_roles);
     let request_id = RequestId::new(state.request_id_counter.fetch_add(1, Ordering::Relaxed));
     let deadline = crate::control::server::shared::session::StatementDeadline::of_statement(state)
         .tokio_instant();

@@ -2,270 +2,272 @@
 
 //! ROLLUP / CUBE / GROUPING SETS execution.
 //!
-//! For each grouping set we run the existing single-set aggregation path,
-//! NULL-fill columns that are absent from that set, inject a `__grouping_id`
-//! bitmask (bit i = 1 when group_by[i] is present), then union all result rows.
+//! The WHERE predicates are applied once. Then each grouping set groups the
+//! surviving rows by the keys active in that set, NULL-fills the keys absent
+//! from it, and adds a `__grouping_id` bitmask (bit i = 1 when group_by[i] is
+//! present). The rows of every set are unioned, then HAVING, ORDER BY and
+//! LIMIT apply to the union.
 //!
-//! The `GROUPING(col)` function evaluates to `(__grouping_id >> i) & 1 ^ 1`
-//! where `i` is the canonical index of `col` — 0 when the column is a real
-//! aggregated value, 1 when it was NULL-filled for this set.
+//! `GROUPING(col)` evaluates to `((__grouping_id >> i) & 1) ^ 1`, where `i`
+//! is the index of `col` in the GROUP BY list: 0 when the column holds a real
+//! grouped value, 1 when it was NULL-filled for this set.
 
 use std::collections::HashMap;
 
 use nodedb_types::Value;
-use sonic_rs;
 
 use super::accum::GroupState;
-use super::aggregate::rows::{apply_user_aliases_to_rows, retain_having};
+use super::aggregate::rows::{apply_user_aliases_to_rows, retain_having, sort_aggregated_rows};
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::bridge::scan_filter::ScanFilter;
+use crate::bridge::scan_filter::{ScanFilter, decode_scan_filters};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
+use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec, SortKeySpec};
 use nodedb_query::msgpack_scan;
 
 /// Hidden column name carrying the grouping bitmask for `GROUPING()` support.
 pub const GROUPING_ID_COL: &str = "__grouping_id";
 
-/// Borrowed inputs to [`execute_grouping_sets`]: the target collection, the
-/// GROUP BY / aggregate / filter / HAVING specs, and the expanded grouping
-/// sets to union results over.
+/// The widest GROUP BY list a grouping bitmask can describe.
+const MAX_GROUPING_KEYS: u32 = u64::BITS;
+
+/// Inputs to [`execute_grouping_sets`]: the rows to aggregate, the GROUP BY /
+/// aggregate / filter / HAVING / sort specs, and the expanded grouping sets.
 pub(super) struct GroupingSetsParams<'a> {
     pub task: &'a ExecutionTask,
-    pub tid: u64,
-    pub collection: &'a str,
-    pub group_by: &'a [String],
+    pub docs: Vec<(String, Vec<u8>)>,
+    pub group_by: &'a [GroupKeySpec],
     pub aggregates: &'a [AggregateSpec],
     pub filters: &'a [u8],
     pub having: &'a [u8],
     pub limit: usize,
     pub grouping_sets: &'a [Vec<u32>],
+    pub sort_keys: &'a [SortKeySpec],
 }
 
 /// Execute a multi-set aggregate (ROLLUP / CUBE / GROUPING SETS).
-///
-/// Scans the collection once per grouping set, computes aggregates using only
-/// the keys active in that set, NULL-fills the absent keys, and unions rows.
-pub(super) fn execute_grouping_sets(
-    core: &mut CoreLoop,
-    params: GroupingSetsParams<'_>,
-) -> Response {
+pub(super) fn execute_grouping_sets(core: &CoreLoop, params: GroupingSetsParams<'_>) -> Response {
+    let task = params.task;
+    match grouping_set_rows(params) {
+        Ok(payload) => core.response_with_payload(task, payload),
+        Err(e) => core.response_error(task, ErrorCode::from(e)),
+    }
+}
+
+/// Aggregate every grouping set and encode the union as a MessagePack array.
+fn grouping_set_rows(params: GroupingSetsParams<'_>) -> crate::Result<Vec<u8>> {
     let GroupingSetsParams {
-        task,
-        tid,
-        collection,
+        task: _,
+        docs,
         group_by,
         aggregates,
         filters,
         having,
         limit,
         grouping_sets,
+        sort_keys,
     } = params;
 
-    let filter_predicates: Vec<ScanFilter> = if filters.is_empty() {
-        Vec::new()
-    } else {
-        match zerompk::from_msgpack(filters) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = %e, "grouping sets: filter deserialization failed");
-                Vec::new()
-            }
-        }
-    };
+    let filter_predicates = decode_scan_filters(filters, "grouping sets WHERE filter")?;
+    let having_predicates = decode_scan_filters(having, "grouping sets HAVING")?;
 
-    let having_predicates: Vec<ScanFilter> = if having.is_empty() {
-        Vec::new()
-    } else {
-        match zerompk::from_msgpack(having) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = %e, "grouping sets: HAVING deserialization failed");
-                Vec::new()
-            }
-        }
-    };
-
-    let scan_limit = core.query_tuning.aggregate_scan_cap;
-    let use_field_index = !filter_predicates.is_empty() || !group_by.is_empty();
-
-    // Scan documents once, collect them all into memory.
-    // This is necessary because we need to run multiple passes (one per set).
-    // Memory is bounded by `scan_limit` from query tuning.
-    let docs_result = core.scan_collection(
-        task.request.database_id.as_u64(),
-        tid,
-        collection,
-        scan_limit,
-    );
-    let owned_docs: Vec<Vec<u8>> = match docs_result {
-        Ok(docs) => docs.into_iter().map(|(_, v)| v.to_vec()).collect(),
-        Err(e) => {
-            return core.response_error(task, ErrorCode::from(e));
-        }
-    };
-
-    // Separate real aggregates from GROUPING() pseudo-aggregates.
-    // GroupState only accumulates real aggregates; GROUPING is computed
-    // post-finalization from the per-set bitmask.
-    let real_aggregates: Vec<&AggregateSpec> = aggregates
+    // GroupState accumulates real aggregates only. GROUPING() is computed
+    // from each set's bitmask after finalization.
+    let (grouping_aggs, real_aggs): (Vec<AggregateSpec>, Vec<AggregateSpec>) = aggregates
         .iter()
-        .filter(|a| a.function != "grouping")
-        .collect();
-    let real_agg_slice: Vec<AggregateSpec> = real_aggregates.iter().map(|a| (*a).clone()).collect();
-    let grouping_aggs: Vec<&AggregateSpec> = aggregates
+        .cloned()
+        .partition(|a| a.function == "grouping");
+    let grouping_cols = grouping_aggs
         .iter()
-        .filter(|a| a.function == "grouping")
-        .collect();
+        .map(|agg| grouping_column(agg, group_by.len()))
+        .collect::<crate::Result<Vec<u32>>>()?;
+
+    let rows = matching_rows(&docs, &filter_predicates)?;
 
     let mut all_rows: Vec<Value> = Vec::new();
-
     for set in grouping_sets {
-        // Build the active key list for this set.
-        let active_keys: Vec<&String> = set
-            .iter()
-            .filter_map(|&idx| group_by.get(idx as usize))
-            .collect();
+        let grouping_id = grouping_bitmask(set, group_by.len())?;
+        // The active keys in GROUP BY order, so the group key's slots follow
+        // the canonical key order whatever order the set lists them in.
+        let mut active: Vec<usize> = set.iter().map(|&i| i as usize).collect();
+        active.sort_unstable();
+        active.dedup();
+        let active_specs: Vec<GroupKeySpec> = active.iter().map(|&i| group_by[i].clone()).collect();
 
-        // Grouping bitmask: bit i set means group_by[i] IS present in this set.
-        let grouping_id: u64 = set.iter().fold(0u64, |acc, &i| acc | (1u64 << i));
-
-        // Bare-column specs for the active keys, so this set's group key uses
-        // the identical `build_group_key` encoding as the single-set path.
-        let active_specs: Vec<GroupKeySpec> = active_keys
-            .iter()
-            .map(|s| GroupKeySpec::column(s.as_str()))
-            .collect();
-
-        // Aggregate over the documents using only active keys and real aggregates.
         let mut groups: HashMap<String, GroupState> = HashMap::new();
-
-        for raw in &owned_docs {
-            // Apply WHERE filters.
-            if !filter_predicates.is_empty() {
-                if use_field_index {
-                    let idx = msgpack_scan::FieldIndex::build(raw, 0)
-                        .unwrap_or_else(msgpack_scan::FieldIndex::empty);
-                    match ScanFilter::all_match_binary_indexed(&filter_predicates, raw, &idx) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return core.response_error(task, ErrorCode::from(e));
-                        }
-                    }
-                } else {
-                    match ScanFilter::all_match_binary(&filter_predicates, raw) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return core.response_error(task, ErrorCode::from(e));
-                        }
-                    }
+        for raw in &rows {
+            let key = msgpack_scan::build_group_key(raw, &active_specs)?;
+            let state = match groups.entry(key) {
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(GroupState::new(&real_aggs)?)
                 }
-            }
-
-            let group_key = match msgpack_scan::build_group_key(raw, &active_specs) {
-                Ok(k) => k,
-                Err(e) => return core.response_error(task, ErrorCode::from(e)),
             };
-            if let Err(e) = groups
-                .entry(group_key)
-                .or_insert_with(|| GroupState::new(&real_agg_slice))
-                .feed(&real_agg_slice, raw)
-            {
-                return core.response_error(task, ErrorCode::from(e));
-            }
+            state.feed(&real_aggs, raw)?;
         }
-
-        // For an empty grouping set (grand-total), produce one aggregate row
-        // even when no documents exist in the collection.
-        if active_keys.is_empty() && groups.is_empty() {
-            let mut grand = GroupState::new(&real_agg_slice);
-            for raw in &owned_docs {
-                match ScanFilter::all_match_binary(&filter_predicates, raw) {
-                    Ok(true) => {
-                        if let Err(e) = grand.feed(&real_agg_slice, raw) {
-                            return core.response_error(task, ErrorCode::from(e));
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        return core.response_error(task, ErrorCode::from(e));
-                    }
-                }
-            }
-            groups.insert(String::new(), grand);
+        // The grand-total set yields one row even over zero input rows.
+        if active.is_empty() && groups.is_empty() {
+            groups.insert(String::new(), GroupState::new(&real_aggs)?);
         }
 
         for (group_key, state) in groups {
             let mut row: HashMap<String, Value> = HashMap::new();
-
-            // Parse the group key (JSON array of active key values).
-            let active_values: Vec<serde_json::Value> =
-                if active_keys.is_empty() || group_key.is_empty() {
-                    Vec::new()
-                } else {
-                    sonic_rs::from_str::<Vec<serde_json::Value>>(&group_key).unwrap_or_default()
-                };
-
-            // Emit all canonical keys: active ones get their value, absent ones get NULL.
-            for (i, key) in group_by.iter().enumerate() {
-                let present = set.contains(&(i as u32));
-                if present {
-                    // Find position of this key in active_keys.
-                    let pos = active_keys
-                        .iter()
-                        .position(|k| *k == key)
-                        .unwrap_or(usize::MAX);
-                    let val = active_values
-                        .get(pos)
-                        .cloned()
-                        .map_or(Value::Null, Value::from);
-                    row.insert(key.clone(), val);
-                } else {
-                    row.insert(key.clone(), Value::Null);
-                }
+            let values = active_key_values(&group_key, &active_specs)?;
+            for spec in group_by {
+                row.insert(spec.output_name.clone(), Value::Null);
             }
-
-            // Real aggregate results.
-            let finalized = match state.finalize(&real_agg_slice) {
-                Ok(finalized) => finalized,
-                Err(e) => return core.response_error(task, ErrorCode::from(e)),
-            };
-            for (alias, val) in finalized {
-                row.insert(alias, val);
+            for (spec, value) in active_specs.iter().zip(values) {
+                row.insert(spec.output_name.clone(), value);
             }
-
-            // GROUPING(col) pseudo-aggregates: compute from the bitmask.
-            // `agg.field` encodes the canonical key index as a decimal string.
-            // Returns 0 if the key is present (real value), 1 if absent (NULL-filled).
-            for agg in &grouping_aggs {
-                let col_idx: u64 = agg.field.parse().unwrap_or(u64::MAX);
-                let bit_present = (grouping_id >> col_idx) & 1;
-                let grouping_val = 1u64 ^ bit_present;
-                let output_alias = agg.user_alias.as_deref().unwrap_or(&agg.alias);
-                row.insert(output_alias.to_string(), Value::from_u64(grouping_val));
+            for (alias, value) in state.finalize(&real_aggs)? {
+                row.insert(alias, value);
             }
-
-            // Hidden grouping bitmask column — available for downstream use.
+            for (agg, &col) in grouping_aggs.iter().zip(&grouping_cols) {
+                let present = (grouping_id >> col) & 1;
+                let output = agg.user_alias.as_deref().unwrap_or(&agg.alias);
+                row.insert(output.to_string(), Value::from_u64(present ^ 1));
+            }
             row.insert(GROUPING_ID_COL.to_string(), Value::from_u64(grouping_id));
-
             all_rows.push(Value::Object(row));
         }
     }
 
-    // Apply HAVING. An evaluation error in a predicate fails the statement.
-    if let Err(e) = retain_having(&mut all_rows, &having_predicates) {
-        return core.response_error(task, ErrorCode::from(e));
-    }
-
-    // Apply user aliases for real aggregates (grouping aliases were applied above).
-    apply_user_aliases_to_rows(&mut all_rows, &real_agg_slice);
-
+    // HAVING is WHERE-shaped: an evaluation error fails the statement.
+    retain_having(&mut all_rows, &having_predicates)?;
+    // GROUPING() outputs already carry their user aliases.
+    apply_user_aliases_to_rows(&mut all_rows, &real_aggs);
+    sort_aggregated_rows(&mut all_rows, sort_keys)?;
     all_rows.truncate(limit);
 
-    match super::super::response_codec::encode_value_vec(&all_rows) {
-        Ok(payload) => core.response_with_payload(task, payload),
-        Err(e) => core.response_error(task, ErrorCode::from(e)),
+    super::super::response_codec::encode_value_vec(&all_rows)
+}
+
+/// The rows the WHERE predicates admit.
+fn matching_rows<'d>(
+    docs: &'d [(String, Vec<u8>)],
+    filters: &[ScanFilter],
+) -> crate::Result<Vec<&'d [u8]>> {
+    let mut rows = Vec::with_capacity(docs.len());
+    for (_, raw) in docs {
+        if ScanFilter::all_match_binary(filters, raw)? {
+            rows.push(raw.as_slice());
+        }
+    }
+    Ok(rows)
+}
+
+/// The presence bitmask of one grouping set: bit i is set when group_by[i]
+/// is in the set.
+fn grouping_bitmask(set: &[u32], key_count: usize) -> crate::Result<u64> {
+    set.iter().try_fold(0u64, |acc, &i| {
+        if i >= MAX_GROUPING_KEYS || i as usize >= key_count {
+            return Err(crate::Error::PlanError {
+                detail: format!(
+                    "grouping set names GROUP BY key {i}, but the GROUP BY list has {key_count} \
+                     keys"
+                ),
+            });
+        }
+        Ok(acc | (1u64 << i))
+    })
+}
+
+/// The GROUP BY index a `GROUPING(col)` pseudo-aggregate names. The planner
+/// writes it into `field` as a decimal index.
+fn grouping_column(agg: &AggregateSpec, key_count: usize) -> crate::Result<u32> {
+    let index: u32 = agg.field.parse().map_err(|_| crate::Error::PlanError {
+        detail: format!(
+            "GROUPING() argument '{}' is not a GROUP BY key index",
+            agg.field
+        ),
+    })?;
+    if index >= MAX_GROUPING_KEYS || index as usize >= key_count {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "GROUPING() names GROUP BY key {index}, but the GROUP BY list has {key_count} keys"
+            ),
+        });
+    }
+    Ok(index)
+}
+
+/// The grouped values of one group key, one per active key spec.
+///
+/// `build_group_key` writes one slot per spec that has a column or an
+/// expression, so a spec with neither takes NULL. A key that does not parse
+/// is an error.
+fn active_key_values(group_key: &str, active_specs: &[GroupKeySpec]) -> crate::Result<Vec<Value>> {
+    if active_specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts: Vec<serde_json::Value> =
+        sonic_rs::from_str(group_key).map_err(|e| crate::Error::Codec {
+            detail: format!("grouping set group key decode: {e}"),
+        })?;
+    let mut parts = parts.into_iter();
+    let mut values = Vec::with_capacity(active_specs.len());
+    for spec in active_specs {
+        if spec.field.is_none() && spec.expr.is_none() {
+            values.push(Value::Null);
+            continue;
+        }
+        let part = parts.next().ok_or(crate::Error::Codec {
+            detail: format!("grouping set group key '{group_key}' has too few values"),
+        })?;
+        values.push(Value::from(part));
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(function: &str, field: &str) -> AggregateSpec {
+        AggregateSpec {
+            function: function.to_string(),
+            alias: format!("{function}({field})"),
+            user_alias: None,
+            field: field.to_string(),
+            expr: None,
+            param: None,
+        }
+    }
+
+    #[test]
+    fn bitmask_sets_one_bit_per_key() {
+        assert_eq!(grouping_bitmask(&[0, 2], 3).expect("valid"), 0b101);
+        assert_eq!(grouping_bitmask(&[], 3).expect("valid"), 0);
+    }
+
+    #[test]
+    fn bitmask_refuses_out_of_range_key() {
+        assert!(grouping_bitmask(&[3], 3).is_err());
+        assert!(grouping_bitmask(&[64], 100).is_err());
+    }
+
+    #[test]
+    fn grouping_column_refuses_bad_index() {
+        assert_eq!(
+            grouping_column(&spec("grouping", "1"), 2).expect("valid"),
+            1
+        );
+        assert!(grouping_column(&spec("grouping", "x"), 2).is_err());
+        assert!(grouping_column(&spec("grouping", "2"), 2).is_err());
+    }
+
+    #[test]
+    fn key_values_follow_the_specs() {
+        let specs = vec![GroupKeySpec::column("a"), GroupKeySpec::column("b")];
+        let values = active_key_values(r#"["x",3]"#, &specs).expect("parses");
+        assert_eq!(values.len(), 2);
+        assert!(matches!(&values[0], Value::String(s) if s == "x"));
+    }
+
+    #[test]
+    fn unparsable_key_errors() {
+        let specs = vec![GroupKeySpec::column("a")];
+        assert!(active_key_values("not json", &specs).is_err());
+        assert!(active_key_values("[]", &specs).is_err());
     }
 }

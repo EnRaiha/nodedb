@@ -3,6 +3,7 @@
 //! Parse `ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>`
 //! and `SHOW CONFLICT POLICY ON <name>`.
 
+use super::clause::{ClauseCursor, Token, tokenize};
 use crate::ddl_ast::alter_ops::{ConflictPolicyKind, ConstraintKindKeyword};
 use crate::ddl_ast::statement::{AlterCollectionOp, CollectionStmt, NodedbStatement, PolicyStmt};
 use crate::error::SqlError;
@@ -14,81 +15,57 @@ use crate::error::SqlError;
 /// - `SHOW CONFLICT POLICY ON <name>`
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
-    _trimmed: &str,
+    _parts: &[&str],
+    trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    if upper.starts_with("SHOW CONFLICT POLICY ON ") {
-        return Some(parse_show_conflict_policy(parts));
+    if upper.starts_with("SHOW CONFLICT POLICY ") {
+        return Some(parse_show_conflict_policy(trimmed));
     }
-    // ALTER COLLECTION <name> SET ON CONFLICT is handled inside the collection
-    // parser's alter_ops path, but we also intercept it here so the prefix
-    // "ALTER COLLECTION ... SET ON CONFLICT" routes before the generic
-    // collection handler inspects "SET ON".
-    if upper.starts_with("ALTER COLLECTION ") && upper.contains(" SET ON CONFLICT ") {
-        return Some(parse_alter_set_on_conflict(parts));
+    // Runs before the collection family, so `ALTER COLLECTION <name> SET ON
+    // CONFLICT` is claimed here. The clause must follow the name directly;
+    // the same words inside a value are not this statement.
+    if upper.starts_with("ALTER COLLECTION ") {
+        let toks = tokenize(trimmed);
+        let mut probe = ClauseCursor::new(trimmed, &toks, "ALTER COLLECTION");
+        let is_set_on_conflict = probe.eat_keywords(&["ALTER", "COLLECTION"])
+            && probe.name("collection").is_ok()
+            && probe.peek_keywords(&["SET", "ON", "CONFLICT"]);
+        if is_set_on_conflict {
+            return Some(parse_alter_set_on_conflict(trimmed, &toks));
+        }
     }
     None
 }
 
-fn parse_show_conflict_policy(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
-    // SHOW CONFLICT POLICY ON <name>
-    // parts: [SHOW, CONFLICT, POLICY, ON, <name>]
-    if parts.len() < 5 {
-        return Err(SqlError::Parse {
-            detail: "syntax: SHOW CONFLICT POLICY ON <collection>".to_string(),
-        });
-    }
-    let on_idx = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("ON"))
-        .ok_or_else(|| SqlError::Parse {
-            detail: "SHOW CONFLICT POLICY: missing ON keyword".to_string(),
-        })?;
-    let name = parts.get(on_idx + 1).ok_or_else(|| SqlError::Parse {
-        detail: "SHOW CONFLICT POLICY ON: missing collection name".to_string(),
-    })?;
+/// `SHOW CONFLICT POLICY ON <name>`.
+fn parse_show_conflict_policy(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "SHOW CONFLICT POLICY");
+    c.expect_keywords(&["SHOW", "CONFLICT", "POLICY", "ON"])?;
+    let collection = c.name("collection")?;
+    c.finish()?;
     Ok(NodedbStatement::Policy(PolicyStmt::ShowConflictPolicy {
-        collection: name.to_lowercase(),
+        collection,
     }))
 }
 
-fn parse_alter_set_on_conflict(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
-    // ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>
-    // parts: [ALTER, COLLECTION, <name>, SET, ON, CONFLICT, <policy>, FOR, <kind>]
-    let name = parts.get(2).ok_or_else(|| SqlError::Parse {
-        detail: "ALTER COLLECTION SET ON CONFLICT: missing collection name".to_string(),
-    })?;
-
-    // Find CONFLICT keyword position, then policy is the token after it.
-    let conflict_idx = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("CONFLICT"))
-        .ok_or_else(|| SqlError::Parse {
-            detail: "ALTER COLLECTION SET ON CONFLICT: missing CONFLICT keyword".to_string(),
-        })?;
-
-    let policy_str = parts.get(conflict_idx + 1).ok_or_else(|| SqlError::Parse {
-        detail: "ALTER COLLECTION SET ON CONFLICT: missing policy keyword".to_string(),
-    })?;
-
-    let for_idx = parts
-        .iter()
-        .position(|p| p.eq_ignore_ascii_case("FOR"))
-        .ok_or_else(|| SqlError::Parse {
-            detail: "ALTER COLLECTION SET ON CONFLICT <policy>: missing FOR keyword".to_string(),
-        })?;
-
-    let kind_str = parts.get(for_idx + 1).ok_or_else(|| SqlError::Parse {
-        detail: "ALTER COLLECTION SET ON CONFLICT <policy> FOR: missing constraint kind"
-            .to_string(),
-    })?;
-
-    let policy = parse_policy_keyword(policy_str)?;
-    let constraint_kind = parse_constraint_kind(kind_str)?;
+/// `ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>`.
+fn parse_alter_set_on_conflict<'a>(
+    sql: &'a str,
+    toks: &[Token<'a>],
+) -> Result<NodedbStatement, SqlError> {
+    let mut c = ClauseCursor::new(sql, toks, "ALTER COLLECTION SET ON CONFLICT");
+    c.expect_keywords(&["ALTER", "COLLECTION"])?;
+    let name = c.name("collection")?;
+    c.expect_keywords(&["SET", "ON", "CONFLICT"])?;
+    let policy = parse_policy_keyword(c.word("conflict policy")?)?;
+    c.expect_keyword("FOR")?;
+    let constraint_kind = parse_constraint_kind(c.word("constraint kind")?)?;
+    c.finish()?;
 
     Ok(NodedbStatement::Collection(
         CollectionStmt::AlterCollection {
-            name: name.to_lowercase(),
+            name,
             operation: AlterCollectionOp::SetOnConflict {
                 policy,
                 constraint_kind,
@@ -245,5 +222,28 @@ mod tests {
     fn unknown_constraint_kind_rejected() {
         let e = err("ALTER COLLECTION x SET ON CONFLICT LAST_WRITER_WINS FOR BADKIND");
         assert!(matches!(e, SqlError::Parse { .. }));
+    }
+
+    #[test]
+    fn trailing_tokens_are_refused() {
+        let e = err("ALTER COLLECTION t SET ON CONFLICT LAST_WRITER_WINS FOR UNIQUE extra");
+        assert!(matches!(e, SqlError::Parse { .. }));
+    }
+
+    #[test]
+    fn set_on_conflict_inside_a_value_is_not_this_statement() {
+        let stmt = parse("ALTER COLLECTION t ADD COLUMN m TEXT DEFAULT ' SET ON CONFLICT '");
+        assert!(
+            !matches!(
+                stmt,
+                Some(Ok(NodedbStatement::Collection(
+                    CollectionStmt::AlterCollection {
+                        operation: AlterCollectionOp::SetOnConflict { .. },
+                        ..
+                    }
+                )))
+            ),
+            "got {stmt:?}"
+        );
     }
 }

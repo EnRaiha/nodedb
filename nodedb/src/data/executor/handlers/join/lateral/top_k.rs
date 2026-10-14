@@ -4,16 +4,16 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
-use crate::bridge::scan_filter::{FilterOp, ScanFilter};
+use crate::bridge::envelope::{PhysicalPlan, Response};
+use crate::bridge::scan_filter::{FilterOp, ScanFilter, decode_scan_filters};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::JoinProjection;
 
+use super::inner::{OuterRowJoin, encode_inner_filters};
 use super::shared::{
-    MAX_RESULT_ROWS, build_row, build_scan_plan, extract_outer_field, flatten_outer_row,
-    strip_filter_qualifiers, unwrap_data_field,
+    build_scan_plan, correlation_value, flatten_outer_row, strip_filter_qualifiers,
 };
 
 /// Parameters for `LateralTopK` execution.
@@ -50,15 +50,13 @@ impl CoreLoop {
             None => return outer_resp,
         };
 
-        let base_inner_filters: Vec<ScanFilter> = {
-            let raw: Vec<ScanFilter> = if p.inner_filters.is_empty() {
-                Vec::new()
-            } else {
-                zerompk::from_msgpack(p.inner_filters).unwrap_or_default()
-            };
-            // Strip table-alias qualifiers from field names so the inner scan
-            // can resolve them against unqualified document fields.
-            strip_filter_qualifiers(raw)
+        // A malformed filter payload is an error. Reading it as "no filter"
+        // would join every inner row. Table-alias qualifiers are stripped so
+        // the inner scan resolves fields against unqualified document fields.
+        let base_inner_filters = match decode_scan_filters(p.inner_filters, "LATERAL inner filter")
+        {
+            Ok(filters) => strip_filter_qualifiers(filters),
+            Err(e) => return self.response_error(p.task, e),
         };
 
         let mut result: Vec<Vec<u8>> = Vec::new();
@@ -70,81 +68,48 @@ impl CoreLoop {
             let flat_outer = flatten_outer_row(outer_bytes);
 
             let mut corr_filters = base_inner_filters.clone();
+            let mut satisfiable = true;
             for (outer_col, inner_col) in p.correlation_keys {
-                if let Some(val) = extract_outer_field(outer_bytes, outer_col) {
-                    corr_filters.push(ScanFilter {
+                match correlation_value(outer_bytes, outer_col) {
+                    Ok(Some(value)) => corr_filters.push(ScanFilter {
                         field: inner_col.clone(),
                         op: FilterOp::Eq,
-                        value: val,
+                        value,
                         clauses: Vec::new(),
                         expr: None,
-                    });
+                    }),
+                    Ok(None) => {
+                        satisfiable = false;
+                        break;
+                    }
+                    Err(e) => return self.response_error(p.task, e),
                 }
             }
 
-            let filter_bytes = match zerompk::to_msgpack_vec(&corr_filters) {
-                Ok(b) => b,
-                Err(e) => {
-                    return self.response_error(
-                        p.task,
-                        ErrorCode::Internal {
-                            detail: format!("lateral filter serialization: {e}"),
-                        },
-                    );
+            let inner_plan = if satisfiable {
+                match encode_inner_filters(&corr_filters) {
+                    Ok(filter_bytes) => Some(build_scan_plan(
+                        p.inner_collection,
+                        filter_bytes,
+                        p.inner_order_by,
+                        p.inner_limit,
+                    )),
+                    Err(code) => return self.response_error(p.task, code),
                 }
+            } else {
+                None
             };
 
-            let inner_plan = build_scan_plan(
-                p.inner_collection,
-                filter_bytes,
-                p.inner_order_by,
-                p.inner_limit,
-            );
-
-            let inner_resp = self.execute_plan(p.task, &inner_plan);
-            let inner_docs = response_codec::decode_response_to_docs(&inner_resp);
-
-            match inner_docs {
-                None if p.left_join => {
-                    let row = build_row(
-                        &flat_outer,
-                        None,
-                        p.outer_alias,
-                        p.lateral_alias,
-                        p.projection,
-                    );
-                    result.push(row);
-                }
-                None => {}
-                Some(docs) if docs.is_empty() && p.left_join => {
-                    let row = build_row(
-                        &flat_outer,
-                        None,
-                        p.outer_alias,
-                        p.lateral_alias,
-                        p.projection,
-                    );
-                    result.push(row);
-                }
-                Some(docs) => {
-                    for (_inner_id, inner_bytes) in &docs {
-                        let inner_data = unwrap_data_field(inner_bytes);
-                        let row = build_row(
-                            &flat_outer,
-                            Some(inner_data),
-                            p.outer_alias,
-                            p.lateral_alias,
-                            p.projection,
-                        );
-                        result.push(row);
-                        if result.len() >= MAX_RESULT_ROWS {
-                            break;
-                        }
-                    }
-                }
-            }
-            if result.len() >= MAX_RESULT_ROWS {
-                break;
+            let row = OuterRowJoin {
+                flat_outer: &flat_outer,
+                inner_plan,
+                outer_alias: p.outer_alias,
+                lateral_alias: p.lateral_alias,
+                projection: p.projection,
+                left_join: p.left_join,
+            };
+            if let Err(resp) = self.lateral_join_outer_row(p.task, row, &mut result) {
+                return resp;
             }
         }
 

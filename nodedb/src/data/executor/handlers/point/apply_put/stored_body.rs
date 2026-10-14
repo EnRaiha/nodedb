@@ -11,7 +11,8 @@ use nodedb_types::Surrogate;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::chain_guard::ChainIntent;
-use crate::data::executor::handlers::generated;
+use crate::data::executor::enforcement::typeguard::GuardScope;
+use crate::data::executor::handlers::write_body;
 use crate::data::executor::{doc_format, strict_format};
 use crate::types::{DatabaseId, TenantId};
 
@@ -25,6 +26,8 @@ pub(in crate::data::executor) struct StoredBodyInput<'a> {
     pub sys_from_ms: i64,
     pub valid_from_ms: i64,
     pub valid_until_ms: i64,
+    /// Which fields this write puts in scope for typeguard validation.
+    pub guards: GuardScope<'a>,
 }
 
 /// The two forms of one row this write lands.
@@ -54,6 +57,7 @@ impl CoreLoop {
             sys_from_ms,
             valid_from_ms,
             valid_until_ms,
+            guards,
         } = input;
 
         // A HASH_CHAIN row a write re-applies keeps its durable bytes, so no
@@ -69,20 +73,15 @@ impl CoreLoop {
             _ => None,
         };
 
-        // Evaluate generated columns before encoding.
+        // Apply typeguards and generated columns before encoding. A refused
+        // write keeps its own error code: a typeguard violation, or the
+        // evaluation error of a generated expression.
         let value = if let Some(config) = self.doc_configs.get(config_key)
-            && !config.enforcement.generated_columns.is_empty()
+            && write_body::rewrites_body(config)
         {
             if let Ok(mut doc) = doc_format::decode_document(value) {
-                if let Err(e) = generated::evaluate_generated_columns(
-                    &mut doc,
-                    &config.enforcement.generated_columns,
-                ) {
-                    return Err(crate::Error::Storage {
-                        engine: "generated".into(),
-                        detail: format!("generated column evaluation failed: {e:?}"),
-                    });
-                }
+                write_body::materialize_write_body(config, &mut doc, guards)
+                    .map_err(crate::Error::DataPlane)?;
                 doc_format::encode_to_msgpack(&doc)
             } else {
                 value.to_vec()

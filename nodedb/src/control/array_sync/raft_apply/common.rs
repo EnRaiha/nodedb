@@ -122,6 +122,8 @@ pub(super) async fn submit_array_write(
             // Auth ran on the node that proposed the entry; the committed entry
             // carries no session user.
             user_id: None,
+            // An array cell write is judged by no role-guarded transition.
+            user_roles: Vec::new(),
             // The redo record is appended HERE, on this replica, from the
             // committed plan: the proposer's LSN is deliberately not carried on
             // the wire, and the array engine's tile state has no other

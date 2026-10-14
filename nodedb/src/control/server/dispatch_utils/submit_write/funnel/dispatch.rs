@@ -38,6 +38,8 @@ pub(super) struct DispatchTarget {
     pub trace_id: TraceId,
     pub event_source: crate::event::EventSource,
     pub user_id: Option<std::sync::Arc<str>>,
+    /// The roles of the identity that wrote the write.
+    pub user_roles: Vec<String>,
     pub txn_id: Option<TxnId>,
     pub wal_lsn: Option<Lsn>,
     pub resolved_now_ms: Option<u64>,
@@ -95,7 +97,7 @@ pub(super) async fn dispatch_to_data_plane(
         consistency: ReadConsistency::Strong,
         idempotency_key: None,
         event_source: target.event_source,
-        user_roles: Vec::new(),
+        user_roles: target.user_roles,
         user_id: target.user_id,
         statement_digest: None,
         txn_id: target.txn_id,

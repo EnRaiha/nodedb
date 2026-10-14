@@ -18,6 +18,9 @@ pub enum EngineType {
     /// operations are unsupported on this engine (DML happens via
     /// dedicated `INSERT INTO ARRAY` / `DELETE FROM ARRAY` syntax).
     Array,
+    /// A continuous aggregate read as a relation. Read-only: routes through
+    /// `ContinuousAggregateRules`, which refuses every write.
+    ContinuousAggregate,
 }
 
 /// SQL join type.
@@ -94,6 +97,16 @@ pub struct AggregateExpr {
     /// the grouping-set bitmask and return 0 (present) or 1 (NULL-filled).
     /// `None` for all ordinary aggregate functions.
     pub grouping_col_index: Option<usize>,
+    /// Lowercase source text of a `FILTER (WHERE ...)` predicate. The
+    /// planner folds the predicate into `args` as
+    /// `CASE WHEN <predicate> THEN <arg> END`, so a row the predicate does
+    /// not admit feeds NULL, which every aggregate skips. The text is part
+    /// of the output key only.
+    pub filter_text: Option<String>,
+    /// Lowercase source text of a computed argument (`v * 2`). `None` for a
+    /// column or wildcard argument. Part of the aggregate's output key, so
+    /// two computed aggregates of one function get distinct keys.
+    pub arg_text: Option<String>,
 }
 
 /// Records SELECT-list interleaving of GROUP BY keys and aggregate

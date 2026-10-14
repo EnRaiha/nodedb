@@ -4,11 +4,17 @@ use std::collections::HashMap;
 
 use crate::control::server::shared::ddl::result::DdlError;
 
+/// One row of a parsed INSERT/UPSERT statement.
+pub(in crate::control::server::shared::ddl::neutral::collection) struct ParsedRow {
+    pub doc_id: String,
+    pub fields: HashMap<String, nodedb_types::Value>,
+}
+
 /// Parsed INSERT/UPSERT statement fields.
 pub(in crate::control::server::shared::ddl::neutral::collection) struct ParsedInsert {
     pub coll_name: String,
-    pub doc_id: String,
-    pub fields: HashMap<String, nodedb_types::Value>,
+    /// Every row of the statement, in statement order. Never empty.
+    pub rows: Vec<ParsedRow>,
     /// The raw column list written after `RETURNING`, when the statement has
     /// one. Carried (rather than reduced to a flag) because the statement is
     /// REBUILT from `fields` before planning: a flag would say the clause

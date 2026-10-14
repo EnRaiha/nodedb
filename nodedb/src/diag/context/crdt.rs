@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Forensic payloads for CRDT capture sites: history post-apply, and rejected
-//! deltas the dead-letter queue refused.
+//! Forensic payloads for CRDT capture sites: history post-apply, rejected
+//! deltas the dead-letter queue refused, and constraint installs a committed
+//! DDL left to the reconcile loop.
 //!
 //! COMPACT HISTORY discards oplog entries on every node. A node that misses
 //! the compaction keeps a history its peers reclaimed, so a read at an old
@@ -96,9 +97,67 @@ impl DomainContext for CrdtDeadLetterNotEnqueued<'_> {
     }
 }
 
+/// A committed DDL whose CRDT constraint install on the collection's data
+/// Raft log failed, so the DDL returned before its constraint set was live.
+pub(in crate::diag) struct ConstraintInstallDeferred<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    /// Collection whose constraint version the DDL changed.
+    pub collection: &'a str,
+    /// What failed, without the per-occurrence detail.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for ConstraintInstallDeferred<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.constraint_install_deferred"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The error class names the cause. The collection is the occurrence,
+        // so one unreachable group leader files one report.
+        format!("cause={}", self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "database_id": self.database_id,
+            "tenant_id": self.tenant_id,
+            "collection": self.collection,
+            "error_class": self.error_class,
+            "why_reported": "the DDL committed a new constraint version, but its install on \
+                             the collection's data Raft log failed. A CRDT delta admitted \
+                             against the new version is refused as a retryable gap on every \
+                             replica that has not installed it",
+            "operator_action": "check that the collection's data group has a reachable \
+                                 leader. The constraint-reconcile loop on the metadata leader \
+                                 re-delivers the set. A report that keeps counting means that \
+                                 delivery fails too",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constraint_install_grouping_ignores_the_collection() {
+        let first = ConstraintInstallDeferred {
+            database_id: 1,
+            tenant_id: 2,
+            collection: "users",
+            error_class: "deadline exceeded",
+        };
+        let second = ConstraintInstallDeferred {
+            database_id: 9,
+            tenant_id: 8,
+            collection: "orders",
+            ..first
+        };
+        assert_eq!(first.grouping_key(), second.grouping_key());
+        assert_eq!(first.grouping_key(), "cause=deadline exceeded");
+    }
 
     #[test]
     fn dead_letter_grouping_ignores_the_occurrence() {

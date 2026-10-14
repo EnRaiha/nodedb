@@ -9,10 +9,9 @@
 
 use nodedb_types::timeseries::SymbolDictionary;
 
-use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType, TimeKind};
-
-/// The symbol id a NULL symbol cell stores.
-pub(in crate::data::executor) const NULL_SYMBOL_ID: u32 = u32::MAX;
+use crate::engine::timeseries::columnar_memtable::{
+    ColumnData, ColumnType, NULL_SYMBOL_ID, TimeKind,
+};
 
 /// One timeseries cell, read as its declared column type.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -62,6 +62,11 @@ pub struct CrdtDeltaPreview {
     pub post_image: Option<nodedb_types::Value>,
     /// Deterministic canonical MessagePack representation of [`post_image`](Self::post_image).
     pub post_image_msgpack: Vec<u8>,
+    /// The target row as the authoritative state holds it before the delta,
+    /// in the same canonical encoding as `post_image_msgpack`. Encodes `None`
+    /// when the row is absent. A constraint on how a row may change judges
+    /// this image against the post-image.
+    pub pre_image_msgpack: Vec<u8>,
     /// SHA-256 over the post-import sorted `(peer, counter)` frontier entries.
     pub resulting_frontier_digest: [u8; 32],
     /// Number of new operations contributed beyond the fork's prior oplog
@@ -182,6 +187,22 @@ impl CrdtState {
             });
         }
 
+        // `read_row` opens the collection's root map, and opening an absent
+        // root registers it in the authoritative state. The pre-image reads
+        // the row only when its collection already exists, so the preview
+        // stays non-mutating.
+        let collection_exists = match self.doc.get_value() {
+            LoroValue::Map(roots) => roots.contains_key(expected_collection),
+            _ => false,
+        };
+        let raw_pre_image = if collection_exists {
+            self.read_row(expected_collection, expected_row)
+        } else {
+            None
+        };
+        let pre_image_msgpack =
+            zerompk::to_msgpack_vec(&raw_pre_image.as_ref().map(CanonicalLoroValue::from))
+                .map_err(|error| CrdtError::Loro(format!("preview pre-image encode: {error}")))?;
         let raw_post_image = fork_state.read_row(expected_collection, expected_row);
         let post_image = raw_post_image.as_ref().map(loro_to_value);
         let post_image_msgpack =
@@ -198,6 +219,7 @@ impl CrdtState {
             write_set,
             post_image,
             post_image_msgpack,
+            pre_image_msgpack,
             resulting_frontier_digest: CrdtState::frontier_digest_from(&resulting_frontier),
             imported_ops,
             trimmed_ops: admission.trimmed_operations(),

@@ -2,6 +2,7 @@
 
 //! The per-identity resolution rule and the top-level plan walk.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
 use nodedb_physical::physical_plan::PhysicalPlan;
@@ -10,6 +11,40 @@ use nodedb_types::{CollectionKey, Surrogate};
 use super::super::SurrogateAssigner;
 use super::carried::CarriedIdentity;
 use crate::types::{DatabaseId, TenantId};
+
+/// One surrogate slot of a batched op: the collection it binds in, the key
+/// bytes, and the slot holding the carried surrogate. The bind rewrites the
+/// slot with the authoritative value.
+pub(super) struct BindSlot<'k, 's> {
+    pub(super) key: CollectionKey<'k>,
+    pub(super) pk: Cow<'s, [u8]>,
+    pub(super) surrogate: &'s mut Surrogate,
+}
+
+impl<'k, 's> BindSlot<'k, 's> {
+    /// A slot keyed by `pk`.
+    pub(super) fn keyed(
+        key: CollectionKey<'k>,
+        pk: &'s [u8],
+        surrogate: &'s mut Surrogate,
+    ) -> Self {
+        Self {
+            key,
+            pk: Cow::Borrowed(pk),
+            surrogate,
+        }
+    }
+
+    /// A slot for a row with no user key: it self-keys by its carried
+    /// surrogate's big-endian bytes, the key `assign_anonymous` binds under.
+    pub(super) fn self_keyed(key: CollectionKey<'k>, surrogate: &'s mut Surrogate) -> Self {
+        Self {
+            key,
+            pk: Cow::Owned(surrogate.as_u32().to_be_bytes().to_vec()),
+            surrogate,
+        }
+    }
+}
 
 /// Binds carried identities against one node's catalog under one tenancy scope.
 pub struct IdentityBinder<'a> {
@@ -90,7 +125,24 @@ impl<'a> IdentityBinder<'a> {
         pk_bytes: &[u8],
         carried: Surrogate,
     ) -> crate::Result<Surrogate> {
-        if carried == Surrogate::ZERO {
+        let mut bound = self.resolve_many(&[(key, pk_bytes, carried)])?;
+        bound.pop().ok_or_else(|| crate::Error::Internal {
+            detail: format!("bind of a key in '{}' returned no surrogate", key.name()),
+        })
+    }
+
+    /// [`Self::resolve`] for many `(collection, pk_bytes, carried)` identities.
+    /// Binds first-wins in one catalog transaction per collection, and returns
+    /// the authoritative surrogate per identity in input order. A carried
+    /// `Surrogate::ZERO` refuses the whole batch before anything binds.
+    pub(super) fn resolve_many(
+        &self,
+        identities: &[(CollectionKey<'_>, &[u8], Surrogate)],
+    ) -> crate::Result<Vec<Surrogate>> {
+        if let Some(&(key, pk_bytes, _)) = identities
+            .iter()
+            .find(|&&(_, _, carried)| carried == Surrogate::ZERO)
+        {
             return Err(crate::Error::Internal {
                 detail: format!(
                     "write of key '{}' in '{}' carries no surrogate; every write carries the \
@@ -100,9 +152,56 @@ impl<'a> IdentityBinder<'a> {
                 ),
             });
         }
-        let bound = self.assigner.bind(key, self.tenant_id, pk_bytes, carried)?;
-        self.record(key, pk_bytes, bound);
-        Ok(bound)
+        let mut keys: Vec<CollectionKey<'_>> = Vec::new();
+        for &(key, _, _) in identities {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        let mut out = vec![Surrogate::ZERO; identities.len()];
+        for key in keys {
+            let indices: Vec<usize> = (0..identities.len())
+                .filter(|&i| identities[i].0 == key)
+                .collect();
+            let rows: Vec<(&[u8], Surrogate)> = indices
+                .iter()
+                .map(|&i| (identities[i].1, identities[i].2))
+                .collect();
+            let bound = self.assigner.bind_many(key, self.tenant_id, &rows)?;
+            if bound.len() != indices.len() {
+                return Err(crate::Error::Internal {
+                    detail: format!(
+                        "bind in '{}' answered {} of {} keys",
+                        key.name(),
+                        bound.len(),
+                        indices.len()
+                    ),
+                });
+            }
+            for (&i, surrogate) in indices.iter().zip(bound) {
+                out[i] = surrogate;
+            }
+        }
+        for (&(key, pk_bytes, _), &bound) in identities.iter().zip(&out) {
+            self.record(key, pk_bytes, bound);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::resolve_many`] writing each authoritative value back into its
+    /// slot. A slot carries its collection, its key bytes, and the carried
+    /// surrogate it holds.
+    pub(super) fn resolve_slots_in_place(&self, slots: Vec<BindSlot<'_, '_>>) -> crate::Result<()> {
+        let identities: Vec<(CollectionKey<'_>, &[u8], Surrogate)> = slots
+            .iter()
+            .map(|slot| (slot.key, slot.pk.as_ref(), *slot.surrogate))
+            .collect();
+        let bound = self.resolve_many(&identities)?;
+        drop(identities);
+        for (slot, surrogate) in slots.into_iter().zip(bound) {
+            *slot.surrogate = surrogate;
+        }
+        Ok(())
     }
 
     /// [`Self::resolve`] for a row with no user key: the surrogate self-keys by

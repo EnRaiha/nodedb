@@ -288,10 +288,24 @@ fn decoded_to_f64(col: DecodedColumn) -> (Vec<f64>, Vec<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::timeseries::{IngestResult, MetricSample};
+    use nodedb_types::timeseries::IngestResult;
 
-    use super::super::columnar_memtable::{ColumnarMemtable, ColumnarMemtableConfig};
+    use super::super::columnar_memtable::{ColumnValue, ColumnarMemtable, ColumnarMemtableConfig};
     use super::*;
+
+    /// Ingest one `(timestamp, value)` row into a metric-layout memtable.
+    fn ingest_sample(
+        mt: &mut ColumnarMemtable,
+        series_id: u64,
+        ts: i64,
+        value: f64,
+    ) -> IngestResult {
+        mt.ingest_row(
+            series_id,
+            &[ColumnValue::Timestamp(ts), ColumnValue::Float64(value)],
+        )
+        .expect("a metric row fits the metric layout")
+    }
 
     /// `ScopedMemory` bound to the timeseries engine, backed by a real
     /// governor with ample per-engine limits.
@@ -306,7 +320,8 @@ mod tests {
 
     fn default_config() -> ColumnarMemtableConfig {
         ColumnarMemtableConfig {
-            max_memory_bytes: crate::engine::timeseries::memtable::DEFAULT_MEMTABLE_BUDGET_BYTES,
+            max_memory_bytes: nodedb_types::config::tuning::TimeseriesToning::default()
+                .memtable_budget_bytes,
             hard_memory_limit: 80 * 1024 * 1024,
             max_tag_cardinality: 100_000,
         }
@@ -351,13 +366,7 @@ mod tests {
         let mut mt = ColumnarMemtable::new_metric(default_config());
 
         for i in 0..100 {
-            let result = mt.ingest_metric(
-                i % 10,
-                MetricSample {
-                    timestamp_ms: 1000 + i as i64,
-                    value: i as f64 * 0.5,
-                },
-            );
+            let result = ingest_sample(&mut mt, i % 10, 1000 + i as i64, i as f64 * 0.5);
             assert_ne!(result, IngestResult::Rejected);
         }
 
@@ -397,13 +406,7 @@ mod tests {
     fn timestamp_block_stats_extraction() {
         let mut mt = ColumnarMemtable::new_metric(default_config());
         for i in 0..50 {
-            mt.ingest_metric(
-                1,
-                MetricSample {
-                    timestamp_ms: 2000 + i as i64,
-                    value: 1.0,
-                },
-            );
+            ingest_sample(&mut mt, 1, 2000 + i as i64, 1.0);
         }
 
         let drain = mt.drain();
@@ -421,12 +424,11 @@ mod tests {
     fn write_test_segment(count: usize, start_ts: i64) -> Vec<u8> {
         let mut mt = ColumnarMemtable::new_metric(default_config());
         for i in 0..count {
-            mt.ingest_metric(
+            ingest_sample(
+                &mut mt,
                 (i % 5) as u64,
-                MetricSample {
-                    timestamp_ms: start_ts + i as i64,
-                    value: i as f64 * 0.25,
-                },
+                start_ts + i as i64,
+                i as f64 * 0.25,
             );
         }
         let drain = mt.drain();
@@ -519,14 +521,8 @@ mod tests {
         let mut mt = ColumnarMemtable::new_metric(default_config());
         for i in 0..count {
             let ts = start_ts + i as i64;
-            let result = mt.ingest_metric(
-                (i % 3) as u64,
-                MetricSample {
-                    timestamp_ms: ts,
-                    value: i as f64,
-                },
-            );
-            assert_ne!(result, nodedb_types::timeseries::IngestResult::Rejected);
+            let result = ingest_sample(&mut mt, (i % 3) as u64, ts, i as f64);
+            assert_ne!(result, IngestResult::Rejected);
         }
         let drain = mt.drain();
         write_ts_drain_as_segment(&drain, None, test_memory()).expect("write large-ts segment")

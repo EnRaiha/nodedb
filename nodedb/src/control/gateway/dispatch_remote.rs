@@ -43,6 +43,10 @@ pub(super) struct RemoteDispatchArgs<'a> {
     /// Groups the remote node confirms before it reads. Empty for a write or
     /// a weaker read.
     pub read_groups: Vec<u64>,
+    /// Roles of the identity that wrote the statement. The remote node puts
+    /// them on the replicated write so every replica judges them. Empty for
+    /// a read or a system write.
+    pub user_roles: Vec<String>,
 }
 
 /// Remote dispatch via `ExecuteRequest` RPC.
@@ -62,6 +66,7 @@ pub(super) async fn dispatch_remote(
         txn_id,
         linearizable,
         read_groups,
+        user_roles,
     } = args;
     // The statement's deadline, fixed before any wait of this attempt.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
@@ -168,6 +173,7 @@ pub(super) async fn dispatch_remote(
         txn_id,
         vshard_id: scoped_vshard,
         read_groups,
+        user_roles,
     });
 
     debug!(

@@ -184,25 +184,31 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
         )
         .await?
         .into_iter();
+        // Every keyless row draws in one catalog transaction.
+        let keyless_count = pks.len() - keyed.len();
+        let mut keyless = if keyless_count > 0 {
+            self.shared
+                .surrogate_assigner
+                .assign_anonymous_many(
+                    nodedb_types::CollectionKey::from_bare(database_id, &collection),
+                    tenant_id,
+                    keyless_count,
+                )
+                .await?
+        } else {
+            Vec::new()
+        }
+        .into_iter();
         let mut surrogates: Vec<nodedb_types::Surrogate> = Vec::with_capacity(pks.len());
         for pk in &pks {
-            if pk.is_empty() {
-                surrogates.push(
-                    self.shared
-                        .surrogate_assigner
-                        .assign_anonymous(
-                            nodedb_types::CollectionKey::from_bare(database_id, &collection),
-                            tenant_id,
-                        )
-                        .await?,
-                );
+            let next = if pk.is_empty() {
+                keyless.next()
             } else {
-                surrogates.push(bound.next().ok_or_else(|| crate::Error::Internal {
-                    detail: format!(
-                        "columnar sync into '{collection}': a keyed row got no surrogate"
-                    ),
-                })?);
-            }
+                bound.next()
+            };
+            surrogates.push(next.ok_or_else(|| crate::Error::Internal {
+                detail: format!("columnar sync into '{collection}': a row got no surrogate"),
+            })?);
         }
 
         // Encode as msgpack — the Data Plane handler calls `value_from_msgpack(payload)`

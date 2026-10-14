@@ -34,7 +34,8 @@ pub(in crate::data::executor) struct ResolvedUpdateRow {
 /// Parameters for `execute_update_from_join`.
 pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     pub target_collection: &'a str,
-    pub source_collection: &'a str,
+    /// The source relation's label, for logs and errors.
+    pub source_label: &'a str,
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
@@ -48,13 +49,9 @@ pub(in crate::data::executor) struct UpdateFromJoinParams<'a> {
     /// `Vec<ResolvedUpdateRowWire>` for the expander to rewrite into concrete
     /// `PointPut` ops. `false` = the normal write path.
     pub resolve_only: bool,
-    /// Control-Plane-shipped source rows for cross-core `UPDATE ... FROM`. When
-    /// `Some`, the source join-map is built from these pre-scanned
-    /// `(source_doc_id, raw_stored_source_bytes)` rows instead of a local read
-    /// of the source collection (whose vShard may live on a different core).
-    /// `None` selects the legacy local-storage read (co-resident / in-txn
-    /// buffered replay).
-    pub source_rows: Option<&'a [(String, Vec<u8>)]>,
+    /// The source rows the Control Plane read, each a standard msgpack map.
+    /// The join map is built from these alone.
+    pub source_rows: &'a [Vec<u8>],
     /// Compiled RLS read policy of the TARGET collection, gating the
     /// `RETURNING` rows. Empty = no policy.
     pub rls_filters: &'a [u8],

@@ -64,3 +64,54 @@ pub fn timeseries_partition_unreadable(
     .with_backtrace()
     .emit();
 }
+
+/// Report a committed multi-partition timeseries flush whose install did not
+/// finish. Called only from the install step of `flush_ts_collection` and of
+/// its roll-forward, which keep the flush pending and retry it.
+pub fn timeseries_flush_not_installed(
+    err: &crate::Error,
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+) {
+    let class = error_class(err);
+    let ctx = context::TimeseriesFlushNotInstalled {
+        database_id,
+        tenant_id,
+        collection,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "committed timeseries flush did not install, so the collection waits for its roll-forward",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
+/// Report a timeseries memtable the idle maintenance flush could not write.
+/// Called only from the idle flush, which keeps the rows and retries later.
+pub fn timeseries_idle_flush_failed(
+    err: &crate::Error,
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+) {
+    let class = error_class(err);
+    let ctx = context::TimeseriesIdleFlushFailed {
+        database_id,
+        tenant_id,
+        collection,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "idle timeseries flush failed, so the memtable keeps its rows",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}

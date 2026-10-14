@@ -224,7 +224,7 @@ fn build_timeseries_schema(
 ) -> Option<Box<nodedb_physical::physical_plan::TimeseriesSchema>> {
     let nodedb_types::CollectionType::Columnar(nodedb_types::ColumnarProfile::Timeseries {
         time_key,
-        ..
+        interval,
     }) = &coll.collection_type
     else {
         return None;
@@ -232,6 +232,9 @@ fn build_timeseries_schema(
     Some(Box::new(nodedb_physical::physical_plan::TimeseriesSchema {
         time_key: time_key.clone(),
         columns: coll.fields.clone(),
+        // The collection type's interval is the one source of the partition
+        // interval: CREATE and ALTER both write it.
+        partition_interval: interval.clone(),
     }))
 }
 
@@ -373,6 +376,12 @@ pub(crate) fn build_doc_config_from_stored<S: CollectionSource + ?Sized>(
             coll.database_id,
         ),
         generated_columns: build_generated_column_specs(coll),
+        // Typeguards exist on schemaless collections only.
+        type_guards: if coll.collection_type.is_schemaless() {
+            coll.type_guards.clone()
+        } else {
+            Vec::new()
+        },
     };
 
     // Written as a struct literal with every field named — and deliberately
@@ -381,8 +390,14 @@ pub(crate) fn build_doc_config_from_stored<S: CollectionSource + ?Sized>(
     // behaves as though the attribute was never declared. Naming every
     // field turns that into a compile error here, in the one function both the
     // live-DDL path and the boot seed go through.
+    // A violation names the collection the user wrote, never the qualified key.
+    let type_guards = crate::data::executor::enforcement::typeguard::CompiledTypeGuard::compile_all(
+        &coll.name,
+        &enforcement.type_guards,
+    );
     crate::engine::document::store::CollectionConfig {
         name,
+        type_guards,
         index_paths: indexes
             .iter()
             .map(crate::engine::document::store::IndexPath::from_registered)

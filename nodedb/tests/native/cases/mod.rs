@@ -22,6 +22,7 @@ mod native_session_parameters;
 mod native_show_dispatch;
 mod native_sorted_index_range;
 mod native_sql_authorization;
+mod native_state_transitions;
 mod native_transactions_savepoint;
 mod native_transactions_staging;
 mod native_trigger_statement_txn;

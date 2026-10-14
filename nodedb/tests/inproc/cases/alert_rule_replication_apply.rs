@@ -12,6 +12,7 @@ use nodedb::control::catalog_entry::post_apply::apply_post_apply_side_effects_sy
 use nodedb::control::catalog_entry::{CatalogEntry, apply};
 use nodedb::event::alert::hysteresis::EvaluateParams;
 use nodedb::event::alert::types::{AlertCondition, AlertDef, CompareOp, NotifyTarget};
+use nodedb::event::alert::{AlertGroupCell, AlertGroupKey};
 use nodedb_test_support::pgwire_harness::TestServer;
 
 const DB: u64 = 0;
@@ -19,6 +20,11 @@ const TENANT: u64 = 1;
 const ALERT: &str = "replicated_high_temp";
 const COLLECTION: &str = "replicated_metrics";
 const GROUP: &str = "device-1";
+
+/// The alert group of `GROUP`.
+fn group() -> AlertGroupKey {
+    AlertGroupKey::from_cells(vec![AlertGroupCell::Text(GROUP.to_string())])
+}
 
 fn definition() -> AlertDef {
     AlertDef {
@@ -162,7 +168,7 @@ async fn replicated_delete_removes_the_alert_rule_and_its_hysteresis() {
         database_id: DB,
         tenant_id: TENANT,
         alert_name: ALERT,
-        group_key: GROUP,
+        group_key: &group(),
         condition_met: true,
         value: 99.0,
         fire_after: 1,
@@ -173,7 +179,7 @@ async fn replicated_delete_removes_the_alert_rule_and_its_hysteresis() {
         server
             .shared
             .alert_hysteresis
-            .get_state(DB, TENANT, ALERT, GROUP)
+            .get_state(DB, TENANT, ALERT, &group())
             .is_some(),
         "the evaluation must leave hysteresis state to clean up"
     );
@@ -192,7 +198,7 @@ async fn replicated_delete_removes_the_alert_rule_and_its_hysteresis() {
         server
             .shared
             .alert_hysteresis
-            .get_state(DB, TENANT, ALERT, GROUP)
+            .get_state(DB, TENANT, ALERT, &group())
             .is_none(),
         "the replicated delete must clear hysteresis state on every node"
     );

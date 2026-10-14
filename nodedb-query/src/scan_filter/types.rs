@@ -148,7 +148,13 @@ impl ScanFilter {
             | FilterOp::NeColumn => {}
         }
 
-        let field_val = match doc.get(&self.field) {
+        // A bare name also reaches a qualified field (`amount` reads
+        // `orders.amount`), as the binary matcher's suffix lookup does. The
+        // field reads as absent, and so NULL, only when neither exists.
+        let field_val = match doc
+            .get(&self.field)
+            .or_else(|| field_by_suffix(doc, &self.field))
+        {
             Some(v) => v,
             None => return Ok(self.op == FilterOp::IsNull),
         };
@@ -258,7 +264,10 @@ impl ScanFilter {
                     nodedb_types::Value::String(s) => s.as_str(),
                     _ => return Ok(false),
                 };
-                let other_val = match doc.get(other_col) {
+                let other_val = match doc
+                    .get(other_col)
+                    .or_else(|| field_by_suffix(doc, other_col))
+                {
                     Some(v) => v,
                     None => return Ok(false),
                 };
@@ -313,6 +322,29 @@ pub(crate) fn column_compare(
         | FilterOp::Or
         | FilterOp::Expr => false,
     }
+}
+
+/// The field a bare name reaches in a row keyed `qualifier.column`: the
+/// value under a key ending in `.name`. When several qualifiers carry the
+/// name, the smallest key wins, so the choice does not depend on map order.
+/// `None` for a qualified name, and when no key carries it.
+fn field_by_suffix<'a>(
+    doc: &'a nodedb_types::Value,
+    name: &str,
+) -> Option<&'a nodedb_types::Value> {
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let nodedb_types::Value::Object(map) = doc else {
+        return None;
+    };
+    map.iter()
+        .filter(|(key, _)| {
+            key.strip_suffix(name)
+                .is_some_and(|qualifier| qualifier.ends_with('.') && qualifier.len() > 1)
+        })
+        .min_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, value)| value)
 }
 
 #[cfg(test)]

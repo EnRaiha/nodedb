@@ -7,9 +7,10 @@
 //! instead of string prefixes, so the compiler catches missing
 //! handlers when a new DDL is added.
 //!
-//! The parser ([`parse`]) converts raw SQL into a `NodedbStatement`
-//! using whitespace-split token matching — the same technique the
-//! old string-prefix router used, but producing a typed output.
+//! The parser ([`parse`]) converts raw SQL into a `NodedbStatement`.
+//! Each statement parser reads literal-aware tokens left to right: a
+//! keyword matches only at its clause position, never inside a string
+//! literal or quoted identifier, and an unread token is a parse error.
 
 pub mod alter_ops;
 pub mod collection_type;

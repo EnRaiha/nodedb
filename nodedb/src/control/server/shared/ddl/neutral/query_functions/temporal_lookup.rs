@@ -4,6 +4,7 @@
 //!
 //! Returns the row with latest `time_column <= as_of` for the given key.
 
+use nodedb_sql::parser::query_function::TemporalLookupArgs;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -14,30 +15,20 @@ use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
-use super::helpers::{
-    clean_arg, empty_result, err, extract_function_args, single_result, unwrap_scan_docs,
-};
+use super::helpers::{empty_result, err, single_result, unwrap_scan_docs};
 
 pub async fn temporal_lookup(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    sql: &str,
+    args: &TemporalLookupArgs,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = extract_function_args(sql, "TEMPORAL_LOOKUP")?;
-    if args.len() < 5 {
-        return Err(err(
-            "42601",
-            "TEMPORAL_LOOKUP requires (table, key_value, as_of, key_column, time_column)",
-        ));
-    }
-
-    let table = clean_arg(args[0]);
-    let key_value = clean_arg(args[1]);
-    let as_of = clean_arg(args[2]);
-    let key_column = clean_arg(args[3]);
-    let time_column = clean_arg(args[4]);
+    let table = args.table.clone();
+    let key_value = args.key_value.clone();
+    let as_of = args.as_of.clone();
+    let key_column = args.key_column.clone();
+    let time_column = args.time_column.clone();
 
     // `table` came out of the caller's argument list, so the read it names is
     // authorized, row-filtered, and redacted here — nothing downstream of the

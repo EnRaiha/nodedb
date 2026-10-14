@@ -61,6 +61,7 @@ pub(super) async fn singular_period_value(
         // `BulkUpdate`, and `BulkDelete` before reaching this function —
         // every other variant is unreachable.
         DocumentOp::BatchInsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::PointGet { .. }
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::Scan { .. }

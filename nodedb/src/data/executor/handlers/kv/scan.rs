@@ -5,6 +5,7 @@
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::scan_filter::{FilterOp, ScanFilter, decode_scan_filters};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::scan_budget;
 use crate::data::executor::task::ExecutionTask;
@@ -72,8 +73,16 @@ impl CoreLoop {
             count
         };
 
-        // Try to extract a single equality filter for index pushdown.
-        let (filter_field, filter_value) = extract_eq_filter(filters);
+        // A malformed filter payload is an error. Reading it as "no filter"
+        // would return every row of the collection.
+        let filter_predicates = match decode_scan_filters(filters, "kv scan filter") {
+            Ok(predicates) => predicates,
+            Err(e) => return self.response_error(task, e),
+        };
+
+        // Index pushdown for one equality conjunct. The post-scan filter
+        // below still checks every predicate on every row.
+        let probe = eq_index_probe(&filter_predicates);
         let (mut entries, _next_cursor) = self.kv_engine.scan(KvScanParams {
             database_id: did,
             tenant_id: tid,
@@ -82,8 +91,8 @@ impl CoreLoop {
             count: fetch_count,
             now_ms,
             match_pattern,
-            filter_field: filter_field.as_deref(),
-            filter_value: filter_value.as_deref(),
+            filter_field: probe.as_ref().map(|(field, _)| *field),
+            filter_value: probe.as_ref().map(|(_, key)| key.as_slice()),
             surrogate_ceiling,
         });
 
@@ -119,16 +128,6 @@ impl CoreLoop {
                 return self.response_error(task, ErrorCode::ResourcesExhausted);
             }
         }
-
-        // Parse filter predicates for post-scan evaluation.
-        // Index pushdown handles eq filters on indexed fields, but general
-        // predicates (gt, lt, in, etc.) need post-scan evaluation.
-        let filter_predicates: Vec<crate::bridge::scan_filter::ScanFilter> = if !filters.is_empty()
-        {
-            zerompk::from_msgpack(filters).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
 
         // Build results as raw msgpack — no serde_json::Value intermediary.
         let mut result_entries: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
@@ -171,7 +170,7 @@ impl CoreLoop {
             && let Err(e) =
                 super::super::sort_utils::sort_msgpack_rows(&mut result_entries, sort_keys)
         {
-            return self.response_error(task, crate::Error::from(e));
+            return self.response_error(task, e);
         }
 
         // Build response as flat msgpack array — same format as document/columnar scan.
@@ -247,61 +246,307 @@ impl CoreLoop {
     }
 }
 
-/// Extract a single equality filter from serialized ScanFilter bytes.
+/// The secondary-index probe for a decoded filter set: the field and index
+/// key of the first top-level `field = <literal>` conjunct.
 ///
-/// Looks for the first `{"field": "x", "op": "eq", "value": "y"}` filter.
-/// Returns `(Some(field), Some(value_bytes))` if found, `(None, None)` otherwise.
-pub(in crate::data::executor) fn extract_eq_filter(
-    filters: &[u8],
-) -> (Option<String>, Option<Vec<u8>>) {
-    if filters.is_empty() {
-        return (None, None);
-    }
-
-    // Filters are MessagePack-encoded Vec<ScanFilter>.
-    let Ok(parsed) = zerompk::from_msgpack::<Vec<nodedb_types::json_msgpack::JsonValue>>(filters)
-        .map(|v| {
-            v.into_iter()
-                .map(|jv| jv.0)
-                .collect::<Vec<serde_json::Value>>()
-        })
-    else {
-        tracing::trace!(
-            len = filters.len(),
-            "filter deserialization failed, falling back to full scan"
-        );
-        return (None, None);
-    };
-
-    for filter in &parsed {
-        let Some(field) = filter.get("field").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(op) = filter.get("op").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if op != "eq" {
-            continue;
+/// A KV index files each value under its coerced-equality bucket, so the
+/// literal's key reaches every row the coerced `=` accepts: `5` reaches a
+/// stored `5`, `'5'` and `5.0`, and a timestamp reaches the stored strings
+/// naming its instant. The key can also reach rows the `=` refuses, and the
+/// post-scan filter drops them. A literal that equals nothing, NULL
+/// included, gives no probe.
+pub(in crate::data::executor) fn eq_index_probe(filters: &[ScanFilter]) -> Option<(&str, Vec<u8>)> {
+    filters.iter().find_map(|f| {
+        let plain_eq = matches!(f.op, FilterOp::Eq)
+            && !f.field.is_empty()
+            && f.clauses.is_empty()
+            && f.expr.is_none();
+        if !plain_eq {
+            return None;
         }
-        let Some(value) = filter.get("value") else {
-            continue;
-        };
+        crate::engine::kv::index::kv_probe_key(&f.value).map(|key| (f.field.as_str(), key))
+    })
+}
 
-        let value_bytes = match value {
-            serde_json::Value::String(s) => s.as_bytes().to_vec(),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    let sortable = (i as u64) ^ (1u64 << 63);
-                    sortable.to_be_bytes().to_vec()
-                } else {
-                    n.to_string().into_bytes()
-                }
-            }
-            other => other.to_string().into_bytes(),
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::kv::index::kv_index_key;
+    use crate::engine::kv::test_support::row_surrogate;
+    use crate::engine::kv::{KvEngine, KvPutParams, RegisterIndexParams};
+    use nodedb_types::Value;
 
-        return (Some(field.to_string()), Some(value_bytes));
+    fn eq(field: &str, value: Value) -> ScanFilter {
+        ScanFilter {
+            field: field.into(),
+            op: FilterOp::Eq,
+            value,
+            clauses: Vec::new(),
+            expr: None,
+        }
     }
 
-    (None, None)
+    #[test]
+    fn probe_uses_the_first_plain_equality() {
+        let filters = [
+            eq("age", Value::Integer(5)),
+            eq("region", Value::String("us-east".into())),
+        ];
+        assert_eq!(
+            eq_index_probe(&filters),
+            Some(("age", kv_index_key(&Value::Integer(5))))
+        );
+    }
+
+    /// Numeric, numeric-string, datetime and text literals all probe, each
+    /// under the key its coerced equals are filed under.
+    #[test]
+    fn every_comparable_literal_probes() {
+        let five = kv_index_key(&Value::Integer(5));
+        assert_eq!(
+            eq_index_probe(&[eq("n", Value::String("5".into()))]),
+            Some(("n", five.clone()))
+        );
+        assert_eq!(
+            eq_index_probe(&[eq("n", Value::Float(5.0))]),
+            Some(("n", five))
+        );
+        assert_eq!(
+            eq_index_probe(&[eq("t", Value::String("2024-01-02".into()))]),
+            Some((
+                "t",
+                kv_index_key(&Value::String("2024-01-02T00:00:00".into()))
+            ))
+        );
+        assert_eq!(
+            eq_index_probe(&[eq("r", Value::String("us".into()))]),
+            Some(("r", kv_index_key(&Value::String("us".into()))))
+        );
+    }
+
+    /// `= NULL` matches no row, so it gives no probe.
+    #[test]
+    fn a_null_literal_gives_no_probe() {
+        assert_eq!(eq_index_probe(&[eq("n", Value::Null)]), None);
+    }
+
+    const NOW: u64 = 1_000;
+
+    /// An engine with collection `c` indexed on field `n`.
+    fn engine_indexed_on_n() -> KvEngine {
+        let mut engine = KvEngine::new(NOW, 16, 0.75, 4, 64, 1000, 1024);
+        engine.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "n",
+            field_position: 0,
+            backfill: false,
+            now_ms: NOW,
+        });
+        engine
+    }
+
+    fn put(engine: &mut KvEngine, key: &[u8], n: Value) {
+        let row = Value::Object(std::collections::HashMap::from([("n".to_string(), n)]));
+        let body = nodedb_types::value_to_msgpack(&row).expect("encode row");
+        engine
+            .put(KvPutParams {
+                database_id: 0,
+                tenant_id: 1,
+                collection: "c",
+                key,
+                value: &body,
+                ttl_ms: 0,
+                now_ms: NOW,
+                surrogate: row_surrogate(key),
+            })
+            .expect("a bound row writes");
+    }
+
+    /// The rows the engine returns for `n = literal` when the scan takes the
+    /// probe `eq_index_probe` gives, sorted by key. The engine applies no
+    /// predicate itself: a scan that ignored the probe returns every row.
+    fn probed(engine: &KvEngine, literal: Value) -> Vec<Vec<u8>> {
+        let filters = [eq("n", literal)];
+        let (field, key) = eq_index_probe(&filters).expect("the literal probes");
+        let (rows, _) = engine.scan(KvScanParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            cursor: &[],
+            count: usize::MAX,
+            now_ms: NOW,
+            match_pattern: None,
+            filter_field: Some(field),
+            filter_value: Some(&key),
+            surrogate_ceiling: None,
+        });
+        let mut keys: Vec<Vec<u8>> = rows.into_iter().map(|(key, _)| key).collect();
+        keys.sort();
+        keys
+    }
+
+    fn keys(names: &[&str]) -> Vec<Vec<u8>> {
+        names.iter().map(|name| name.as_bytes().to_vec()).collect()
+    }
+
+    /// An integer literal reaches the rows storing it as an integer, as a
+    /// numeric string and as an equal float, and only those: the other rows
+    /// stay out, so the scan read the index.
+    #[test]
+    fn an_int_literal_reaches_every_equal_stored_form_through_the_index() {
+        let mut engine = engine_indexed_on_n();
+        put(&mut engine, b"int", Value::Integer(5));
+        put(&mut engine, b"text", Value::String("5".into()));
+        put(&mut engine, b"float", Value::Float(5.0));
+        put(&mut engine, b"other", Value::Integer(6));
+        put(&mut engine, b"word", Value::String("five".into()));
+
+        let expected = keys(&["float", "int", "text"]);
+        assert_eq!(probed(&engine, Value::Integer(5)), expected);
+        assert_eq!(probed(&engine, Value::String("5".into())), expected);
+        assert_eq!(probed(&engine, Value::Float(5.0)), expected);
+    }
+
+    /// A datetime literal reaches the rows storing its instant, as a
+    /// datetime or as text in either ISO-8601 spelling.
+    #[test]
+    fn a_datetime_literal_reaches_every_stored_form_of_its_instant() {
+        let instant = nodedb_types::NdbDateTime::parse("2024-01-02T03:04:05").expect("instant");
+        let mut engine = engine_indexed_on_n();
+        put(&mut engine, b"dt", Value::DateTime(instant));
+        put(
+            &mut engine,
+            b"iso",
+            Value::String("2024-01-02T03:04:05".into()),
+        );
+        put(
+            &mut engine,
+            b"spaced",
+            Value::String("2024-01-02 03:04:05".into()),
+        );
+        put(
+            &mut engine,
+            b"later",
+            Value::String("2024-01-03T03:04:05".into()),
+        );
+
+        let expected = keys(&["dt", "iso", "spaced"]);
+        assert_eq!(probed(&engine, Value::DateTime(instant)), expected);
+        assert_eq!(
+            probed(&engine, Value::String("2024-01-02T03:04:05".into())),
+            expected
+        );
+    }
+
+    /// An update re-files a row under its new value's key and a delete
+    /// removes it, whatever form the value takes.
+    #[test]
+    fn updates_and_deletes_keep_the_index_consistent() {
+        let five = Value::Integer(5);
+        let seven = Value::Integer(7);
+        let mut engine = engine_indexed_on_n();
+        put(&mut engine, b"a", Value::Integer(5));
+        put(&mut engine, b"b", Value::String("5".into()));
+        put(&mut engine, b"c", Value::String("unrelated".into()));
+
+        put(&mut engine, b"a", Value::Float(7.0));
+        assert_eq!(probed(&engine, five.clone()), keys(&["b"]));
+        assert_eq!(probed(&engine, seven.clone()), keys(&["a"]));
+
+        put(&mut engine, b"b", Value::String("7".into()));
+        assert!(engine.index_lookup_eq(0, 1, "c", "n", &five).is_empty());
+        assert_eq!(probed(&engine, seven.clone()), keys(&["a", "b"]));
+
+        assert_eq!(engine.delete(0, 1, "c", &[b"a".to_vec()], NOW), 1);
+        assert_eq!(probed(&engine, seven.clone()), keys(&["b"]));
+        assert_eq!(engine.delete(0, 1, "c", &[b"b".to_vec()], NOW), 1);
+        assert!(engine.index_lookup_eq(0, 1, "c", "n", &seven).is_empty());
+        assert_eq!(
+            engine.index_lookup_eq(0, 1, "c", "n", &Value::String("unrelated".into())),
+            keys(&["c"])
+        );
+    }
+
+    /// A miss on a complete index returns no row: the engine scan applies no
+    /// predicate, so a scan that read the table would return all three.
+    #[test]
+    fn a_miss_on_a_complete_index_returns_nothing_without_scanning() {
+        let mut engine = engine_indexed_on_n();
+        put(&mut engine, b"a", Value::Integer(5));
+        put(&mut engine, b"b", Value::String("5".into()));
+        put(&mut engine, b"c", Value::String("five".into()));
+
+        assert!(probed(&engine, Value::Integer(9)).is_empty());
+        assert!(probed(&engine, Value::String("nine".into())).is_empty());
+    }
+
+    /// The keys of the rows whose `n` a WHERE `n = literal` accepts, read
+    /// through the scan path the handler takes: the probe, then the
+    /// predicate on every row the engine returns.
+    fn matching(engine: &KvEngine, literal: Value) -> Vec<Vec<u8>> {
+        let filters = [eq("n", literal.clone())];
+        let probe = eq_index_probe(&filters);
+        let (rows, _) = engine.scan(KvScanParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            cursor: &[],
+            count: usize::MAX,
+            now_ms: NOW,
+            match_pattern: None,
+            filter_field: probe.as_ref().map(|(field, _)| *field),
+            filter_value: probe.as_ref().map(|(_, key)| key.as_slice()),
+            surrogate_ceiling: None,
+        });
+        let mut keys: Vec<Vec<u8>> = rows
+            .into_iter()
+            .filter(|(_, body)| match nodedb_types::value_from_msgpack(body) {
+                Ok(Value::Object(map)) => map.get("n").is_some_and(|n| n.eq_coerced(&literal)),
+                _ => false,
+            })
+            .map(|(key, _)| key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// An index registered with `backfill=false` over existing rows lacks
+    /// them, so an equality reads the whole collection and finds the rows
+    /// written before the index and after it.
+    #[test]
+    fn a_late_index_without_backfill_still_finds_older_rows() {
+        let mut engine = KvEngine::new(NOW, 16, 0.75, 4, 64, 1000, 1024);
+        put(&mut engine, b"old", Value::Integer(5));
+        put(&mut engine, b"old_other", Value::Integer(6));
+        engine.register_index(RegisterIndexParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "c",
+            field: "n",
+            field_position: 0,
+            backfill: false,
+            now_ms: NOW,
+        });
+        put(&mut engine, b"new", Value::String("5".into()));
+        put(&mut engine, b"new_other", Value::Integer(7));
+
+        assert_eq!(
+            engine.index_lookup_eq(0, 1, "c", "n", &Value::Integer(5)),
+            keys(&["new"]),
+            "test premise: the index lacks the row written before it"
+        );
+        assert_eq!(matching(&engine, Value::Integer(5)), keys(&["new", "old"]));
+        assert_eq!(matching(&engine, Value::Integer(6)), keys(&["old_other"]));
+    }
+
+    #[test]
+    fn non_equality_or_grouped_filter_gives_no_probe() {
+        let mut ne = eq("region", Value::String("us".into()));
+        ne.op = FilterOp::Ne;
+        let mut or = eq("region", Value::String("us".into()));
+        or.clauses = vec![vec![eq("region", Value::String("eu".into()))]];
+        assert_eq!(eq_index_probe(&[ne, or]), None);
+    }
 }

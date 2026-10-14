@@ -9,6 +9,8 @@ use crate::data::executor::core_loop::CoreLoop;
 
 use super::NestedLoopJoinParams;
 use super::merge_join_docs_binary;
+use super::side_rows::JoinSideSource;
+use super::support::row_qualifier;
 
 impl CoreLoop {
     /// Nested loop join: O(N×M) fallback for non-equi joins, theta joins,
@@ -30,6 +32,8 @@ impl CoreLoop {
             limit,
             left_rls_filters,
             right_rls_filters,
+            left_input,
+            right_input,
         } = p;
         debug!(
             core = self.core_id,
@@ -48,17 +52,18 @@ impl CoreLoop {
         let scan_limit =
             crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
-        let left_docs = match self.scan_collection_with_rls(
-            task.request.database_id.as_u64(),
+        let left_docs = match self.join_side_rows(
+            task,
             tid,
-            left_collection,
+            JoinSideSource {
+                collection: left_collection,
+                input: left_input,
+                rls_filters: left_rls_filters,
+            },
             scan_limit,
-            left_rls_filters,
         ) {
             Ok(d) => d,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+            Err(resp) => return *resp,
         };
 
         // Memory-budget guard on the probe side (left). Checked immediately
@@ -69,17 +74,18 @@ impl CoreLoop {
             return err;
         }
 
-        let right_docs = match self.scan_collection_with_rls(
-            task.request.database_id.as_u64(),
+        let right_docs = match self.join_side_rows(
+            task,
             tid,
-            right_collection,
+            JoinSideSource {
+                collection: right_collection,
+                input: right_input,
+                rls_filters: right_rls_filters,
+            },
             scan_limit,
-            right_rls_filters,
         ) {
             Ok(d) => d,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+            Err(resp) => return *resp,
         };
 
         // Memory-budget guard on the inner side (right). Same convention as the
@@ -130,6 +136,12 @@ impl CoreLoop {
             )
         };
 
+        // Each side's columns are qualified with its bare collection name,
+        // the name SQL qualifies them with.
+        let database_id = task.request.database_id;
+        let left_qualifier = row_qualifier(left_collection, database_id);
+        let right_qualifier = row_qualifier(right_collection, database_id);
+
         let mut right_matched: Vec<bool> = vec![false; right_docs.len()];
         let mut results = Vec::new();
 
@@ -153,8 +165,8 @@ impl CoreLoop {
                     let merged = merge_join_docs_binary(
                         left_bytes,
                         Some(right_bytes),
-                        left_collection,
-                        right_collection,
+                        left_qualifier,
+                        right_qualifier,
                     );
                     match crate::bridge::scan_filter::ScanFilter::all_match_binary(
                         &predicates,
@@ -173,8 +185,8 @@ impl CoreLoop {
                     results.push(merge_join_docs_binary(
                         left_bytes,
                         Some(right_bytes),
-                        left_collection,
-                        right_collection,
+                        left_qualifier,
+                        right_qualifier,
                     ));
                 }
             }
@@ -184,8 +196,8 @@ impl CoreLoop {
                 results.push(merge_join_docs_binary(
                     left_bytes,
                     None,
-                    left_collection,
-                    right_collection,
+                    left_qualifier,
+                    right_qualifier,
                 ));
             }
         }
@@ -201,7 +213,7 @@ impl CoreLoop {
                         &[],
                         Some(right_bytes),
                         "",
-                        right_collection,
+                        right_qualifier,
                     ));
                 }
             }

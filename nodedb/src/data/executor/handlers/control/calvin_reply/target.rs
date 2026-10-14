@@ -104,6 +104,12 @@ pub(super) fn returning_target(plan: &PhysicalPlan) -> Option<ReturningTarget<'_
                 rls_filters,
                 ..
             }
+            | DocumentOp::BatchUpsert {
+                collection,
+                returning: Some(spec),
+                rls_filters,
+                ..
+            }
             | DocumentOp::BulkUpdate {
                 collection,
                 returning: Some(spec),
@@ -208,34 +214,48 @@ pub(super) fn returning_target(plan: &PhysicalPlan) -> Option<ReturningTarget<'_
         PhysicalPlan::Vector(op) => match op {
             VectorOp::DirectUpsert {
                 collection,
+                field,
                 returning: Some(spec),
                 rls_filters,
                 ..
             }
             | VectorOp::DirectInsert {
                 collection,
+                field,
                 returning: Some(spec),
                 rls_filters,
                 ..
             }
             | VectorOp::DirectInsertIfAbsent {
                 collection,
+                field,
+                returning: Some(spec),
+                rls_filters,
+                ..
+            }
+            | VectorOp::DirectBatchWrite {
+                collection,
+                field,
                 returning: Some(spec),
                 rls_filters,
                 ..
             }
             | VectorOp::DirectUpdate {
                 collection,
+                field,
                 returning: Some(spec),
                 rls_filters,
                 ..
-            } => Some(ReturningTarget::new(
-                spec,
-                rls_filters,
-                collection.as_str(),
-                RowEngine::Vector,
-                After,
-            )),
+            } => Some(ReturningTarget {
+                vector_field: Some(field.as_str()),
+                ..ReturningTarget::new(
+                    spec,
+                    rls_filters,
+                    collection.as_str(),
+                    RowEngine::Vector,
+                    After,
+                )
+            }),
             VectorOp::DirectDelete {
                 collection,
                 field,

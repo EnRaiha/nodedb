@@ -631,4 +631,55 @@ mod tests {
             "nothing installed"
         );
     }
+
+    /// A peer delta admitted against a constraint version this replica has
+    /// not installed is fenced: nothing imports and the mark is held. Once
+    /// the version installs, the re-push at the same seq applies.
+    #[test]
+    fn a_delta_ahead_of_the_installed_constraint_version_is_fenced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _request_tx, _response_rx) = make_core_with_dir(dir.path());
+        let seed = task_at(10);
+        install_unique_email(&mut core, &seed);
+        let delta = user_delta(3, "b", "b@y.com");
+        let prov = provenance(1);
+        let fenced_params = || {
+            let mut params = users_params("b", &delta);
+            params.peer_id = 3;
+            params.provenance = Some(&prov);
+            params.constraint_version_required = 2;
+            params
+        };
+        let row_present = |core: &crate::data::executor::core_loop::CoreLoop| {
+            core.crdt_engines
+                .get(&(seed.request.database_id, seed.request.tenant_id))
+                .is_some_and(|engine| engine.row_exists("users", "b"))
+        };
+
+        core.execute_crdt_apply(&task_at(11), fenced_params());
+        assert_eq!(core.sync_hwm_value(9, 1), 0, "the mark is held");
+        assert!(!row_present(&core), "a fenced delta imports nothing");
+
+        let engine = core
+            .get_crdt_engine(seed.request.database_id, seed.request.tenant_id)
+            .expect("engine");
+        assert!(engine.set_collection_constraints(
+            "users",
+            2,
+            vec![nodedb_crdt::Constraint {
+                name: "users_email_unique".into(),
+                collection: "users".into(),
+                field: "email".into(),
+                kind: nodedb_crdt::ConstraintKind::Unique,
+            }],
+        ));
+        let response = core.execute_crdt_apply(&task_at(12), fenced_params());
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        assert_eq!(
+            core.sync_hwm_value(9, 1),
+            1,
+            "the re-push advanced the mark"
+        );
+        assert!(row_present(&core), "the re-push imported the row");
+    }
 }

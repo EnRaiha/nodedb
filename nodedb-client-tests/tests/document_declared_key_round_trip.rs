@@ -191,7 +191,7 @@ async fn vector_search_restricts_allowed_ids_on_a_declared_key() {
         &remote,
         "CREATE COLLECTION sku_vecs \
          FIELDS (sku TEXT PRIMARY KEY, embedding VECTOR(2)) \
-         WITH (engine='vector', m=8, ef_construction=50)",
+         WITH (engine='document_schemaless', m=8, ef_construction=50)",
     )
     .await;
     for (sku, x) in [

@@ -30,6 +30,7 @@
 //!      finalized rows into a `Resolved::Gathered` response (distributed GROUP BY).
 //!    - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
+mod cagg_rows;
 mod capture;
 pub mod exchange;
 mod join_input;
@@ -40,3 +41,4 @@ mod shuffle_aggregate;
 
 pub use capture::DistributedReadCapture;
 pub use exchange::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};
+pub(crate) use materialize::materialize_task_providers;

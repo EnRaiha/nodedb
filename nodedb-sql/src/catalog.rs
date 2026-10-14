@@ -112,6 +112,11 @@ pub enum SqlCatalogError {
         /// collection is hard-deleted by the GC sweeper.
         retention_expires_at_ns: u64,
     },
+
+    /// The relation's catalog record exists but could not be read: a
+    /// stored definition that does not decode, or a catalog read error.
+    #[error("relation '{relation}' could not be read: {detail}")]
+    Unreadable { relation: String, detail: String },
 }
 
 /// A relation that resolves to planner metadata without a stored collection.

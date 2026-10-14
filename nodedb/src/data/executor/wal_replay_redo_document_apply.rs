@@ -101,6 +101,9 @@ impl CoreLoop {
                     unique: crate::data::executor::enforcement::unique::UniqueJudge::Unit,
                     resolved_targets: &[],
                     wal_lsn: (row.record_lsn != 0).then(|| crate::types::Lsn::new(row.record_lsn)),
+                    // A redo carries the submitted body: the guards inject
+                    // again, and the commit already judged them.
+                    guards: crate::data::executor::enforcement::typeguard::GuardScope::InjectOnly,
                 },
             )
             .and_then(|mut outcome| {
@@ -313,6 +316,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo");

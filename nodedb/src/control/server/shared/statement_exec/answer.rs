@@ -85,7 +85,8 @@ impl StatementFold {
         plan_kind: PlanKind,
         payload: &[u8],
     ) -> Result<Option<u64>, StatementError> {
-        let redaction = QueryRedaction::for_plan(exec.tenant_id(), exec.scope.auth(), plan);
+        let redaction =
+            QueryRedaction::for_plan(exec.tenant_id(), exec.database_id, exec.scope.auth(), plan);
         match shape_response_materialized(MaterializedShapeRequest {
             payload,
             plan,

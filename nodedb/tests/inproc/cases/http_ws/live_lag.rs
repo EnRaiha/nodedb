@@ -54,16 +54,20 @@ async fn ws_live_lag_never_silently_skips_events() {
     let document_suffix = "x".repeat(2_048);
     const PUBLISHED: u64 = 4_096 + 512;
     const ROWS_PER_COMMIT: u64 = 512;
+    // Each transaction stages its rows as one multi-row statement, so the
+    // seed pays one surrogate commit per batch, not per row.
     for batch in 0..PUBLISHED / ROWS_PER_COMMIT {
+        let values: Vec<String> = (batch * ROWS_PER_COMMIT..(batch + 1) * ROWS_PER_COMMIT)
+            .map(|sequence| format!("('lagged-order-{sequence:05}-{document_suffix}')"))
+            .collect();
         srv.node.exec("BEGIN").await.expect("begin");
-        for sequence in batch * ROWS_PER_COMMIT..(batch + 1) * ROWS_PER_COMMIT {
-            srv.node
-                .exec(&format!(
-                    "INSERT INTO orders {{ id: 'lagged-order-{sequence:05}-{document_suffix}' }}"
-                ))
-                .await
-                .unwrap_or_else(|error| panic!("insert lagged order {sequence}: {error}"));
-        }
+        srv.node
+            .exec(&format!(
+                "INSERT INTO orders (id) VALUES {}",
+                values.join(", ")
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("insert lagged order batch {batch}: {error}"));
         srv.node.exec("COMMIT").await.expect("commit");
     }
 

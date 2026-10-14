@@ -10,6 +10,7 @@ pub mod dispatch_remote_stream;
 pub mod dispatcher;
 pub mod error_map;
 pub mod fuser;
+pub mod home_collection;
 pub mod invalidation;
 pub mod key_extractor;
 pub mod live_leaders;

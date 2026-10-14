@@ -92,6 +92,8 @@ fn ts_scan(
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: Vec::new(),
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     // Payload may be MessagePack (grouped aggregates) or JSON — decode both.
@@ -134,6 +136,8 @@ fn ts_scan_filtered(
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: Vec::new(),
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     let json_str = nodedb::data::executor::response_codec::decode_payload_to_json(&raw);
@@ -771,6 +775,8 @@ fn large_group_by_returns_single_valid_json() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: Vec::new(),
+            having: Vec::new(),
+            tiering: None,
         }),
     );
 

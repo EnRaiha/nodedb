@@ -5,10 +5,11 @@
 //!
 //! A collection's UNIQUE / NOT NULL constraints are derived from the catalog
 //! and must be installed into every data-group replica's CRDT validator — the
-//! component that rejects constraint-violating peer deltas at commit. The
-//! metadata leader's reconcile loop re-derives each collection's constraint set
-//! and replicates it via a `ConstraintChange` entry on the collection's vshard
-//! data Raft log; each replica installs it, fenced by `constraint_version`.
+//! component that rejects constraint-violating peer deltas at commit. The DDL
+//! that changes a collection's constraint set proposes a `ConstraintChange`
+//! entry on the collection's vshard data Raft log before it returns, and the
+//! metadata leader's reconcile loop re-delivers the set as a safety net. Each
+//! replica installs it, fenced by `constraint_version`.
 //!
 //! Reading the catalog row on a follower would only prove the catalog
 //! replicated — NOT that the validator installed. These tests read the
@@ -20,9 +21,9 @@
 //!   2. alter — a later schema mutation grows the set on every replica.
 //!   3. crash recovery — killing the metadata leader leaves the set installed
 //!      on every survivor; a new metadata leader takes over reconciliation.
-//!      This is what justifies a recurring reconcile loop over a one-shot
-//!      create-time hook: leadership can move, and the surviving cluster must
-//!      still converge without the original proposer alive.
+//!      This is what keeps the recurring reconcile loop beside the DDL-time
+//!      install: leadership can move, and the surviving cluster must still
+//!      converge without the original proposer alive.
 
 use crate::common;
 use common::cluster_harness::{TestCluster, TestClusterNode, wait_for_async};

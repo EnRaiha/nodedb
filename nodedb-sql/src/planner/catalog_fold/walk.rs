@@ -172,6 +172,7 @@ fn walk_plan(
             collection,
             engine,
             source,
+            source_alias,
             target_join_col,
             source_join_col,
             mut assignments,
@@ -189,6 +190,7 @@ fn walk_plan(
                 collection,
                 engine,
                 source: Box::new(walk_plan(*source, catalog, database_id, tenant_id)),
+                source_alias,
                 target_join_col,
                 source_join_col,
                 assignments,
@@ -200,13 +202,13 @@ fn walk_plan(
         SqlPlan::InsertSelect {
             target,
             source,
-            limit,
             column_map,
+            source_columns,
         } => SqlPlan::InsertSelect {
             target,
             source: Box::new(walk_plan(*source, catalog, database_id, tenant_id)),
-            limit,
             column_map,
+            source_columns,
         },
 
         SqlPlan::Aggregate {

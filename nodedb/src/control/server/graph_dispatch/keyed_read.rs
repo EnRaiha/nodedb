@@ -113,6 +113,7 @@ pub async fn read_on_vshard(
                 version_set: &version_set,
                 txn_id,
                 linearizable,
+                user_roles: &[],
             })
             .await?;
             reads.note([vshard_id], &outcome.read_versions);

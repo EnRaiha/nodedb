@@ -31,17 +31,7 @@ pub(super) fn apply_surrogate_bind(
         applied_key,
         ..
     } = pos;
-    let result = identities.iter().try_for_each(|identity| {
-        ctx.state
-            .surrogate_assigner
-            .bind(
-                nodedb_types::CollectionKey::from_bare(database_id, &identity.collection),
-                tenant_id,
-                &identity.pk_bytes,
-                nodedb_types::Surrogate::new(identity.surrogate),
-            )
-            .map(|_| ())
-    });
+    let result = bind_identities(&ctx, tenant_id, database_id, identities);
     let durable = result.is_ok();
     ctx.tracker.complete(
         group_id,
@@ -53,4 +43,38 @@ pub(super) fn apply_surrogate_bind(
         durable,
         result: None,
     }
+}
+
+/// Bind the entry's identities first-wins, one catalog transaction per
+/// collection the entry names. Keys of one collection bind in entry order.
+fn bind_identities(
+    ctx: &ApplyContext<'_>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    identities: &[ReplicatedIdentity],
+) -> crate::Result<()> {
+    let mut collections: Vec<&str> = Vec::new();
+    for identity in identities {
+        if !collections.contains(&identity.collection.as_str()) {
+            collections.push(&identity.collection);
+        }
+    }
+    for collection in collections {
+        let rows: Vec<(&[u8], nodedb_types::Surrogate)> = identities
+            .iter()
+            .filter(|identity| identity.collection == collection)
+            .map(|identity| {
+                (
+                    identity.pk_bytes.as_slice(),
+                    nodedb_types::Surrogate::new(identity.surrogate),
+                )
+            })
+            .collect();
+        ctx.state.surrogate_assigner.bind_many(
+            nodedb_types::CollectionKey::from_bare(database_id, collection),
+            tenant_id,
+            &rows,
+        )?;
+    }
+    Ok(())
 }

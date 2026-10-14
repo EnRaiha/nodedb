@@ -83,29 +83,6 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
                 },
             )?
         }
-        ReplicatedWrite::KvInsertIfAbsent {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            surrogate,
-            resolved_now_ms: rn,
-            returning,
-            rls_filters,
-        } => {
-            resolved_now_ms = *rn;
-            kv::insert_if_absent(
-                collection,
-                key,
-                value,
-                *ttl_ms,
-                *surrogate,
-                ReturningFields {
-                    returning: decode_returning(returning)?,
-                    rls_filters,
-                },
-            )?
-        }
         ReplicatedWrite::KvInsertOnConflictUpdate {
             collection,
             key,
@@ -137,6 +114,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
             collection,
             entries,
             ttl_ms,
+            intent,
             surrogates,
             resolved_now_ms: rn,
             returning,
@@ -147,6 +125,7 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<(PhysicalPlan
                 collection,
                 entries,
                 *ttl_ms,
+                intent.clone(),
                 surrogates,
                 ReturningFields {
                     returning: decode_returning(returning)?,

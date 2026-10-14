@@ -50,6 +50,8 @@ pub(in super::super) fn convert_upsert(
         tenant_id,
         ctx,
     } = args;
+    // The name the user wrote, for refusal messages.
+    let user_collection = collection;
     let key = ctx.collection_key(collection);
     let coll_qualified = super::super::convert::db_qualified(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
@@ -57,11 +59,21 @@ pub(in super::super) fn convert_upsert(
     let vshard = key.vshard();
     let mut tasks = Vec::new();
 
-    // Detect CRDT document collections once. An explicit `ON CONFLICT DO UPDATE
-    // SET ...` cannot be honored: CRDT conflict resolution IS the LWW
-    // full-replace `DocUpsert` performs, so a caller-supplied merge clause has
-    // no place to run. Reject rather than silently ignore it.
-    let is_crdt = super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    // Detect CRDT document collections once, in the same catalog read as the
+    // write checks. An explicit `ON CONFLICT DO UPDATE SET ...` cannot be
+    // honored: CRDT conflict resolution IS the LWW full-replace `DocUpsert`
+    // performs, so a caller-supplied merge clause has no place to run. Reject
+    // rather than silently ignore it.
+    let gates = super::balanced_gate::document_collection_write_gates(ctx, collection)?;
+    // A write that supplies a generated column is refused, in its rows and
+    // in its `ON CONFLICT DO UPDATE SET` targets.
+    super::write_checks::refuse_generated_cells(user_collection, &gates.generated, rows)?;
+    crate::control::security::catalog::collection_generated::refuse_generated_write(
+        user_collection,
+        &gates.generated,
+        on_conflict_updates.iter().map(|(name, _)| name.as_str()),
+    )?;
+    let is_crdt = gates.crdt;
     if is_crdt && !on_conflict_updates.is_empty() {
         return Err(crate::Error::BadRequest {
             detail: format!(
@@ -87,6 +99,14 @@ pub(in super::super) fn convert_upsert(
         declared_primary_key_name(ctx, collection)?
     };
 
+    // A multi-row document upsert lowers to ONE `BatchUpsert` page: one
+    // Data-Plane request and one replicated write for the statement, its
+    // rows judged as `Upsert` judges each. A single row stays an `Upsert`. A
+    // CRDT collection converges row by row through `DocUpsert`.
+    let paged = !is_crdt && rows.len() > 1 && matches!(route, WriteRoute::Document);
+    let mut page_documents: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut page_surrogates: Vec<nodedb_types::Surrogate> = Vec::new();
+
     for row in rows {
         match route {
             WriteRoute::Document => {
@@ -105,6 +125,11 @@ pub(in super::super) fn convert_upsert(
                     on_conflict_updates,
                     &doc_id,
                 )?;
+                if paged {
+                    page_documents.push((doc_id, value_bytes));
+                    page_surrogates.push(surrogate);
+                    continue;
+                }
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                         collection: qualified_collection.clone(),
@@ -146,6 +171,30 @@ pub(in super::super) fn convert_upsert(
                 columnar_rows.push(row);
             }
         }
+    }
+
+    if !page_documents.is_empty() {
+        tasks.push(PhysicalTask {
+            tenant_id,
+            vshard_id: vshard,
+            database_id: ctx.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection: qualified_collection.clone(),
+                documents: page_documents,
+                surrogates: page_surrogates,
+                on_conflict_updates: on_conflict_values.clone(),
+                // Filled in by the RLS injection pass, which runs after
+                // conversion.
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                rls_filters: Vec::new(),
+                // Filled in by the protocol layer's RETURNING injection.
+                returning: None,
+                // Filled by the materialized-sum resolution pass.
+                resolved_sum_targets: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        });
     }
 
     if !columnar_rows.is_empty() {

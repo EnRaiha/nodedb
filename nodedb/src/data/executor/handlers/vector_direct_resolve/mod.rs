@@ -4,6 +4,7 @@
 
 mod apply;
 mod dispatch;
+mod resolve_batch;
 mod resolve_delete;
 mod resolve_update;
 mod resolve_upsert;

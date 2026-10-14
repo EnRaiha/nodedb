@@ -2,20 +2,22 @@
 
 //! Trigger-firing helpers of the protocol-neutral INSERT DML handler. Every
 //! body joins the statement's transaction, so the statement's write and its
-//! bodies' writes commit together.
+//! bodies' writes commit together. Each helper fires for one row.
 
-use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
+use std::collections::HashMap;
+
+use crate::control::server::shared::ddl::result::DdlError;
 use crate::control::trigger::SyncFire;
 
-/// Fire SYNC AFTER INSERT triggers, returning an error response on failure.
-/// Each body joins the statement's transaction `fire.txn`.
+/// Fire the SYNC AFTER INSERT triggers of one row. Each body joins the
+/// statement's transaction `fire.txn`.
 pub(super) async fn fire_sync_after_triggers(
     fire: SyncFire<'_>,
     coll_name: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> Option<Result<Vec<DdlResult>, DdlError>> {
+    fields: &HashMap<String, nodedb_types::Value>,
+) -> Result<(), DdlError> {
     use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
-    if let Err(e) = crate::control::trigger::fire::fire_after_insert(
+    crate::control::trigger::fire::fire_after_insert(
         crate::control::trigger::fire::FireAfterInsertParams {
             state: fire.state,
             identity: fire.identity,
@@ -35,48 +37,34 @@ pub(super) async fn fire_sync_after_triggers(
     )
     .await
     .into_result()
-    {
-        return Some(Err(DdlError::from_error_in_context("trigger error", &e)));
-    }
-    None
+    .map_err(|e| DdlError::from_error_in_context("trigger error", &e))
 }
 
-/// Fire INSTEAD OF INSERT triggers, returning the result.
+/// Fire the INSTEAD OF INSERT triggers of one row. `true` when a trigger
+/// replaced the row's write: the row counts as processed and is not written.
 pub(super) async fn fire_instead_triggers(
     fire: SyncFire<'_>,
     coll_name: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
-    tag: &str,
-) -> Option<Result<Vec<DdlResult>, DdlError>> {
+    fields: &HashMap<String, nodedb_types::Value>,
+) -> Result<bool, DdlError> {
+    use crate::control::trigger::fire_instead::InsteadOfResult;
     match crate::control::trigger::fire_instead::fire_instead_of_insert(fire, coll_name, fields)
         .await
     {
-        Ok(crate::control::trigger::fire_instead::InsteadOfResult::Handled) => {
-            // The INSTEAD OF trigger replaced a single-document statement, so
-            // it always stands in for exactly one logical row — never a bare
-            // tag (real `psql` cannot parse a bare `INSERT`).
-            Some(Ok(vec![DdlResult::Status {
-                command: tag.to_string(),
-                rows_affected: Some(1),
-            }]))
-        }
-        Ok(crate::control::trigger::fire_instead::InsteadOfResult::NoTrigger) => None,
-        Err(e) => Some(Err(DdlError::from_error_in_context("trigger error", &e))),
+        Ok(InsteadOfResult::Handled) => Ok(true),
+        Ok(InsteadOfResult::NoTrigger) => Ok(false),
+        Err(e) => Err(DdlError::from_error_in_context("trigger error", &e)),
     }
 }
 
-/// Fire BEFORE INSERT triggers, returning mutated fields or an error.
+/// Fire the BEFORE INSERT triggers of one row. A body can reject the row via
+/// RAISE EXCEPTION, or return the row's mutated fields.
 pub(super) async fn fire_before_triggers(
     fire: SyncFire<'_>,
     coll_name: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
-) -> Result<std::collections::HashMap<String, nodedb_types::Value>, Result<Vec<DdlResult>, DdlError>>
-{
-    match crate::control::trigger::fire_before::fire_before_insert(fire, coll_name, fields).await {
-        Ok(f) => Ok(f),
-        Err(e) => Err(Err(DdlError::from_error_in_context(
-            "BEFORE trigger error",
-            &e,
-        ))),
-    }
+    fields: &HashMap<String, nodedb_types::Value>,
+) -> Result<HashMap<String, nodedb_types::Value>, DdlError> {
+    crate::control::trigger::fire_before::fire_before_insert(fire, coll_name, fields)
+        .await
+        .map_err(|e| DdlError::from_error_in_context("BEFORE trigger error", &e))
 }

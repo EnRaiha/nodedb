@@ -73,7 +73,7 @@ impl NodeDbPgHandler {
             auth_ctx,
             session_sequences,
         } = params;
-        let redaction = QueryRedaction::for_plan(tenant_id, auth_ctx, plan);
+        let redaction = QueryRedaction::for_plan(tenant_id, database_id, auth_ctx, plan);
         let sequences = SessionSequenceAccess::for_session(
             &self.state,
             session_sequences,

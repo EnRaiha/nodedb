@@ -213,6 +213,7 @@ fn build_inner_scan(args: InnerScanArgs<'_>) -> Result<SqlPlan> {
         .ok_or_else(|| SqlError::UnknownTable {
             name: inner_collection.clone(),
         })?;
+    temporal.require_bitemporal(&inner_collection, inner_info.bitemporal)?;
     // A correlated residual predicate names the outer relation, so the inner
     // scope nests inside it.
     let inner_scope = TableScope::single(ResolvedTable {

@@ -33,6 +33,7 @@ use super::read_gate::CollectionReadGate;
 pub async fn weighted_pick(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let args = super::kv_atomic::parse_function_args(sql, "WEIGHTED_PICK")?;
@@ -89,18 +90,28 @@ pub async fn weighted_pick(
     }
 
     let tenant_id = identity.tenant_id;
-    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     // `collection` is a caller argument, so the scan it names is authorized and
     // row-filtered here — a pick is a read of every row in the collection. The
     // weight a row is drawn with, and reported with, is the stored weight
     // column, so a redaction rule on it is refused rather than masked: a masked
     // weight will change which row is drawn, not only how it prints.
-    let gate = CollectionReadGate::open(state, identity, DatabaseId::DEFAULT, &collection)?;
+    let gate = CollectionReadGate::open(state, identity, database_id, &collection)?;
     gate.refuse_if_field_redacted(&collection, &weight_col, "the sampling weight")?;
 
     // Step 1: Scan the collection to get all entries.
-    let entries = scan_all_entries(state, &gate, tenant_id, vshard, &collection).await?;
+    let entries = scan_all_entries(
+        state,
+        &gate,
+        ScanTarget {
+            tenant_id,
+            database_id,
+            vshard,
+        },
+        &collection,
+    )
+    .await?;
     if entries.is_empty() {
         return Ok(vec![empty_pick_rows()]);
     }
@@ -207,6 +218,8 @@ pub async fn weighted_pick(
                 trace_id: TraceId::ZERO,
                 event_source: crate::event::EventSource::User,
                 txn_id: None,
+                // The audit row is a system write.
+                user_roles: Vec::new(),
             },
         )
         .await
@@ -238,17 +251,28 @@ pub async fn weighted_pick(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+/// Where the picked collection's scan routes.
+struct ScanTarget {
+    tenant_id: crate::types::TenantId,
+    database_id: DatabaseId,
+    vshard: VShardId,
+}
+
 /// Scan every row of a KV collection as `(key, row)`. A KV scan row is a
 /// document map carrying the row's `key` beside its value fields.
 async fn scan_all_entries(
     state: &SharedState,
     gate: &CollectionReadGate<'_>,
-    tenant_id: crate::types::TenantId,
-    vshard: VShardId,
+    target: ScanTarget,
     collection: &str,
 ) -> Result<Vec<(String, serde_json::Value)>, DdlError> {
+    let ScanTarget {
+        tenant_id,
+        database_id,
+        vshard,
+    } = target;
     let mut plan = PhysicalPlan::Kv(KvOp::Scan {
-        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, collection),
+        collection: nodedb_types::QualifiedCollection::new(database_id, collection),
         cursor: Vec::new(),
         count: 100_000,
         filters: Vec::new(),
@@ -265,7 +289,7 @@ async fn scan_all_entries(
     let payload = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         vshard,
         plan,
         TraceId::ZERO,

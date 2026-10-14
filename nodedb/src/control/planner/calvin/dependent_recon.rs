@@ -163,16 +163,30 @@ pub async fn dispatch_authorized_dependent_edge_recon(
         .into_iter()
         .map(|task| task.into_physical_task())
         .collect();
-    dispatch_dependent_edge_recon_inner(state, tasks, Some(identity), tenant_id, database_id).await
+    let user_roles = identity.role_names();
+    dispatch_dependent_edge_recon_inner(
+        state,
+        tasks,
+        Some(identity),
+        tenant_id,
+        database_id,
+        user_roles,
+    )
+    .await
 }
 
+/// [`dispatch_authorized_dependent_edge_recon`] for tasks already
+/// authorized. The transaction carries `user_roles`, the roles of the
+/// identity that wrote the tasks.
 pub(crate) async fn dispatch_dependent_edge_recon(
     state: &SharedState,
     tasks: Vec<PhysicalTask>,
     tenant_id: TenantId,
     database_id: DatabaseId,
+    user_roles: Vec<String>,
 ) -> crate::Result<DependentReconOutcome> {
-    dispatch_dependent_edge_recon_inner(state, tasks, None, tenant_id, database_id).await
+    dispatch_dependent_edge_recon_inner(state, tasks, None, tenant_id, database_id, user_roles)
+        .await
 }
 
 async fn dispatch_dependent_edge_recon_inner(
@@ -181,6 +195,7 @@ async fn dispatch_dependent_edge_recon_inner(
     identity: Option<&crate::control::security::identity::AuthenticatedIdentity>,
     tenant_id: TenantId,
     database_id: DatabaseId,
+    user_roles: Vec<String>,
 ) -> crate::Result<DependentReconOutcome> {
     // A TRUNCATE empties the collection and tombstones its edges on every
     // vShard, in one transaction.
@@ -259,6 +274,7 @@ async fn dispatch_dependent_edge_recon_inner(
         let tasks = &tasks;
         let dep_collection = &dep_collection;
         let edge_mode = &edge_mode;
+        let user_roles = &user_roles;
         async move {
             // Implicit-edge reconciliation: a matched edge document
             // (`_from`/`_to`) has an auto-created graph edge that must be
@@ -386,7 +402,7 @@ async fn dispatch_dependent_edge_recon_inner(
                             t
                         })
                         .collect();
-                    let tx_class = build_single_vshard_predicted_tx_class(
+                    let mut tx_class = build_single_vshard_predicted_tx_class(
                         &modified_tasks,
                         tenant_id,
                         dep_collection,
@@ -394,6 +410,9 @@ async fn dispatch_dependent_edge_recon_inner(
                         &[],
                     )
                     .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                    if let Some(class) = tx_class.as_mut() {
+                        class.set_user_roles(user_roles.to_vec());
+                    }
                     Ok(tx_class)
                 },
                 // Retryable: a routed submit races a leader change. The cause

@@ -10,17 +10,17 @@
 
 use super::super::types::ReplicatedWrite;
 use super::document::{WireReturning, wire_target_bindings, wire_targets};
-use nodedb_physical::physical_plan::ResolvedSumTarget;
 use nodedb_physical::physical_plan::document::MergeClauseOp;
+use nodedb_physical::physical_plan::{ResolvedSumTarget, RowSource};
 
 /// The join the two writes share: target, source, alias and join columns.
 pub(super) struct JoinFields<'a> {
     pub target_collection: &'a str,
-    pub source_collection: &'a str,
+    pub source: &'a RowSource,
     pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
-    pub source_rows: &'a [(String, Vec<u8>)],
+    pub source_rows: &'a [Vec<u8>],
     pub resolved_sum_targets: &'a [ResolvedSumTarget],
     pub declared_primary_key: Option<&'a str>,
 }
@@ -39,7 +39,7 @@ pub(super) fn merge_apply(
 ) -> ReplicatedWrite {
     ReplicatedWrite::MergeApply {
         target_collection: join.target_collection.to_owned(),
-        source_collection: join.source_collection.to_owned(),
+        source: join.source.clone(),
         source_alias: join.source_alias.to_owned(),
         target_join_col: join.target_join_col.to_owned(),
         source_join_col: join.source_join_col.to_owned(),
@@ -63,7 +63,7 @@ pub(super) fn update_from_join_apply(
 ) -> ReplicatedWrite {
     ReplicatedWrite::UpdateFromJoinApply {
         target_collection: join.target_collection.to_owned(),
-        source_collection: join.source_collection.to_owned(),
+        source: join.source.clone(),
         source_alias: join.source_alias.to_owned(),
         target_join_col: join.target_join_col.to_owned(),
         source_join_col: join.source_join_col.to_owned(),

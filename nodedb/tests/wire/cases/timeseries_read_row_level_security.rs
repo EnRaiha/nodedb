@@ -363,3 +363,45 @@ async fn a_non_instant_policy_literal_on_a_timestamp_time_key_is_refused() {
         "the refusal must name the column: {error}"
     );
 }
+
+/// A ROLLUP aggregate leaves the native grouped scan, and the generic
+/// aggregate still folds only the rows the read policy admits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeseries_rollup_aggregate_folds_only_policy_admitted_rows() {
+    let server = TestServer::start().await;
+    let user = "ts_rls_roller";
+    seed(&server, "ts_rls_rollup", user).await;
+
+    let mut rows = rows_as(
+        &server,
+        user,
+        "SELECT owner, COUNT(*) FROM ts_rls_rollup GROUP BY ROLLUP (owner)",
+    )
+    .await;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![format!("{user}|1"), "|1".to_string()],
+        "the excluded owner's rows reach neither the group nor the total: {rows:?}"
+    );
+}
+
+/// A HAVING aggregate over flushed partitions counts only admitted rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeseries_having_aggregate_over_flushed_partitions_counts_only_admitted_rows() {
+    let server = TestServer::start_with_timeseries_memtable_budget(1).await;
+    let user = "ts_rls_haver";
+    seed(&server, "ts_rls_having", user).await;
+
+    let rows = rows_as(
+        &server,
+        user,
+        "SELECT owner, COUNT(*) FROM ts_rls_having GROUP BY owner HAVING COUNT(*) > 0",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![format!("{user}|1")],
+        "HAVING sees only the admitted group: {rows:?}"
+    );
+}

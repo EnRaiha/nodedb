@@ -135,6 +135,8 @@ async fn dispatch_durable(
             trace_id: TraceId::ZERO,
             event_source: crate::event::EventSource::User,
             txn_id: None,
+            // Index maintenance is a system write.
+            user_roles: Vec::new(),
         },
     )
     .await;

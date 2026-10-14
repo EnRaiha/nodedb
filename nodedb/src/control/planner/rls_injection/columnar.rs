@@ -3,7 +3,7 @@
 //! RLS resolution for the three peer engines sharing the columnar storage
 //! core: plain columnar, timeseries, and spatial.
 
-use nodedb_physical::physical_plan::{ColumnarOp, SpatialOp, TimeseriesOp};
+use nodedb_physical::physical_plan::{ColumnarOp, PartitionsAction, SpatialOp, TimeseriesOp};
 
 use super::context::RlsCtx;
 
@@ -105,6 +105,26 @@ pub(super) fn inject_timeseries(ctx: &RlsCtx<'_>, op: &mut TimeseriesOp) -> crat
             collection,
             "a truncate removes every row without reading one, so no row image is available",
         ),
+
+        // No-op: a refresh cut changes no row and returns none. Who may
+        // refresh is the aggregate's ownership, checked before it is planned.
+        TimeseriesOp::RefreshAggregate { .. } => Ok(()),
+
+        // Refuse: a partition listing reports row counts and time ranges over
+        // every row, so a read policy cannot be honored. A rewrite changes and
+        // returns no row.
+        TimeseriesOp::Partitions { collection, action } => match action {
+            PartitionsAction::List => ctx.refuse_if_policy(
+                collection,
+                "a partition listing reports row counts over every row",
+            ),
+            PartitionsAction::Rewrite => Ok(()),
+        },
+
+        // No-op: the coordinator issues this read for a continuous aggregate
+        // relation. The aggregate's own read policies join the provider scan
+        // that consumes these rows.
+        TimeseriesOp::ReadAggregate { .. } => Ok(()),
     }
 }
 

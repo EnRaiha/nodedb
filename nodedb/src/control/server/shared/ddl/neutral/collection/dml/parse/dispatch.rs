@@ -88,6 +88,9 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             ),
         };
         let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
+        // A column DEFAULT that calls `nextval` draws per row in row order,
+        // and records into this session's `currval` map, as the SQL form does.
+        query_ctx.set_session_sequences(txn_ctx.sessions.sequence_values(txn_ctx.session_id));
         let (tasks, output_schema, versions, _) = query_ctx
             .plan_sql_with_rls_and_versions(
                 sql,

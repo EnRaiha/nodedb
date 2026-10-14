@@ -2,160 +2,78 @@
 
 //! `REWRITE PARTITIONS FOR <name>`
 //!
-//! Triggers an async background rewrite of all sealed partitions
-//! for a timeseries collection. Non-blocking — returns immediately.
-//! Useful for reclaiming space after column drops or applying new compression.
+//! The Data Plane core that owns the collection rewrites each sealed or merged
+//! partition with the collection's current schema and codecs, dropping every
+//! column the schema no longer holds. The statement returns once every
+//! partition is rewritten, and reports how many were.
 
+use nodedb_physical::physical_plan::{PartitionsAction, TimeseriesOp};
 use nodedb_types::DatabaseId;
 
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::bridge::envelope::PhysicalPlan;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::ddl::sql_parse::parse_ident_token;
 use crate::control::state::SharedState;
+use crate::types::TraceId;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::helpers::ddl_err;
+use super::super::read_gate::CollectionReadGate;
+use super::helpers::{ddl_err, require_timeseries};
+
+/// The count the Data Plane reports.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Rewritten {
+    affected: u64,
+}
 
 /// REWRITE PARTITIONS FOR <name>
-pub fn rewrite_partitions(
+pub async fn rewrite_partitions(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
-    // REWRITE PARTITIONS FOR <name>
-    if parts.len() < 4 {
+    if parts.len() < 4 || !parts[2].eq_ignore_ascii_case("FOR") {
         return Err(ddl_err(
             "42601",
-            "syntax: REWRITE PARTITIONS FOR <collection>",
+            "syntax: REWRITE PARTITIONS FOR <timeseries>",
         ));
     }
-
     let name = parse_ident_token(parts[3])?;
     let tenant_id = identity.tenant_id;
+    require_timeseries(state, database_id, tenant_id, &name)?;
 
-    // Verify collection exists and is timeseries.
-    {
-        let catalog = state.credentials.catalog();
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name) {
-            Ok(Some(coll)) if coll.collection_type.is_timeseries() => {}
-            Ok(Some(_)) => {
-                return Err(ddl_err(
-                    "42809",
-                    format!("'{name}' is not a timeseries collection"),
-                ));
-            }
-            _ => {
-                return Err(ddl_err(
-                    "42P01",
-                    format!("collection '{name}' does not exist"),
-                ));
-            }
-        }
-    }
+    // A rewrite changes the collection's storage layout: an ALTER of it.
+    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    gate.authorize_permission(&name, Permission::Alter)?;
+    let mut plan = PhysicalPlan::Timeseries(TimeseriesOp::Partitions {
+        collection: nodedb_types::QualifiedCollection::new(database_id, &name),
+        action: PartitionsAction::Rewrite,
+    });
+    gate.inject_rls(&mut plan)?;
 
-    // Collect partition directories to rewrite.
-    let partitions_to_rewrite: Vec<String> = if let Some(registries) = state.timeseries_registries()
-    {
-        let key = format!("{}:{}", tenant_id.as_u64(), name);
-        let regs = crate::control::lock_utils::lock_or_recover(registries.lock(), "ts_registries");
-        if let Some(registry) = regs.get(&key) {
-            registry
-                .iter()
-                .filter(|(_, e)| {
-                    e.meta.state == nodedb_types::timeseries::PartitionState::Sealed
-                        || e.meta.state == nodedb_types::timeseries::PartitionState::Merged
-                })
-                .map(|(_, e)| e.dir_name.clone())
-                .collect()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &name).vshard();
+    let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        state,
+        tenant_id,
+        database_id,
+        vshard,
+        plan,
+        TraceId::generate(),
+    )
+    .await
+    .map_err(|e| DdlError::from_error(&e))?;
+    let rewritten: Rewritten =
+        crate::data::executor::response_codec::decode_payload(&response.payload)
+            .map_err(|e| DdlError::from_error(&e))?;
 
-    let sealed_count = partitions_to_rewrite.len();
     tracing::info!(
         collection = name,
-        sealed_partitions = sealed_count,
-        "REWRITE PARTITIONS scheduled (async, non-blocking)"
+        rewritten = rewritten.affected,
+        "REWRITE PARTITIONS completed"
     );
-
-    if sealed_count > 0 {
-        let wal_dir = state.wal.wal_dir();
-        let ts_base = wal_dir
-            .parent()
-            .unwrap_or(wal_dir)
-            .join("timeseries")
-            .to_path_buf();
-        let collection_name = name.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let mut rewritten = 0usize;
-            for dir_name in &partitions_to_rewrite {
-                // Registry entries are generated from partition timestamps, but
-                // they are also reloaded from `partition.meta` on disk, and the
-                // name is joined onto `ts_base` and handed to `remove_dir_all`
-                // below. Reject anything that is not one plain component rather
-                // than trust the round trip.
-                if !nodedb_types::is_plain_path_component(dir_name) {
-                    tracing::warn!(
-                        collection = %collection_name,
-                        partition = %dir_name,
-                        "skipping partition rewrite: directory name is not a plain path component"
-                    );
-                    continue;
-                }
-                let partition_dir = ts_base.join(dir_name);
-                if !partition_dir.exists() {
-                    continue;
-                }
-                match crate::engine::timeseries::merge::merge_partitions(
-                    &ts_base,
-                    std::slice::from_ref(&partition_dir),
-                    &format!("{dir_name}.rewrite"),
-                ) {
-                    Ok(result) => {
-                        let backup_name = format!("{dir_name}.old");
-                        if nodedb_wal::segment::atomic_swap_dirs_fsync(
-                            &ts_base,
-                            dir_name,
-                            &backup_name,
-                            &format!("{dir_name}.rewrite"),
-                        )
-                        .is_ok()
-                        {
-                            let _ = std::fs::remove_dir_all(ts_base.join(&backup_name));
-                            // Write updated metadata to partition.meta (on-disk source of truth).
-                            let meta_bytes =
-                                sonic_rs::to_vec_pretty(&result.meta).unwrap_or_default();
-                            let _ = nodedb_wal::segment::atomic_write_fsync(
-                                &partition_dir,
-                                "partition.meta",
-                                &meta_bytes,
-                            );
-                            rewritten += 1;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            partition = dir_name,
-                            error = %e,
-                            "rewrite failed for partition"
-                        );
-                    }
-                }
-            }
-            tracing::info!(
-                collection = collection_name,
-                rewritten,
-                total = sealed_count,
-                "REWRITE PARTITIONS completed"
-            );
-        });
-    }
-
     Ok(vec![DdlResult::Status {
         command: "REWRITE PARTITIONS".to_string(),
-        rows_affected: None,
+        rows_affected: Some(rewritten.affected),
     }])
 }

@@ -28,6 +28,8 @@ pub struct Sample {
 #[derive(Debug, Clone)]
 pub struct Series {
     pub labels: Labels,
+    /// Ascending by timestamp, at most one sample per timestamp. The
+    /// selectors binary-search on this order.
     pub samples: Vec<Sample>,
 }
 
@@ -194,6 +196,8 @@ pub fn json_escape(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // JSON forbids every other control character unescaped.
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
             c => out.push(c),
         }
     }

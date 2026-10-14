@@ -3,7 +3,7 @@
 //! Decode `ReplicatedWrite` variants that produce `PhysicalPlan::Columnar`.
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp, UpdateValue};
+use nodedb_physical::physical_plan::{ColumnarOp, RefreshCut, TimeseriesOp, UpdateValue};
 use nodedb_types::RlsWriteCheck;
 
 /// Reconstruct a `ColumnarOp::Truncate` plan. Same idempotent-replay
@@ -21,6 +21,15 @@ pub(super) fn timeseries_truncate(collection: &str, restart_identity: bool) -> P
     PhysicalPlan::Timeseries(TimeseriesOp::Truncate {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         restart_identity,
+    })
+}
+
+/// Reconstruct a `TimeseriesOp::RefreshAggregate` plan: the refresh cut,
+/// applied at this committed log position on every replica.
+pub(super) fn timeseries_aggregate_refresh(collection: &str, cut: RefreshCut) -> PhysicalPlan {
+    PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate {
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
+        cut,
     })
 }
 
@@ -175,5 +184,25 @@ mod tests {
         };
         assert_eq!(collection.as_str(), "ts");
         assert!(restart_identity);
+    }
+    #[test]
+    fn timeseries_aggregate_refresh_round_trips_its_cut() {
+        let sent = RefreshCut {
+            aggregate: "ts_1m".to_owned(),
+            incarnation: nodedb_types::Hlc::new(7, 1),
+            refresh_id: 42,
+            periodic: true,
+        };
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "ts"),
+            cut: sent.clone(),
+        });
+        let PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate { collection, cut }) =
+            round_trip(&plan)
+        else {
+            panic!("decoded to the wrong shape");
+        };
+        assert_eq!(collection.as_str(), "ts");
+        assert_eq!(cut, sent);
     }
 }

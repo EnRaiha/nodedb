@@ -21,38 +21,61 @@ pub(in crate::control::server::shared::ddl::neutral::collection) fn fields_to_in
     collection: &str,
     fields: &std::collections::HashMap<String, nodedb_types::Value>,
 ) -> String {
-    fields_to_write_sql("INSERT INTO", collection, fields)
+    fields_to_write_sql("INSERT INTO", collection, std::slice::from_ref(fields))
 }
 
-/// Build a SQL UPSERT statement from field map. See
-/// `fields_to_insert_sql` for the identifier quoting rationale.
+/// Build one SQL INSERT statement from the field maps of its rows, in row
+/// order. See `fields_to_insert_sql` for the identifier quoting rationale.
+pub(in crate::control::server::shared::ddl::neutral::collection) fn rows_to_insert_sql(
+    collection: &str,
+    rows: &[std::collections::HashMap<String, nodedb_types::Value>],
+) -> String {
+    fields_to_write_sql("INSERT INTO", collection, rows)
+}
+
+/// Build one SQL UPSERT statement from the field maps of its rows, in row
+/// order. See `fields_to_insert_sql` for the identifier quoting rationale.
 pub(in crate::control::server::shared::ddl::neutral::collection) fn fields_to_upsert_sql(
     collection: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
+    rows: &[std::collections::HashMap<String, nodedb_types::Value>],
 ) -> String {
-    fields_to_write_sql("UPSERT INTO", collection, fields)
+    fields_to_write_sql("UPSERT INTO", collection, rows)
 }
 
+/// The column list is the sorted union of every row's keys. A row missing
+/// a column writes `NULL` there.
 fn fields_to_write_sql(
     keyword: &str,
     collection: &str,
-    fields: &std::collections::HashMap<String, nodedb_types::Value>,
+    rows: &[std::collections::HashMap<String, nodedb_types::Value>],
 ) -> String {
-    let mut cols = Vec::with_capacity(fields.len());
-    let mut vals = Vec::with_capacity(fields.len());
-    let mut entries: Vec<_> = fields.iter().collect();
-    entries.sort_by_key(|(key, _)| key.as_str());
-
-    for (key, value) in entries {
-        cols.push(quote_column_identifier(key));
-        vals.push(value_to_sql_literal(value));
-    }
+    let columns: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .flat_map(|row| row.keys().map(String::as_str))
+        .collect();
+    let cols: Vec<String> = columns
+        .iter()
+        .map(|key| quote_column_identifier(key))
+        .collect();
+    let tuples: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let vals: Vec<String> = columns
+                .iter()
+                .map(|key| match row.get(*key) {
+                    Some(value) => value_to_sql_literal(value),
+                    None => "NULL".to_owned(),
+                })
+                .collect();
+            format!("({})", vals.join(", "))
+        })
+        .collect();
 
     format!(
-        "{keyword} {} ({}) VALUES ({})",
+        "{keyword} {} ({}) VALUES {}",
         collection,
         cols.join(", "),
-        vals.join(", ")
+        tuples.join(", ")
     )
 }
 
@@ -80,7 +103,7 @@ mod tests {
             "a); DROP COLLECTION other; --",
             nodedb_types::Value::Integer(1),
         );
-        let sql = fields_to_upsert_sql("t", &fields);
+        let sql = fields_to_upsert_sql("t", std::slice::from_ref(&fields));
         let quoted = "\"a); DROP COLLECTION other; --\"";
         assert!(sql.contains(quoted));
         for part in sql.split(quoted) {
@@ -108,21 +131,37 @@ mod tests {
             "a\"); DROP COLLECTION other; --",
             nodedb_types::Value::Integer(1),
         );
-        let sql = fields_to_upsert_sql("t", &fields);
+        let sql = fields_to_upsert_sql("t", std::slice::from_ref(&fields));
         assert!(sql.contains("\"a\"\"); DROP COLLECTION other; --\""));
     }
 
     #[test]
     fn upsert_sql_canonicalizes_nan_float() {
         let fields = one_field("score", nodedb_types::Value::Float(f64::NAN));
-        let sql = fields_to_upsert_sql("t", &fields);
+        let sql = fields_to_upsert_sql("t", std::slice::from_ref(&fields));
         assert!(!sql.contains("NaN"));
     }
 
     #[test]
     fn upsert_sql_canonicalizes_infinity_float() {
         let fields = one_field("score", nodedb_types::Value::Float(f64::INFINITY));
-        let sql = fields_to_upsert_sql("t", &fields);
+        let sql = fields_to_upsert_sql("t", std::slice::from_ref(&fields));
         assert!(!sql.contains("inf"));
+    }
+
+    #[test]
+    fn upsert_sql_writes_one_tuple_per_row_over_the_column_union() {
+        let mut first = HashMap::new();
+        first.insert("id".into(), nodedb_types::Value::String("a".into()));
+        first.insert("n".into(), nodedb_types::Value::Integer(1));
+        let mut second = HashMap::new();
+        second.insert("id".into(), nodedb_types::Value::String("b".into()));
+        let sql = fields_to_upsert_sql("t", &[first, second]);
+        assert!(
+            sql.starts_with("UPSERT INTO t (\"id\", \"n\") VALUES ("),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("), (").count(), 1, "{sql}");
+        assert!(sql.ends_with(", NULL)"), "{sql}");
     }
 }

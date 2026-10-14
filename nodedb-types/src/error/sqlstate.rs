@@ -202,6 +202,10 @@ pub const AMBIGUOUS_COLUMN: &str = "42702";
 /// represent, such as a column `DEFAULT` refused at `CREATE`)
 pub const DATATYPE_MISMATCH: &str = "42804";
 
+/// `42809` — `wrong_object_type` (a statement the named object's kind does
+/// not take, such as a write to a continuous aggregate)
+pub const WRONG_OBJECT_TYPE: &str = "42809";
+
 /// `42846` — `cannot_coerce`
 pub const CANNOT_COERCE: &str = "42846";
 
@@ -437,6 +441,7 @@ mod tests {
             AMBIGUOUS_COLUMN,
             UNDEFINED_OBJECT,
             DATATYPE_MISMATCH,
+            WRONG_OBJECT_TYPE,
             CANNOT_COERCE,
             UNDEFINED_TABLE,
             UNDEFINED_FUNCTION,

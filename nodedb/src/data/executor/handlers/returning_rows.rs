@@ -152,10 +152,19 @@ impl CoreLoop {
     }
 }
 
+/// The columns a vector-primary `RETURNING` row renders its identity and its
+/// vector under.
+#[derive(Clone, Copy)]
+pub(in crate::data::executor) struct VectorRowColumns<'a> {
+    pub identity: &'a str,
+    pub vector: &'a str,
+}
+
 /// A vector-primary row a write path hands back to a `RETURNING`
-/// projection: its sparse-store key paired with the sidecar bytes stored
-/// (or removed) under it.
-pub(in crate::data::executor) type VectorStoredRow<'a> = (&'a nodedb_types::StorageKey, &'a [u8]);
+/// projection: its sparse-store key, the sidecar bytes stored (or removed)
+/// under it, and the vector its node carries (or carried).
+pub(in crate::data::executor) type VectorStoredRow<'a> =
+    (&'a nodedb_types::StorageKey, &'a [u8], &'a [f32]);
 
 impl CoreLoop {
     /// Build a vector-primary write's `RETURNING` response from the sidecars
@@ -163,17 +172,18 @@ impl CoreLoop {
     /// [`SparseBodyFormatRef::VectorSidecar`] — the same converter `SELECT`
     /// uses. The sidecar is `zerompk` TAGGED bytes an ordinary document
     /// decode misreads (`"alice"` comes back as `[4,"alice"]`), so the
-    /// format must be this literal, not re-decided. `identity_column` is the
-    /// column each row renders its identity under.
+    /// format must be this literal, not re-decided. `columns` names the
+    /// columns each row renders its identity and its vector under, as a
+    /// `SELECT` renders them.
     pub(in crate::data::executor) fn vector_stored_returning_response(
         &self,
         task: &ExecutionTask,
         spec: &ReturningSpec,
         rls_filters: &[u8],
-        identity_column: &str,
+        columns: VectorRowColumns<'_>,
         rows: &[VectorStoredRow<'_>],
     ) -> Response {
-        match vector_stored_rows_payload(spec, rls_filters, identity_column, rows) {
+        match vector_stored_rows_payload(spec, rls_filters, columns, rows) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, e),
         }
@@ -187,21 +197,28 @@ impl CoreLoop {
 pub(in crate::data::executor) fn vector_stored_rows_payload(
     spec: &ReturningSpec,
     rls_filters: &[u8],
-    identity_column: &str,
+    columns: VectorRowColumns<'_>,
     rows: &[VectorStoredRow<'_>],
 ) -> crate::Result<Vec<u8>> {
     // An unreadable sidecar fails the statement: an empty row set here
     // would report "the write affected nothing" for a write that did land.
     let docs: Vec<Value> = rows
         .iter()
-        .map(|(row_key, sidecar)| {
+        .map(|(row_key, sidecar, vector)| {
             let (_id, mp) = sparse_row_to_doc(
                 row_key,
                 sidecar,
                 SparseBodyFormatRef::VectorSidecar,
-                identity_column,
+                columns.identity,
             );
-            doc_format::decode_document_value(&mp)
+            let mut doc = doc_format::decode_document_value(&mp)?;
+            if let Value::Object(map) = &mut doc {
+                map.insert(
+                    columns.vector.to_string(),
+                    super::vector_row_column::vector_value(vector),
+                );
+            }
+            Ok(doc)
         })
         .collect::<crate::Result<Vec<_>>>()?;
     build_rows_payload(spec, rls_filters, &docs).map_err(|e| crate::Error::Internal {

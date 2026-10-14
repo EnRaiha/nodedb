@@ -162,12 +162,65 @@ fn extract_table_reference(
 
 fn extract_join_on_condition(op: &ast::JoinOperator) -> Option<&ast::Expr> {
     use ast::JoinOperator::*;
+    // A bare `JOIN` parses as `Join`, apart from `INNER JOIN`; `LEFT JOIN`
+    // and `RIGHT JOIN` likewise parse apart from their `OUTER` spellings.
     let constraint = match op {
-        Inner(c) | LeftOuter(c) | RightOuter(c) | FullOuter(c) => c,
+        Join(c) | Inner(c) | Left(c) | LeftOuter(c) | Right(c) | RightOuter(c) | FullOuter(c) => c,
         _ => return None,
     };
     match constraint {
         ast::JoinConstraint::On(expr) => Some(expr),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    /// The `(collection_field, working_field)` link of the first join in
+    /// `sql`, a recursive arm joining collection `c` to working table `t`.
+    fn link_of(sql: &str) -> Option<(String, String)> {
+        let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parse arm");
+        let ast::Statement::Query(query) = &statements[0] else {
+            panic!("expected a query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected a SELECT");
+        };
+        let join = &select.from[0].joins[0];
+        let on = extract_join_on_condition(&join.join_operator)?;
+        extract_equi_link(on, "c", "t")
+    }
+
+    /// Every join spelling that carries an ON clause yields the link: a bare
+    /// `JOIN` parses apart from `INNER JOIN`, and missing it drops the link.
+    #[test]
+    fn every_on_join_spelling_yields_the_link() {
+        let expected = Some(("parent".to_string(), "id".to_string()));
+        for join in [
+            "JOIN",
+            "INNER JOIN",
+            "LEFT JOIN",
+            "LEFT OUTER JOIN",
+            "RIGHT JOIN",
+            "RIGHT OUTER JOIN",
+            "FULL OUTER JOIN",
+        ] {
+            let sql = format!("SELECT c.* FROM tree c {join} t ON c.parent = t.id");
+            assert_eq!(link_of(&sql), expected, "{join}");
+        }
+    }
+
+    /// The link is oriented by alias, whichever side of `=` names the
+    /// working table.
+    #[test]
+    fn the_link_is_oriented_by_alias() {
+        assert_eq!(
+            link_of("SELECT c.* FROM tree c JOIN t ON t.id = c.parent"),
+            Some(("parent".to_string(), "id".to_string()))
+        );
     }
 }

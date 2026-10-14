@@ -9,6 +9,7 @@
 use crate::control::crdt_admission::CrdtPostImagePolicy;
 use crate::control::security::audit::{AuditEmitContext, AuditEmitter, AuditEvent};
 use crate::control::security::auth_context::AuthContext;
+use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::rls::RlsPolicyStore;
 use crate::types::TenantId;
 use nodedb_types::{CrdtPreviewResult, Value};
@@ -20,6 +21,16 @@ pub struct ExternalCrdtPostImagePolicy<'a> {
     auth: AuthContext,
     rls: &'a RlsPolicyStore,
     audit: &'a dyn AuditEmitter,
+    /// Where the collection's typeguards and transition rules are read from.
+    /// `None` judges no rule.
+    guards: Option<GuardSource<'a>>,
+}
+
+/// The catalog row a CRDT admission reads the collection's typeguards and
+/// transition rules from.
+struct GuardSource<'a> {
+    catalog: &'a SystemCatalog,
+    database_id: nodedb_types::DatabaseId,
 }
 
 impl<'a> ExternalCrdtPostImagePolicy<'a> {
@@ -36,7 +47,88 @@ impl<'a> ExternalCrdtPostImagePolicy<'a> {
             auth,
             rls,
             audit,
+            guards: None,
         }
+    }
+
+    /// Judge the merge against the collection's typeguards and transition
+    /// rules too.
+    ///
+    /// A CRDT collection declares no guard `DEFAULT` / `VALUE`: every replica
+    /// merges the state on its own, so the server injects nothing. REQUIRED,
+    /// type and CHECK validate the post-image the merge produces. State
+    /// constraints and transition checks judge the stored row → post-image
+    /// change, with the writer's roles.
+    pub fn with_type_guards_from(
+        mut self,
+        catalog: &'a SystemCatalog,
+        database_id: nodedb_types::DatabaseId,
+    ) -> Self {
+        self.guards = Some(GuardSource {
+            catalog,
+            database_id,
+        });
+        self
+    }
+
+    /// Validate the merge against the collection's declared rules: the
+    /// typeguards on the merged post-image, and the state constraints and
+    /// transition checks on the change from the stored row to it.
+    fn check_collection_rules(
+        &self,
+        pre_image: Option<&Value>,
+        post_image: Option<&Value>,
+    ) -> crate::Result<()> {
+        let Some(source) = self.guards.as_ref() else {
+            return Ok(());
+        };
+        let Some(document) = post_image else {
+            // A delete leaves no post-image for a rule to judge.
+            return Ok(());
+        };
+        let bare = crate::control::target_identity::naming::bare_collection_name(
+            source.database_id,
+            self.collection,
+        );
+        let Some(coll) =
+            source
+                .catalog
+                .get_collection(source.database_id, self.tenant_id.as_u64(), &bare)?
+        else {
+            return Ok(());
+        };
+        if !coll.type_guards.is_empty() {
+            let compiled =
+                crate::data::executor::enforcement::typeguard::CompiledTypeGuard::compile_all(
+                    &bare,
+                    &coll.type_guards,
+                );
+            crate::data::executor::enforcement::typeguard::check_type_guards(
+                &compiled, document, None,
+            )
+            .map_err(crate::Error::DataPlane)?;
+        }
+        // An insert has no stored row, so no transition to judge.
+        if let Some(previous) = pre_image {
+            use crate::data::executor::enforcement::update_transitions::{
+                UpdateTransitionRules, check_update_transitions,
+            };
+            let rules = UpdateTransitionRules {
+                state_constraints: &coll.state_constraints,
+                transition_checks: &coll.transition_checks,
+            };
+            if !rules.is_empty() {
+                check_update_transitions(
+                    &bare,
+                    rules,
+                    &serde_json::Value::from(previous.clone()),
+                    &serde_json::Value::from(document.clone()),
+                    &self.auth.roles,
+                )
+                .map_err(crate::Error::DataPlane)?;
+            }
+        }
+        Ok(())
     }
 
     /// Build the policy from the immutable authenticated identity and bind its
@@ -71,6 +163,19 @@ impl<'a> ExternalCrdtPostImagePolicy<'a> {
 
 impl CrdtPostImagePolicy for ExternalCrdtPostImagePolicy<'_> {
     fn evaluate(&self, preview: &CrdtPreviewResult) -> crate::Result<()> {
+        // Typeguards and transition rules bind every writer, a superuser
+        // included.
+        if self.guards.is_some() {
+            let decode = |bytes: &[u8], which: &str| -> crate::Result<Option<Value>> {
+                zerompk::from_msgpack(bytes).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("CRDT {which} does not decode: {e}"),
+                })
+            };
+            let pre_image = decode(&preview.pre_image_msgpack, "pre-image")?;
+            let post_image = decode(&preview.post_image_msgpack, "post-image")?;
+            self.check_collection_rules(pre_image.as_ref(), post_image.as_ref())?;
+        }
         if self.auth.is_superuser() {
             return Ok(());
         }
@@ -159,6 +264,7 @@ mod tests {
     fn preview(post_image: Option<Value>) -> CrdtPreviewResult {
         CrdtPreviewResult {
             post_image_msgpack: zerompk::to_msgpack_vec(&post_image).expect("encode post-image"),
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
             frontier_digest: [7; 32],
@@ -214,6 +320,7 @@ mod tests {
         );
         let malformed = CrdtPreviewResult {
             post_image_msgpack: vec![0x8f],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
             frontier_digest: [0; 32],
@@ -302,6 +409,7 @@ mod tests {
             root_policy
                 .evaluate(&CrdtPreviewResult {
                     post_image_msgpack: vec![0; nodedb_crdt::DEFAULT_MAX_POST_IMAGE_BYTES + 1],
+                    pre_image_msgpack: vec![0xc0],
                     imported_ops: 1,
                     trimmed_ops: 0,
                     frontier_digest: [0; 32],

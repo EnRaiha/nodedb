@@ -94,6 +94,7 @@ pub struct UpdateFromVisitArgs<'a> {
     pub collection: &'a str,
     pub engine: EngineType,
     pub source: &'a SqlPlan,
+    pub source_alias: &'a str,
     pub target_join_col: &'a str,
     pub source_join_col: &'a str,
     pub assignments: &'a [(String, SqlExpr)],
@@ -132,6 +133,8 @@ pub struct TimeseriesScanVisitArgs<'a> {
     pub group_by: &'a [String],
     pub aggregates: &'a [AggregateExpr],
     pub filters: &'a [Filter],
+    /// HAVING predicates over the finalized group rows.
+    pub having: &'a [Filter],
     pub projection: &'a [Projection],
     pub gap_fill: &'a str,
     pub limit: usize,

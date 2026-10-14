@@ -206,14 +206,15 @@ impl SurrogateWalAppender for CountingAppender {
         Ok(())
     }
 
-    fn record_bind_to_wal(
+    fn record_binds_to_wal(
         &self,
         _key: nodedb_types::CollectionKey<'_>,
         _tenant_id: nodedb_types::TenantId,
-        _surrogate: u32,
-        _pk_bytes: &[u8],
+        binds: &[(u32, &[u8])],
     ) -> nodedb::Result<()> {
-        self.binds.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let records = u32::try_from(binds.len()).expect("bind batch fits u32");
+        self.binds
+            .fetch_add(records, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 }
@@ -250,7 +251,7 @@ async fn flush_emits_wal_record_at_threshold() {
         .load(std::sync::atomic::Ordering::Acquire);
     assert_eq!(
         bind_calls as usize, n,
-        "expected one SurrogateBind per fresh allocation"
+        "expected one bound entry per fresh allocation"
     );
     let cat = creds.catalog();
     let persisted = cat.get_surrogate_hwm().unwrap();

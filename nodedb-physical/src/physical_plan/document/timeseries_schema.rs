@@ -27,6 +27,10 @@ pub struct TimeseriesSchema {
     pub time_key: String,
     /// Declared `(column_name, type_str)` pairs in declaration order.
     pub columns: Vec<(String, String)>,
+    /// The declared partition interval, as `partition_by` spells it (`1h`,
+    /// `1d`, `1M`, `1y`, `AUTO`, `UNBOUNDED`). A flush cuts one partition per
+    /// interval its rows fall in.
+    pub partition_interval: String,
 }
 
 impl TimeseriesSchema {

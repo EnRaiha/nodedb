@@ -7,23 +7,48 @@
 
 use nodedb_types::{PriorityClass, QuotaSpec};
 
+use crate::ddl_ast::parse::clause::{ClauseCursor, Tok, tokenize};
 use crate::error::SqlError;
 
-/// Parse a `(field = value, ...)` clause from a raw SQL string into a [`QuotaSpec`].
+/// Parse the `QUOTA (field = value, ...)` clause of a statement into a
+/// [`QuotaSpec`].
 ///
-/// Finds the first `(` after the `QUOTA` keyword, reads key=value pairs until `)`,
-/// and rejects unknown keys or `=>` used instead of `=`.
+/// The clause is the `QUOTA` keyword followed by a parenthesized list, and
+/// it must end the statement. A `(` inside a name or a literal before it is
+/// never read as the list. Unknown keys and `=>` used instead of `=` are
+/// refused.
 pub fn parse_quota_spec(sql: &str, context: &str) -> Result<QuotaSpec, SqlError> {
-    // Find the opening paren.
-    let paren_start = sql.find('(').ok_or_else(|| SqlError::Parse {
-        detail: format!("{context}: expected '(' before quota arguments"),
-    })?;
-    let after = &sql[paren_start + 1..];
-    let paren_end = after.find(')').ok_or_else(|| SqlError::Parse {
+    let toks = tokenize(sql);
+    let at = toks
+        .windows(2)
+        .position(|w| {
+            matches!(&w[0].tok, Tok::Word(kw) if kw.eq_ignore_ascii_case("QUOTA"))
+                && w[1].tok == Tok::Punct('(')
+        })
+        .ok_or_else(|| SqlError::Parse {
+            detail: format!("{context}: expected '(' before quota arguments"),
+        })?;
+    let mut c = ClauseCursor::new(sql, &toks[at + 1..], "QUOTA");
+    let inner = c.raw_paren("QUOTA").map_err(|_| SqlError::Parse {
         detail: format!("{context}: unterminated '(' in quota clause"),
     })?;
-    let inner = &after[..paren_end];
+    if !c.at_end() {
+        return Err(SqlError::Parse {
+            detail: format!(
+                "{context}: unexpected {} after the quota list",
+                c.describe_next()
+            ),
+        });
+    }
+    parse_quota_pairs(inner, context)
+}
 
+/// Parse the inside of a quota list, `field = value, ...`, into a
+/// [`QuotaSpec`].
+pub(in crate::ddl_ast::parse) fn parse_quota_pairs(
+    inner: &str,
+    context: &str,
+) -> Result<QuotaSpec, SqlError> {
     let mut spec = QuotaSpec::default();
 
     for pair in inner.split(',') {

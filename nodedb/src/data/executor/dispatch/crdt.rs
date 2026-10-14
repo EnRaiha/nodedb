@@ -249,6 +249,7 @@ impl CoreLoop {
                     partial: *partial,
                     returning: returning.as_ref(),
                     rls_filters,
+                    judge_guards: true,
                 },
             ),
 

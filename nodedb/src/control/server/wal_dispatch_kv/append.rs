@@ -54,6 +54,17 @@ fn append_sync_mark(
     wal.append_sync_seq_advance(prov.producer_id, prov.epoch, prov.stream_id, prov.seq)
 }
 
+/// The refusal of a KV write whose rows depend on stored state that reached
+/// the WAL as the bare op.
+fn unresolved_conditional_write(collection: &str) -> crate::Error {
+    crate::Error::Internal {
+        detail: format!(
+            "internal invariant break: a conditional kv insert on '{collection}' reached the \
+             WAL unresolved; write_resolve resolves it to the rows it writes first"
+        ),
+    }
+}
+
 /// Serialize a KV operation and append to the WAL — see [`KvAppendOutcome`].
 /// `now_override` pins `expire_at_ms` to an instant decided elsewhere (e.g. a
 /// Raft-committed entry), so every replica's redo installs it verbatim.
@@ -91,15 +102,19 @@ pub fn wal_append_kv_op(
             )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
-        KvOp::Insert {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            surrogate,
-            ..
+        // A conditional write that skips a stored row would leave a record
+        // that replay applies as a put over that row. It resolves to the rows
+        // it writes before it reaches the WAL.
+        KvOp::InsertIfAbsent { collection, .. } => {
+            return Err(unresolved_conditional_write(collection.as_str()));
         }
-        | KvOp::InsertIfAbsent {
+        KvOp::BatchPut {
+            collection, intent, ..
+        } if intent.depends_on_stored_rows() => {
+            return Err(unresolved_conditional_write(collection.as_str()));
+        }
+        // A refused insert writes nothing: its outcome cancels this record.
+        KvOp::Insert {
             collection,
             key,
             value,

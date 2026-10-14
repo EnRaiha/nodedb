@@ -62,7 +62,8 @@ pub fn explain_tiers(
         (0i64, i64::MAX)
     };
     let explanation =
-        crate::control::planner::auto_tier::explain_tier_selection(&policy, time_range);
+        crate::control::planner::auto_tier::explain_tier_selection(&policy, time_range)
+            .map_err(|e| err("22023", &format!("AUTO_TIER on '{collection}': {e}")))?;
 
     let columns = vec!["plan".to_string()];
     let mut rows = Vec::new();

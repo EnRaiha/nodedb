@@ -63,50 +63,65 @@ pub(crate) fn eval(ctx: &EvalContext, expr: &Expr) -> Result<Value, PromqlError>
             expr: inner,
             range,
             step,
-        } => eval_subquery(ctx, inner, *range, *step),
+            offset,
+        } => eval_subquery(ctx, inner, *range, *step, *offset),
     }
 }
 
-/// Evaluate a subquery: `expr[range:step]`.
+/// Step of a `[range:]` subquery: Prometheus' default evaluation interval.
+const DEFAULT_SUBQUERY_STEP_MS: i64 = 60_000;
+
+/// Evaluate a subquery: `expr[range:step] offset o`.
 ///
-/// Evaluates the inner expression at each step within the range,
-/// collecting results into a range vector (matrix).
+/// The inner expression must yield an instant vector. It is evaluated at
+/// every timestamp that is a multiple of the step inside the left-open
+/// window `(t - o - range, t - o]`, as Prometheus aligns subquery steps to
+/// absolute time. The results form a range vector.
 fn eval_subquery(
     ctx: &EvalContext,
     inner: &Expr,
     range: Duration,
     step: Option<Duration>,
+    offset: Option<Duration>,
 ) -> Result<Value, PromqlError> {
-    let end_ms = ctx.timestamp_ms;
-    let start_ms = end_ms - range.ms();
-    // Default step: evaluation interval, or 1 minute if unset.
-    let step_ms = step.map_or(60_000, |d| d.ms()).max(1);
+    let end_ms = ctx.timestamp_ms - offset.map_or(0, |d| d.ms());
+    let window_start = end_ms - range.ms();
+    let step_ms = step.map_or(DEFAULT_SUBQUERY_STEP_MS, |d| d.ms()).max(1);
+    let mut ts = window_start.div_euclid(step_ms) * step_ms;
+    if ts <= window_start {
+        ts += step_ms;
+    }
 
     let mut result_series: BTreeMap<String, RangeSeries> = BTreeMap::new();
-
-    let mut ts = start_ms;
     while ts <= end_ms {
         let step_ctx = EvalContext {
-            series: ctx.series.clone(),
+            series: std::sync::Arc::clone(&ctx.series),
             timestamp_ms: ts,
             lookback_ms: ctx.lookback_ms,
         };
-        let val = eval(&step_ctx, inner)?;
-
-        if let Value::Vector(samples) = val {
-            for s in samples {
-                let key = helpers::labels_key(&s.labels);
-                let entry = result_series.entry(key).or_insert_with(|| RangeSeries {
-                    labels: s.labels.clone(),
-                    samples: vec![],
-                });
-                entry.samples.push(Sample {
-                    timestamp_ms: ts,
-                    value: s.value,
+        let samples = match eval(&step_ctx, inner)? {
+            Value::Vector(samples) => samples,
+            other => {
+                return Err(PromqlError::TypeError {
+                    context: "subquery".to_string(),
+                    detail: format!(
+                        "subquery needs an instant vector expression, got {}",
+                        other.result_type()
+                    ),
                 });
             }
+        };
+        for s in samples {
+            let key = helpers::labels_key(&s.labels);
+            let entry = result_series.entry(key).or_insert_with(|| RangeSeries {
+                labels: s.labels.clone(),
+                samples: vec![],
+            });
+            entry.samples.push(Sample {
+                timestamp_ms: ts,
+                value: s.value,
+            });
         }
-
         ts += step_ms;
     }
 

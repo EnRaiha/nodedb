@@ -15,13 +15,21 @@ use nodedb_types::Surrogate;
 use super::binder::IdentityBinder;
 
 pub(super) fn bind(binder: &IdentityBinder<'_>, batch: &RestoredRedo) -> crate::Result<()> {
-    for identity in &batch.identities {
+    let identities: Vec<_> = batch
+        .identities
+        .iter()
+        .map(|identity| {
+            (
+                binder.bare_key(&identity.collection),
+                identity.pk_bytes.as_slice(),
+                Surrogate::new(identity.surrogate),
+            )
+        })
+        .collect();
+    // Every identity binds in one catalog transaction per collection.
+    let bound = binder.resolve_many(&identities)?;
+    for (identity, bound) in batch.identities.iter().zip(bound) {
         let carried = Surrogate::new(identity.surrogate);
-        let bound = binder.resolve(
-            binder.bare_key(&identity.collection),
-            &identity.pk_bytes,
-            carried,
-        )?;
         if bound != carried {
             return Err(crate::Error::Internal {
                 detail: format!(

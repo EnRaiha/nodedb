@@ -76,6 +76,10 @@ pub(crate) struct NestedLoopJoinParams<'a> {
     pub left_rls_filters: &'a [u8],
     /// Row-level-security filters for the locally-scanned right side.
     pub right_rls_filters: &'a [u8],
+    /// Coordinator-resolved rows for the left side; `None` scans locally.
+    pub left_input: Option<&'a nodedb_physical::physical_plan::PhysicalPlan>,
+    /// Coordinator-resolved rows for the right side; `None` scans locally.
+    pub right_input: Option<&'a nodedb_physical::physical_plan::PhysicalPlan>,
 }
 
 /// Sort-merge join: O((N+M)·log N) equi-join with optional pre-sorted inputs.
@@ -95,6 +99,10 @@ pub(crate) struct SortMergeJoinParams<'a> {
     pub left_rls_filters: &'a [u8],
     /// Row-level-security filters for the locally-scanned right side.
     pub right_rls_filters: &'a [u8],
+    /// Coordinator-resolved rows for the left side; `None` scans locally.
+    pub left_input: Option<&'a nodedb_physical::physical_plan::PhysicalPlan>,
+    /// Coordinator-resolved rows for the right side; `None` scans locally.
+    pub right_input: Option<&'a nodedb_physical::physical_plan::PhysicalPlan>,
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────

@@ -117,6 +117,7 @@ fn timeseries_retry(params: &SubmitWrite) -> Option<SubmitWrite> {
         event_source: params.event_source,
         txn_id: None,
         user_id: params.user_id.clone(),
+        user_roles: params.user_roles.clone(),
         durability: WalDurability::AppendHere {
             now_override: *now_override,
             apply_key: 0,

@@ -12,3 +12,4 @@ mod write_upsert;
 pub(in crate::data::executor) use types::{
     KvDeleteParams, KvGetParams, KvInsertOnConflictUpdateParams, KvWriteParams,
 };
+pub(in crate::data::executor) use write_basic::kv_duplicate_key;

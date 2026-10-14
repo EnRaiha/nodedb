@@ -10,7 +10,9 @@ mod surrogate_keys;
 mod update_delete;
 mod upsert;
 mod vector_primary;
+mod write_checks;
 
+pub(super) use balanced_gate::document_collection_write_gates;
 pub(super) use insert::{ConvertInsertArgs, convert_insert, declared_primary_key_name};
 pub(crate) use insert::{DEFAULT_IDENTITY_COLUMN, build_columnar_schema};
 pub(super) use kv_insert::convert_kv_insert;

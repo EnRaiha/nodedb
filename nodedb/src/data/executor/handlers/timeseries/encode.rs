@@ -7,6 +7,7 @@ use nodedb_query::agg_key::canonical_agg_key;
 use crate::data::executor::core_loop::TsGroupKeyKind;
 use crate::data::executor::handlers::columnar_read::rmpv_time_cell;
 use crate::engine::timeseries::columnar_memtable::TimeKind;
+use crate::engine::timeseries::grouped_scan::GroupCell;
 use crate::util::rmpv_value::value_to_rmpv;
 
 /// The wire types of a grouped result's key columns.
@@ -18,36 +19,36 @@ pub(in crate::data::executor) struct GroupedKeyTypes<'a> {
     pub bucket_kind: TimeKind,
 }
 
-/// Render one GROUP BY key part with the type its column carries ungrouped.
+/// How a grouped result is bucketed, filtered, ordered, and cut.
+pub(in crate::data::executor) struct GroupedOutputShape<'a> {
+    /// Maximum number of rows returned.
+    pub limit: usize,
+    /// Time bucket width in milliseconds. Zero means no `bucket` column.
+    pub bucket_interval_ms: i64,
+    /// ORDER BY keys applied after HAVING.
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
+    /// HAVING filters applied to the finalized group rows.
+    pub having: &'a [crate::bridge::scan_filter::ScanFilter],
+}
+
+/// Render one GROUP BY key cell with the type its column carries ungrouped.
 ///
-/// The grouped scan reduces every key to a string, so the column's own type
-/// is put back here. An empty part is SQL NULL. A declared instant is stored
-/// in milliseconds and rendered as a typed instant, exactly as row emission
-/// renders it, so the two routes to one stored instant render it identically.
-///
-/// A part that does not parse as its column's type falls back to the text it
-/// holds: the key is data the scan produced, and dropping the group would
-/// lose a row.
-fn group_key_value(part: Option<&&str>, kind: TsGroupKeyKind) -> crate::Result<rmpv::Value> {
-    let Some(text) = part.filter(|s| !s.is_empty()) else {
-        return Ok(rmpv::Value::Nil);
-    };
-    let value = match kind {
-        TsGroupKeyKind::Instant(k) => match text.parse::<i64>() {
-            Ok(millis) => rmpv_time_cell(TimeKind::Instant(k), millis)?,
-            Err(_) => rmpv::Value::String((*text).into()),
+/// A NULL cell renders NULL; an empty-string symbol renders `''`. An integer
+/// cell of a declared instant column is its millisecond count and renders as
+/// a typed instant, exactly as row emission renders it, so the two routes to
+/// one stored instant render it identically.
+fn group_key_value(cell: Option<&GroupCell>, kind: TsGroupKeyKind) -> crate::Result<rmpv::Value> {
+    Ok(match cell {
+        None | Some(GroupCell::Null) => rmpv::Value::Nil,
+        Some(GroupCell::Text(text)) => rmpv::Value::String(text.as_str().into()),
+        Some(GroupCell::Float(bits)) => rmpv::Value::F64(f64::from_bits(*bits)),
+        Some(GroupCell::Int(n)) => match kind {
+            TsGroupKeyKind::Instant(k) => rmpv_time_cell(TimeKind::Instant(k), *n)?,
+            TsGroupKeyKind::Integer | TsGroupKeyKind::Float | TsGroupKeyKind::Text => {
+                rmpv::Value::Integer((*n).into())
+            }
         },
-        TsGroupKeyKind::Integer => match text.parse::<i64>() {
-            Ok(n) => rmpv::Value::Integer(n.into()),
-            Err(_) => rmpv::Value::String((*text).into()),
-        },
-        TsGroupKeyKind::Float => match text.parse::<f64>() {
-            Ok(f) => rmpv::Value::F64(f),
-            Err(_) => rmpv::Value::String((*text).into()),
-        },
-        TsGroupKeyKind::Text => rmpv::Value::String((*text).into()),
-    };
-    Ok(value)
+    })
 }
 
 /// Serialize GroupedAggResult directly to MessagePack bytes.
@@ -55,31 +56,33 @@ fn group_key_value(part: Option<&&str>, kind: TsGroupKeyKind) -> crate::Result<r
 /// Avoids building `Vec<serde_json::Value>` (2M allocations for 2M groups).
 /// Writes an array of maps directly to the MessagePack buffer.
 ///
-/// Key format in GroupedAggResult:
-/// - GROUP BY only: "group1\0group2"
-/// - time_bucket only: "bucket_ts"
-/// - time_bucket + GROUP BY: "bucket_ts\0group1\0group2"
-///
-/// The `bucket` column is derived from the collection's time key and renders
-/// with that column's own kind, `key_types.bucket_kind`.
+/// Each group's typed key carries its time bucket when the query buckets,
+/// then one cell per GROUP BY column. The `bucket` column is derived from
+/// the collection's time key and renders with that column's own kind,
+/// `key_types.bucket_kind`.
 pub(in crate::data::executor) fn encode_grouped_results(
     result: &crate::engine::timeseries::grouped_scan::GroupedAggResult,
     group_by: &[String],
     aggregates: &[(String, String)],
-    limit: usize,
-    bucket_interval_ms: i64,
-    sort_keys: &[nodedb_physical::physical_plan::SortKeySpec],
+    shape: GroupedOutputShape<'_>,
     key_types: GroupedKeyTypes<'_>,
 ) -> crate::Result<Vec<u8>> {
+    let GroupedOutputShape {
+        limit,
+        bucket_interval_ms,
+        sort_keys,
+        having,
+    } = shape;
     let GroupedKeyTypes {
         group_key_kinds,
         bucket_kind,
     } = key_types;
     let has_bucket = bucket_interval_ms > 0;
-    // An ordered query has to see every group before cutting to `limit`:
-    // groups arrive in hash-map order, so the first `limit` of them are an
-    // arbitrary subset. Unordered queries keep the cheap early cut.
-    let gather = if sort_keys.is_empty() {
+    // An ordered or HAVING-filtered query has to see every group before
+    // cutting to `limit`: groups arrive in hash-map order, so the first
+    // `limit` of them are an arbitrary subset. Other queries keep the cheap
+    // early cut.
+    let gather = if sort_keys.is_empty() && having.is_empty() {
         limit
     } else {
         usize::MAX
@@ -103,35 +106,23 @@ pub(in crate::data::executor) fn encode_grouped_results(
         }
 
         let mut fields: Vec<(rmpv::Value, rmpv::Value)> = Vec::with_capacity(fields_per_row);
-        let parts: Vec<&str> = key.split('\0').collect();
 
         if has_bucket {
-            let bucket_ts = parts
-                .first()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
+            let bucket_ts = key.bucket.ok_or(crate::Error::Internal {
+                detail: "a bucketed timeseries group has no bucket in its key".into(),
+            })?;
             fields.push((
                 rmpv::Value::String("bucket".into()),
                 rmpv_time_cell(bucket_kind, bucket_ts)?,
             ));
-
-            for (i, field) in group_by.iter().enumerate() {
-                let kind = group_key_kinds
-                    .get(i)
-                    .copied()
-                    .unwrap_or(TsGroupKeyKind::Text);
-                let val = group_key_value(parts.get(i + 1), kind)?;
-                fields.push((rmpv::Value::String(field.as_str().into()), val));
-            }
-        } else {
-            for (i, field) in group_by.iter().enumerate() {
-                let kind = group_key_kinds
-                    .get(i)
-                    .copied()
-                    .unwrap_or(TsGroupKeyKind::Text);
-                let val = group_key_value(parts.get(i), kind)?;
-                fields.push((rmpv::Value::String(field.as_str().into()), val));
-            }
+        }
+        for (i, field) in group_by.iter().enumerate() {
+            let kind = group_key_kinds
+                .get(i)
+                .copied()
+                .unwrap_or(TsGroupKeyKind::Text);
+            let val = group_key_value(key.cells.get(i), kind)?;
+            fields.push((rmpv::Value::String(field.as_str().into()), val));
         }
 
         for (agg_idx, agg_key) in agg_keys.iter().enumerate() {
@@ -148,10 +139,15 @@ pub(in crate::data::executor) fn encode_grouped_results(
                 "max" => cell(accum.max()),
                 "first" => cell(accum.first()),
                 "last" => cell(accum.last()),
-                "stddev" | "ts_stddev" if accum.count >= 2 => {
-                    rmpv::Value::F64(accum.stddev_population())
+                // The planner sends only `ts_stddev` here: the population
+                // form, NULL for fewer than 2 values.
+                "ts_stddev" if accum.count >= 2 => rmpv::Value::F64(accum.stddev_population()),
+                "ts_stddev" => rmpv::Value::Nil,
+                other => {
+                    return Err(crate::Error::Internal {
+                        detail: format!("timeseries grouped aggregate '{other}' has no encoding"),
+                    });
                 }
-                _ => rmpv::Value::Nil,
             };
             fields.push((rmpv::Value::String(agg_key.as_str().into()), val));
         }
@@ -159,28 +155,49 @@ pub(in crate::data::executor) fn encode_grouped_results(
         rows.push(rmpv::Value::Map(fields));
     }
 
+    // HAVING filters the finalized group rows before sort and limit.
+    if !having.is_empty() {
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(&mut bytes, &row).map_err(|e| crate::Error::Codec {
+                detail: format!("HAVING row encode: {e}"),
+            })?;
+            if crate::bridge::scan_filter::ScanFilter::all_match_binary(having, &bytes)? {
+                kept.push(row);
+            }
+        }
+        rows = kept;
+    }
+
     super::sort::sort_rows(&mut rows, sort_keys)?;
     rows.truncate(limit);
 
     let array = rmpv::Value::Array(rows);
     let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &array).unwrap_or(());
+    rmpv::encode::write_value(&mut buf, &array).map_err(|e| crate::Error::Codec {
+        detail: format!("grouped timeseries result encode: {e}"),
+    })?;
     Ok(buf)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::timeseries::grouped_scan::GroupedAggResult;
+    use crate::engine::timeseries::grouped_scan::{GroupKey, GroupedAggResult};
     use nodedb_types::InstantKind;
 
     const BUCKET_MS: i64 = 1_583_402_400_000;
 
     fn one_bucket() -> GroupedAggResult {
         let mut result = GroupedAggResult::new(1);
-        result
-            .groups
-            .insert(BUCKET_MS.to_string(), vec![Default::default()]);
+        result.groups.insert(
+            GroupKey {
+                bucket: Some(BUCKET_MS),
+                cells: Vec::new(),
+            },
+            vec![Default::default()],
+        );
         result
     }
 
@@ -189,9 +206,12 @@ mod tests {
             &one_bucket(),
             &[],
             &[("count".to_string(), "v".to_string())],
-            usize::MAX,
-            60_000,
-            &[],
+            GroupedOutputShape {
+                limit: usize::MAX,
+                bucket_interval_ms: 60_000,
+                sort_keys: &[],
+                having: &[],
+            },
             GroupedKeyTypes {
                 group_key_kinds: &[],
                 bucket_kind,
@@ -247,7 +267,7 @@ mod tests {
                 a
             })
             .collect();
-        result.groups.insert(String::new(), accums);
+        result.groups.insert(GroupKey::default(), accums);
         let aggregates: Vec<(String, String)> = ops
             .iter()
             .map(|op| (op.to_string(), "v".to_string()))
@@ -256,9 +276,12 @@ mod tests {
             &result,
             &[],
             &aggregates,
-            usize::MAX,
-            0,
-            &[],
+            GroupedOutputShape {
+                limit: usize::MAX,
+                bucket_interval_ms: 0,
+                sort_keys: &[],
+                having: &[],
+            },
             GroupedKeyTypes {
                 group_key_kinds: &[],
                 bucket_kind: TimeKind::Millis,
@@ -377,7 +400,7 @@ mod tests {
     #[test]
     fn an_instant_group_key_is_a_typed_instant() {
         let cell = group_key_value(
-            Some(&BUCKET_MS.to_string().as_str()),
+            Some(&GroupCell::Int(BUCKET_MS)),
             TsGroupKeyKind::Instant(InstantKind::Utc),
         )
         .expect("group key");
@@ -387,6 +410,121 @@ mod tests {
                 InstantKind::Utc.ext_type(),
                 (BUCKET_MS * 1000).to_be_bytes().to_vec()
             )
+        );
+    }
+
+    /// An empty-string symbol group renders `''`; a NULL symbol group
+    /// renders NULL.
+    #[test]
+    fn empty_and_null_symbol_keys_differ() {
+        assert_eq!(
+            group_key_value(Some(&GroupCell::Text(String::new())), TsGroupKeyKind::Text)
+                .expect("empty"),
+            rmpv::Value::String("".into())
+        );
+        assert_eq!(
+            group_key_value(Some(&GroupCell::Null), TsGroupKeyKind::Text).expect("null"),
+            rmpv::Value::Nil
+        );
+    }
+
+    /// End to end through the grouped scan: a row stored before the `host`
+    /// column existed holds the NULL symbol, a later row holds `''`, and a
+    /// third ingests an explicit NULL. NULL and `''` are two groups,
+    /// rendered NULL and `''`.
+    #[test]
+    fn grouped_scan_keeps_null_and_empty_symbol_groups_apart() {
+        use crate::engine::timeseries::columnar_memtable::{
+            ColumnType, ColumnValue, ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema,
+        };
+        use crate::engine::timeseries::grouped_scan::aggregate_memtable;
+
+        let mut mt = ColumnarMemtable::new(
+            ColumnarSchema {
+                columns: vec![
+                    ("ts".into(), ColumnType::Timestamp(TimeKind::Millis)),
+                    ("v".into(), ColumnType::Float64),
+                ],
+                timestamp_idx: 0,
+                codecs: vec![nodedb_codec::ColumnCodec::Auto; 2],
+            },
+            ColumnarMemtableConfig::default(),
+        );
+        mt.ingest_row(
+            0,
+            &[ColumnValue::Timestamp(1_000), ColumnValue::Float64(1.0)],
+        )
+        .expect("row before the column");
+        mt.add_column("host".into(), ColumnType::Symbol);
+        mt.ingest_row(
+            0,
+            &[
+                ColumnValue::Timestamp(2_000),
+                ColumnValue::Float64(2.0),
+                ColumnValue::Symbol(String::new()),
+            ],
+        )
+        .expect("row with an empty host");
+        mt.ingest_row(
+            0,
+            &[
+                ColumnValue::Timestamp(3_000),
+                ColumnValue::Float64(3.0),
+                ColumnValue::Null,
+            ],
+        )
+        .expect("row with a NULL host");
+
+        let result = aggregate_memtable(
+            &mt,
+            &["host".to_string()],
+            &[("count".to_string(), "*".to_string())],
+            &[],
+            (i64::MIN, i64::MAX),
+            0,
+        )
+        .expect("aggregate")
+        .expect("groups");
+        assert_eq!(result.groups.len(), 2, "NULL and '' are separate groups");
+
+        let bytes = encode_grouped_results(
+            &result,
+            &["host".to_string()],
+            &[("count".to_string(), "*".to_string())],
+            GroupedOutputShape {
+                limit: usize::MAX,
+                bucket_interval_ms: 0,
+                sort_keys: &[],
+                having: &[],
+            },
+            GroupedKeyTypes {
+                group_key_kinds: &[TsGroupKeyKind::Text],
+                bucket_kind: TimeKind::Millis,
+            },
+        )
+        .expect("encode");
+        let rmpv::Value::Array(rows) =
+            crate::util::bounded_msgpack::read_value(&bytes).expect("decode")
+        else {
+            panic!("not an array");
+        };
+        let mut hosts: Vec<rmpv::Value> = rows
+            .iter()
+            .map(|row| {
+                let rmpv::Value::Map(fields) = row else {
+                    panic!("not a map");
+                };
+                fields
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some("host"))
+                    .map(|(_, v)| v.clone())
+                    .expect("host column")
+            })
+            .collect();
+        hosts.sort_by_key(|v| v.is_nil());
+        assert_eq!(
+            hosts,
+            vec![rmpv::Value::String("".into()), rmpv::Value::Nil]
         );
     }
 }

@@ -63,7 +63,9 @@ mod tests {
     ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::Merge {
             target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "target"),
-            source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
+            source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                QualifiedCollection::new(DatabaseId::DEFAULT, "source"),
+            ),
             source_alias: "s".to_string(),
             target_join_col: "id".to_string(),
             source_join_col: "id".to_string(),
@@ -128,6 +130,7 @@ mod tests {
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 documents: Vec::new(),
+                if_absent: false,
                 surrogates: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),
@@ -140,6 +143,16 @@ mod tests {
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
                 surrogate: nodedb_types::Surrogate::new(1),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                returning: spec(),
+                rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
+            }),
+            PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+                documents: Vec::new(),
+                surrogates: Vec::new(),
+                on_conflict_updates: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
                 returning: spec(),
                 rls_filters: Vec::new(),
@@ -209,6 +222,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 entries: Vec::new(),
                 ttl_ms: 0,
+                intent: nodedb_physical::physical_plan::KvBatchIntent::Insert,
                 surrogates: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),

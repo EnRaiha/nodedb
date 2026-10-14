@@ -314,7 +314,7 @@ async fn insert_select_keys_an_empty_string_like_any_other_value() {
         .expect("seed pk_es_src");
 
     server
-        .exec("INSERT INTO pk_es_dst (id, v) SELECT '', v FROM pk_es_src")
+        .exec("INSERT INTO pk_es_dst (id, v) SELECT '', v FROM pk_es_src WHERE id = 'a'")
         .await
         .expect("an empty-string key is a legal value");
 
@@ -322,11 +322,22 @@ async fn insert_select_keys_an_empty_string_like_any_other_value() {
         .query_text("SELECT v FROM pk_es_dst WHERE id = ''")
         .await
         .expect("point read on the empty-string key");
-    assert_eq!(
-        rows.len(),
-        1,
-        "both source rows carry the same key, so one row survives: {rows:?}"
-    );
+    assert_eq!(rows, vec!["first".to_string()], "the row is keyed by ''");
+
+    // The empty string is one key like any other: copying a second row onto
+    // it is a duplicate, refused as a VALUES insert refuses it, and the
+    // stored row stays.
+    server
+        .expect_error(
+            "INSERT INTO pk_es_dst (id, v) SELECT '', v FROM pk_es_src WHERE id = 'b'",
+            "duplicate key",
+        )
+        .await;
+    let rows = server
+        .query_text("SELECT v FROM pk_es_dst WHERE id = ''")
+        .await
+        .expect("point read on the empty-string key");
+    assert_eq!(rows, vec!["first".to_string()]);
 }
 
 /// A non-literal right-hand side reaches the row with a value only the Data

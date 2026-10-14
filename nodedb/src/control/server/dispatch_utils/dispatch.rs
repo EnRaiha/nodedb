@@ -29,6 +29,7 @@ pub async fn dispatch_authorized_to_data_plane(
 ) -> crate::Result<Response> {
     // The write lease lives until the dispatch returns its outcome.
     let (authorized, _lease) = checked.into_parts();
+    let user_roles = authorized.identity().role_names();
     let task = authorized.into_physical_task();
     dispatch_to_data_plane_inner(
         shared,
@@ -40,6 +41,7 @@ pub async fn dispatch_authorized_to_data_plane(
             trace_id,
             event_source: crate::event::EventSource::User,
             txn_id: task.txn_id,
+            user_roles,
             durability: WalDurability::CallerSupplied {
                 wal_lsn: None,
                 resolved_now_ms: None,
@@ -60,6 +62,7 @@ pub async fn dispatch_authorized_autocommit_write(
 ) -> crate::Result<Response> {
     // The write lease lives until the dispatch returns its outcome.
     let (authorized, _lease) = checked.into_parts();
+    let user_roles = authorized.identity().role_names();
     let task = authorized.into_physical_task();
     dispatch_to_data_plane_inner(
         shared,
@@ -71,6 +74,7 @@ pub async fn dispatch_authorized_autocommit_write(
             trace_id,
             event_source: crate::event::EventSource::User,
             txn_id: task.txn_id,
+            user_roles,
             durability: WalDurability::AppendHere {
                 now_override: None,
                 apply_key: 0,
@@ -99,6 +103,7 @@ pub(crate) async fn dispatch_authorized_autocommit_write_with_source(
 ) -> crate::Result<Response> {
     // The write lease lives until the dispatch returns its outcome.
     let (authorized, _lease) = checked.into_parts();
+    let user_roles = authorized.identity().role_names();
     let task = authorized.into_physical_task();
     dispatch_to_data_plane_inner(
         shared,
@@ -110,6 +115,7 @@ pub(crate) async fn dispatch_authorized_autocommit_write_with_source(
             trace_id,
             event_source,
             txn_id: task.txn_id,
+            user_roles,
             durability: WalDurability::AppendHere {
                 now_override: None,
                 apply_key: 0,
@@ -171,6 +177,8 @@ pub(crate) async fn dispatch_to_data_plane_with_source(
             trace_id,
             event_source,
             txn_id: None,
+            // Trusted internal plumbing writes as no user.
+            user_roles: Vec::new(),
             // The caller (trigger / sync / internal funnel) owns durability on its
             // own path; the funnel does not append here.
             durability: WalDurability::CallerSupplied {
@@ -223,6 +231,8 @@ pub(crate) async fn dispatch_trusted_internal_write_to_data_plane(
             trace_id,
             event_source,
             txn_id,
+            // A trusted internal write is made by no user.
+            user_roles: Vec::new(),
             // Caller pre-appended and supplied `wal_lsn`: the funnel must not
             // append again.
             durability: WalDurability::CallerSupplied {
@@ -266,6 +276,8 @@ pub(crate) async fn dispatch_replayed_write_to_data_plane(
             trace_id,
             event_source,
             txn_id,
+            // A replayed record was judged when it first applied.
+            user_roles: Vec::new(),
             durability: WalDurability::CallerSupplied {
                 wal_lsn,
                 resolved_now_ms,
@@ -301,6 +313,7 @@ pub(crate) async fn dispatch_autocommit_write(
         trace_id,
         event_source,
         txn_id,
+        user_roles,
     } = write;
     dispatch_to_data_plane_inner(
         shared,
@@ -312,6 +325,7 @@ pub(crate) async fn dispatch_autocommit_write(
             trace_id,
             event_source,
             txn_id,
+            user_roles,
             // The funnel appends the WAL record under the admission guard right
             // before enqueue and stamps the minted LSN onto the `Request`.
             durability: WalDurability::AppendHere {
@@ -351,6 +365,7 @@ async fn dispatch_step(shared: &SharedState, params: DataPlaneDispatch) -> crate
         trace_id,
         event_source,
         txn_id,
+        user_roles,
         mut durability,
         read_route,
         change_feed,
@@ -440,6 +455,7 @@ async fn dispatch_step(shared: &SharedState, params: DataPlaneDispatch) -> crate
             txn_id,
             // Internal / autocommit funnel: no session user to attribute.
             user_id: None,
+            user_roles,
             durability,
             ordering: WriteOrdering::Gate,
             // Each entry point declares whether its writes publish.
@@ -1032,6 +1048,7 @@ mod tests {
             event_source: crate::event::EventSource::User,
             txn_id: None,
             user_id: None,
+            user_roles: Vec::new(),
             durability: super::WalDurability::AppendHere {
                 now_override: None,
                 apply_key,

@@ -15,15 +15,17 @@ use super::tables::collections::encode_row;
 pub async fn dropped_collections(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> crate::Result<Vec<Vec<u8>>> {
     let catalog = state.credentials.catalog();
 
-    let dropped = catalog
-        .load_dropped_collections(DatabaseId::DEFAULT)
-        .map_err(|e| crate::Error::Storage {
-            engine: "catalog".to_string(),
-            detail: e.to_string(),
-        })?;
+    let dropped =
+        catalog
+            .load_dropped_collections(database_id)
+            .map_err(|e| crate::Error::Storage {
+                engine: "catalog".to_string(),
+                detail: e.to_string(),
+            })?;
 
     let retention = state
         .retention_settings
@@ -55,7 +57,7 @@ pub async fn dropped_collections(
         let size_estimate = if coll.size_bytes_estimate > 0 {
             coll.size_bytes_estimate
         } else {
-            query_collection_size(state, coll.tenant_id, &coll.name)
+            query_collection_size(state, database_id, coll.tenant_id, &coll.name)
                 .await
                 .unwrap_or(0)
         };
@@ -88,11 +90,12 @@ pub async fn dropped_collections(
 
 async fn query_collection_size(
     state: &SharedState,
+    database_id: DatabaseId,
     tenant_id: u64,
     collection: &str,
 ) -> Option<u64> {
     use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
-    use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
+    use crate::types::{ReadConsistency, TenantId, TraceId, VShardId};
     use nodedb_physical::physical_plan::MetaOp;
 
     let request_id = state.next_request_id();
@@ -101,7 +104,7 @@ async fn query_collection_size(
     let request = Request {
         request_id,
         tenant_id: TenantId::new(tenant_id),
-        database_id: DatabaseId::DEFAULT,
+        database_id,
         vshard_id: VShardId::new(0),
         plan: PhysicalPlan::Meta(MetaOp::QueryCollectionSize {
             tenant_id,

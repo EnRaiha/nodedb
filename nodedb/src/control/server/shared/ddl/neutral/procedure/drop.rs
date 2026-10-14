@@ -18,6 +18,7 @@ use super::super::auth_support::{require_tenant_admin, status};
 pub async fn drop_procedure(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop procedures")?;
@@ -45,9 +46,6 @@ pub async fn drop_procedure(
     }
     let name = parse_ident_token(parts[idx].trim_end_matches(';'))?;
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 

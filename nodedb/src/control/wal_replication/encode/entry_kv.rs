@@ -78,25 +78,23 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
                 rls_filters,
             },
         ),
-        KvOp::InsertIfAbsent {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            surrogate,
-            returning,
-            rls_filters,
-        } => kv::insert_if_absent(
-            collection.as_str(),
-            key,
-            value,
-            *ttl_ms,
-            surrogate.as_u32(),
-            WireReturning {
-                returning,
-                rls_filters,
-            },
-        ),
+        // Whether the row is written depends on stored state, so the write
+        // resolves to a mutation list first. A record of the bare op would
+        // make a replica or a replay overwrite a stored row.
+        KvOp::InsertIfAbsent { collection, .. } => {
+            return Err(refuse_unresolved(
+                collection.as_str(),
+                "INSERT ... ON CONFLICT DO NOTHING",
+            ));
+        }
+        KvOp::BatchPut {
+            collection, intent, ..
+        } if intent.depends_on_stored_rows() => {
+            return Err(refuse_unresolved(
+                collection.as_str(),
+                "multi-row conditional INSERT",
+            ));
+        }
         KvOp::InsertOnConflictUpdate {
             collection,
             key,
@@ -124,6 +122,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             collection,
             entries,
             ttl_ms,
+            intent,
             surrogates,
             returning,
             rls_filters,
@@ -131,6 +130,7 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
             collection.as_str(),
             entries,
             *ttl_ms,
+            intent.clone(),
             surrogates,
             WireReturning {
                 returning,
@@ -326,6 +326,17 @@ pub(super) fn kv_write(op: &KvOp) -> crate::Result<Option<ReplicatedWrite>> {
         | KvOp::SortedIndexScore { .. }
         | KvOp::SortedIndexTxnRead { .. } => return Ok(None),
     }))
+}
+
+/// Refuse a KV write whose rows depend on stored state: it resolves to
+/// `KvOp::ResolvedWrite` before it is proposed.
+fn refuse_unresolved(collection: &str, statement: &str) -> crate::Error {
+    crate::Error::Internal {
+        detail: format!(
+            "internal invariant break: a kv {statement} on '{collection}' reached the Raft \
+             propose path unresolved; write_resolve resolves it to a mutation list first"
+        ),
+    }
 }
 
 /// Refuse a KV predicate UPDATE/DELETE on a governed collection: a follower has

@@ -10,6 +10,8 @@
 //! - Binary operators: `+`, `-`, `*`, `/`, `%`
 //! - Comparison: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`
 //! - Logical: `AND`, `OR`, `NOT`
+//! - Predicates: `IS [NOT] NULL`, `[NOT] LIKE` / `ILIKE` (with `ESCAPE`),
+//!   `[NOT] IN (...)`, `[NOT] BETWEEN ... AND ...`
 //! - Parenthesized sub-expressions: `(a + b) * c`
 //! - Function calls: `ROUND(price * 1.08, 2)`, `CONCAT(a, ' ', b)`
 //! - COALESCE: `COALESCE(a, b, '')`
@@ -19,7 +21,9 @@
 //! Determinism validation: rejects `NOW()`, `RANDOM()`, `NEXTVAL()`, `UUID()`.
 
 use super::error::ExprParseError;
+use super::predicate::parse_postfix_predicate;
 use super::tokenizer::{Token, TokenKind, tokenize};
+use super::validate::{collect_columns, validate_deterministic};
 use crate::expr::{BinaryOp, SqlExpr};
 use nodedb_types::Value;
 
@@ -86,10 +90,10 @@ fn parse_and(
     pos: &mut usize,
     depth: &mut usize,
 ) -> Result<SqlExpr, ExprParseError> {
-    let mut left = parse_comparison(tokens, pos, depth)?;
+    let mut left = parse_not(tokens, pos, depth)?;
     while peek_keyword(tokens, *pos, "AND") {
         *pos += 1;
-        let right = parse_comparison(tokens, pos, depth)?;
+        let right = parse_not(tokens, pos, depth)?;
         left = SqlExpr::BinaryOp {
             left: Box::new(left),
             op: BinaryOp::And,
@@ -99,12 +103,27 @@ fn parse_and(
     Ok(left)
 }
 
+/// `NOT` binds looser than a comparison: `NOT a = b` is `NOT (a = b)`.
+fn parse_not(
+    tokens: &[Token],
+    pos: &mut usize,
+    depth: &mut usize,
+) -> Result<SqlExpr, ExprParseError> {
+    if peek_keyword(tokens, *pos, "NOT") {
+        *pos += 1;
+        let inner = parse_not(tokens, pos, depth)?;
+        return Ok(SqlExpr::Negate(Box::new(inner)));
+    }
+    parse_comparison(tokens, pos, depth)
+}
+
 fn parse_comparison(
     tokens: &[Token],
     pos: &mut usize,
     depth: &mut usize,
 ) -> Result<SqlExpr, ExprParseError> {
-    let left = parse_additive(tokens, pos, depth)?;
+    let operand = parse_additive(tokens, pos, depth)?;
+    let left = parse_postfix_predicate(operand, tokens, pos, depth)?;
     if *pos < tokens.len() && tokens[*pos].kind == TokenKind::Op {
         let op = match tokens[*pos].text.as_str() {
             "=" => BinaryOp::Eq,
@@ -126,7 +145,7 @@ fn parse_comparison(
     Ok(left)
 }
 
-fn parse_additive(
+pub(super) fn parse_additive(
     tokens: &[Token],
     pos: &mut usize,
     depth: &mut usize,
@@ -315,7 +334,7 @@ fn parse_case(
     })
 }
 
-fn parse_arg_list(
+pub(super) fn parse_arg_list(
     tokens: &[Token],
     pos: &mut usize,
     depth: &mut usize,
@@ -340,13 +359,17 @@ fn parse_arg_list(
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-fn peek_keyword(tokens: &[Token], pos: usize, keyword: &str) -> bool {
+pub(super) fn peek_keyword(tokens: &[Token], pos: usize, keyword: &str) -> bool {
     pos < tokens.len()
         && tokens[pos].kind == TokenKind::Ident
         && tokens[pos].text.eq_ignore_ascii_case(keyword)
 }
 
-fn expect_keyword(tokens: &[Token], pos: &mut usize, keyword: &str) -> Result<(), ExprParseError> {
+pub(super) fn expect_keyword(
+    tokens: &[Token],
+    pos: &mut usize,
+    keyword: &str,
+) -> Result<(), ExprParseError> {
     if peek_keyword(tokens, *pos, keyword) {
         *pos += 1;
         Ok(())
@@ -378,122 +401,6 @@ fn expect_token(
             found: got,
             pos: *pos,
         })
-    }
-}
-
-// ── Validation ────────────────────────────────────────────────────────
-
-const NON_DETERMINISTIC: &[&str] = &[
-    "now",
-    "current_timestamp",
-    "random",
-    "nextval",
-    "uuid",
-    "uuid_v4",
-    "uuid_v7",
-    "gen_random_uuid",
-    "ulid",
-    "cuid2",
-    "nanoid",
-];
-
-fn validate_deterministic(expr: &SqlExpr) -> Result<(), ExprParseError> {
-    match expr {
-        SqlExpr::Function { name, args } => {
-            if NON_DETERMINISTIC.contains(&name.as_str()) {
-                return Err(ExprParseError::InvalidLiteral {
-                    detail: format!(
-                        "non-deterministic function '{name}()' not allowed in GENERATED ALWAYS AS"
-                    ),
-                });
-            }
-            for arg in args {
-                validate_deterministic(arg)?;
-            }
-            Ok(())
-        }
-        SqlExpr::BinaryOp { left, right, .. } => {
-            validate_deterministic(left)?;
-            validate_deterministic(right)
-        }
-        SqlExpr::Negate(inner) => validate_deterministic(inner),
-        SqlExpr::Coalesce(args) => {
-            for arg in args {
-                validate_deterministic(arg)?;
-            }
-            Ok(())
-        }
-        SqlExpr::Case {
-            operand,
-            when_thens,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                validate_deterministic(op)?;
-            }
-            for (cond, then) in when_thens {
-                validate_deterministic(cond)?;
-                validate_deterministic(then)?;
-            }
-            if let Some(e) = else_expr {
-                validate_deterministic(e)?;
-            }
-            Ok(())
-        }
-        SqlExpr::Cast { expr, .. } => validate_deterministic(expr),
-        SqlExpr::NullIf(a, b) => {
-            validate_deterministic(a)?;
-            validate_deterministic(b)
-        }
-        SqlExpr::IsNull { expr, .. } => validate_deterministic(expr),
-        SqlExpr::Column(_)
-        | SqlExpr::Literal(_)
-        | SqlExpr::OldColumn(_)
-        | SqlExpr::ExcludedColumn(_) => Ok(()),
-    }
-}
-
-pub(crate) fn collect_columns(expr: &SqlExpr, deps: &mut Vec<String>) {
-    match expr {
-        SqlExpr::Column(name) => deps.push(name.clone()),
-        SqlExpr::BinaryOp { left, right, .. } => {
-            collect_columns(left, deps);
-            collect_columns(right, deps);
-        }
-        SqlExpr::Negate(inner) => collect_columns(inner, deps),
-        SqlExpr::Function { args, .. } => {
-            for arg in args {
-                collect_columns(arg, deps);
-            }
-        }
-        SqlExpr::Coalesce(args) => {
-            for arg in args {
-                collect_columns(arg, deps);
-            }
-        }
-        SqlExpr::Case {
-            operand,
-            when_thens,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                collect_columns(op, deps);
-            }
-            for (cond, then) in when_thens {
-                collect_columns(cond, deps);
-                collect_columns(then, deps);
-            }
-            if let Some(e) = else_expr {
-                collect_columns(e, deps);
-            }
-        }
-        SqlExpr::Cast { expr, .. } => collect_columns(expr, deps),
-        SqlExpr::NullIf(a, b) => {
-            collect_columns(a, deps);
-            collect_columns(b, deps);
-        }
-        SqlExpr::IsNull { expr, .. } => collect_columns(expr, deps),
-        SqlExpr::Literal(_) | SqlExpr::OldColumn(_) | SqlExpr::ExcludedColumn(_) => {}
     }
 }
 

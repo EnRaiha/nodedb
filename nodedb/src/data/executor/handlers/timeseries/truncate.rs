@@ -137,8 +137,11 @@ impl CoreLoop {
             + registry.as_ref().map(|r| r.total_row_count()).unwrap_or(0);
         let replay_stamp = self.ts_replay_stamps.insert(key.clone(), stamp);
 
+        // The aggregates' image moved aside with the directory, so the
+        // reset aggregates reload empty. An undo moves the directory back and
+        // resets them again, so they reload the image it carries.
         self.continuous_agg_mgr
-            .reset_for_source(db.as_u64(), collection);
+            .reset_for_source(db.as_u64(), tid.as_u64(), collection);
 
         match undo_log {
             Some(log) => log.push(UndoEntry::TimeseriesTruncate(Box::new(

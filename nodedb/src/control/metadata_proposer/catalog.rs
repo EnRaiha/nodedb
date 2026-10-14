@@ -8,6 +8,7 @@ use std::time::Instant;
 use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, encode_entry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
+use crate::control::constraint_install::{ConstraintTarget, constraint_targets};
 use crate::control::propose_outcome::ProposeOutcome;
 use crate::control::state::SharedState;
 use crate::error::Error;
@@ -31,11 +32,18 @@ use crate::control::server::shared::session::StatementDeadline;
 /// An entry that changes authorization state returns only once it binds
 /// every node: the authorization barrier runs after the local apply, with the
 /// DDL preparation lock and lease already released.
+///
+/// An entry that changes a collection's CRDT constraint version installs the
+/// new set through the collection's data Raft log before it returns. The
+/// entry is committed by then, so a failed install never fails it.
 pub async fn propose_catalog_entry_async(
     shared: &SharedState,
     entry: &CatalogEntry,
 ) -> Result<ProposeOutcome, Error> {
-    let outcome = propose_and_apply_locally(shared, entry).await?;
+    let (outcome, constraint_targets) = propose_and_apply_locally(shared, entry).await?;
+    // A changed constraint set is live on the collection's data log before
+    // the DDL returns, so the first CRDT apply after it is not fenced.
+    crate::control::constraint_install::install_constraints(shared, &constraint_targets).await;
     if let ProposeOutcome::Replicated { log_index } = outcome
         && entry.bears_authorization()
     {
@@ -54,18 +62,20 @@ pub async fn propose_catalog_entry_async(
 }
 
 /// Propose `entry` and wait until this node applied it. The preparation lock
-/// and lease are released before it returns.
+/// and lease are released before it returns. Also returns the collections
+/// whose constraint version the entry changed.
 async fn propose_and_apply_locally(
     shared: &SharedState,
     entry: &CatalogEntry,
-) -> Result<ProposeOutcome, Error> {
+) -> Result<(ProposeOutcome, Vec<ConstraintTarget>), Error> {
     // Buffering is decided first, ahead of every replication-mode gate: an open
     // transaction owns the entry regardless of whether this deployment
     // replicates DDL, and COMMIT re-runs the mode choice for the whole batch.
     // Entries also stay unstamped until then, so repeated mutations of one
     // descriptor receive distinct versions in commit order.
+    // A buffered entry installs its constraints when its COMMIT finalizes.
     if crate::control::server::shared::session::ddl_buffer::try_buffer(entry.clone()) {
-        return Ok(ProposeOutcome::Buffered);
+        return Ok((ProposeOutcome::Buffered, Vec::new()));
     }
 
     let handle = shared.metadata_raft_handle()?;
@@ -77,21 +87,21 @@ async fn propose_and_apply_locally(
     let lease = acquire_ddl_prepare_lease_async(shared, handle.as_ref()).await?;
     let proposed = async {
         let drained = drain_prior_version(shared, entry).await?;
-        let stamped = stamp_or_end_drain(shared, entry, drained).await?;
-        propose_prepared(
+        let (stamped, targets) = stamp_or_end_drain(shared, entry, drained).await?;
+        let log_index = propose_prepared(
             shared,
             handle.as_ref(),
             lease.token(),
             catalog_ddl_entry(&stamped)?,
             StatementDeadline::of_statement(shared).instant(),
         )
-        .await
+        .await?;
+        Ok::<_, Error>((log_index, targets))
     }
     .await;
     lease.release().await;
-    Ok(ProposeOutcome::Replicated {
-        log_index: proposed?,
-    })
+    let (log_index, targets) = proposed?;
+    Ok((ProposeOutcome::Replicated { log_index }, targets))
 }
 
 /// Drain the prior version of the descriptor `entry` changes. Returns the
@@ -129,8 +139,9 @@ async fn drain_prior_version(
     Ok(Some(descriptor_id))
 }
 
-/// Stamp `entry`. A failed stamp ends the drain of `drained` and returns the
-/// stamp error.
+/// Stamp `entry`, and name the collections whose constraint version the
+/// stamped entry changes. A failure ends the drain of `drained` and returns
+/// the error.
 ///
 /// Freezes the descriptor_version / constraint_version / modification_hlc
 /// HERE, at propose time, so the value is computed exactly once from this
@@ -142,12 +153,14 @@ async fn stamp_or_end_drain(
     shared: &SharedState,
     entry: &CatalogEntry,
     drained: Option<nodedb_cluster::DescriptorId>,
-) -> Result<CatalogEntry, Error> {
-    match catalog_entry::descriptor_stamp::stamp(
-        entry.clone(),
-        &shared.hlc_clock,
-        shared.credentials.catalog(),
-    ) {
+) -> Result<(CatalogEntry, Vec<ConstraintTarget>), Error> {
+    let catalog = shared.credentials.catalog();
+    let stamped = catalog_entry::descriptor_stamp::stamp(entry.clone(), &shared.hlc_clock, catalog)
+        .and_then(|stamped| {
+            let targets = constraint_targets(catalog, std::slice::from_ref(&stamped))?;
+            Ok((stamped, targets))
+        });
+    match stamped {
         Ok(stamped) => Ok(stamped),
         Err(error) => Err(end_unproposed_drain(shared, drained, error).await),
     }

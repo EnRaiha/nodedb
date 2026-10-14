@@ -28,15 +28,13 @@ use super::parse::{ParsedCreateFunction, parse_create_function};
 pub async fn create_function(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create functions")?;
 
     let parsed = parse_create_function(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 

@@ -197,6 +197,7 @@ impl CoreLoop {
             DocumentOp::BatchInsert {
                 collection,
                 documents,
+                if_absent,
                 surrogates,
                 returning,
                 rls_filters,
@@ -209,6 +210,7 @@ impl CoreLoop {
                     collection: collection.as_str(),
                     documents,
                     surrogates,
+                    if_absent: *if_absent,
                     returning: returning.as_ref(),
                     rls_filters,
                     resolved_sum_targets,
@@ -321,6 +323,8 @@ impl CoreLoop {
                     resolved_sum_targets,
                 },
             ),
+
+            DocumentOp::BatchUpsert { .. } => self.dispatch_upsert_batch(task, tid, op),
 
             DocumentOp::Truncate {
                 collection,

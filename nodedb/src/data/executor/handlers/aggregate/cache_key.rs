@@ -34,10 +34,13 @@ fn aggregate_specs_key(aggregates: &[AggregateSpec]) -> String {
                 .as_ref()
                 .map(expression_key)
                 .unwrap_or_else(|| agg.field.clone());
+            // The parameter is part of the identity: `approx_percentile(v,
+            // 0.5)` and `approx_percentile(v, 0.9)` are different answers.
             format!(
-                "{}({})->{}=>{}",
+                "{}({};{:?})->{}=>{}",
                 agg.function,
                 input,
+                agg.param,
                 agg.alias,
                 agg.user_alias.as_deref().unwrap_or(&agg.alias)
             )
@@ -101,19 +104,4 @@ pub(super) fn aggregate_cache_key(
         crate::types::TenantId::new(tid),
         rest,
     )
-}
-
-pub(super) fn legacy_aggregate_pairs(
-    aggregates: &[AggregateSpec],
-) -> Option<Vec<(String, String)>> {
-    aggregates
-        .iter()
-        .map(|agg| {
-            if agg.expr.is_some() {
-                None
-            } else {
-                Some((agg.function.clone(), agg.field.clone()))
-            }
-        })
-        .collect()
 }

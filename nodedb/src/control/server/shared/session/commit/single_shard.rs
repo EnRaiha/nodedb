@@ -22,17 +22,19 @@ use crate::wal::RedoPublish;
 use super::super::outcome::{AbortReason, TxnDataPlane};
 
 /// Single-shard commit: resolve the transaction's staged post-images into one
-/// `RedoRecord` that also carries `publishes`, then commit it through the
-/// vShard's apply log. Returns `Some(reason)` on failure.
+/// `RedoRecord` that also carries `publishes` and the roles of `identity`,
+/// then commit it through the vShard's apply log. Returns `Some(reason)` on
+/// failure.
 pub(super) async fn dispatch_single_shard(
     state: &SharedState,
     dp: &impl TxnDataPlane,
     buffered: &[PhysicalTask],
-    tenant_id: crate::types::TenantId,
+    identity: &crate::control::security::identity::AuthenticatedIdentity,
     vshard_id: crate::types::VShardId,
     publishes: Vec<RedoPublish>,
     ts_preview: &super::ts_rejections::RejectedByCollection,
 ) -> Option<AbortReason> {
+    let tenant_id = identity.tenant_id;
     let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
     let database_id = buffered
         .first()
@@ -98,6 +100,9 @@ pub(super) async fn dispatch_single_shard(
 
     // A transaction with no durable write and no message installs nothing.
     redo.publishes = publishes;
+    // Every replica judges a role-guarded state transition against the roles
+    // of the identity that commits.
+    redo.user_roles = identity.role_names();
     if redo.ops.is_empty() && redo.publishes.is_empty() {
         return None;
     }
@@ -164,6 +169,8 @@ pub(super) async fn commit_publishes(
         row_sources: Vec::new(),
         publishes,
         row_changes: Vec::new(),
+        // A record of messages alone writes no row for a transition to judge.
+        user_roles: Vec::new(),
     };
     let payload = match TransactionRedoPayload::from_commit(
         state,

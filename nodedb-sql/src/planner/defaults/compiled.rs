@@ -76,6 +76,18 @@ impl CompiledDefault {
         }
     }
 
+    /// Every row column this DEFAULT reads, in first-seen order.
+    ///
+    /// A column DEFAULT is evaluated with no row in scope, so a non-empty
+    /// answer means the declaration can never produce a value. A generator or
+    /// a literal reads no column.
+    pub fn referenced_columns(&self) -> Vec<String> {
+        match &self.kind {
+            DefaultKind::Expr(parsed) => crate::types::plan::referenced_columns(parsed),
+            DefaultKind::Generator(_) | DefaultKind::Literal(_) => Vec::new(),
+        }
+    }
+
     /// Whether this DEFAULT produces a fresh value on every evaluation.
     ///
     /// A plan carrying one is never admitted to the plan cache, or the cache
@@ -366,5 +378,31 @@ mod tests {
         let error = CompiledDefault::compile("a", "no_such_function_here('x')")
             .expect_err("unknown function refused");
         assert!(matches!(error, SqlError::UnevaluableDefault { .. }));
+    }
+
+    /// Only a parsed expression can read a row column. A generator, a
+    /// literal and a constant call read none.
+    #[test]
+    fn only_a_parsed_expression_reads_a_column() {
+        for constant in [
+            "UUID_V7",
+            "gen_uuid_v7()",
+            "'active'",
+            "42",
+            "now()",
+            "nextval('s')",
+            "current_timestamp",
+            "LOWER('X')",
+        ] {
+            let compiled = CompiledDefault::declare("c", constant).expect("declares");
+            assert!(
+                compiled.referenced_columns().is_empty(),
+                "{constant} reads no column"
+            );
+        }
+        for (expr, column) in [("LOWER(status)", "status"), ("status || '-x'", "status")] {
+            let compiled = CompiledDefault::declare("c", expr).expect("declares");
+            assert_eq!(compiled.referenced_columns(), [column], "{expr}");
+        }
     }
 }

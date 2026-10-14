@@ -118,6 +118,20 @@ impl CoreLoop {
             }
         }
 
+        // The state and transition rules judge each row's stored image and
+        // post-image, before the first row commits, for the same reason.
+        for row in &rows {
+            if let Err(e) = self.check_stored_update_transitions(
+                &config_key,
+                target_collection,
+                &row.old_body,
+                &row.body,
+                &task.request.user_roles,
+            ) {
+                return Err(self.response_error(task, e));
+            }
+        }
+
         // UNIQUE is judged on the statement's post-state before the first row
         // commits: a value one row releases is free for another.
         let post_images: Vec<PostImage<'_>> = rows
@@ -488,8 +502,15 @@ mod tests {
             })
             .expect("seed index");
 
-        let source_map: std::collections::HashMap<String, serde_json::Value> =
-            [("a".to_string(), serde_json::json!({"k": "a"}))].into();
+        let source_map = super::super::join_source_map::JoinSource::build(
+            "UPDATE ... FROM",
+            "src",
+            "k",
+            &[doc_format::encode_to_msgpack(
+                &serde_json::json!({"k": "a"}),
+            )],
+        )
+        .expect("build source");
         let updates = vec![(
             "note".to_string(),
             UpdateValue::Literal(

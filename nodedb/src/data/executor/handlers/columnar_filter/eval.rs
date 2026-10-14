@@ -2,12 +2,12 @@
 
 //! Filter evaluation on columnar data vectors.
 //!
-//! Provides sparse, dense, and SIMD-bitmask filter evaluation paths.
+//! Provides sparse and SIMD-bitmask filter evaluation paths.
 
 use super::ColumnarSource;
 use super::dict::{eval_dict_filter_bitmask, eval_dict_filter_sparse};
 use crate::bridge::scan_filter::{FilterOp, ScanFilter};
-use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
+use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType, NULL_SYMBOL_ID};
 
 /// Evaluate filters on a sparse set of row indices (e.g., after time-range pruning).
 ///
@@ -88,81 +88,6 @@ pub(crate) fn eval_filters_sparse(
     Some(mask)
 }
 
-/// Evaluate filters on a contiguous row range `0..row_count`.
-pub(crate) fn eval_filters_dense(
-    src: &dyn ColumnarSource,
-    filters: &[ScanFilter],
-    row_count: usize,
-) -> Option<Vec<bool>> {
-    let mut mask = vec![true; row_count];
-
-    for f in filters {
-        if f.op == FilterOp::MatchAll {
-            continue;
-        }
-        if !f.clauses.is_empty() {
-            return None;
-        }
-
-        let (col_pos, col_type, col_data) = src.resolve_column(&f.field)?;
-
-        // DictEncoded intercepts before ColumnType dispatch.
-        if let ColumnData::DictEncoded {
-            ids,
-            dictionary,
-            reverse,
-            valid,
-        } = col_data
-        {
-            let indices: Vec<u32> = (0..row_count as u32).collect();
-            eval_dict_filter_sparse(ids, dictionary, reverse, valid, f, &indices, &mut mask)?;
-            continue;
-        }
-
-        match col_type {
-            ColumnType::Float64 => {
-                let fv = f.value.as_f64()?;
-                if let ColumnData::Float64(vals) = col_data {
-                    for i in 0..row_count {
-                        if !mask[i] {
-                            continue;
-                        }
-                        mask[i] = eval_numeric_f64(vals[i], f.op.as_str(), fv)?;
-                    }
-                }
-            }
-            ColumnType::Int64 => {
-                let fv = f.value.as_i64()?;
-                if let ColumnData::Int64(vals) = col_data {
-                    for i in 0..row_count {
-                        if !mask[i] {
-                            continue;
-                        }
-                        mask[i] = eval_numeric_i64(vals[i], f.op.as_str(), fv)?;
-                    }
-                }
-            }
-            ColumnType::Timestamp(kind) => {
-                let fv = kind.literal_ms(&f.value)?;
-                if let ColumnData::Timestamp(vals) = col_data {
-                    for i in 0..row_count {
-                        if !mask[i] {
-                            continue;
-                        }
-                        mask[i] = eval_numeric_i64(vals[i], f.op.as_str(), fv)?;
-                    }
-                }
-            }
-            ColumnType::Symbol => {
-                let indices: Vec<u32> = (0..row_count as u32).collect();
-                eval_symbol_filter(src, col_pos, col_data, f, &indices, &mut mask)?;
-            }
-        }
-    }
-
-    Some(mask)
-}
-
 /// Apply passing indices from a bitmask.
 pub(crate) fn apply_mask(indices: &[u32], mask: &[bool]) -> Vec<u32> {
     indices
@@ -182,7 +107,7 @@ pub(crate) fn apply_mask(indices: &[u32], mask: &[bool]) -> Vec<u32> {
 ///
 /// Uses SIMD kernels for numeric and symbol equality comparisons.
 /// Returns `None` for filter patterns that can't be evaluated (OR clauses,
-/// unsupported operators) — caller should fall back to `eval_filters_dense`.
+/// unsupported operators) — caller should fall back to `eval_filters_sparse`.
 pub(crate) fn eval_filters_bitmask(
     src: &dyn ColumnarSource,
     filters: &[ScanFilter],
@@ -237,13 +162,19 @@ pub(crate) fn eval_filters_bitmask(
                         let b = (rt.lte_f64)(slice, hi);
                         simd_filter::bitmask_and(&a, &b)
                     }
+                    // A NaN cell is NULL: neither equal nor unequal. Every
+                    // number is at least -inf; NaN is not.
                     "ne" => {
                         let lo = fv - f64::EPSILON;
                         let hi = fv + f64::EPSILON;
                         let a = (rt.gte_f64)(slice, lo);
                         let b = (rt.lte_f64)(slice, hi);
                         let eq = simd_filter::bitmask_and(&a, &b);
-                        simd_filter::bitmask_not(&eq, row_count)
+                        let not_null = (rt.gte_f64)(slice, f64::NEG_INFINITY);
+                        simd_filter::bitmask_and(
+                            &simd_filter::bitmask_not(&eq, row_count),
+                            &not_null,
+                        )
                     }
                     _ => return None,
                 }
@@ -313,11 +244,14 @@ pub(crate) fn eval_filters_bitmask(
                             vec![0u64; simd_filter::words_for(row_count)]
                         }
                     }
+                    // A NULL cell is neither equal nor unequal to a value.
                     "ne" => {
-                        if let Some(target_id) = dict.get_id(filter_str) {
-                            (rt.ne_u32)(slice, target_id)
-                        } else {
-                            simd_filter::bitmask_all(row_count)
+                        let not_null = (rt.ne_u32)(slice, NULL_SYMBOL_ID);
+                        match dict.get_id(filter_str) {
+                            Some(target_id) => {
+                                simd_filter::bitmask_and(&(rt.ne_u32)(slice, target_id), &not_null)
+                            }
+                            None => not_null,
                         }
                     }
                     _ => return None,
@@ -385,12 +319,13 @@ fn eval_symbol_filter(
                 }
             }
         }
+        // A NULL cell is neither equal nor unequal to a value.
         "ne" => {
-            if let Some(target_id) = dict.get_id(filter_str) {
-                for (mi, &idx) in indices.iter().enumerate() {
-                    if mask[mi] {
-                        mask[mi] = ids[idx as usize] != target_id;
-                    }
+            let target_id = dict.get_id(filter_str);
+            for (mi, &idx) in indices.iter().enumerate() {
+                if mask[mi] {
+                    let id = ids[idx as usize];
+                    mask[mi] = id != NULL_SYMBOL_ID && Some(id) != target_id;
                 }
             }
         }

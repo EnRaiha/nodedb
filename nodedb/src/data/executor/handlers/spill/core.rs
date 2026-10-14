@@ -4,8 +4,7 @@
 //!
 //! `SpillCore<K, V>` handles serializing an in-memory map to spill files and
 //! merging them back.  All application-specific logic (governor integration,
-//! feed routing, merge semantics) lives in the typed wrappers in `groupby.rs`
-//! and `columnar.rs`.
+//! feed routing, merge semantics) lives in the typed wrapper in `groupby.rs`.
 //!
 //! ## Plane-safe I/O
 //!
@@ -318,33 +317,22 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// A group state holding NaN and ±Infinity spills, reads back, and
-    /// merges with every non-finite value intact.
+    /// Float state holding NaN and ±Infinity spills, reads back, and merges
+    /// with every non-finite value intact. Each value is `[sum, count]`.
     #[test]
-    fn spill_keeps_non_finite_group_state() {
-        use crate::data::executor::handlers::columnar_agg_support::AggAccum;
-        use nodedb_types::Value;
-
-        fn state(v: f64) -> Vec<AggAccum> {
-            let mut acc = AggAccum::new();
-            acc.count = 1;
-            acc.sum.add_f64(v);
-            acc.min = Some(Value::Float(v));
-            acc.max = Some(Value::Float(v));
-            vec![acc]
-        }
-        fn is_float(v: Option<&Value>, want: f64) -> bool {
-            matches!(v, Some(Value::Float(f)) if f == &want || (f.is_nan() && want.is_nan()))
+    fn spill_keeps_non_finite_values() {
+        fn state(v: f64) -> Vec<f64> {
+            vec![v, 1.0]
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let mut core: SpillCore<String, Vec<AggAccum>> =
-            SpillCore::new(dir.path().join("sc")).unwrap();
+        let mut core: SpillCore<String, Vec<f64>> = SpillCore::new(dir.path().join("sc")).unwrap();
         core.flush_run(
             vec![
                 ("g".to_string(), state(f64::INFINITY)),
                 ("n".to_string(), state(f64::NAN)),
                 ("o".to_string(), state(1e308)),
+                ("i".to_string(), state(f64::NEG_INFINITY)),
             ]
             .into_iter(),
         )
@@ -357,32 +345,27 @@ mod tests {
             .into_iter(),
         )
         .unwrap();
-        let mut in_mem: HashMap<String, Vec<AggAccum>> = HashMap::new();
+        let mut in_mem: HashMap<String, Vec<f64>> = HashMap::new();
         in_mem.insert("o".to_string(), state(1e308));
 
         let out = core
             .merge(&mut in_mem, 100, |dst, src| {
                 for (d, s) in dst.iter_mut().zip(src) {
-                    d.merge(s);
+                    *d += s;
                 }
             })
             .unwrap();
 
-        // Infinity plus -Infinity is NaN; the extremes keep both infinities.
-        let g = &out["g"][0];
-        assert_eq!(g.count, 2);
-        assert!(is_float(Some(&g.sum.sum().unwrap()), f64::NAN));
-        assert!(is_float(g.min.as_ref(), f64::NEG_INFINITY));
-        assert!(is_float(g.max.as_ref(), f64::INFINITY));
-        // NaN survives the run and is the largest extreme.
-        let n = &out["n"][0];
-        assert!(is_float(Some(&n.sum.sum().unwrap()), f64::NAN));
-        assert!(is_float(n.min.as_ref(), 1.0));
-        assert!(is_float(n.max.as_ref(), f64::NAN));
+        // Infinity plus -Infinity is NaN.
+        assert!(out["g"][0].is_nan());
+        assert_eq!(out["g"][1], 2.0);
+        // NaN survives the run.
+        assert!(out["n"][0].is_nan());
         // A run total plus the in-memory total overflows to Infinity.
-        let o = &out["o"][0];
-        assert_eq!(o.count, 2);
-        assert!(is_float(Some(&o.sum.sum().unwrap()), f64::INFINITY));
+        assert_eq!(out["o"][0], f64::INFINITY);
+        assert_eq!(out["o"][1], 2.0);
+        // An unmerged -Infinity reads back exactly.
+        assert_eq!(out["i"][0], f64::NEG_INFINITY);
     }
 
     /// Exceeding `cap × FINALIZE_CAP_FACTOR` distinct keys returns a

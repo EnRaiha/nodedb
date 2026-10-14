@@ -356,14 +356,15 @@ impl WalWriter {
         self.buffer.write(&header_bytes);
         self.buffer.write(&record.payload);
 
-        // Mirror into the double-write buffer (deferred — no fsync yet) only
+        // Stage into the double-write buffer (in memory, no disk write) only
         // once the record is committed to the write buffer. The DWB is keyed
         // by LSN, so a record that failed to land in the WAL must not leave a
         // phantom entry behind: this LSN goes to the next append, and torn-
         // write recovery would then resurrect the wrong record for it.
         //
-        // The DWB is fsynced in batch during `sync()`, before the WAL fsync.
-        // This amortizes DWB fsync cost across the entire group commit batch.
+        // `sync()` writes the surviving staged slots and fsyncs the DWB before
+        // the WAL fsync. One batch costs at most `DWB_CAPACITY` slot writes
+        // and one DWB fsync, however many records it holds.
         self.mirror_into_dwb(lsn, &record);
 
         self.next_lsn.store(lsn + 1, Ordering::Relaxed);

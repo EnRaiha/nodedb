@@ -28,12 +28,13 @@ use nodedb_physical::physical_plan::{KvOp, PhysicalPlan, TransferAmount};
 use rust_decimal::Decimal;
 
 use super::super::result::{DdlError, DdlResult};
-use super::kv_atomic::{dispatch_and_respond, parse_function_args, unquote};
+use super::kv_atomic::{KvAtomicDispatch, dispatch_and_respond, parse_function_args, unquote};
 
 /// Handle `SELECT TRANSFER(collection, source_key, dest_key, field, amount)`
 pub async fn transfer(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -51,13 +52,14 @@ pub async fn transfer(
     let source_key = unquote(&args[1]);
     let dest_key = unquote(&args[2]);
     let field = unquote(&args[3]);
-    let decimal_field = transfer_field_is_decimal(state, identity, &collection, &field)?;
+    let decimal_field =
+        transfer_field_is_decimal(state, identity, database_id, &collection, &field)?;
     let amount = parse_amount(args[4].trim(), &field, decimal_field)?;
     if !amount.is_positive() {
         return Err(ddl_err("42601", "TRANSFER: amount must be positive"));
     }
 
-    let vshard = nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection).vshard();
+    let vshard = nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard();
 
     // Dispatch to Data Plane — entire read+validate+write is atomic (single TPC
     // core). Routed through the protocol-neutral in-transaction staging gate
@@ -75,7 +77,7 @@ pub async fn transfer(
     // Both identities resolve in one batch at the collection's home.
     let bound = crate::control::server::surrogate_exchange::assign_surrogates_routed(
         state,
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         identity.tenant_id,
         &[source_bytes.as_slice(), dest_bytes.as_slice()],
         crate::types::TraceId::ZERO,
@@ -89,7 +91,7 @@ pub async fn transfer(
         )));
     };
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
-        collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, &collection),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         source_key: source_bytes,
         dest_key: dest_bytes,
         field,
@@ -104,10 +106,13 @@ pub async fn transfer(
     dispatch_and_respond(
         state,
         identity,
-        vshard,
-        plan,
-        "TRANSFER",
-        &[collection.as_str()],
+        database_id,
+        KvAtomicDispatch {
+            vshard,
+            plan,
+            func_name: "TRANSFER",
+            collections: &[collection.as_str()],
+        },
         txn_ctx,
     )
     .await
@@ -117,6 +122,7 @@ pub async fn transfer(
 pub async fn transfer_item(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -139,9 +145,8 @@ pub async fn transfer_item(
     // A move between collections on two vShards runs as one read-dependent
     // Calvin transaction. A move within one vShard runs on its core.
     let vshard_src =
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &source_collection).vshard();
-    let vshard_dst =
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &dest_collection).vshard();
+        nodedb_types::CollectionKey::from_bare(database_id, &source_collection).vshard();
+    let vshard_dst = nodedb_types::CollectionKey::from_bare(database_id, &dest_collection).vshard();
     let cross_shard = vshard_src != vshard_dst;
 
     let item_key = format!("{source_owner}:{item_id}");
@@ -152,7 +157,7 @@ pub async fn transfer_item(
     let dest_bytes = dest_key.into_bytes();
     let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
         state,
-        nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, &dest_collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &dest_collection),
         identity.tenant_id,
         &dest_bytes,
         crate::types::TraceId::ZERO,
@@ -163,14 +168,8 @@ pub async fn transfer_item(
     // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
     // through the same in-transaction staging gate as `TRANSFER` (see above).
     let plan = PhysicalPlan::Kv(KvOp::TransferItem {
-        source_collection: nodedb_types::QualifiedCollection::new(
-            DatabaseId::DEFAULT,
-            &source_collection,
-        ),
-        dest_collection: nodedb_types::QualifiedCollection::new(
-            DatabaseId::DEFAULT,
-            &dest_collection,
-        ),
+        source_collection: nodedb_types::QualifiedCollection::new(database_id, &source_collection),
+        dest_collection: nodedb_types::QualifiedCollection::new(database_id, &dest_collection),
         item_key: item_key.into_bytes(),
         dest_key: dest_bytes,
         surrogate,
@@ -184,6 +183,7 @@ pub async fn transfer_item(
         return super::transfer_cross_shard::transfer_item_across_shards(
             state,
             identity,
+            database_id,
             txn_ctx,
             plan,
             [source_collection.as_str(), dest_collection.as_str()],
@@ -195,10 +195,13 @@ pub async fn transfer_item(
     dispatch_and_respond(
         state,
         identity,
-        vshard_src,
-        plan,
-        "TRANSFER_ITEM",
-        &[source_collection.as_str(), dest_collection.as_str()],
+        database_id,
+        KvAtomicDispatch {
+            vshard: vshard_src,
+            plan,
+            func_name: "TRANSFER_ITEM",
+            collections: &[source_collection.as_str(), dest_collection.as_str()],
+        },
         txn_ctx,
     )
     .await
@@ -213,11 +216,11 @@ pub async fn transfer_item(
 fn transfer_field_is_decimal(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
     field: &str,
 ) -> Result<bool, DdlError> {
-    let gate =
-        super::read_gate::CollectionReadGate::for_request(state, identity, DatabaseId::DEFAULT);
+    let gate = super::read_gate::CollectionReadGate::for_request(state, identity, database_id);
     gate.authorize(collection)?;
     gate.authorize_permission(
         collection,
@@ -226,7 +229,7 @@ fn transfer_field_is_decimal(
     crate::control::planner::sql_plan_convert::kv_transfer_field::kv_transfer_field_is_decimal(
         state,
         identity.tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         collection,
         field,
     )

@@ -224,6 +224,7 @@ fn predicate_scope(op: &DocumentOp) -> Option<PredicateScope> {
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::PointDelete { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }
@@ -269,6 +270,7 @@ fn set_predicate_resolution(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::PointDelete { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::PointGet { .. }
         | DocumentOp::Scan { .. }

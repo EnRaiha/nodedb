@@ -44,6 +44,8 @@ mod test_group_by_alias;
 mod test_kv;
 #[path = "executor_tests/test_kv_advanced.rs"]
 mod test_kv_advanced;
+#[path = "executor_tests/test_kv_batch_intent.rs"]
+mod test_kv_batch_intent;
 #[path = "executor_tests/test_kv_scan_budget.rs"]
 mod test_kv_scan_budget;
 #[path = "executor_tests/test_kv_ttl_overlay.rs"]

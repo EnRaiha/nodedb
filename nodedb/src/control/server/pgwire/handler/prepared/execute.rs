@@ -135,10 +135,12 @@ impl NodeDbPgHandler {
 
         // When the statement declared typed result columns via Describe, the
         // client expects DataRow messages with one field per declared column
-        // (the RowDescription was already sent by Describe). Build a neutral
-        // projection from the declared result fields — lookup_key == display_name
-        // == field name, exactly matching the prior post-hoc reproject — so the
-        // SELECT-read producer shapes and projects the response in one pass.
+        // (the RowDescription was already sent by Describe). Build the
+        // projection from the declared result fields: each one reads the key
+        // the executor emits its value under and renders under its field
+        // name, as the planned output schema does on the simple-query path.
+        // The SELECT-read producer shapes and projects the response in one
+        // pass.
         // When no result columns were declared, no projection is applied.
         //
         // DML RETURNING rows are shaped from a `RowsPayload` whose own column
@@ -158,7 +160,7 @@ impl NodeDbPgHandler {
                     .iter()
                     .map(|column| OutputColumn {
                         display_name: column.name.clone(),
-                        lookup_key: column.name.clone(),
+                        lookup_key: column.lookup_key.clone(),
                         // The column's type from Parse, so the encoder
                         // renders the matching PostgreSQL form.
                         ty: column.ty,

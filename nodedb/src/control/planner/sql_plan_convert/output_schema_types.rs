@@ -232,6 +232,8 @@ mod tests {
             alias: function.to_string(),
             distinct: false,
             grouping_col_index: None,
+            filter_text: None,
+            arg_text: None,
         }
     }
 

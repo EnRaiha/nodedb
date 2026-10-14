@@ -171,8 +171,19 @@ pub(super) fn timeseries_write(op: &TimeseriesOp) -> Option<ReplicatedWrite> {
             restart_identity,
         } => columnar::timeseries_truncate(collection.as_str(), *restart_identity),
 
-        // Not a write — reads / scans, and the read-only resolve pass.
-        TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => return None,
+        TimeseriesOp::RefreshAggregate { collection, cut } => {
+            ReplicatedWrite::TimeseriesAggregateRefresh {
+                collection: collection.as_str().to_owned(),
+                cut: cut.clone(),
+            }
+        }
+
+        // Not a write — reads / scans, the read-only resolve pass, and
+        // partition maintenance, which changes no row.
+        TimeseriesOp::Scan { .. }
+        | TimeseriesOp::ResolveIngest(_)
+        | TimeseriesOp::Partitions { .. }
+        | TimeseriesOp::ReadAggregate { .. } => return None,
     })
 }
 

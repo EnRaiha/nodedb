@@ -2,241 +2,228 @@
 
 //! Parse CREATE/DROP/ALTER/SHOW SCHEDULE + SHOW SCHEDULE HISTORY.
 
-use super::helpers::extract_name_after_if_exists;
+use super::clause::{ClauseCursor, tokenize};
+use super::helpers::if_exists_name;
 use crate::ddl_ast::statement::{AutomationStmt, NodedbStatement};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::{find_ascii_case_insensitive, rfind_ascii_case_insensitive};
-
-/// Extract the content between the first pair of single quotes after
-/// "CRON" in the SQL string.
-fn extract_quoted_cron(sql: &str) -> Option<String> {
-    let cron_idx = find_ascii_case_insensitive(sql, "CRON")?;
-    let rest = &sql[cron_idx + 4..];
-    let start = rest.find('\'')?;
-    let inner = &rest[start + 1..];
-    let mut i = 0;
-    let bytes = inner.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                i += 2;
-                continue;
-            }
-            return Some(inner[..i].replace("''", "'"));
-        }
-        i += 1;
-    }
-    None
-}
 
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    (|| -> Result<Option<NodedbStatement>, SqlError> {
-        if upper.starts_with("CREATE SCHEDULE ") {
-            return Ok(Some(parse_create_schedule(upper, trimmed)));
-        }
-        if upper.starts_with("DROP SCHEDULE ") {
-            let if_exists = upper.contains("IF EXISTS");
-            let name = match extract_name_after_if_exists(parts, "SCHEDULE") {
-                None => return Ok(None),
-                Some(r) => r?,
-            };
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::DropSchedule { name, if_exists },
-            )));
-        }
-        if upper.starts_with("ALTER SCHEDULE ") {
-            // ALTER SCHEDULE <name> ENABLE | DISABLE | SET CRON '<expr>'
-            let name = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
-            let action = parts.get(3).map(|s| s.to_uppercase()).unwrap_or_default();
-            // When action is "SET CRON", extract the quoted cron expression.
-            let cron_expr = if action == "SET" {
-                extract_quoted_cron(trimmed)
-            } else {
-                None
-            };
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::AlterSchedule {
-                    name,
-                    action,
-                    cron_expr,
-                },
-            )));
-        }
-        if upper.starts_with("SHOW SCHEDULE HISTORY ") {
-            let name = match parts.get(3) {
-                None => return Ok(None),
-                Some(s) => s.to_string(),
-            };
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::ShowScheduleHistory { name },
-            )));
-        }
-        if upper == "SHOW SCHEDULES" || upper.starts_with("SHOW SCHEDULES") {
-            return Ok(Some(NodedbStatement::Automation(
-                AutomationStmt::ShowSchedules,
-            )));
-        }
-        Ok(None)
-    })()
-    .transpose()
+    if upper.starts_with("SHOW SCHEDULES") {
+        return Some(Ok(NodedbStatement::Automation(
+            AutomationStmt::ShowSchedules,
+        )));
+    }
+    let known = [
+        "CREATE SCHEDULE ",
+        "DROP SCHEDULE ",
+        "ALTER SCHEDULE ",
+        "SHOW SCHEDULE HISTORY ",
+    ];
+    if !known.iter().any(|p| upper.starts_with(p)) {
+        return None;
+    }
+    Some(parse(trimmed).map(NodedbStatement::Automation))
 }
 
-/// Structural extraction for `CREATE SCHEDULE`.
+fn parse(sql: &str) -> Result<AutomationStmt, SqlError> {
+    let toks = tokenize(sql);
+    let mut c = ClauseCursor::new(sql, &toks, "SCHEDULE");
+    if c.eat_keywords(&["CREATE", "SCHEDULE"]) {
+        return parse_create_schedule(&mut c);
+    }
+    if c.eat_keywords(&["DROP", "SCHEDULE"]) {
+        let (if_exists, name) = if_exists_name(&mut c, "schedule name")?;
+        c.finish()?;
+        return Ok(AutomationStmt::DropSchedule { name, if_exists });
+    }
+    if c.eat_keywords(&["ALTER", "SCHEDULE"]) {
+        // ALTER SCHEDULE <name> ENABLE | DISABLE | SET CRON '<expr>'
+        let name = c.name("schedule name")?;
+        let action = c.one_of("action", &["ENABLE", "DISABLE", "SET"])?;
+        let cron_expr = if action == "SET" {
+            c.expect_keyword("CRON")?;
+            Some(c.string("CRON")?)
+        } else {
+            None
+        };
+        c.finish()?;
+        return Ok(AutomationStmt::AlterSchedule {
+            name,
+            action: action.to_string(),
+            cron_expr,
+        });
+    }
+    c.expect_keywords(&["SHOW", "SCHEDULE", "HISTORY"])?;
+    let name = c.raw("schedule name")?.to_string();
+    c.finish()?;
+    Ok(AutomationStmt::ShowScheduleHistory { name })
+}
+
+/// Read `CREATE SCHEDULE <name> CRON <expr> [SCOPE LOCAL|NORMAL]
+/// [WITH (ALLOW_OVERLAP = <bool>, MISSED = <policy>)] AS <body>`.
 ///
-/// Extracts name, cron_expr, body_sql, scope, missed_policy, allow_overlap
-/// as primitive types. The handler converts scope/missed_policy strings to
-/// their respective enum variants.
-fn parse_create_schedule(upper: &str, trimmed: &str) -> NodedbStatement {
-    let prefix = "CREATE SCHEDULE ";
-    let rest = &trimmed[prefix.len()..];
-    let _rest_upper = &upper[prefix.len()..];
-    let tokens: Vec<&str> = rest.split_whitespace().collect();
-
-    let name = tokens.first().map(|s| s.to_lowercase()).unwrap_or_default();
-
-    // Extract cron expression (quoted or 5-field unquoted).
-    let cron_expr = extract_cron_expr_str(rest).unwrap_or_default();
-
-    // scope: SCOPE LOCAL → "LOCAL", default "NORMAL"
-    let scope = if upper.contains(" SCOPE LOCAL") {
-        "LOCAL".to_string()
-    } else {
-        "NORMAL".to_string()
+/// The cron expression is a quoted string or five unquoted fields. The body
+/// is everything after the header's `AS`; an `AS` inside the body is part of
+/// the body.
+fn parse_create_schedule(c: &mut ClauseCursor<'_, '_>) -> Result<AutomationStmt, SqlError> {
+    let name = c.name("schedule name")?;
+    c.expect_keyword("CRON")?;
+    let cron_expr = match c.string("CRON") {
+        Ok(expr) => expr,
+        Err(_) => {
+            let mut fields = Vec::with_capacity(5);
+            for _ in 0..5 {
+                fields.push(c.raw_run("cron field")?);
+            }
+            fields.join(" ")
+        }
     };
 
-    // allow_overlap: default true; WITH (ALLOW_OVERLAP = false) → false
+    let mut scope = "NORMAL";
     let mut allow_overlap = true;
     let mut missed_policy = "SKIP".to_string();
-
-    if let Some(with_pos) = find_ascii_case_insensitive(trimmed, " WITH ") {
-        let after_with = &trimmed[with_pos + 6..];
-        if let Some(inner) = after_with
-            .trim()
-            .strip_prefix('(')
-            .and_then(|s| s.split_once(')'))
-            .map(|(i, _)| i)
-        {
-            for opt in inner.split(',') {
-                let opt = opt.trim();
-                if let Some((key, val)) = opt.split_once('=') {
-                    let key = key.trim().to_uppercase();
-                    let val = val.trim().trim_matches('\'').trim_matches('"');
-                    match key.as_str() {
-                        "ALLOW_OVERLAP" => {
-                            allow_overlap = !val.eq_ignore_ascii_case("false");
-                        }
-                        "MISSED" => {
-                            missed_policy = val.to_uppercase();
-                        }
-                        _ => {}
+    loop {
+        if c.eat_keyword("SCOPE") {
+            c.clause("SCOPE")?;
+            scope = c.one_of("SCOPE", &["LOCAL", "NORMAL"])?;
+        } else if c.eat_keyword("WITH") {
+            c.clause("WITH")?;
+            let options = c.paren_list("WITH options", |c| {
+                let key = c.word("option name")?.to_ascii_uppercase();
+                c.expect_punct('=')?;
+                Ok((key, c.raw_run("option value")?.to_string()))
+            })?;
+            for (key, value) in options {
+                let value = value.trim_matches('\'').trim_matches('"');
+                match key.as_str() {
+                    "ALLOW_OVERLAP" => {
+                        allow_overlap = if value.eq_ignore_ascii_case("true") {
+                            true
+                        } else if value.eq_ignore_ascii_case("false") {
+                            false
+                        } else {
+                            return Err(c.error(format!(
+                                "ALLOW_OVERLAP must be TRUE or FALSE — found '{value}'"
+                            )));
+                        };
+                    }
+                    "MISSED" => missed_policy = value.to_uppercase(),
+                    other => {
+                        return Err(c.error(format!(
+                            "unknown option '{other}' (expected ALLOW_OVERLAP | MISSED)"
+                        )));
                     }
                 }
             }
+        } else {
+            break;
         }
     }
 
-    // Body SQL: everything after the last " AS " keyword.
-    let body_sql = rfind_ascii_case_insensitive(trimmed, " AS ")
-        .map(|pos| trimmed[pos + 4..].trim().to_string())
-        .unwrap_or_default();
+    c.expect_keyword("AS")?;
+    let body_sql = c.rest().to_string();
+    if body_sql.is_empty() {
+        return Err(c.error("AS needs a schedule body"));
+    }
 
-    NodedbStatement::Automation(AutomationStmt::CreateSchedule {
+    Ok(AutomationStmt::CreateSchedule {
         name,
         cron_expr,
         body_sql,
-        scope,
+        scope: scope.to_string(),
         missed_policy,
         allow_overlap,
     })
-}
-
-/// Extract cron expression from rest (after "CREATE SCHEDULE <name> ").
-fn extract_cron_expr_str(rest: &str) -> Option<String> {
-    let cron_pos = find_ascii_case_insensitive(rest, "CRON")?;
-    let after_cron = rest[cron_pos + 4..].trim_start();
-
-    // Quoted form: 'expr'
-    if let Some(after_quote) = after_cron.strip_prefix('\'')
-        && let Some(end) = after_quote.find('\'')
-    {
-        return Some(after_quote[..end].to_string());
-    }
-
-    // Unquoted form: 5 whitespace tokens
-    let tokens: Vec<&str> = after_cron.split_whitespace().collect();
-    if tokens.len() >= 5 {
-        return Some(format!(
-            "{} {} {} {} {}",
-            tokens[0], tokens[1], tokens[2], tokens[3], tokens[4]
-        ));
-    }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn create(sql: &str) -> NodedbStatement {
-        let upper = sql.to_uppercase();
-        parse_create_schedule(&upper, sql)
+    fn create(sql: &str) -> AutomationStmt {
+        parse(sql).expect("parses")
     }
 
     #[test]
     fn unicode_schedule_name_preserves_original_offsets() {
         let sql = "CREATE SCHEDULE cleanupﬀﬀ CRON '0 0 * * *' AS BEGIN DELETE FROM old; END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateSchedule {
+        let AutomationStmt::CreateSchedule {
             name,
             cron_expr,
             body_sql,
             ..
-        }) = create(sql)
-        {
-            assert_eq!(name, "cleanupﬀﬀ");
-            assert_eq!(cron_expr, "0 0 * * *");
-            assert_eq!(body_sql, "BEGIN DELETE FROM old; END");
-        } else {
+        } = create(sql)
+        else {
             panic!("expected CreateSchedule");
-        }
+        };
+        assert_eq!(name, "cleanupﬀﬀ");
+        assert_eq!(cron_expr, "0 0 * * *");
+        assert_eq!(body_sql, "BEGIN DELETE FROM old; END");
     }
 
     #[test]
     fn basic_schedule() {
         let sql = "CREATE SCHEDULE cleanup CRON '0 0 * * *' AS BEGIN DELETE FROM old; END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateSchedule {
+        let AutomationStmt::CreateSchedule {
             name,
             cron_expr,
             body_sql,
             scope,
             allow_overlap,
             ..
-        }) = create(sql)
-        {
-            assert_eq!(name, "cleanup");
-            assert_eq!(cron_expr, "0 0 * * *");
-            assert!(body_sql.contains("DELETE FROM old"));
-            assert_eq!(scope, "NORMAL");
-            assert!(allow_overlap);
-        } else {
+        } = create(sql)
+        else {
             panic!("expected CreateSchedule");
-        }
+        };
+        assert_eq!(name, "cleanup");
+        assert_eq!(cron_expr, "0 0 * * *");
+        assert!(body_sql.contains("DELETE FROM old"));
+        assert_eq!(scope, "NORMAL");
+        assert!(allow_overlap);
+    }
+
+    #[test]
+    fn unquoted_cron_fields() {
+        let sql = "CREATE SCHEDULE s CRON */5 * * * * AS BEGIN RETURN; END";
+        let AutomationStmt::CreateSchedule { cron_expr, .. } = create(sql) else {
+            panic!("expected CreateSchedule");
+        };
+        assert_eq!(cron_expr, "*/5 * * * *");
     }
 
     #[test]
     fn scope_local() {
         let sql = "CREATE SCHEDULE gc CRON '0 * * * *' SCOPE LOCAL AS BEGIN RETURN; END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateSchedule { scope, .. }) =
-            create(sql)
-        {
-            assert_eq!(scope, "LOCAL");
-        } else {
+        let AutomationStmt::CreateSchedule { scope, .. } = create(sql) else {
             panic!("expected CreateSchedule");
-        }
+        };
+        assert_eq!(scope, "LOCAL");
+    }
+
+    #[test]
+    fn scope_words_inside_the_body_set_nothing() {
+        let sql = "CREATE SCHEDULE s CRON '0 * * * *' AS INSERT INTO log VALUES ('x SCOPE LOCAL')";
+        let AutomationStmt::CreateSchedule {
+            scope, body_sql, ..
+        } = create(sql)
+        else {
+            panic!("expected CreateSchedule");
+        };
+        assert_eq!(scope, "NORMAL");
+        assert_eq!(body_sql, "INSERT INTO log VALUES ('x SCOPE LOCAL')");
+    }
+
+    #[test]
+    fn as_inside_the_body_stays_in_the_body() {
+        let sql = "CREATE SCHEDULE s CRON '0 * * * *' AS INSERT INTO t SELECT a AS b FROM u";
+        let AutomationStmt::CreateSchedule { body_sql, .. } = create(sql) else {
+            panic!("expected CreateSchedule");
+        };
+        assert_eq!(body_sql, "INSERT INTO t SELECT a AS b FROM u");
     }
 
     #[test]
@@ -244,16 +231,39 @@ mod tests {
         let sql = "CREATE SCHEDULE agg CRON '*/5 * * * *' \
                    WITH (ALLOW_OVERLAP = false, MISSED = CATCH_UP) \
                    AS BEGIN INSERT INTO stats SELECT 1; END";
-        if let NodedbStatement::Automation(AutomationStmt::CreateSchedule {
+        let AutomationStmt::CreateSchedule {
             allow_overlap,
             missed_policy,
             ..
-        }) = create(sql)
-        {
-            assert!(!allow_overlap);
-            assert_eq!(missed_policy, "CATCH_UP");
-        } else {
+        } = create(sql)
+        else {
             panic!("expected CreateSchedule");
-        }
+        };
+        assert!(!allow_overlap);
+        assert_eq!(missed_policy, "CATCH_UP");
+    }
+
+    #[test]
+    fn unknown_option_and_non_boolean_overlap_are_refused() {
+        assert!(
+            parse("CREATE SCHEDULE s CRON '* * * * *' WITH (OVERLAP = false) AS SELECT 1").is_err()
+        );
+        assert!(
+            parse("CREATE SCHEDULE s CRON '* * * * *' WITH (ALLOW_OVERLAP = no) AS SELECT 1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn alter_schedule_forms() {
+        let AutomationStmt::AlterSchedule {
+            action, cron_expr, ..
+        } = parse("ALTER SCHEDULE cleanup SET CRON '0 0 * * *'").expect("parses")
+        else {
+            panic!("expected AlterSchedule");
+        };
+        assert_eq!(action, "SET");
+        assert_eq!(cron_expr.as_deref(), Some("0 0 * * *"));
+        assert!(parse("ALTER SCHEDULE cleanup ENABLE NOW").is_err());
     }
 }

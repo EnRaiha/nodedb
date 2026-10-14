@@ -2,135 +2,98 @@
 
 //! Auto-wiring: create/remove continuous aggregates from retention policy tiers.
 //!
-//! When a retention policy is created, this module builds a `ContinuousAggregateDef`
-//! for each downsample tier and dispatches it to the Data Plane via `MetaOp`.
-//! Tiers are chained: tier N aggregates from tier N-1 (cascading).
+//! Each downsample tier of a retention policy is a continuous aggregate.
+//! Tiers are chained: tier N aggregates from tier N-1 (cascading). A tier
+//! registers on every core of every node, exactly as a user aggregate does:
+//! at the policy's post-apply on every node, at boot from the stored
+//! policies, and on the proposer before CREATE answers.
 
-use std::time::Duration;
-
-use crate::bridge::envelope::PhysicalPlan;
+use crate::control::catalog_entry::post_apply::{
+    register_continuous_aggregate_def_on_every_core, unregister_continuous_aggregate_on_every_core,
+};
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::{ContinuousAggregateDef, RefreshPolicy};
 use crate::engine::timeseries::retention_policy::types::RetentionPolicyDef;
-use crate::types::{DatabaseId, TenantId};
-use nodedb_physical::physical_plan::MetaOp;
 
-/// Register continuous aggregates for all downsample tiers in a retention policy.
+/// The continuous aggregate of every downsample tier of `def`, tier 1
+/// first.
 ///
-/// For each non-RAW tier, creates a `ContinuousAggregateDef` with:
+/// For each non-RAW tier:
 /// - Name: `_policy_{policy_name}_tier{N}`
 /// - Source: collection (tier 1) or previous tier's aggregate (tier 2+)
 /// - Refresh: OnFlush for tier 1, OnSeal for higher tiers
-///
-/// Dispatches each to the Data Plane via `MetaOp::RegisterContinuousAggregate`.
+pub fn tier_definitions(def: &RetentionPolicyDef) -> Vec<ContinuousAggregateDef> {
+    def.downsample_tiers()
+        .iter()
+        .map(|tier| {
+            let source = if tier.tier_index == 1 {
+                def.collection.clone()
+            } else {
+                def.aggregate_name(tier.tier_index - 1)
+            };
+            // OnFlush for tier 1 (lowest latency), OnSeal for higher tiers
+            // (lower CPU cost: cascaded data is less urgent).
+            let refresh_policy = if tier.tier_index == 1 {
+                RefreshPolicy::OnFlush
+            } else {
+                RefreshPolicy::OnSeal
+            };
+            ContinuousAggregateDef {
+                database_id: def.database_id,
+                name: def.aggregate_name(tier.tier_index),
+                source,
+                bucket_interval: format_interval_ms(tier.resolution_ms),
+                bucket_interval_ms: i64::try_from(tier.resolution_ms).unwrap_or(i64::MAX),
+                group_by: Vec::new(),
+                aggregates: tier.aggregates.clone(),
+                refresh_policy,
+                retention_period_ms: tier.retain_ms,
+                stale: false,
+                // The policy's creation names this tier's incarnation, so
+                // every registration of the same policy keeps the tier's
+                // image.
+                incarnation: nodedb_types::Hlc::new(def.created_at, 0),
+            }
+        })
+        .collect()
+}
+
+/// Register the continuous aggregate of every downsample tier of `def` on
+/// every core of this node.
 pub async fn register_tiers(
     state: &SharedState,
     def: &RetentionPolicyDef,
 ) -> Result<(), crate::Error> {
-    let tenant_id = TenantId::new(def.tenant_id);
-
-    for tier in def.downsample_tiers() {
-        let agg_name = def.aggregate_name(tier.tier_index);
-
-        // Source: for tier 1, aggregate from the raw collection.
-        // For tier 2+, cascade from the previous tier's aggregate.
-        let source = if tier.tier_index == 1 {
-            def.collection.clone()
-        } else {
-            def.aggregate_name(tier.tier_index - 1)
-        };
-
-        // Refresh policy: OnFlush for tier 1 (lowest latency),
-        // OnSeal for higher tiers (lower CPU cost — cascaded data is less urgent).
-        let refresh_policy = if tier.tier_index == 1 {
-            RefreshPolicy::OnFlush
-        } else {
-            RefreshPolicy::OnSeal
-        };
-
-        let interval_str = format_interval_ms(tier.resolution_ms);
-
-        let agg_def = ContinuousAggregateDef {
-            database_id: def.database_id,
-            name: agg_name.clone(),
-            source: source.clone(),
-            bucket_interval: interval_str,
-            bucket_interval_ms: tier.resolution_ms as i64,
-            group_by: Vec::new(),
-            aggregates: tier.aggregates.clone(),
-            refresh_policy,
-            retention_period_ms: tier.retain_ms,
-            stale: false,
-        };
-
-        let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate {
-            def: agg_def.clone(),
-        });
-
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
-            state,
-            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
-                crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
-                tenant_id,
-                nodedb_types::CollectionKey::from_bare(DatabaseId::new(def.database_id), &source),
-                plan,
-            ),
-            Duration::from_secs(5),
-        )
-        .await?;
-
+    for agg_def in tier_definitions(def) {
+        let name = agg_def.name.clone();
+        let source = agg_def.source.clone();
+        register_continuous_aggregate_def_on_every_core(state, def.tenant_id, agg_def).await?;
         tracing::info!(
-            aggregate = agg_name,
+            aggregate = name,
             source,
-            tier = tier.tier_index,
-            resolution_ms = tier.resolution_ms,
+            policy = %def.name,
             "auto-wired continuous aggregate for retention policy"
         );
     }
-
     Ok(())
 }
 
-/// Unregister all continuous aggregates created by a retention policy.
-///
-/// Called on `DROP RETENTION POLICY` to clean up auto-created aggregates.
+/// Unregister every continuous aggregate created by a retention policy
+/// from every core of this node, highest tier first.
 pub async fn unregister_tiers(
     state: &SharedState,
     def: &RetentionPolicyDef,
 ) -> Result<(), crate::Error> {
-    let tenant_id = TenantId::new(def.tenant_id);
-
-    // Unregister in reverse order (highest tier first) to avoid
-    // cascading source-not-found issues.
     for tier in def.downsample_tiers().iter().rev() {
-        let agg_name = def.aggregate_name(tier.tier_index);
-
-        let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate {
-            name: agg_name.clone(),
-        });
-
-        // All aggregates routed via the base collection for vShard affinity.
-        let route_collection = &def.collection;
-
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
-            state,
-            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
-                crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
-                tenant_id,
-                nodedb_types::CollectionKey::from_bare(DatabaseId::new(def.database_id), route_collection),
-                plan,
-            ),
-            Duration::from_secs(5),
-        )
-        .await?;
-
+        let name = def.aggregate_name(tier.tier_index);
+        unregister_continuous_aggregate_on_every_core(state, def.database_id, def.tenant_id, &name)
+            .await?;
         tracing::info!(
-            aggregate = agg_name,
+            aggregate = name,
             tier = tier.tier_index,
             "removed continuous aggregate for retention policy"
         );
     }
-
     Ok(())
 }
 

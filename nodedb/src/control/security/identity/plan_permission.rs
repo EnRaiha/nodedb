@@ -133,6 +133,22 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             Permission::Read
         }
 
+        // A refresh cut is a replicated write: it flushes the source and moves
+        // the aggregate's state, so it is write-class for admission and
+        // durability. Who may refresh is decided by the REFRESH handler: the
+        // aggregate's owner or a tenant admin, holding read on the source.
+        PhysicalPlan::Timeseries(TimeseriesOp::RefreshAggregate { .. }) => Permission::Write,
+
+        // The finalized rows of a continuous aggregate.
+        PhysicalPlan::Timeseries(TimeseriesOp::ReadAggregate { .. }) => Permission::Read,
+
+        // A partition listing reads. A rewrite changes the collection's
+        // storage layout, which is an ALTER of the collection.
+        PhysicalPlan::Timeseries(TimeseriesOp::Partitions { action, .. }) => match action {
+            nodedb_physical::physical_plan::PartitionsAction::List => Permission::Read,
+            nodedb_physical::physical_plan::PartitionsAction::Rewrite => Permission::Alter,
+        },
+
         // Write operations.
         PhysicalPlan::Crdt(
             CrdtOp::Apply { .. }
@@ -160,6 +176,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | VectorOp::DirectUpsert { .. }
             | VectorOp::DirectInsert { .. }
             | VectorOp::DirectInsertIfAbsent { .. }
+            | VectorOp::DirectBatchWrite { .. }
             | VectorOp::DirectDelete { .. }
             | VectorOp::DirectTruncate { .. }
             | VectorOp::DirectUpdate { .. }
@@ -177,6 +194,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::BulkDelete { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Upsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::Truncate { .. }
             | DocumentOp::Merge { .. }
@@ -241,6 +259,8 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             MetaOp::RegisterContinuousAggregate { .. }
             | MetaOp::UnregisterContinuousAggregate { .. }
             | MetaOp::ListContinuousAggregates
+            | MetaOp::ContinuousAggregatesRegistered
+            | MetaOp::AwaitContinuousAggregateRefresh { .. }
             | MetaOp::ConvertCollection { .. },
         ) => Permission::Alter,
 

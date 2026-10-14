@@ -100,7 +100,7 @@ async fn backup_restore_vector_survives_restart() {
     // ── Step 1: source server — create collection + HNSW index, insert vectors ─
     let srv_a = TestServer::start().await;
     srv_a
-        .exec("CREATE COLLECTION vec_restart WITH (engine='vector')")
+        .exec("CREATE COLLECTION vec_restart WITH (engine='document_schemaless')")
         .await
         .expect("CREATE COLLECTION vec_restart on srvA");
     srv_a

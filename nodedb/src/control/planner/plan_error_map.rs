@@ -50,6 +50,9 @@ pub(crate) fn map_plan_error(
         nodedb_sql::SqlError::ObjectNotInPrerequisiteState { object, detail } => {
             crate::Error::ObjectNotInPrerequisiteState { object, detail }
         }
+        nodedb_sql::SqlError::WrongObjectType { detail } => {
+            crate::Error::WrongObjectType { detail }
+        }
         // A constant expression that divides by zero is the same condition the
         // row-scope evaluator raises, so it carries the same code.
         nodedb_sql::SqlError::DivisionByZero => crate::Error::DivisionByZero,

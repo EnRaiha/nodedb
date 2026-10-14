@@ -185,6 +185,7 @@ fn settleable_insert(op: &DocumentOp) -> crate::Result<Option<SettleableInsert<'
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::PointDelete { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Truncate { .. }
@@ -229,6 +230,7 @@ fn defer_binding(plan: &mut PhysicalPlan, target_collection: String) {
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::PointDelete { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Truncate { .. }

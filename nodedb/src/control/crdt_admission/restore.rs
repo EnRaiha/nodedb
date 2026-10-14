@@ -124,6 +124,7 @@ mod tests {
         let delta = vec![0x91, 0x02];
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
             frontier_digest: [0x84; 32],

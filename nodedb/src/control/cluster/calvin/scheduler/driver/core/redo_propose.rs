@@ -327,6 +327,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let resolved = nodedb_physical::physical_plan::CalvinResolved {
             redo: redo.to_bytes().expect("encode redo"),

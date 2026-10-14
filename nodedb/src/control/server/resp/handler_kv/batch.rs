@@ -106,6 +106,7 @@ pub(in crate::control::server::resp) async fn handle_mset(
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
         entries,
         ttl_ms: 0,
+        intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
         surrogates,
         returning: None,
         rls_filters: Vec::new(),

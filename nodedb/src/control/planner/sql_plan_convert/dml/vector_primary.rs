@@ -13,7 +13,9 @@ use nodedb_types::{CollectionKey, RlsWriteCheck, Surrogate};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
-use nodedb_physical::physical_plan::{UpdateValue, VectorOp, VectorWriteTargets};
+use nodedb_physical::physical_plan::{
+    UpdateValue, VectorDirectRow, VectorDirectWriteIntent, VectorOp, VectorWriteTargets,
+};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::convert::{ConvertContext, db_qualified};
@@ -130,7 +132,7 @@ pub(in super::super) fn convert_vector_primary_insert(
     } else {
         assignments_to_update_values(on_conflict_updates)?
     };
-    let mut tasks = Vec::with_capacity(rows.len());
+    let mut page: Vec<VectorDirectRow> = Vec::with_capacity(rows.len());
     for row in rows {
         // Enforce the per-tenant vector dimension quota before building any
         // task. 0 means unlimited.
@@ -172,58 +174,103 @@ pub(in super::super) fn convert_vector_primary_insert(
         {
             fields.insert(key_column.to_string(), SqlValue::String(doc_id.clone()));
         }
-        let pk_bytes = doc_id.into_bytes();
-        let payload = encode_payload(&fields)?;
-
-        // `returning` and `rls_filters` are filled in after conversion: the
-        // RETURNING spec by the protocol layer's injection pass, the read
-        // filter by the RLS injection pass.
-        let op = match intent {
-            VectorPrimaryInsertIntent::Insert => VectorOp::DirectInsert {
-                collection: r.qualified.clone(),
-                field: cfg.field.to_string(),
-                surrogate,
-                pk_bytes,
-                vector: row.vector.clone(),
-                payload,
-                quantization: cfg.quantization,
-                storage_dtype: cfg.storage_dtype,
-                payload_indexes: cfg.payload_indexes.to_vec(),
-                returning: None,
-                rls_filters: Vec::new(),
-            },
-            VectorPrimaryInsertIntent::InsertIfAbsent => VectorOp::DirectInsertIfAbsent {
-                collection: r.qualified.clone(),
-                field: cfg.field.to_string(),
-                surrogate,
-                pk_bytes,
-                vector: row.vector.clone(),
-                payload,
-                quantization: cfg.quantization,
-                storage_dtype: cfg.storage_dtype,
-                payload_indexes: cfg.payload_indexes.to_vec(),
-                returning: None,
-                rls_filters: Vec::new(),
-            },
-            VectorPrimaryInsertIntent::Upsert => VectorOp::DirectUpsert {
-                collection: r.qualified.clone(),
-                field: cfg.field.to_string(),
-                surrogate,
-                pk_bytes,
-                vector: row.vector.clone(),
-                payload,
-                quantization: cfg.quantization,
-                storage_dtype: cfg.storage_dtype,
-                payload_indexes: cfg.payload_indexes.to_vec(),
-                returning: None,
-                rls_filters: Vec::new(),
-                on_conflict_updates: update_values.clone(),
-                rls_write_check: RlsWriteCheck::pending_injection(),
-            },
-        };
-        tasks.push(task(tenant_id, &r, ctx, op));
+        page.push(VectorDirectRow {
+            surrogate,
+            pk_bytes: doc_id.into_bytes(),
+            vector: row.vector.clone(),
+            payload: encode_payload(&fields)?,
+        });
     }
-    Ok(tasks)
+
+    // `returning` and `rls_filters` are filled in after conversion: the
+    // RETURNING spec by the protocol layer's injection pass, the read filter
+    // by the RLS injection pass.
+    let op = match <[VectorDirectRow; 1]>::try_from(page) {
+        Ok([row]) => point_write(&r, cfg, intent, row, update_values),
+        // Several rows are one page, so the statement lands whole or not at
+        // all, as one replicated entry.
+        Err(page) => VectorOp::DirectBatchWrite {
+            collection: r.qualified.clone(),
+            field: cfg.field.to_string(),
+            intent: physical_intent(intent),
+            rows: page,
+            quantization: cfg.quantization,
+            storage_dtype: cfg.storage_dtype,
+            payload_indexes: cfg.payload_indexes.to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+            on_conflict_updates: update_values,
+            rls_write_check: RlsWriteCheck::pending_injection(),
+        },
+    };
+    Ok(vec![task(tenant_id, &r, ctx, op)])
+}
+
+fn physical_intent(intent: VectorPrimaryInsertIntent) -> VectorDirectWriteIntent {
+    match intent {
+        VectorPrimaryInsertIntent::Insert => VectorDirectWriteIntent::Insert,
+        VectorPrimaryInsertIntent::InsertIfAbsent => VectorDirectWriteIntent::InsertIfAbsent,
+        VectorPrimaryInsertIntent::Upsert => VectorDirectWriteIntent::Upsert,
+    }
+}
+
+/// The point op for a one-row statement.
+fn point_write(
+    r: &Routing<'_>,
+    cfg: &VectorPrimaryCfg<'_>,
+    intent: VectorPrimaryInsertIntent,
+    row: VectorDirectRow,
+    on_conflict_updates: Vec<(String, UpdateValue)>,
+) -> VectorOp {
+    let VectorDirectRow {
+        surrogate,
+        pk_bytes,
+        vector,
+        payload,
+    } = row;
+    match intent {
+        VectorPrimaryInsertIntent::Insert => VectorOp::DirectInsert {
+            collection: r.qualified.clone(),
+            field: cfg.field.to_string(),
+            surrogate,
+            pk_bytes,
+            vector,
+            payload,
+            quantization: cfg.quantization,
+            storage_dtype: cfg.storage_dtype,
+            payload_indexes: cfg.payload_indexes.to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+        },
+        VectorPrimaryInsertIntent::InsertIfAbsent => VectorOp::DirectInsertIfAbsent {
+            collection: r.qualified.clone(),
+            field: cfg.field.to_string(),
+            surrogate,
+            pk_bytes,
+            vector,
+            payload,
+            quantization: cfg.quantization,
+            storage_dtype: cfg.storage_dtype,
+            payload_indexes: cfg.payload_indexes.to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+        },
+        VectorPrimaryInsertIntent::Upsert => VectorOp::DirectUpsert {
+            collection: r.qualified.clone(),
+            field: cfg.field.to_string(),
+            surrogate,
+            pk_bytes,
+            vector,
+            payload,
+            quantization: cfg.quantization,
+            storage_dtype: cfg.storage_dtype,
+            payload_indexes: cfg.payload_indexes.to_vec(),
+            returning: None,
+            rls_filters: Vec::new(),
+            on_conflict_updates,
+            rls_write_check: RlsWriteCheck::pending_injection(),
+        },
+    }
 }
 
 /// Resolve `target_keys` read-only to the surrogates they are bound to, or
@@ -455,19 +502,21 @@ mod tests {
 
     /// The row's primary key, not its vector, is the identity carried to the
     /// Data Plane: two rows with the same vector and different keys are two
-    /// rows, and the key bytes travel for followers to bind.
+    /// rows, and the key bytes travel for followers to bind. Both rows ride
+    /// one page, so the statement is one task.
     #[test]
     fn identity_is_the_primary_key_not_the_vector() {
         let ctx = make_ctx(0);
         let rows = vec![row(3, "r1"), row(3, "r2")];
         let tasks = convert(&ctx, &rows, VectorPrimaryInsertIntent::Insert).expect("convert");
-        let keys: Vec<Vec<u8>> = tasks
-            .iter()
-            .map(|t| match &t.plan {
-                PhysicalPlan::Vector(VectorOp::DirectInsert { pk_bytes, .. }) => pk_bytes.clone(),
-                other => panic!("expected DirectInsert, got {other:?}"),
-            })
-            .collect();
+        assert_eq!(tasks.len(), 1, "one task for the statement");
+        let keys: Vec<Vec<u8>> = match &tasks[0].plan {
+            PhysicalPlan::Vector(VectorOp::DirectBatchWrite { intent, rows, .. }) => {
+                assert_eq!(*intent, VectorDirectWriteIntent::Insert);
+                rows.iter().map(|row| row.pk_bytes.clone()).collect()
+            }
+            other => panic!("expected DirectBatchWrite, got {other:?}"),
+        };
         assert_eq!(keys, vec![b"r1".to_vec(), b"r2".to_vec()]);
     }
 

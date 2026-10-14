@@ -413,7 +413,7 @@ pub(super) fn decrypt_segment_file(
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::timeseries::{MetricSample, PartitionMeta, PartitionState};
+    use nodedb_types::timeseries::{PartitionMeta, PartitionState};
     use tempfile::TempDir;
 
     use super::super::super::columnar_memtable::{
@@ -443,13 +443,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut mt = ColumnarMemtable::new_metric(test_config());
         for i in 0..100 {
-            mt.ingest_metric(
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1_000_000 + i * 1000,
-                    value: i as f64 * 2.0,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1_000_000 + i * 1000),
+                    ColumnValue::Float64(i as f64 * 2.0),
+                ],
+            )
+            .unwrap();
         }
         (tmp, mt.drain())
     }
@@ -512,13 +513,14 @@ mod tests {
 
         let mut mt = ColumnarMemtable::new_metric(test_config());
         for i in 0..5000 {
-            mt.ingest_metric(
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1_700_000_000_000 + i * 1000,
-                    value: i as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1_700_000_000_000 + i * 1000),
+                    ColumnValue::Float64(i as f64),
+                ],
+            )
+            .unwrap();
         }
         let drain = mt.drain();
         writer
@@ -593,13 +595,14 @@ mod tests {
 
         let mut mt = ColumnarMemtable::new_metric(test_config());
         for i in 0..1000 {
-            mt.ingest_metric(
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1_700_000_000_000 + i * 10_000,
-                    value: 42.0 + i as f64 * 0.1,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1_700_000_000_000 + i * 10_000),
+                    ColumnValue::Float64(42.0 + i as f64 * 0.1),
+                ],
+            )
+            .unwrap();
         }
         let drain = mt.drain();
         writer

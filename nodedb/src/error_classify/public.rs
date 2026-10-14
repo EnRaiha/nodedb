@@ -182,6 +182,10 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
         Error::ObjectNotInPrerequisiteState { object, detail } => {
             NodeDbError::object_not_ready(object.clone(), detail.clone())
         }
+        // The public class `code_for_sqlstate` gives `42809`.
+        Error::WrongObjectType { detail } => {
+            NodeDbError::from_wire(nodedb_types::error::ErrorCode::BAD_REQUEST, detail.clone())
+        }
         Error::UndefinedColumn { column } => NodeDbError::undefined_column(column.clone()),
         Error::TextColumn {
             collection,

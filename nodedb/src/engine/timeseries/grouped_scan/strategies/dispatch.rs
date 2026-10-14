@@ -2,7 +2,7 @@
 
 //! Strategy selection: picks the grouping strategy for a scan from its
 //! GROUP BY shape, symbol cardinality, and row count, then resolves the
-//! integer keys to strings.
+//! integer keys to typed group keys.
 
 use super::super::super::columnar_memtable::{ColumnData, ColumnType};
 use super::super::types::{GroupedAggResult, ResolvedSchema};
@@ -77,11 +77,11 @@ pub(in crate::engine::timeseries::grouped_scan) fn dispatch_grouping<'a>(
         aggregate_hash_generic(resolved, columns, mask, row_count, num_aggs)
     };
 
-    // Resolve integer keys to strings.
+    // Resolve integer keys to typed keys.
     let mut result = GroupedAggResult::new(num_aggs);
     for (int_key, accums) in local_groups {
-        let str_key = resolve_group_key(&int_key, resolved, sym_lookup);
-        result.merge_group(str_key, &accums);
+        let key = resolve_group_key(&int_key, resolved, columns, sym_lookup);
+        result.merge_group(key, &accums);
     }
     result
 }

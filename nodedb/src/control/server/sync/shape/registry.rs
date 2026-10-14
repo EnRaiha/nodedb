@@ -10,7 +10,7 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use nodedb_query::metadata_filter::matches_metadata_filter;
-use nodedb_types::{DatabaseId, filter::MetadataFilter};
+use nodedb_types::filter::MetadataFilter;
 
 use super::definition::{ShapeDefinition, ShapeId, ShapeScope, ShapeType};
 
@@ -237,29 +237,29 @@ impl ShapeRegistry {
     }
 
     /// Export all shapes for persistence (serializable snapshot).
-    pub fn export_all(&self) -> Vec<(String, u64, ShapeDefinition)> {
+    ///
+    /// Each entry carries its session's tenant and database scope, so an
+    /// import restores every shape into the database it was subscribed in.
+    pub fn export_all(&self) -> Vec<(String, ShapeScope, ShapeDefinition)> {
         let sessions =
             crate::control::lock_utils::read_or_recover(self.sessions.read(), "shape_sessions");
         let mut result = Vec::new();
         for (session_id, client) in sessions.iter() {
             for shape in client.shapes.values() {
-                result.push((session_id.clone(), client.scope.tenant_id, shape.clone()));
+                result.push((session_id.clone(), client.scope, shape.clone()));
             }
         }
         result
     }
 
     /// Import shapes from a persisted snapshot (called on startup).
-    pub fn import(&self, shapes: Vec<(String, u64, ShapeDefinition)>) {
+    pub fn import(&self, shapes: Vec<(String, ShapeScope, ShapeDefinition)>) {
         let mut sessions =
             crate::control::lock_utils::write_or_recover(self.sessions.write(), "shape_sessions");
-        for (session_id, tenant_id, shape) in shapes {
+        for (session_id, scope, shape) in shapes {
             let client = sessions.entry(session_id).or_insert_with(|| ClientShapes {
                 shapes: HashMap::new(),
-                scope: ShapeScope {
-                    tenant_id,
-                    database_id: DatabaseId::DEFAULT,
-                },
+                scope,
                 last_modified: Instant::now(),
             });
             client
@@ -283,6 +283,8 @@ impl ShapeRegistry {
 
 #[cfg(test)]
 mod tests {
+    use nodedb_types::DatabaseId;
+
     use super::super::definition::ShapeType;
     use super::*;
 
@@ -592,5 +594,23 @@ mod tests {
         let matches = reg.evaluate_array_mutation(scope(1), "mat", &[50]);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, "s2");
+    }
+
+    /// An export and import keep each session's database, so a shape
+    /// subscribed outside the default database is restored into it.
+    #[test]
+    fn export_and_import_keep_the_session_database() {
+        let reg = ShapeRegistry::new();
+        let other = ShapeScope {
+            tenant_id: 1,
+            database_id: DatabaseId::new(7),
+        };
+        reg.subscribe("s1", other, make_doc_shape("d1", "orders"));
+
+        let restored = ShapeRegistry::new();
+        restored.import(reg.export_all());
+
+        assert!(restored.get_shape("s1", other, "d1").is_some());
+        assert!(restored.get_shape("s1", scope(1), "d1").is_none());
     }
 }

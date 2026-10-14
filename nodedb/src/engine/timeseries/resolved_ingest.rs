@@ -170,13 +170,13 @@ impl ResolvedTsBatch {
 }
 
 /// The empty value a column the batch does not name takes, as a memtable
-/// fills a column added after rows landed.
+/// fills a column added after rows landed. A symbol or float column takes
+/// SQL NULL, never an empty string. Integer and time columns have no NULL.
 pub fn empty_value(column_type: ColumnType) -> ColumnValue {
     match column_type {
         ColumnType::Timestamp(_) => ColumnValue::Timestamp(0),
-        ColumnType::Float64 => ColumnValue::Float64(f64::NAN),
+        ColumnType::Float64 | ColumnType::Symbol => ColumnValue::Null,
         ColumnType::Int64 => ColumnValue::Int64(0),
-        ColumnType::Symbol => ColumnValue::Symbol(String::new()),
     }
 }
 
@@ -188,6 +188,7 @@ pub fn value_fits(value: &ColumnValue, column_type: ColumnType) -> bool {
             | (ColumnValue::Float64(_), ColumnType::Float64)
             | (ColumnValue::Int64(_), ColumnType::Int64)
             | (ColumnValue::Symbol(_), ColumnType::Symbol)
+            | (ColumnValue::Null, ColumnType::Symbol | ColumnType::Float64)
     )
 }
 
@@ -240,5 +241,31 @@ mod tests {
             &ColumnValue::Symbol("x".into()),
             ColumnType::Int64
         ));
+        assert!(value_fits(&ColumnValue::Null, ColumnType::Symbol));
+        assert!(value_fits(&ColumnValue::Null, ColumnType::Float64));
+        assert!(!value_fits(&ColumnValue::Null, ColumnType::Int64));
+    }
+
+    /// A symbol column a row does not name is NULL, never `''`.
+    #[test]
+    fn an_unnamed_symbol_is_null() {
+        assert_eq!(empty_value(ColumnType::Symbol), ColumnValue::Null);
+        assert_eq!(empty_value(ColumnType::Float64), ColumnValue::Null);
+    }
+
+    /// A NULL cell survives the batch encoding the WAL carries.
+    #[test]
+    fn a_null_cell_round_trips() {
+        let row = ResolvedTsRow {
+            line: 0,
+            tags: Vec::new(),
+            timestamp_ms: 1_000,
+            values: vec![ColumnValue::Timestamp(1_000), ColumnValue::Null],
+            absent: vec![1],
+            image: Vec::new(),
+        };
+        let bytes = zerompk::to_msgpack_vec(&row).expect("encode row");
+        let back: ResolvedTsRow = zerompk::from_msgpack(&bytes).expect("decode row");
+        assert_eq!(back, row);
     }
 }

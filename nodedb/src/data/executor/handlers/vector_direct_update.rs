@@ -17,6 +17,7 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+use super::returning_rows::VectorRowColumns;
 use super::rls_write_gate;
 use super::upsert::apply_on_conflict_updates;
 use super::vector_direct_row::{
@@ -145,13 +146,17 @@ impl CoreLoop {
 
         // No index means no row was ever written: nothing to rewrite.
         let probe_key = CoreLoop::vector_index_key(database_id, tid, collection, field);
+        let columns = VectorRowColumns {
+            identity: &identity_column,
+            vector: field,
+        };
         if !self.vector_collections.contains_key(&probe_key) {
             if let Some(spec) = returning {
                 return self.vector_stored_returning_response(
                     task,
                     spec,
                     rls_filters,
-                    &identity_column,
+                    columns,
                     &[],
                 );
             }
@@ -220,15 +225,29 @@ impl CoreLoop {
         }
 
         if let Some(spec) = returning {
-            let rows: Vec<(&StorageKey, &[u8])> =
-                written.iter().map(|(k, b)| (k, b.as_slice())).collect();
-            return self.vector_stored_returning_response(
-                task,
-                spec,
-                rls_filters,
-                &identity_column,
-                &rows,
-            );
+            // The post-image vector: the one the node now carries.
+            let vectors = match written
+                .iter()
+                .map(|(key, _)| {
+                    self.committed_primary_vector(
+                        database_id,
+                        tid,
+                        collection,
+                        field,
+                        key.surrogate(),
+                    )
+                })
+                .collect::<crate::Result<Vec<Vec<f32>>>>()
+            {
+                Ok(vectors) => vectors,
+                Err(e) => return self.response_error(task, e),
+            };
+            let rows: Vec<(&StorageKey, &[u8], &[f32])> = written
+                .iter()
+                .zip(vectors.iter())
+                .map(|((k, b), v)| (k, b.as_slice(), v.as_slice()))
+                .collect();
+            return self.vector_stored_returning_response(task, spec, rls_filters, columns, &rows);
         }
         self.response_affected(task, written.len() as u64)
     }

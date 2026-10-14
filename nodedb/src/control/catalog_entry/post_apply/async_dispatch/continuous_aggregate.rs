@@ -89,15 +89,40 @@ pub async fn register_on_every_core(
             database_id: 0,
         })?;
     let database_id = def.database_id;
-    let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate { def });
-    let fanout = fanout_for(database_id, tenant_id, name);
-    dispatch_to_every_core(shared, &fanout, &plan)
+    register_def_on_every_core(shared, tenant_id, def)
         .await
         .map_err(|error| RegisterFailure {
             error,
             stage: RegisterStage::Dispatch,
             database_id,
         })
+}
+
+/// Register `def` for `tenant_id` on every core on this node.
+pub async fn register_def_on_every_core(
+    shared: &SharedState,
+    tenant_id: u64,
+    def: ContinuousAggregateDef,
+) -> crate::Result<()> {
+    let database_id = def.database_id;
+    let name = def.name.clone();
+    let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate { def });
+    let fanout = fanout_for(database_id, tenant_id, &name);
+    dispatch_to_every_core(shared, &fanout, &plan).await
+}
+
+/// Unregister aggregate `name` of `tenant_id` from every core on this node.
+pub async fn unregister_on_every_core(
+    shared: &SharedState,
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+) -> crate::Result<()> {
+    let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate {
+        name: name.to_string(),
+    });
+    let fanout = fanout_for(database_id, tenant_id, name);
+    dispatch_to_every_core(shared, &fanout, &plan).await
 }
 
 /// Dispatch `MetaOp::UnregisterContinuousAggregate` to every core
@@ -109,9 +134,7 @@ pub async fn delete_async(
     name: String,
     shared: Arc<SharedState>,
 ) {
-    let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: name.clone() });
-    let fanout = fanout_for(database_id, tenant_id, &name);
-    if let Err(error) = dispatch_to_every_core(&shared, &fanout, &plan).await {
+    if let Err(error) = unregister_on_every_core(&shared, database_id, tenant_id, &name).await {
         crate::diag::continuous_aggregate_not_applied(
             &error,
             "delete_dispatch",
@@ -120,6 +143,15 @@ pub async fn delete_async(
             &name,
         );
     }
+}
+
+/// Tell every core on this node that boot registered every continuous
+/// aggregate the catalog holds, so each core drops the image entries of
+/// aggregates that no longer exist.
+pub async fn finish_boot_registration_on_every_core(shared: &SharedState) -> crate::Result<()> {
+    let plan = PhysicalPlan::Meta(MetaOp::ContinuousAggregatesRegistered);
+    let fanout = fanout_for(0, 0, "boot registration");
+    dispatch_to_every_core(shared, &fanout, &plan).await
 }
 
 fn fanout_for(database_id: u64, tenant_id: u64, name: &str) -> CoreFanout<'_> {

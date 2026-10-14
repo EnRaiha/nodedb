@@ -47,7 +47,7 @@ const SETUP: &[&str] = &[
     "CREATE COLLECTION vr_metrics (captured_at TIMESTAMP TIME_KEY, host TEXT, v FLOAT) \
      WITH (engine='timeseries')",
     "INSERT INTO vr_metrics (captured_at, host, v) VALUES ('2020-03-05 10:00:00', 'h1', 1.5)",
-    "CREATE COLLECTION vr_vec WITH (engine='vector')",
+    "CREATE COLLECTION vr_vec WITH (engine='document_schemaless')",
     "CREATE INDEX ON vr_vec (embedding)",
     "INSERT INTO vr_vec { id: 'v1', embedding: [1.0, 0.0, 0.0, 0.0] }",
     "INSERT INTO vr_vec { id: 'v2', embedding: [0.0, 1.0, 0.0, 0.0] }",

@@ -44,11 +44,24 @@ pub(super) fn rebind_surrogates(
                 ),
             });
         }
-        state.surrogate_assigner.bind(
-            nodedb_types::CollectionKey::from_bare(target.dest, &e.collection),
-            TenantId::new(e.tenant_id),
-            &e.pk,
-            Surrogate::new(e.surrogate),
+    }
+    // One catalog transaction per (tenant, collection) the backup binds.
+    let mut groups: Vec<(u64, &str)> = Vec::new();
+    for e in binds {
+        if !groups.contains(&(e.tenant_id, e.collection.as_str())) {
+            groups.push((e.tenant_id, e.collection.as_str()));
+        }
+    }
+    for (tenant_id, collection) in groups {
+        let rows: Vec<(&[u8], Surrogate)> = binds
+            .iter()
+            .filter(|e| e.tenant_id == tenant_id && e.collection == collection)
+            .map(|e| (e.pk.as_slice(), Surrogate::new(e.surrogate)))
+            .collect();
+        state.surrogate_assigner.bind_many(
+            CollectionKey::from_bare(target.dest, collection),
+            TenantId::new(tenant_id),
+            &rows,
         )?;
     }
     Ok(())

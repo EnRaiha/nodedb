@@ -217,6 +217,8 @@ mod tests {
                     system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                     computed_columns: Vec::new(),
+                    having: Vec::new(),
+                    tiering: None,
                 }),
                 None,
             );

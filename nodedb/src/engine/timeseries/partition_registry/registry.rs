@@ -9,8 +9,12 @@ use nodedb_types::timeseries::{
     PartitionInterval, PartitionMeta, PartitionState, TieredPartitionConfig,
 };
 
+use super::boundary::interval_bounds;
 use super::entry::{PartitionEntry, format_partition_dir};
 use super::rate::RateEstimator;
+
+/// One day, in milliseconds: the interval `Auto` starts at.
+const DAY_MS: u64 = 86_400_000;
 
 /// Registry of all partitions for one timeseries collection.
 pub struct PartitionRegistry {
@@ -70,40 +74,18 @@ impl PartitionRegistry {
     }
 
     /// Compute partition boundaries (start_ms, end_ms) for a given timestamp.
+    ///
+    /// A duration, a calendar month and a calendar year align as
+    /// [`interval_bounds`] aligns them. `Unbounded` is one partition. `Auto`
+    /// is resolved to a duration in `new()`, so any interval without bounds
+    /// other than `Unbounded` falls back to one day.
     fn partition_boundaries(&self, timestamp_ms: i64) -> (i64, i64) {
-        match &self.current_interval {
-            PartitionInterval::Duration(ms) => {
-                let ms = *ms as i64;
-                let start = (timestamp_ms / ms) * ms;
-                (start, start + ms)
-            }
-            PartitionInterval::Month => {
-                // Align to calendar month start/end (simplified: 30d).
-                let approx_month_ms = 30 * 86_400_000i64;
-                let start = (timestamp_ms / approx_month_ms) * approx_month_ms;
-                (start, start + approx_month_ms)
-            }
-            PartitionInterval::Year => {
-                let approx_year_ms = 365 * 86_400_000i64;
-                let start = (timestamp_ms / approx_year_ms) * approx_year_ms;
-                (start, start + approx_year_ms)
-            }
-            PartitionInterval::Unbounded => {
-                // Single partition: start=0, end=MAX.
-                (0, i64::MAX)
-            }
-            PartitionInterval::Auto => {
-                // Should have been resolved to a concrete interval in new().
-                let ms = 86_400_000i64; // fallback 1d
-                let start = (timestamp_ms / ms) * ms;
-                (start, start + ms)
-            }
-            _ => {
-                let ms = 86_400_000i64;
-                let start = (timestamp_ms / ms) * ms;
-                (start, start + ms)
-            }
+        if matches!(self.current_interval, PartitionInterval::Unbounded) {
+            return (0, i64::MAX);
         }
+        interval_bounds(&self.current_interval, timestamp_ms)
+            .or_else(|| interval_bounds(&PartitionInterval::Duration(DAY_MS), timestamp_ms))
+            .unwrap_or((timestamp_ms, timestamp_ms))
     }
 
     /// Record ingest for adaptive interval algorithm.

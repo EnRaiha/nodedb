@@ -55,6 +55,9 @@ pub struct CollectionConfig {
     /// rows key by the implicit `id` or `_rowid`. A sparse row's identity
     /// renders under this column, else under `id`.
     pub declared_key: Option<String>,
+    /// The typeguards of `enforcement.type_guards`, parsed once at
+    /// registration. Every write applies them to the body it stores.
+    pub type_guards: Vec<crate::data::executor::enforcement::typeguard::CompiledTypeGuard>,
 }
 
 impl CollectionConfig {
@@ -72,6 +75,7 @@ impl CollectionConfig {
             vector_fields: Vec::new(),
             declared_columns: Vec::new(),
             declared_key: None,
+            type_guards: Vec::new(),
         }
     }
 

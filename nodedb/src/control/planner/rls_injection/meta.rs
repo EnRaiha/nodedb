@@ -86,6 +86,8 @@ pub(super) fn inject_meta(ctx: &RlsCtx<'_>, op: &mut MetaOp) -> crate::Result<()
         | MetaOp::RegisterContinuousAggregate { .. }
         | MetaOp::UnregisterContinuousAggregate { .. }
         | MetaOp::ListContinuousAggregates
+        | MetaOp::ContinuousAggregatesRegistered
+        | MetaOp::AwaitContinuousAggregateRefresh { .. }
         | MetaOp::ConvertCollection { .. }
         | MetaOp::RestoreTenantSnapshot { .. }
         | MetaOp::PurgeTenant { .. }

@@ -268,6 +268,8 @@ impl Scheduler {
         let mut request = self.build_exempt_request(request_id, tenant_id, database_id, plan);
         // The stage tags the rows it stages by the slice's source.
         request.event_source = super::super::request::slice_event_source(&txn.tx_class, &scope);
+        // The stage judges a role-guarded transition against the writer's roles.
+        request.user_roles = txn.tx_class.user_roles.clone();
 
         // The leader checks the transaction's collection incarnations.
         let (superseded, gates) = self.check_incarnations(&txn.tx_class);

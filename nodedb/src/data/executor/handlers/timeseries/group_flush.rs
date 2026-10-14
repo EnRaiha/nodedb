@@ -117,20 +117,10 @@ fn add_payload(load: &mut TsRecordLoad, payload: &[u8], format: Option<&str>) {
     let lines: Vec<String> = match format {
         Some("ilp-msgpack") => zerompk::from_msgpack::<Vec<String>>(payload).unwrap_or_default(),
         Some("ilp") => utf8_lines(payload),
-        _ => {
-            if let Ok(batch) =
-                zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
-            {
-                load.rows = load.rows.saturating_add(batch.samples.len());
-                return;
-            }
-            match format {
-                None => utf8_lines(payload),
-                // A JSON or msgpack row payload: its rows are counted by the
-                // ingest. Its bytes still count toward the budget test.
-                Some(_) => Vec::new(),
-            }
-        }
+        // A JSON or msgpack row payload: its rows are counted by the ingest.
+        // Its bytes still count toward the budget test. The replay arm
+        // refuses a record that names no format or an unknown one.
+        _ => Vec::new(),
     };
     for line in lines {
         if line.trim().is_empty() {
@@ -442,6 +432,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo")

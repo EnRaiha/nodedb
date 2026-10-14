@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use super::coverage::IndexCoverage;
 use super::field::KvIndexTree;
 
 /// A composite secondary index on multiple value fields.
@@ -19,19 +20,26 @@ pub struct KvCompositeIndex {
     field_positions: Vec<usize>,
     /// composite_key_bytes → set of primary_key_bytes.
     tree: KvIndexTree,
+    /// Which rows the index holds; only a complete index answers a probe.
+    coverage: IndexCoverage,
 }
 
 impl KvCompositeIndex {
-    pub fn new(fields: Vec<String>, field_positions: Vec<usize>) -> Self {
+    pub fn new(fields: Vec<String>, field_positions: Vec<usize>, coverage: IndexCoverage) -> Self {
         Self {
             fields,
             field_positions,
             tree: BTreeMap::new(),
+            coverage,
         }
     }
 
     pub fn fields(&self) -> &[String] {
         &self.fields
+    }
+
+    pub fn coverage(&self) -> IndexCoverage {
+        self.coverage
     }
 
     pub fn field_positions(&self) -> &[usize] {
@@ -156,7 +164,11 @@ mod tests {
 
     #[test]
     fn composite_index_insert_and_exact_lookup() {
-        let mut ci = KvCompositeIndex::new(vec!["region".into(), "status".into()], vec![0, 1]);
+        let mut ci = KvCompositeIndex::new(
+            vec!["region".into(), "status".into()],
+            vec![0, 1],
+            IndexCoverage::Complete,
+        );
         ci.insert(&[b"us-east", b"active"], b"k1".to_vec());
         ci.insert(&[b"us-east", b"inactive"], b"k2".to_vec());
         ci.insert(&[b"eu-west", b"active"], b"k3".to_vec());
@@ -175,7 +187,11 @@ mod tests {
 
     #[test]
     fn composite_index_prefix_lookup() {
-        let mut ci = KvCompositeIndex::new(vec!["region".into(), "status".into()], vec![0, 1]);
+        let mut ci = KvCompositeIndex::new(
+            vec!["region".into(), "status".into()],
+            vec![0, 1],
+            IndexCoverage::Complete,
+        );
         ci.insert(&[b"us-east", b"active"], b"k1".to_vec());
         ci.insert(&[b"us-east", b"inactive"], b"k2".to_vec());
         ci.insert(&[b"eu-west", b"active"], b"k3".to_vec());
@@ -187,7 +203,11 @@ mod tests {
 
     #[test]
     fn composite_index_remove() {
-        let mut ci = KvCompositeIndex::new(vec!["a".into(), "b".into()], vec![0, 1]);
+        let mut ci = KvCompositeIndex::new(
+            vec!["a".into(), "b".into()],
+            vec![0, 1],
+            IndexCoverage::Complete,
+        );
         ci.insert(&[b"x", b"y"], b"k1".to_vec());
         assert_eq!(ci.entry_count(), 1);
 
@@ -201,7 +221,11 @@ mod tests {
     /// — the case that makes rebuilding from split-apart values unsound.
     #[test]
     fn raw_entries_roundtrip_reproduces_lookups() {
-        let mut ci = KvCompositeIndex::new(vec!["a".into(), "b".into()], vec![0, 1]);
+        let mut ci = KvCompositeIndex::new(
+            vec!["a".into(), "b".into()],
+            vec![0, 1],
+            IndexCoverage::Complete,
+        );
         ci.insert(&[b"x", b"y"], b"k1".to_vec());
         ci.insert(&[b"x\0z", b"y"], b"k2".to_vec());
 
@@ -211,7 +235,11 @@ mod tests {
             .flat_map(|(key, pks)| pks.iter().map(|pk| (key.clone(), pk.clone())))
             .collect();
 
-        let mut restored = KvCompositeIndex::new(vec!["a".into(), "b".into()], vec![0, 1]);
+        let mut restored = KvCompositeIndex::new(
+            vec!["a".into(), "b".into()],
+            vec![0, 1],
+            IndexCoverage::Complete,
+        );
         for (key, pk) in exported {
             restored.insert_raw(key, pk);
         }

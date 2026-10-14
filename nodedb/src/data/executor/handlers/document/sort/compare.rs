@@ -110,21 +110,16 @@ pub(in crate::data::executor) fn all_column_keys(sort_keys: &[SortKeySpec]) -> b
 
 /// Evaluate every sort key against one raw msgpack document.
 ///
-/// A document that cannot be decoded contributes NULL keys and sorts to the
-/// front rather than failing the scan — matching the binary comparator, which
-/// treats an absent field as ordering-neutral. An expression *evaluation*
-/// failure is a different thing entirely and propagates.
+/// A document that does not decode is an error, as is an expression
+/// evaluation error. Sorting the document under NULL keys would place it by
+/// values it does not hold.
 pub(in crate::data::executor) fn eval_sort_values(
     doc_bytes: &[u8],
     sort_keys: &[SortKeySpec],
 ) -> crate::Result<SortValues> {
-    let doc = match nodedb_types::json_from_msgpack(doc_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(err = %e, "msgpack decode failed during sort; treating row as null");
-            serde_json::Value::Null
-        }
-    };
+    let doc = nodedb_types::json_from_msgpack(doc_bytes).map_err(|e| crate::Error::Codec {
+        detail: format!("ORDER BY document decode: {e}"),
+    })?;
 
     sort_keys
         .iter()

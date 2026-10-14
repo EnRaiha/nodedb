@@ -2,7 +2,7 @@
 
 //! Does a write routed through the Calvin scheduler survive `kill -9` on an
 //! ordinary single-node boot? ILP routes to Calvin unconditionally and lands
-//! in the WAL-only `TimeseriesMemtable`; `wal.wait_durable` has zero callers
+//! in the WAL-only columnar memtable; `wal.wait_durable` has zero callers
 //! under `control/cluster/calvin/`. The pre-crash pgwire read rules out a
 //! visibility quirk being mistaken for post-crash data loss.
 

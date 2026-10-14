@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use nodedb_types::Value;
 
 use super::super::rows::{apply_user_aliases_to_rows, retain_having, sort_aggregated_rows};
-use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::accum::GroupState;
 use nodedb_physical::physical_plan::{AggregateSpec, GroupKeySpec};
@@ -77,7 +76,7 @@ impl CoreLoop {
         // fully empty merge (every shard matched nothing) synthesizes the
         // one identity row.
         if group_by.is_empty() && groups.is_empty() {
-            groups.insert("__all__".to_string(), GroupState::new(aggregates));
+            groups.insert("__all__".to_string(), GroupState::new(aggregates)?);
         }
 
         let mut results: Vec<Value> = Vec::new();
@@ -85,9 +84,13 @@ impl CoreLoop {
         for (group_key, state) in groups {
             let mut row: HashMap<String, Value> = HashMap::new();
 
-            if !group_by.is_empty()
-                && let Ok(parts) = sonic_rs::from_str::<Vec<serde_json::Value>>(&group_key)
-            {
+            if !group_by.is_empty() {
+                let parts =
+                    sonic_rs::from_str::<Vec<serde_json::Value>>(&group_key).map_err(|e| {
+                        crate::Error::Codec {
+                            detail: format!("aggregate group key decode: {e}"),
+                        }
+                    })?;
                 // One positional slot per key that contributed to the key bytes
                 // (a bare `field` or a computed `expr`); emit each under its
                 // `output_name` — for a computed key this is the evaluated
@@ -137,20 +140,9 @@ impl CoreLoop {
             results.push(Value::Object(row));
         }
 
-        if !having.is_empty() {
-            let having_predicates: Vec<ScanFilter> = match zerompk::from_msgpack(having) {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        error = %e,
-                        "HAVING predicate deserialization failed (schemaless)"
-                    );
-                    Vec::new()
-                }
-            };
-            retain_having(&mut results, &having_predicates)?;
-        }
+        let having_predicates =
+            crate::bridge::scan_filter::decode_scan_filters(having, "aggregate HAVING")?;
+        retain_having(&mut results, &having_predicates)?;
 
         apply_user_aliases_to_rows(&mut results, aggregates);
         // Post-aggregate ORDER BY: sort group rows before

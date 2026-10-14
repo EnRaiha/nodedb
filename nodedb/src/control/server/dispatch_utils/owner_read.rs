@@ -17,8 +17,12 @@
 //!
 //! A graph or array plan spreads its rows across every hosted group. It runs
 //! here and confirms the groups it reads (`graph_dispatch::read_groups`).
+//!
+//! A `REFRESH CONTINUOUS AGGREGATE` wait is placed the same way: the cut it
+//! waits for applies only on replicas of its root source's group.
 
 use futures::future::{BoxFuture, Either, Ready, ready};
+use nodedb_physical::physical_plan::MetaOp;
 
 use crate::bridge::envelope::{ErrorCode, Payload, PhysicalPlan, Response, Status};
 use crate::control::cluster::linearizable_read::{
@@ -66,10 +70,22 @@ pub(crate) fn route_owned_read(
     scope: OwnedReadScope,
     plan: PhysicalPlan,
 ) -> Either<Ready<crate::Result<OwnedRead>>, BoxFuture<'_, crate::Result<OwnedRead>>> {
-    if shared.cluster_routing.is_none() || !matches!(required_permission(&plan), Permission::Read) {
+    if shared.cluster_routing.is_none() || !runs_on_owner(&plan) {
         return Either::Left(ready(Ok(OwnedRead::Local(Box::new(plan)))));
     }
     Either::Right(Box::pin(route_cluster_read(shared, scope, plan)))
+}
+
+/// Whether `plan` must run on a replica of its collection's group: a read of
+/// user rows, or a refresh wait. A refresh wait reads the cut state of its
+/// root source, which only a replica of the root's group holds. It needs the
+/// `Alter` grant, so the permission alone does not place it.
+fn runs_on_owner(plan: &PhysicalPlan) -> bool {
+    matches!(required_permission(plan), Permission::Read)
+        || matches!(
+            plan,
+            PhysicalPlan::Meta(MetaOp::AwaitContinuousAggregateRefresh { .. })
+        )
 }
 
 /// [`route_owned_read`] for a read on a cluster node.

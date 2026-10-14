@@ -268,6 +268,8 @@ async fn dispatch_counter_write(
             trace_id: TraceId::ZERO,
             event_source: crate::event::EventSource::User,
             txn_id: None,
+            // The rate state is a system write.
+            user_roles: Vec::new(),
         },
     )
     .await

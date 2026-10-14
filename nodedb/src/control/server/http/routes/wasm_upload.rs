@@ -11,7 +11,7 @@
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::super::admission::admit_without_rate_limit;
@@ -25,6 +25,9 @@ use crate::control::planner::wasm;
 /// at the route's body-extraction boundary.
 pub const MAX_WASM_MODULE_BYTES: usize = 10 * 1024 * 1024;
 
+/// The request header that names the database.
+const DATABASE_HEADER: &str = "x-nodedb-database";
+
 /// `PUT /v1/functions/:name/wasm` — upload a WASM binary for a function.
 ///
 /// The function must already exist with `language = WASM` in the catalog.
@@ -33,14 +36,25 @@ pub async fn upload_wasm(
     ResolvedIdentity(identity): ResolvedIdentity,
     peer: PeerAddr,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     // Authentication runs as a parts extractor before the body extractor. The
     // tenant-admin/database gate must complete before catalog or blob access.
-    let database_id = identity
-        .default_database
-        .unwrap_or(crate::types::DatabaseId::DEFAULT);
+    // The `X-NodeDB-Database` header selects the database the function lives
+    // in. Without it, the identity's default database applies.
+    let database_id = if headers.contains_key(DATABASE_HEADER) {
+        super::query::resolve_database_id(
+            &headers,
+            &super::query::DatabaseQueryParam::default(),
+            &state,
+        )?
+    } else {
+        identity
+            .default_database
+            .unwrap_or(crate::types::DatabaseId::DEFAULT)
+    };
     // Blacklist + account status, no rate limit: a module upload is a bulk
     // administrative transfer, not the per-query traffic the rate limiter's
     // cost table models. It runs before the tenant-admin check and before any

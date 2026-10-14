@@ -203,6 +203,25 @@ pub struct TimeseriesToning {
     pub total_budget_bytes: usize,
     #[serde(default = "default_ts_block_size")]
     pub block_size: usize,
+    /// Sealed partitions one maintenance tick reads to fold into continuous
+    /// aggregates. Bounds the time a tick holds the core while an aggregate
+    /// backfills after a CREATE or a restart.
+    #[serde(default = "default_cagg_fold_partitions_per_tick")]
+    pub cagg_fold_partitions_per_tick: usize,
+    /// Partition groups one maintenance tick merges. Late rows flush into a
+    /// new partition beside the one their interval already has; a merge
+    /// combines the partitions of one interval into one.
+    #[serde(default = "default_merge_groups_per_tick")]
+    pub merge_groups_per_tick: usize,
+    /// Most rows one merge reads and writes. Bounds the memory a merge holds.
+    /// A larger interval merges in several groups.
+    #[serde(default = "default_merge_max_rows")]
+    pub merge_max_rows: u64,
+    /// How long after an interval ends its partitions merge. Late rows for
+    /// an interval still arriving within this window flush first, so the
+    /// interval merges once.
+    #[serde(default = "default_merge_quiet_ms")]
+    pub merge_quiet_ms: u64,
 }
 
 impl Default for TimeseriesToning {
@@ -213,6 +232,10 @@ impl Default for TimeseriesToning {
             max_tag_cardinality: default_max_tag_cardinality(),
             total_budget_bytes: default_total_budget_bytes(),
             block_size: default_ts_block_size(),
+            cagg_fold_partitions_per_tick: default_cagg_fold_partitions_per_tick(),
+            merge_groups_per_tick: default_merge_groups_per_tick(),
+            merge_max_rows: default_merge_max_rows(),
+            merge_quiet_ms: default_merge_quiet_ms(),
         }
     }
 }
@@ -231,6 +254,18 @@ fn default_total_budget_bytes() -> usize {
 }
 fn default_ts_block_size() -> usize {
     1024
+}
+fn default_cagg_fold_partitions_per_tick() -> usize {
+    8
+}
+fn default_merge_groups_per_tick() -> usize {
+    2
+}
+fn default_merge_max_rows() -> u64 {
+    4_000_000
+}
+fn default_merge_quiet_ms() -> u64 {
+    60_000
 }
 
 /// KV engine tuning (hash table, expiry wheel, slab allocator).

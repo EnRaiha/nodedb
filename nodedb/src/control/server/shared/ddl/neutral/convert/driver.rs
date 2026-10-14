@@ -24,8 +24,10 @@ use nodedb_physical::physical_plan::MetaOp;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::column_defs::parse_convert_sql;
+use super::fields::converted_fields;
+use super::source_key::{bind_source_key, source_key};
 use super::support::err;
-use super::typeguard_columns::typeguards_to_column_defs;
+use super::typeguard_columns::{carry_guard_clauses, typeguards_to_column_defs};
 
 /// CONVERT COLLECTION <name> TO <target_type> [(<col_defs>)]
 pub async fn convert_collection(
@@ -53,22 +55,35 @@ pub async fn convert_collection(
     }
 
     // Build columns before dispatch — needed for both Data Plane and catalog.
-    let columns: Option<Vec<nodedb_types::columnar::ColumnDef>> = match target_type.as_str() {
-        "document_strict" | "kv" => {
-            let cols = if let Some(cols) = explicit_columns {
-                cols
-            } else if !coll.type_guards.is_empty() {
-                typeguards_to_column_defs(&coll.type_guards)?
-            } else {
-                return Err(err(
-                    "42601",
-                    "CONVERT TO strict requires column definitions or active typeguards",
-                ));
-            };
-            Some(cols)
-        }
-        _ => None,
-    };
+    // The converted schema keeps the source's key column, and each guard's
+    // DEFAULT / VALUE is carried onto the column it names.
+    let key = source_key(&coll.collection_type, coll.declared_primary_key.as_deref());
+    let (columns, generated_sources): (Option<Vec<nodedb_types::columnar::ColumnDef>>, _) =
+        match target_type.as_str() {
+            "document_strict" | "kv" => {
+                let explicit = explicit_columns.is_some();
+                let mut cols = match explicit_columns {
+                    Some(cols) => cols,
+                    None if !coll.type_guards.is_empty() => {
+                        typeguards_to_column_defs(&coll.type_guards)?
+                    }
+                    None => {
+                        return Err(err(
+                            "42601",
+                            "CONVERT TO strict requires column definitions or active typeguards",
+                        ));
+                    }
+                };
+                bind_source_key(&mut cols, &key, explicit)?;
+                let generated = carry_guard_clauses(
+                    &mut cols,
+                    &coll.type_guards,
+                    target_type == "document_strict",
+                )?;
+                (Some(cols), generated)
+            }
+            _ => (None, Vec::new()),
+        };
 
     let schema_json_for_dp = if let Some(ref cols) = columns {
         sonic_rs::to_string(cols)
@@ -148,6 +163,9 @@ pub async fn convert_collection(
                     "columns missing for a document_strict/kv target",
                 ));
             };
+            // The declared-field record follows the converted columns, as
+            // `CREATE COLLECTION` records them.
+            coll.fields = converted_fields(&columns, &generated_sources);
             let schema = nodedb_types::columnar::StrictSchema {
                 columns,
                 version: 1,
@@ -169,10 +187,28 @@ pub async fn convert_collection(
     };
 
     coll.collection_type = new_type;
+    // The strict or KV schema is also stored as JSON, as `CREATE COLLECTION`
+    // stores it. ALTER and generated-column registration read that copy.
+    coll.timeseries_config = match &coll.collection_type {
+        nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Strict(schema)) => Some(
+            sonic_rs::to_string(schema)
+                .map_err(|e| DdlError::internal(format!("schema serialization: {e}")))?,
+        ),
+        nodedb_types::CollectionType::KeyValue(config) => Some(
+            sonic_rs::to_string(config)
+                .map_err(|e| DdlError::internal(format!("schema serialization: {e}")))?,
+        ),
+        nodedb_types::CollectionType::Document(nodedb_types::DocumentMode::Schemaless)
+        | nodedb_types::CollectionType::Columnar(_) => None,
+    };
+    // The key column the converted rows are keyed by. A system row id is no
+    // declared key.
+    coll.declared_primary_key = (key != nodedb_types::ROWID_COLUMN).then(|| key.clone());
 
-    // CONVERT TO document_strict: if collection had typeguards, carry over CHECK constraints
-    // and drop typeguard definitions (strict schema subsumes type checking).
-    if target_type == "document_strict" && !coll.type_guards.is_empty() {
+    // A strict or KV schema subsumes type checking: carry each guard's CHECK
+    // onto a CHECK constraint, then drop the guards. Their DEFAULT / VALUE
+    // already reached the converted columns.
+    if matches!(target_type.as_str(), "document_strict" | "kv") && !coll.type_guards.is_empty() {
         for guard in &coll.type_guards {
             if let Some(ref check_expr) = guard.check_expr {
                 // Avoid duplicate names.

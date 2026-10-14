@@ -5,6 +5,7 @@
 //! Full integrity check: recomputes each materialized balance from source rows,
 //! compares to the stored balance, and reports discrepancies.
 
+use nodedb_sql::parser::query_function::VerifyBalanceArgs;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -15,9 +16,7 @@ use crate::types::{DatabaseId, TraceId};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::read_gate::CollectionReadGate;
-use super::helpers::{
-    clean_arg, err, extract_function_args, json_to_decimal, single_result, unwrap_scan_docs,
-};
+use super::helpers::{err, json_to_decimal, single_result, unwrap_scan_docs};
 
 /// `SELECT VERIFY_BALANCE('collection', 'column')`
 ///
@@ -27,16 +26,11 @@ pub async fn verify_balance(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    sql: &str,
+    args: &VerifyBalanceArgs,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
-    let args = extract_function_args(sql, "VERIFY_BALANCE")?;
-    if args.len() < 2 {
-        return Err(err("42601", "VERIFY_BALANCE requires (collection, column)"));
-    }
-
-    let collection = clean_arg(args[0]);
-    let column = clean_arg(args[1]);
+    let collection = args.collection.clone();
+    let column = args.column.clone();
 
     // Both scans below name collections the caller supplied or the catalog
     // resolved from them, so each is authorized and row-filtered here. The

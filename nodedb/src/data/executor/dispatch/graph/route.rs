@@ -222,7 +222,12 @@ impl CoreLoop {
             } => {
                 let triple_text = match (bm25_query.as_deref(), bm25_field.as_deref(), rrf_k_triple)
                 {
-                    (Some(query), Some(_), Some(_)) => Some(query),
+                    (Some(query), Some(field), Some(_)) => {
+                        Some(crate::data::executor::handlers::graph_rag_triple::Bm25Leg {
+                            query,
+                            field,
+                        })
+                    }
                     _ => None,
                 };
                 match stage {
@@ -237,7 +242,7 @@ impl CoreLoop {
                                 vector_top_k: *vector_top_k,
                                 vector_field: vector_field.as_str(),
                                 final_top_k: *final_top_k,
-                                bm25_query: triple_text,
+                                bm25: triple_text,
                             },
                         );
                     }

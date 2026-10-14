@@ -26,23 +26,25 @@ pub async fn catalog_rows(
     name: &str,
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
 ) -> crate::Result<Vec<Vec<u8>>> {
     // Normalize to the canonical static name so case-insensitive references
     // (`PG_CLASS`) dispatch correctly; unknown names produce no rows.
+    // Collection relations list the session database's collections.
     match known_table(name) {
         Some("pg_database") => tables::pg_database(),
         Some("pg_namespace") => tables::pg_namespace(),
         Some("pg_type") => tables::pg_type(),
-        Some("pg_class") => tables::pg_class(state, identity),
-        Some("pg_attribute") => tables::pg_attribute(state, identity),
-        Some("pg_attrdef") => tables::pg_attrdef(state, identity),
+        Some("pg_class") => tables::pg_class(state, identity, database_id),
+        Some("pg_attribute") => tables::pg_attribute(state, identity, database_id),
+        Some("pg_attrdef") => tables::pg_attrdef(state, identity, database_id),
         Some("pg_collation") => tables::pg_collation(),
-        Some("pg_index") => tables::pg_index(state, identity),
+        Some("pg_index") => tables::pg_index(state, identity, database_id),
         Some("pg_range") => tables::pg_range(),
         Some("pg_authid") => tables::pg_authid(state, identity),
         Some("_system.audit_log") => audit_log::audit_log(state, identity),
         Some("_system.dropped_collections") => {
-            dropped_collections::dropped_collections(state, identity).await
+            dropped_collections::dropped_collections(state, identity, database_id).await
         }
         Some("_system.l2_cleanup_queue") => l2_cleanup_queue::l2_cleanup_queue(state, identity),
         _ => Ok(Vec::new()),
@@ -66,7 +68,8 @@ impl CatalogProvider {
         name: &str,
         state: &SharedState,
         identity: &AuthenticatedIdentity,
+        database_id: crate::types::DatabaseId,
     ) -> crate::Result<Vec<Vec<u8>>> {
-        catalog_rows(name, state, identity).await
+        catalog_rows(name, state, identity, database_id).await
     }
 }

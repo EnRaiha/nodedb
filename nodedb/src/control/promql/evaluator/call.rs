@@ -18,9 +18,23 @@ pub fn eval_call(ctx: &EvalContext, func: &str, args: &[Expr]) -> Result<Value, 
                 got: 0,
             });
         }
-        let matrix = eval(ctx, &args[0])?;
+        // `quantile_over_time(φ, v)` takes its scalar first; every other
+        // range function takes the range vector first.
+        let (matrix_idx, scalar_idx) = if func == "quantile_over_time" {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        if args.len() <= matrix_idx {
+            return Err(PromqlError::WrongArgCount {
+                func: func.to_string(),
+                expected: matrix_idx + 1,
+                got: args.len(),
+            });
+        }
+        let matrix = eval(ctx, &args[matrix_idx])?;
         let scalar_arg = if args.len() > 1
-            && let Value::Scalar(v, _) = eval(ctx, &args[1])?
+            && let Value::Scalar(v, _) = eval(ctx, &args[scalar_idx])?
         {
             Some(v)
         } else {

@@ -357,14 +357,15 @@ mod tests {
             surrogate: row_surrogate(b"s1"),
         })
         .expect("a bound row writes");
-        assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
+        let us = nodedb_types::Value::String("us".into());
+        assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", &us).len(), 1);
 
         let reaped = e.tick_expiry(n + 5000);
         assert_eq!(reaped.len(), 1);
 
         assert_eq!(e.total_entries(), 0);
         assert!(
-            e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+            e.index_lookup_eq(0, 1, "sess", "region", &us).is_empty(),
             "reaping the row must remove its index entry"
         );
         assert_eq!(
@@ -386,10 +387,11 @@ mod tests {
         let n = now();
         let tkey = table_key(0, 1, "sess");
 
-        e.indexes
-            .entry(tkey)
-            .or_default()
-            .add_composite_index(vec!["region".into(), "status".into()], vec![0, 1]);
+        e.indexes.entry(tkey).or_default().add_composite_index(
+            vec!["region".into(), "status".into()],
+            vec![0, 1],
+            crate::engine::kv::index::IndexCoverage::Complete,
+        );
 
         e.put(KvPutParams {
             database_id: 0,
@@ -404,11 +406,15 @@ mod tests {
         .expect("a bound row writes");
 
         let ci_fields = vec!["region".to_string(), "status".to_string()];
+        let text_key = |s: &str| {
+            crate::engine::kv::index::kv_index_key(&nodedb_types::Value::String(s.into()))
+        };
+        let (us, active) = (text_key("us"), text_key("active"));
         let hits = |e: &KvEngine| -> usize {
             e.indexes
                 .get(&tkey)
                 .and_then(|s| s.get_composite_index(&ci_fields))
-                .map(|ci| ci.lookup_eq(&[b"us", b"active"]).len())
+                .map(|ci| ci.lookup_eq(&[&us, &active]).len())
                 .unwrap_or(0)
         };
         assert_eq!(hits(&e), 1);
@@ -462,8 +468,9 @@ mod tests {
             e.stats().is_rehashing,
             "test premise: the reaped rows must sit in the rehash source"
         );
+        let us = nodedb_types::Value::String("us".into());
         assert_eq!(
-            e.index_lookup_eq(0, 1, "sess", "region", b"us").len(),
+            e.index_lookup_eq(0, 1, "sess", "region", &us).len(),
             rows as usize
         );
 
@@ -471,7 +478,7 @@ mod tests {
         assert_eq!(reaped.len(), rows as usize);
         assert_eq!(e.total_entries(), 0);
         assert!(
-            e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+            e.index_lookup_eq(0, 1, "sess", "region", &us).is_empty(),
             "rows reaped out of the rehash source must clean their index entries too"
         );
     }

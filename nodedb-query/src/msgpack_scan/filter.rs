@@ -167,7 +167,13 @@ impl ScanFilter {
             | FilterOp::NeColumn => {}
         }
 
-        let (start, end) = match idx.get(&self.field) {
+        // Same lookup order as `matches_binary`: the exact key, then a
+        // qualified key carrying the bare name. Absent, and so NULL, only
+        // when neither exists.
+        let (start, end) = match idx
+            .get(&self.field)
+            .or_else(|| find_field_by_suffix(doc, &format!(".{}", self.field)))
+        {
             Some(r) => r,
             None => return Ok(self.op == FilterOp::IsNull),
         };

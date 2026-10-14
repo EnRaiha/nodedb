@@ -60,6 +60,7 @@ fn make_kv_put_request(
         txn_id: None,
         vshard_id: None,
         read_groups: Vec::new(),
+        user_roles: Vec::new(),
     }
 }
 
@@ -172,6 +173,7 @@ async fn execute_request_read_carries_watermark_lsn() {
         txn_id: None,
         vshard_id: None,
         read_groups: Vec::new(),
+        user_roles: Vec::new(),
     };
 
     let resp = send_execute_request(transport, node1.listen_addr, req).await;
@@ -306,6 +308,7 @@ async fn execute_request_cross_node_dispatch() {
         txn_id: None,
         vshard_id: None,
         read_groups: Vec::new(),
+        user_roles: Vec::new(),
     };
 
     let resp = send_execute_request(sender_transport, target_addr, req).await;

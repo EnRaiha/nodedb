@@ -14,6 +14,7 @@ pub(super) fn period_lock_gated_collection(op: &DocumentOp) -> Option<&str> {
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. }
         | DocumentOp::PointDelete { collection, .. }
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BulkUpdate { collection, .. }
@@ -68,6 +69,7 @@ pub(super) fn push_resolved(op: &mut DocumentOp, entry: ResolvedSumTarget) {
             ..
         } => resolved_sum_targets.push(entry),
         DocumentOp::BatchInsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::PointGet { .. }
         | DocumentOp::PointUpdate { .. }
         | DocumentOp::Scan { .. }

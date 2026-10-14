@@ -17,6 +17,7 @@ impl VectorOp {
             VectorOp::DirectUpsert { collection, .. }
             | VectorOp::DirectInsert { collection, .. }
             | VectorOp::DirectInsertIfAbsent { collection, .. }
+            | VectorOp::DirectBatchWrite { collection, .. }
             | VectorOp::DirectDelete { collection, .. }
             | VectorOp::DirectTruncate { collection, .. }
             | VectorOp::DirectUpdate { collection, .. }

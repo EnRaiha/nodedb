@@ -4,6 +4,8 @@
 
 mod indexed_vector_fields;
 mod insert;
+mod insert_row;
+mod insert_vectors;
 mod parse;
 mod triggers;
 mod upsert;

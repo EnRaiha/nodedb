@@ -13,6 +13,7 @@ mod cluster_leaf;
 pub mod core_outcome;
 pub mod full_scan;
 pub mod gather;
+pub mod owner_dispatch;
 pub mod owning_core;
 pub mod read_scope;
 pub mod received;

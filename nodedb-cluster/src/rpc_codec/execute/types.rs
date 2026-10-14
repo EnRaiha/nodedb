@@ -50,6 +50,10 @@ pub struct ExecuteRequest {
     /// index for each and applies through it before it reads. Empty for a
     /// write or a read that accepts this replica as it is.
     pub read_groups: Vec<u64>,
+    /// The roles of the identity authenticated on the originating node. A
+    /// write carries them to every replica, which judges a role-guarded
+    /// state transition against them. Empty for a read or a system write.
+    pub user_roles: Vec<String>,
 }
 
 /// Response to an `ExecuteRequest`.

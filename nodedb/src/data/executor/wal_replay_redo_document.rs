@@ -500,6 +500,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         WalRecord::new(WalRecordArgs {
             record_type: RecordType::TransactionRedo as u32,
@@ -815,6 +816,7 @@ mod tests {
                 row_sources: Vec::new(),
                 publishes: Vec::new(),
                 row_changes: Vec::new(),
+                user_roles: Vec::new(),
             }
             .to_bytes()
             .expect("encode redo record"),

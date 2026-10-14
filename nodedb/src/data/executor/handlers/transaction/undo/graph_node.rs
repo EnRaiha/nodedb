@@ -193,6 +193,7 @@ mod tests {
                 enforce: true,
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: None,
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::Document,
             },
         )
         .unwrap();

@@ -272,9 +272,42 @@ impl CoreLoop {
         Ok(())
     }
 
+    /// Append the continuous-aggregate image of every root collection this
+    /// core owns. Each image is encoded from memory after its aggregates
+    /// loaded and folded every partition they fold at flush, so it names
+    /// exactly the partitions captured beside it.
+    pub(super) fn collect_owned_cagg_images(
+        &mut self,
+        out: &mut Vec<SnapshotFile>,
+    ) -> crate::Result<()> {
+        let now_ms = self.ingest_now_ms();
+        for (db, tid, root) in self.continuous_agg_mgr.root_sources() {
+            if !self.owns_collection(DatabaseId::new(db), &root)? {
+                continue;
+            }
+            let bytes = self.capture_cagg_image(db, tid, &root, now_ms)?;
+            if bytes.is_empty() {
+                continue;
+            }
+            let rel = crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
+                Path::new(""),
+                db,
+                tid,
+                &root,
+            )
+            .join(crate::engine::timeseries::continuous_agg::CAGG_IMAGE_FILE);
+            out.push(SnapshotFile {
+                component: SnapshotComponent::Timeseries,
+                path: crate::storage::snapshot_files::rel_path_string(&rel)?,
+                bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Whether this core owns `collection`: the core the dispatcher's vShard
     /// router sends its vShard to.
-    pub(super) fn owns_collection(
+    pub(in crate::data::executor) fn owns_collection(
         &self,
         database_id: DatabaseId,
         collection: &str,

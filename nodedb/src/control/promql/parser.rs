@@ -110,7 +110,11 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Token::LBracket) {
             self.advance();
             let range = self.parse_duration()?;
-            let step = if matches!(self.peek(), Token::Colon) {
+            // A colon makes a subquery: `[range:step]`, or `[range:]` for
+            // the default step. Without one, only a vector selector takes a
+            // range.
+            let is_subquery = matches!(self.peek(), Token::Colon);
+            let step = if is_subquery {
                 self.advance();
                 if matches!(self.peek(), Token::RBracket) {
                     None
@@ -122,17 +126,26 @@ impl<'a> Parser<'a> {
             };
             self.expect(&Token::RBracket)?;
 
-            if step.is_some() || !matches!(expr, Expr::VectorSelector { .. }) {
+            if is_subquery {
                 expr = Expr::Subquery {
                     expr: Box::new(expr),
                     range,
                     step,
+                    offset: None,
                 };
-            } else {
+            } else if matches!(expr, Expr::VectorSelector { .. }) {
                 expr = Expr::MatrixSelector {
                     selector: Box::new(expr),
                     range,
                 };
+            } else {
+                return Err(PromqlError::Selector {
+                    detail: format!(
+                        "a range applies only to a vector selector, not {}; \
+                         use a subquery `[range:step]`",
+                        expr_kind(&expr)
+                    ),
+                });
             }
         }
 
@@ -145,7 +158,7 @@ impl<'a> Parser<'a> {
             if neg {
                 dur = Duration(-dur.ms());
             }
-            expr = apply_offset(expr, dur);
+            expr = apply_offset(expr, dur)?;
         }
 
         Ok(expr)
@@ -291,7 +304,7 @@ impl<'a> Parser<'a> {
                 detail: "expected string value in label matcher".to_string(),
             });
         };
-        Ok(LabelMatcher::new(name, op, value))
+        LabelMatcher::new(name, op, value)
     }
 
     fn parse_duration(&mut self) -> Result<Duration, PromqlError> {
@@ -412,14 +425,50 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn apply_offset(expr: Expr, offset: Duration) -> Expr {
+/// Attach `offset` to a vector selector, to the selector inside a range
+/// vector, or to a subquery. Any other expression has no place to carry it,
+/// so the modifier is an error there rather than being dropped.
+fn apply_offset(expr: Expr, offset: Duration) -> Result<Expr, PromqlError> {
     match expr {
-        Expr::VectorSelector { name, matchers, .. } => Expr::VectorSelector {
+        Expr::VectorSelector { name, matchers, .. } => Ok(Expr::VectorSelector {
             name,
             matchers,
             offset: Some(offset),
-        },
-        other => other,
+        }),
+        Expr::MatrixSelector { selector, range } => Ok(Expr::MatrixSelector {
+            selector: Box::new(apply_offset(*selector, offset)?),
+            range,
+        }),
+        Expr::Subquery {
+            expr, range, step, ..
+        } => Ok(Expr::Subquery {
+            expr,
+            range,
+            step,
+            offset: Some(offset),
+        }),
+        other => Err(PromqlError::Selector {
+            detail: format!(
+                "offset modifier applies only to a vector selector, a range selector or a \
+                 subquery, not {}",
+                expr_kind(&other)
+            ),
+        }),
+    }
+}
+
+fn expr_kind(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Scalar(_) => "a number",
+        Expr::StringLiteral(_) => "a string",
+        Expr::VectorSelector { .. } => "a vector selector",
+        Expr::MatrixSelector { .. } => "a range selector",
+        Expr::BinaryOp { .. } => "a binary expression",
+        Expr::Negate(_) => "a negation",
+        Expr::Aggregate { .. } => "an aggregation",
+        Expr::Call { .. } => "a function call",
+        Expr::Paren(_) => "a parenthesized expression",
+        Expr::Subquery { .. } => "a subquery",
     }
 }
 
@@ -542,6 +591,77 @@ mod tests {
             assert_eq!(offset, Some(Duration(300_000)));
         } else {
             panic!("expected VectorSelector");
+        }
+    }
+
+    #[test]
+    fn offset_on_range_selector_reaches_the_inner_selector() {
+        let Expr::MatrixSelector { selector, .. } = p("up[5m] offset 1m") else {
+            panic!("expected MatrixSelector");
+        };
+        let Expr::VectorSelector { offset, .. } = *selector else {
+            panic!("expected VectorSelector inside the range");
+        };
+        assert_eq!(offset, Some(Duration(60_000)));
+    }
+
+    #[test]
+    fn subquery_with_step() {
+        let Expr::Subquery {
+            expr,
+            range,
+            step,
+            offset,
+        } = p("max_over_time(rate(x[5m])[30m:1m])").call_arg0().clone()
+        else {
+            panic!("expected Subquery");
+        };
+        assert!(matches!(*expr, Expr::Call { .. }));
+        assert_eq!(range, Duration(1_800_000));
+        assert_eq!(step, Some(Duration(60_000)));
+        assert_eq!(offset, None);
+    }
+
+    #[test]
+    fn subquery_with_default_step() {
+        let Expr::Subquery { range, step, .. } = p("up[5m:]") else {
+            panic!("expected Subquery");
+        };
+        assert_eq!(range, Duration(300_000));
+        assert_eq!(step, None);
+    }
+
+    #[test]
+    fn subquery_of_a_selector_with_step_is_a_subquery() {
+        assert!(matches!(p("up[10m:1m]"), Expr::Subquery { .. }));
+    }
+
+    #[test]
+    fn offset_after_a_subquery() {
+        let Expr::Subquery { offset, .. } = p("up[10m:1m] offset 5m") else {
+            panic!("expected Subquery");
+        };
+        assert_eq!(offset, Some(Duration(300_000)));
+    }
+
+    #[test]
+    fn range_on_a_non_selector_needs_a_colon() {
+        let tokens = tokenize("rate(x[5m])[30m]").unwrap();
+        assert!(parse(&tokens).is_err());
+    }
+
+    #[test]
+    fn offset_on_a_function_call_is_an_error() {
+        let tokens = tokenize("rate(x[5m]) offset 1m").unwrap();
+        assert!(parse(&tokens).is_err());
+    }
+
+    impl Expr {
+        fn call_arg0(&self) -> &Expr {
+            match self {
+                Expr::Call { args, .. } => &args[0],
+                other => panic!("expected Call, got {other:?}"),
+            }
         }
     }
 

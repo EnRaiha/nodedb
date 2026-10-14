@@ -195,6 +195,8 @@ impl CoreLoop {
                 limit,
                 left_rls_filters,
                 right_rls_filters,
+                left_input,
+                right_input,
             } => self.execute_nested_loop_join(NestedLoopJoinParams {
                 task,
                 tid,
@@ -205,6 +207,8 @@ impl CoreLoop {
                 limit: *limit,
                 left_rls_filters,
                 right_rls_filters,
+                left_input: left_input.as_deref(),
+                right_input: right_input.as_deref(),
             }),
 
             QueryOp::SortMergeJoin {
@@ -216,6 +220,8 @@ impl CoreLoop {
                 pre_sorted,
                 left_rls_filters,
                 right_rls_filters,
+                left_input,
+                right_input,
             } => self.execute_sort_merge_join(SortMergeJoinParams {
                 task,
                 tid,
@@ -227,6 +233,8 @@ impl CoreLoop {
                 pre_sorted: *pre_sorted,
                 left_rls_filters,
                 right_rls_filters,
+                left_input: left_input.as_deref(),
+                right_input: right_input.as_deref(),
             }),
 
             QueryOp::RecursiveScan {

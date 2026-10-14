@@ -211,6 +211,7 @@ mod tests {
         let post_image = vec![0x81, 0xa2, b'o', b'k', 0xc3];
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: post_image.clone(),
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
             frontier_digest: digest,
@@ -284,6 +285,7 @@ mod tests {
         let (state, side, _directory) = fixture();
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 0,
             trimmed_ops: 0,
             frontier_digest: [7; 32],
@@ -323,6 +325,7 @@ mod tests {
         let digest = [0xa5; 32];
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
             frontier_digest: digest,
@@ -382,6 +385,7 @@ mod tests {
         let digest = [0x82; 32];
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 0,
             trimmed_ops: 0,
             frontier_digest: digest,
@@ -434,6 +438,7 @@ mod tests {
         let digest = [0x81; 32];
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 0,
             trimmed_ops: 0,
             frontier_digest: digest,

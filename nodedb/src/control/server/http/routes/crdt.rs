@@ -58,6 +58,13 @@ pub async fn crdt_apply(
     raw_body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security()).await?;
+    // The `X-NodeDB-Database` header selects the database, as on every other
+    // HTTP route. An unknown name is refused with `3D000`.
+    let database_id = super::query::resolve_database_id(
+        &headers,
+        &super::query::DatabaseQueryParam::default(),
+        &state,
+    )?;
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, risk, then rate limit — run first, before the body is parsed or
@@ -69,13 +76,7 @@ pub async fn crdt_apply(
     // model, whereas this is a discrete, session-less HTTP request that gets
     // no other admission check and does have a response to carry
     // `X-RateLimit-*` / `Retry-After` on.
-    let rate_limit_headers = admit(
-        &state,
-        &identity,
-        crate::types::DatabaseId::DEFAULT,
-        peer.as_str(),
-        "crdt_apply",
-    )?;
+    let rate_limit_headers = admit(&state, &identity, database_id, peer.as_str(), "crdt_apply")?;
 
     let body: HttpCrdtApplyRequest = sonic_rs::from_slice(&raw_body)
         .map_err(|e| ApiError::BadRequest(format!("invalid CRDT apply request body: {e}")))?;
@@ -83,6 +84,7 @@ pub async fn crdt_apply(
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
     preflight_crdt_apply(
         &identity,
+        database_id,
         &collection,
         &state.shared.permissions,
         &state.shared.roles,
@@ -98,7 +100,7 @@ pub async fn crdt_apply(
 
     let surrogate = crate::control::server::surrogate_exchange::assign_surrogate_routed(
         &state.shared,
-        nodedb_types::CollectionKey::from_bare(crate::types::DatabaseId::DEFAULT, &collection),
+        nodedb_types::CollectionKey::from_bare(database_id, &collection),
         identity.tenant_id,
         body.doc_id.as_bytes(),
         crate::types::TraceId::ZERO,
@@ -107,10 +109,7 @@ pub async fn crdt_apply(
     .map_err(ApiError::from)?;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: nodedb_types::QualifiedCollection::new(
-            crate::types::DatabaseId::DEFAULT,
-            &collection,
-        ),
+        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
         document_id: body.doc_id.clone(),
         delta,
         peer_id: identity.user_id,
@@ -124,12 +123,8 @@ pub async fn crdt_apply(
 
     let task = PhysicalTask {
         tenant_id: identity.tenant_id,
-        vshard_id: nodedb_types::CollectionKey::from_bare(
-            crate::types::DatabaseId::DEFAULT,
-            &collection,
-        )
-        .vshard(),
-        database_id: crate::types::DatabaseId::DEFAULT,
+        vshard_id: nodedb_types::CollectionKey::from_bare(database_id, &collection).vshard(),
+        database_id,
         plan,
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -150,26 +145,23 @@ pub async fn crdt_apply(
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch will land it on the receiving node only
-    // — lost to followers and entirely on leader failover. This handler is scoped
-    // to the default database (matching its surrogate assignment above).
+    // — lost to followers and entirely on leader failover.
     let _request = state.shared.tenant_request_guard(identity.tenant_id);
     // RLS write policies are stored keyed by `db_qualified(database_id,
-    // collection)`; this handler is pinned to `DatabaseId::DEFAULT`, for which
-    // qualification is the identity transform, but the policy is handed the
-    // qualified key regardless so this call matches every other admission site.
-    let qualified_collection = crate::control::planner::sql_plan_convert::convert::db_qualified(
-        crate::types::DatabaseId::DEFAULT,
-        &collection,
-    );
-    let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
-        identity.tenant_id,
-        crate::types::DatabaseId::DEFAULT,
-        &qualified_collection,
-        &identity,
-        "http".into(),
-        &state.shared.rls,
-        &audit,
-    );
+    // collection)`.
+    let qualified_collection =
+        crate::control::planner::sql_plan_convert::convert::db_qualified(database_id, &collection);
+    let policy =
+        crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
+            identity.tenant_id,
+            database_id,
+            &qualified_collection,
+            &identity,
+            "http".into(),
+            &state.shared.rls,
+            &audit,
+        )
+        .with_type_guards_from(state.shared.credentials.catalog(), database_id);
     let result = crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted(
         &state.shared,
         crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
@@ -192,9 +184,10 @@ pub async fn crdt_apply(
     ))
 }
 
-/// Authorize the fixed DEFAULT-database write before any CRDT apply work.
+/// Authorize the write in the request's database before any CRDT apply work.
 fn preflight_crdt_apply(
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     collection: &str,
     permissions: &PermissionStore,
     roles: &RoleStore,
@@ -202,7 +195,7 @@ fn preflight_crdt_apply(
 ) -> Result<(), AuthorizationError> {
     authorize_collection(
         identity,
-        crate::types::DatabaseId::DEFAULT,
+        database_id,
         collection,
         Permission::Write,
         permissions,
@@ -251,14 +244,21 @@ mod tests {
 
     #[test]
     fn ungranted_regular_identity_is_denied_before_authorized_work_runs() {
-        // This endpoint has no read action or caller-selectable database, so
-        // those authorization-matrix cells are N/A.
+        // This endpoint has no read action, so that authorization-matrix cell
+        // is N/A.
         let identity = regular_identity();
         let permissions = PermissionStore::new();
         let roles = RoleStore::new();
         let audit = CapturingEmitter::new();
         let mut authorized_work_runs = 0;
-        let preflight = preflight_crdt_apply(&identity, "orders", &permissions, &roles, &audit);
+        let preflight = preflight_crdt_apply(
+            &identity,
+            crate::types::DatabaseId::DEFAULT,
+            "orders",
+            &permissions,
+            &roles,
+            &audit,
+        );
 
         if preflight.is_ok() {
             authorized_work_runs += 1;
@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn regular_identity_cannot_write_system_audit_log_even_with_grant() {
-        // This endpoint has no read action or caller-selectable database, so
-        // those authorization-matrix cells are N/A.
+        // This endpoint has no read action, so that authorization-matrix cell
+        // is N/A.
         let identity = regular_identity();
         let permissions = PermissionStore::new();
         permissions
@@ -288,16 +288,23 @@ mod tests {
         let audit = CapturingEmitter::new();
 
         assert!(
-            preflight_crdt_apply(&identity, "_system.audit_log", &permissions, &roles, &audit,)
-                .is_err()
+            preflight_crdt_apply(
+                &identity,
+                crate::types::DatabaseId::DEFAULT,
+                "_system.audit_log",
+                &permissions,
+                &roles,
+                &audit,
+            )
+            .is_err()
         );
         assert_one_audit_denial(&audit);
     }
 
     #[test]
     fn tenant_ten_grant_does_not_authorize_tenant_nine_identity() {
-        // This endpoint has no read action or caller-selectable database, so
-        // those authorization-matrix cells are N/A.
+        // This endpoint has no read action, so that authorization-matrix cell
+        // is N/A.
         let identity = regular_identity();
         let permissions = PermissionStore::new();
         permissions
@@ -312,7 +319,17 @@ mod tests {
         let roles = RoleStore::new();
         let audit = CapturingEmitter::new();
 
-        assert!(preflight_crdt_apply(&identity, "orders", &permissions, &roles, &audit).is_err());
+        assert!(
+            preflight_crdt_apply(
+                &identity,
+                crate::types::DatabaseId::DEFAULT,
+                "orders",
+                &permissions,
+                &roles,
+                &audit,
+            )
+            .is_err()
+        );
         assert_one_audit_denial(&audit);
     }
 

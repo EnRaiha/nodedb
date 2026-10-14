@@ -2,103 +2,127 @@
 
 //! Incremental refresh engine for continuous aggregates.
 //!
-//! Takes a `ColumnarDrainResult` (flushed data) and computes the partial
-//! state of every touched `(time_bucket, group)` from those rows alone:
-//! O(flushed_rows), not O(total_rows). The caller merges that delta into the
-//! materialized state and rolls it up into downstream tiers.
+//! Computes the partial state of every touched `(time_bucket, group)` from
+//! one batch of source rows alone: a flush drain, or one sealed partition
+//! read back. The work is O(rows in the batch), not O(total rows). The
+//! caller merges the delta into the materialized state and rolls it up into
+//! downstream tiers.
 //!
 //! Cells feed the partial state exactly as the ad-hoc aggregate scan feeds
 //! its accumulator: an `Int64` or `Timestamp` cell as an exact integer, a
-//! `Float64` cell as a float, and a symbol cell not at all.
+//! `Float64` cell as a float, and a symbol cell not at all. A GROUP BY cell
+//! keys by its value (see [`GroupCell`]).
 
 use std::collections::HashMap;
 
+use nodedb_types::timeseries::SymbolDictionary;
+
 use super::definition::ContinuousAggregateDef;
-use super::partial::{ColumnLayout, PartialAggregate};
-use super::watermark::WatermarkState;
-use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnarDrainResult};
+use super::partial::{ColumnLayout, GroupCell, PartialAggregate};
+use crate::engine::timeseries::columnar_memtable::{
+    ColumnData, ColumnType, ColumnarDrainResult, ColumnarSchema, TimeKind,
+};
 use crate::engine::timeseries::time_bucket;
 
 /// Partial buckets keyed by `(bucket_ts, group_key)`.
-pub type Buckets = HashMap<(i64, Vec<u32>), PartialAggregate>;
+pub type Buckets = HashMap<(i64, Vec<GroupCell>), PartialAggregate>;
 
-/// Result of a single aggregate refresh.
+/// One batch of source rows to fold: a flush drain or one sealed partition.
+pub struct RefreshSource<'a> {
+    pub schema: &'a ColumnarSchema,
+    /// One column per schema column, in schema order.
+    pub columns: &'a [ColumnData],
+    /// Dictionary of each symbol column that has one, by column index.
+    pub symbol_dicts: &'a HashMap<usize, SymbolDictionary>,
+    pub row_count: usize,
+}
+
+impl<'a> RefreshSource<'a> {
+    /// The rows a flush drained.
+    pub fn of_drain(drain: &'a ColumnarDrainResult) -> Self {
+        Self {
+            schema: &drain.schema,
+            columns: &drain.columns,
+            symbol_dicts: &drain.symbol_dicts,
+            row_count: usize::try_from(drain.row_count).unwrap_or(usize::MAX),
+        }
+    }
+
+    /// The kind of the designated time column.
+    pub fn time_kind(&self) -> Option<TimeKind> {
+        match self.schema.columns.get(self.schema.timestamp_idx) {
+            Some((_, ColumnType::Timestamp(kind))) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// The designated time column's cells, bounded by `row_count`.
+    fn timestamps(&self) -> &'a [i64] {
+        match self.columns.get(self.schema.timestamp_idx) {
+            Some(ColumnData::Timestamp(v)) => &v[..v.len().min(self.row_count)],
+            _ => &[],
+        }
+    }
+}
+
+/// Result of folding one batch of rows into one aggregate's layout.
 pub struct RefreshResult {
     /// Number of input rows processed.
     pub rows_processed: u64,
-    /// Highest timestamp seen in the flushed data.
+    /// Highest timestamp in the batch, or `i64::MIN` for an empty batch.
     pub max_ts: i64,
-    /// Oldest O3 timestamp (below watermark), if any.
-    pub o3_min_ts: Option<i64>,
-    /// Partial state of the flushed rows alone, to merge into the
-    /// materialized state.
+    /// Partial state of the batch alone, to merge into the materialized
+    /// state.
     pub delta: Buckets,
 }
 
-/// Compute the partial state of `drain`'s rows for `def`.
-pub fn refresh_from_drain(
-    def: &ContinuousAggregateDef,
-    drain: &ColumnarDrainResult,
-    watermark: &WatermarkState,
-) -> RefreshResult {
+/// Compute the partial state of `src`'s rows for `def`.
+pub fn refresh_rows(def: &ContinuousAggregateDef, src: &RefreshSource<'_>) -> RefreshResult {
+    let timestamps = src.timestamps();
     let bucket_ms = def.bucket_interval_ms;
-    if bucket_ms <= 0 || drain.row_count == 0 {
+    if bucket_ms <= 0 || timestamps.is_empty() {
         return RefreshResult {
             rows_processed: 0,
-            max_ts: watermark.watermark_ts,
-            o3_min_ts: None,
+            max_ts: i64::MIN,
             delta: Buckets::new(),
         };
     }
 
     let layout = ColumnLayout::of(def);
-    let ts_idx = drain.schema.timestamp_idx;
-    let timestamps = drain.columns[ts_idx].as_timestamps();
     let column_index = |name: &str| {
-        drain
-            .schema
+        src.schema
             .columns
             .iter()
             .position(|(column, _)| column == name)
     };
 
-    // Drain column of each layout slot.
+    // Source column of each layout slot.
     let slot_columns: Vec<Option<&ColumnData>> = layout
         .columns()
         .iter()
-        .map(|name| column_index(name).map(|idx| &drain.columns[idx]))
+        .map(|name| column_index(name).and_then(|idx| src.columns.get(idx)))
         .collect();
 
-    // Drain column of each GROUP BY column.
-    let group_columns: Vec<Option<&ColumnData>> = def
+    // Source column and dictionary of each GROUP BY column.
+    let group_columns: Vec<(Option<&ColumnData>, Option<&SymbolDictionary>)> = def
         .group_by
         .iter()
-        .map(|name| column_index(name).map(|idx| &drain.columns[idx]))
+        .map(|name| match column_index(name) {
+            Some(idx) => (src.columns.get(idx), src.symbol_dicts.get(&idx)),
+            None => (None, None),
+        })
         .collect();
 
-    let current_watermark = watermark.watermark_ts;
-    let mut max_ts = current_watermark;
-    let mut o3_min: Option<i64> = None;
+    let mut max_ts = i64::MIN;
     let mut delta = Buckets::new();
 
-    for row in 0..drain.row_count as usize {
-        let ts = timestamps[row];
+    for (row, &ts) in timestamps.iter().enumerate() {
         let bucket = time_bucket::time_bucket(bucket_ms, ts);
+        max_ts = max_ts.max(ts);
 
-        // O3 detection.
-        if ts <= current_watermark && o3_min.is_none_or(|current| ts < current) {
-            o3_min = Some(ts);
-        }
-        if ts > max_ts {
-            max_ts = ts;
-        }
-
-        let group_key: Vec<u32> = group_columns
+        let group_key: Vec<GroupCell> = group_columns
             .iter()
-            .map(|column| match column {
-                Some(ColumnData::Symbol(ids)) => ids[row],
-                _ => 0,
-            })
+            .map(|(column, dict)| GroupCell::of(*column, *dict, row))
             .collect();
 
         let partial = delta
@@ -108,11 +132,19 @@ pub fn refresh_from_drain(
             });
         partial.count += 1;
         for (slot, column) in slot_columns.iter().enumerate() {
-            let state = &mut partial.columns[slot];
+            let Some(state) = partial.columns.get_mut(slot) else {
+                continue;
+            };
             match column {
-                Some(ColumnData::Float64(v)) => state.add_float(ts, v[row]),
+                Some(ColumnData::Float64(v)) => {
+                    if let Some(x) = v.get(row) {
+                        state.add_float(ts, *x);
+                    }
+                }
                 Some(ColumnData::Int64(v)) | Some(ColumnData::Timestamp(v)) => {
-                    state.add_int(ts, v[row])
+                    if let Some(x) = v.get(row) {
+                        state.add_int(ts, *x);
+                    }
                 }
                 Some(ColumnData::Symbol(_)) | Some(ColumnData::DictEncoded { .. }) | None => {}
             }
@@ -120,21 +152,19 @@ pub fn refresh_from_drain(
     }
 
     RefreshResult {
-        rows_processed: drain.row_count,
+        rows_processed: timestamps.len() as u64,
         max_ts,
-        o3_min_ts: o3_min,
         delta,
     }
 }
 
-/// Merge `delta` into `materialized`. Both hold buckets of one layout.
-pub fn merge_delta(materialized: &mut Buckets, delta: Buckets) {
-    for (key, partial) in delta {
-        match materialized.get_mut(&key) {
-            Some(existing) => existing.merge(&partial),
-            None => {
-                materialized.insert(key, partial);
-            }
-        }
+/// Merge `delta` into `materialized`. Both hold buckets of `layout`.
+/// `delta` stays intact, so the caller can roll it up further.
+pub fn merge_delta(materialized: &mut Buckets, delta: &Buckets, layout: &ColumnLayout) {
+    for ((bucket, key), partial) in delta {
+        materialized
+            .entry((*bucket, key.clone()))
+            .or_insert_with(|| PartialAggregate::new(*bucket, key.clone(), layout))
+            .merge(partial);
     }
 }

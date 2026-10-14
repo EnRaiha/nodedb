@@ -76,6 +76,7 @@ pub(super) struct TimeseriesScanParams<'a> {
     pub group_by: &'a [String],
     pub aggregates: &'a [AggregateExpr],
     pub filters: &'a [Filter],
+    pub having: &'a [Filter],
     pub projection: &'a [Projection],
     pub gap_fill: &'a str,
     pub limit: &'a usize,

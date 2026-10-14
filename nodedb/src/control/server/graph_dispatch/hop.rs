@@ -388,6 +388,7 @@ async fn expand_remote(
                 version_set: &version_set,
                 txn_id,
                 linearizable,
+                user_roles: &[],
             })
             .await
             .map(|outcome| (read_vshard, outcome))

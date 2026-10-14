@@ -5,7 +5,7 @@
 
 use nodedb_physical::physical_plan::{DocumentOp, DocumentResolvedMutation};
 
-use super::binder::IdentityBinder;
+use super::binder::{BindSlot, IdentityBinder};
 
 pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::Result<()> {
     match op {
@@ -54,6 +54,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
             documents,
             surrogates,
             ..
+        }
+        | DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            surrogates,
+            ..
         } => {
             // `zip` truncates silently; a row with no identity is a
             // malformed plan, refused here.
@@ -61,7 +67,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                 return Err(crate::Error::Serialization {
                     format: "physical_plan".into(),
                     detail: format!(
-                        "batch insert into '{}' carries {} documents but {} surrogates; every \
+                        "document page into '{}' carries {} documents but {} surrogates; every \
                          row must carry its own surrogate",
                         collection.as_str(),
                         documents.len(),
@@ -69,14 +75,15 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                     ),
                 });
             }
-            for ((document_id, _value), surrogate) in documents.iter().zip(surrogates.iter_mut()) {
-                binder.resolve_in_place(
-                    binder.plan_key(collection.as_str())?,
-                    document_id.as_bytes(),
-                    surrogate,
-                )?;
-            }
-            Ok(())
+            let key = binder.plan_key(collection.as_str())?;
+            let slots = documents
+                .iter()
+                .zip(surrogates.iter_mut())
+                .map(|((document_id, _value), surrogate)| {
+                    BindSlot::keyed(key, document_id.as_bytes(), surrogate)
+                })
+                .collect();
+            binder.resolve_slots_in_place(slots)
         }
         // The NOT-MATCHED rows a resolved MERGE inserts, keyed by the document
         // id the orchestrator derived when it assigned each surrogate. The
@@ -88,15 +95,26 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
             resolved_insert_identities,
             ..
         } => {
-            for (index, (document_id, surrogate)) in
-                resolved_insert_identities.iter_mut().enumerate()
+            let key = binder.plan_key(target_collection.as_str())?;
+            let identities: Vec<_> = resolved_insert_identities
+                .iter()
+                .map(|(document_id, surrogate)| {
+                    (
+                        key,
+                        document_id.as_bytes(),
+                        nodedb_types::Surrogate::new(*surrogate),
+                    )
+                })
+                .collect();
+            // Every inserted row binds in one catalog transaction.
+            let bound_all = binder.resolve_many(&identities)?;
+            drop(identities);
+            for (index, ((_, surrogate), bound)) in resolved_insert_identities
+                .iter_mut()
+                .zip(bound_all)
+                .enumerate()
             {
                 let carried = nodedb_types::Surrogate::new(*surrogate);
-                let bound = binder.resolve(
-                    binder.plan_key(target_collection.as_str())?,
-                    document_id.as_bytes(),
-                    carried,
-                )?;
                 if bound == carried {
                     continue;
                 }
@@ -113,6 +131,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
         }
         DocumentOp::ResolveWrite(inner) => bind(binder, inner),
         DocumentOp::ResolvedWrite { mutations, .. } => {
+            let mut slots = Vec::with_capacity(mutations.len());
             for mutation in mutations.iter_mut() {
                 match mutation {
                     DocumentResolvedMutation::Put {
@@ -126,14 +145,14 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                         document_id,
                         surrogate,
                         ..
-                    } => binder.resolve_in_place(
+                    } => slots.push(BindSlot::keyed(
                         binder.plan_key(collection.as_str())?,
                         document_id.as_bytes(),
                         surrogate,
-                    )?,
+                    )),
                 }
             }
-            Ok(())
+            binder.resolve_slots_in_place(slots)
         }
         // A predicate or scan-driven write names its rows by surrogate alone
         // once applied; nothing here carries a key to bind.

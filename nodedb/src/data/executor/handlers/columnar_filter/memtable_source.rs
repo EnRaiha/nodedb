@@ -28,7 +28,17 @@ mod tests {
     };
     use nodedb_types::timeseries::SeriesId;
 
-    use super::super::{eval_filters_dense, eval_filters_sparse};
+    use super::super::eval_filters_sparse;
+
+    /// Every row of `0..row_count` through the sparse evaluator.
+    fn eval_filters_dense(
+        src: &dyn super::super::ColumnarSource,
+        filters: &[ScanFilter],
+        row_count: usize,
+    ) -> Option<Vec<bool>> {
+        let indices: Vec<u32> = (0..row_count as u32).collect();
+        eval_filters_sparse(src, filters, &indices)
+    }
 
     fn make_test_mt() -> ColumnarMemtable {
         let schema = ColumnarSchema {

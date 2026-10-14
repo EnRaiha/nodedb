@@ -70,7 +70,8 @@ pub(super) async fn run_task_loop(
         // Captured before dispatch moves `task.plan`. Resolved once per task,
         // reused for every payload it produced.
         let plan_for_shape = task.plan.clone();
-        let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
+        let redaction =
+            QueryRedaction::for_plan(tenant_id, task.database_id, scope.auth(), &plan_for_shape);
         let append = ShapedAppend {
             plan: &plan_for_shape,
             plan_kind: describe_plan(&plan_for_shape),

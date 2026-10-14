@@ -57,6 +57,8 @@ fn timeseries_scan_isolated() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: vec![],
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(resp_a.status, Status::Ok);
@@ -86,6 +88,8 @@ fn timeseries_scan_isolated() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: vec![],
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(resp_b.status, Status::Ok);

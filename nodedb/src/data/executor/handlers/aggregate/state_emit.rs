@@ -60,29 +60,17 @@ impl CoreLoop {
             aggregates,
             filters,
         } = params;
-        // Input-sourced producer (catalog): the rows come from executing the
-        // sub-plan (a coordinator-materialized `ProviderScan`), not from a
-        // per-shard collection scan. Decode the sub-plan rows the SAME way
-        // `execute_aggregate` does — an empty / undecodable payload aggregates
-        // over zero rows, matching a per-shard scan that matched nothing.
-        let docs = if let Some(sub_plan) = input {
-            let sub_response = self.execute_plan(task, sub_plan);
-            crate::data::executor::response_codec::decode_response_to_docs(&sub_response)
-                .unwrap_or_default()
-        } else {
-            // Same per-shard scan cap the streaming aggregate path uses.
-            let scan_limit = self.query_tuning.aggregate_scan_cap;
-            match self.scan_collection(
-                task.request.database_id.as_u64(),
-                tid,
-                collection,
-                scan_limit,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    return self.response_error(task, ErrorCode::from(e));
-                }
-            }
+        // The rows come from the input sub-plan when present, else from a
+        // per-shard scan of the named collection. Both read exactly as
+        // `execute_aggregate` reads them: a child error or an undecodable
+        // payload fails the producer.
+        let docs = match input {
+            Some(sub_plan) => self.input_docs(task, sub_plan),
+            None => self.scan_for_aggregate(task, tid, collection),
+        };
+        let docs = match docs {
+            Ok(docs) => docs,
+            Err(resp) => return *resp,
         };
 
         // Plain GROUP BY: no sub-groups for the shuffle producer.

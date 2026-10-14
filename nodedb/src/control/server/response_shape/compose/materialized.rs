@@ -185,6 +185,7 @@ mod tests {
     fn preview_payload() -> (CrdtPreviewResult, Vec<u8>) {
         let result = CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 17,
             trimmed_ops: 0,
             frontier_digest: [0x5a; 32],

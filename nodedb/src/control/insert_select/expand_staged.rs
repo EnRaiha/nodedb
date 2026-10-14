@@ -4,8 +4,8 @@
 //! `INSERT ... SELECT`.
 //!
 //! Only an in-transaction `INSERT ... SELECT` reaches here (autocommit uses
-//! `run_insert_select`'s scan → `BatchInsert` path instead). The plan is
-//! resolved NOW, not buffered for COMMIT: the source scans base ∪ overlay,
+//! the orchestrator's batched `BatchInsert` path instead). The plan is
+//! resolved NOW, not buffered for COMMIT: the source reads base ∪ overlay,
 //! each copied row gets its own fresh registered surrogate, and the
 //! resulting `PointInsert` ops stage into the overlay via the normal
 //! statement-time path — giving read-your-own-writes and a target-owned
@@ -15,35 +15,35 @@
 //! `PointDelete` have an undo-tracked arm in transactional replay: a
 //! `BatchInsert` here survives an atomic rollback (partial commit).
 
-use nodedb_types::{DatabaseId, Surrogate, TenantId};
+use nodedb_types::TenantId;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::insert_select::copy_rows::{assign_page_rows, resolve_copy_spec};
-use crate::control::maintenance::clone_materializer::scan_source_page;
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::source_read::{SourceReadContext, read_source_rows};
 use crate::control::state::SharedState;
-use crate::types::TxnId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// Resolve one in-transaction `DocumentOp::InsertSelect` task into the
 /// concrete, fresh-surrogate `PointInsert` tasks its copied rows expand to.
 ///
-/// `task.txn_id` must be set to the active transaction so the scan folds
-/// earlier-staged rows. Emitted ops carry the same `txn_id` and a recomputed
-/// target vShard (as the MERGE / `UPDATE ... FROM` expanders do). The ops carry
-/// no sum or period-lock resolution: the caller runs the statement pass on
-/// them, then stages + buffers each one.
+/// `task.txn_id` must be set to the active transaction so the source read
+/// folds earlier-staged rows. The whole source is read before any row is
+/// staged, so it is held to the scan byte budget and fails loudly past it.
+/// Emitted ops carry the same `txn_id` and a recomputed target vShard (as the
+/// MERGE / `UPDATE ... FROM` expanders do). The ops carry no sum or
+/// period-lock resolution: the caller runs the statement pass on them, then
+/// stages + buffers each one.
 pub(crate) async fn resolve_and_emit_insert_select_ops(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let PhysicalPlan::Document(DocumentOp::InsertSelect {
         target_collection,
-        source_collection,
-        source_filters,
-        source_limit,
-        column_map,
+        source,
     }) = &task.plan
     else {
         // Callers only pass an `InsertSelect` task; a mismatch is a bug.
@@ -52,22 +52,35 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
         });
     };
 
-    // Scan the source (base ∪ overlay via `task.txn_id`), assign each row a
-    // fresh, catalog-registered surrogate.
-    let rows = materialize_copy(
+    let spec = resolve_copy_spec(
         state,
-        MaterializeCopy {
+        tenant_id,
+        task.database_id,
+        target_collection.as_str(),
+    )?;
+    let ctx = SourceReadContext {
+        state,
+        identity,
+        tenant_id,
+        database_id: task.database_id,
+        txn_id: task.txn_id,
+    };
+    // Read the source (base ∪ overlay via `task.txn_id`), then assign each
+    // row a fresh, catalog-registered surrogate.
+    let source_rows = read_source_rows(&ctx, source).await?;
+    let rows = if source_rows.is_empty() {
+        Vec::new()
+    } else {
+        assign_page_rows(
+            state,
             tenant_id,
-            database_id: task.database_id,
-            target_collection: target_collection.as_str(),
-            source_collection: source_collection.as_str(),
-            source_filters,
-            source_limit: *source_limit,
-            column_map,
-            txn_id: task.txn_id,
-        },
-    )
-    .await?;
+            task.database_id,
+            target_collection.as_str(),
+            &spec,
+            source_rows,
+        )
+        .await?
+    };
 
     // Recompute the target vShard (rather than reusing the staged task's)
     // to keep dispatch classification honest, as the MERGE expander does.
@@ -90,7 +103,7 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
                 if_absent: false,
                 surrogate,
                 // Expanded internal writes answer no client — see the
-                // orchestrator's paged batch insert.
+                // orchestrator's batched insert.
                 returning: None,
                 rls_filters: Vec::new(),
                 // Filled by the caller's sum and period-lock pass, the one
@@ -103,82 +116,4 @@ pub(crate) async fn resolve_and_emit_insert_select_ops(
         });
     }
     Ok(out)
-}
-
-/// Inputs for [`materialize_copy`], bundled to keep the copy pipeline within
-/// argument limits.
-struct MaterializeCopy<'a> {
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    target_collection: &'a str,
-    source_collection: &'a str,
-    source_filters: &'a [u8],
-    source_limit: usize,
-    column_map: &'a [u8],
-    txn_id: Option<TxnId>,
-}
-
-/// Scan the source page-by-page and produce the concrete target rows:
-/// `(target_document_id, msgpack_value, fresh_surrogate)`, one per surviving
-/// source row. Reuses the shared [`resolve_copy_spec`] / [`assign_page_rows`]
-/// pipeline (scan → filter → assign) so filtering and identity derivation stay
-/// identical to the autocommit path.
-async fn materialize_copy(
-    state: &SharedState,
-    args: MaterializeCopy<'_>,
-) -> crate::Result<Vec<(String, Vec<u8>, Surrogate)>> {
-    let MaterializeCopy {
-        tenant_id,
-        database_id,
-        target_collection,
-        source_collection,
-        source_filters,
-        source_limit,
-        column_map,
-        txn_id,
-    } = args;
-    let spec = resolve_copy_spec(
-        state,
-        tenant_id,
-        database_id,
-        target_collection,
-        source_filters,
-        column_map,
-    )?;
-
-    let mut cursor: Vec<u8> = Vec::new();
-    let mut remaining = source_limit;
-    let mut rows: Vec<(String, Vec<u8>, Surrogate)> = Vec::new();
-
-    while remaining > 0 {
-        let (entries, next_cursor) = scan_source_page(
-            state,
-            tenant_id,
-            database_id,
-            source_collection,
-            &cursor,
-            None,
-            txn_id,
-        )
-        .await?;
-
-        let page = assign_page_rows(
-            state,
-            tenant_id,
-            database_id,
-            target_collection,
-            &spec,
-            entries,
-            &mut remaining,
-        )
-        .await?;
-        rows.extend(page);
-
-        if next_cursor.is_empty() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    Ok(rows)
 }

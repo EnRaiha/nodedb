@@ -24,6 +24,11 @@
 //! recent N records are kept — older ones are overwritten. This is fine
 //! because torn writes can only happen on the most recent write.
 //!
+//! Slots are staged in memory as records are appended and reach disk at the
+//! next flush, ahead of the WAL fsync. A flush writes only the slots that
+//! survive in the ring, so its cost is at most `N` slot writes however many
+//! records the batch holds. See the `staging` module.
+//!
 //! ## Why the WAL alone is not enough
 //!
 //! Losing the DWB is not a cosmetic downgrade. A CRC failure with no DWB copy
@@ -52,6 +57,7 @@ pub mod metrics;
 pub mod mode;
 pub(crate) mod raw_io;
 pub mod recover;
+pub(crate) mod staging;
 pub mod status;
 
 pub use buffer::DoubleWriteBuffer;

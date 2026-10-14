@@ -5,33 +5,30 @@
 
 use nodedb_types::MirrorMode;
 
+use crate::ddl_ast::parse::clause::ClauseCursor;
 use crate::ddl_ast::statement::{DatabaseStmt, NodedbStatement};
 use crate::error::SqlError;
 
-pub(super) fn parse_mirror_database(parts: &[&str]) -> Result<NodedbStatement, SqlError> {
+use super::dispatch::db_name;
+
+/// Read `<local> FROM <cluster>.<database> [MODE = sync | async]` after
+/// `MIRROR DATABASE`.
+pub(super) fn parse_mirror_database(
+    c: &mut ClauseCursor<'_, '_>,
+) -> Result<NodedbStatement, SqlError> {
     // The source is specified as `<cluster_id>.<database_name>`, allowing the
     // handler to set up a cross-cluster QUIC link to the correct source cluster.
-    let local_name = parts
-        .get(2)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "MIRROR DATABASE requires a local name".into(),
-        })?
-        .trim_matches('"')
-        .to_string();
-    let from_idx = parts
-        .iter()
-        .position(|w| w.to_uppercase() == "FROM")
-        .ok_or_else(|| SqlError::Parse {
-            detail: "MIRROR DATABASE requires FROM <source_cluster>.<source_database>".into(),
-        })?;
-    let source_token = parts
-        .get(from_idx + 1)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "MIRROR DATABASE FROM requires <source_cluster>.<source_database>".into(),
-        })?
-        .trim_matches('"');
+    if c.at_end() {
+        return Err(c.error("MIRROR DATABASE requires a local name"));
+    }
+    let local_name = db_name(c, "local name")?;
+    if !c.eat_keyword("FROM") {
+        return Err(c.error("MIRROR DATABASE requires FROM <source_cluster>.<source_database>"));
+    }
+    if c.at_end() {
+        return Err(c.error("MIRROR DATABASE FROM requires <source_cluster>.<source_database>"));
+    }
+    let source_token = c.raw_run("source")?.trim_matches('"');
 
     // Split on the first '.' to extract cluster.database. If there is no dot
     // the whole token is treated as the source_cluster and source_database
@@ -57,18 +54,24 @@ pub(super) fn parse_mirror_database(parts: &[&str]) -> Result<NodedbStatement, S
     };
 
     // MODE = sync | async (optional; default async)
-    let mode = parts
-        .windows(3)
-        .find(|w| w[0].to_uppercase() == "MODE" && w[1] == "=")
-        .map(|w| match w[2].to_uppercase().as_str() {
-            "SYNC" => Ok(MirrorMode::Sync),
-            "ASYNC" => Ok(MirrorMode::Async),
-            other => Err(SqlError::Parse {
-                detail: format!("MIRROR DATABASE MODE: expected 'sync' or 'async', got '{other}'"),
-            }),
-        })
-        .transpose()?
-        .unwrap_or(MirrorMode::Async);
+    let mode = if c.eat_keyword("MODE") {
+        c.expect_punct('=')?;
+        let value = c.word("MODE")?.to_uppercase();
+        match value.as_str() {
+            "SYNC" => MirrorMode::Sync,
+            "ASYNC" => MirrorMode::Async,
+            other => {
+                return Err(SqlError::Parse {
+                    detail: format!(
+                        "MIRROR DATABASE MODE: expected 'sync' or 'async', got '{other}'"
+                    ),
+                });
+            }
+        }
+    } else {
+        MirrorMode::Async
+    };
+    c.finish()?;
 
     Ok(NodedbStatement::Database(DatabaseStmt::MirrorDatabase {
         local_name,
@@ -78,24 +81,19 @@ pub(super) fn parse_mirror_database(parts: &[&str]) -> Result<NodedbStatement, S
     }))
 }
 
+/// Read `[FOR <name>]` after `SHOW DATABASE MIRROR STATUS`.
 pub(super) fn parse_show_database_mirror_status(
-    parts: &[&str],
+    c: &mut ClauseCursor<'_, '_>,
 ) -> Result<NodedbStatement, SqlError> {
-    // SHOW DATABASE MIRROR STATUS [FOR <name>]
-    // parts: [SHOW, DATABASE, MIRROR, STATUS, ...]
-    let name = if parts.get(4).map(|w| w.to_uppercase()).as_deref() == Some("FOR") {
-        let n = parts
-            .get(5)
-            .copied()
-            .ok_or_else(|| SqlError::Parse {
-                detail: "SHOW DATABASE MIRROR STATUS FOR requires a database name".into(),
-            })?
-            .trim_matches('"')
-            .to_string();
-        Some(n)
+    let name = if c.eat_keyword("FOR") {
+        if c.at_end() {
+            return Err(c.error("SHOW DATABASE MIRROR STATUS FOR requires a database name"));
+        }
+        Some(db_name(c, "database name")?)
     } else {
         None
     };
+    c.finish()?;
     Ok(NodedbStatement::Database(
         DatabaseStmt::ShowDatabaseMirrorStatus { name },
     ))

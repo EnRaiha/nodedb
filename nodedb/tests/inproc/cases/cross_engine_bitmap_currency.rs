@@ -500,8 +500,6 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             on: vec![("id".into(), "id".into())],
             join_type: "inner".into(),
             limit: 1000,
-            post_group_by: Vec::new(),
-            post_aggregates: Vec::new(),
             projection: Vec::new(),
             computed_projection: Vec::new(),
             join_filters: Vec::new(),

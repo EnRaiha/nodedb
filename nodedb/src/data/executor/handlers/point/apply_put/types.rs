@@ -56,6 +56,12 @@ pub(in crate::data::executor) struct PointPutParams<'a> {
     /// find its reference row. Empty for a caller whose statement type
     /// resolves nothing, or for `enforce: false` callers, which never read it.
     pub resolved_targets: &'a [ResolvedSumTarget],
+    /// Which fields this write puts in scope for typeguard validation.
+    ///
+    /// `Document` for an insert-shaped write, `Assigned` for a merge-shaped
+    /// one (the UPSERT and MERGE update arms), and `InjectOnly` for redo
+    /// replay and derived writes, which a commit already judged.
+    pub guards: crate::data::executor::enforcement::typeguard::GuardScope<'a>,
 }
 
 /// Capture of the mutations an [`CoreLoop::apply_point_put`](crate::data::executor::core_loop::CoreLoop::apply_point_put)

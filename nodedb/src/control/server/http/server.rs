@@ -140,8 +140,14 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/v1/obsv/api/v1/query_range",
             get(routes::promql::range_query).post(routes::promql::range_query),
         )
-        .route("/v1/obsv/api/v1/series", get(routes::promql::series_query))
-        .route("/v1/obsv/api/v1/labels", get(routes::promql::label_names))
+        .route(
+            "/v1/obsv/api/v1/series",
+            get(routes::promql::series_query).post(routes::promql::series_query),
+        )
+        .route(
+            "/v1/obsv/api/v1/labels",
+            get(routes::promql::label_names).post(routes::promql::label_names),
+        )
         .route(
             "/v1/obsv/api/v1/label/{name}/values",
             get(routes::promql::label_values),

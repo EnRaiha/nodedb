@@ -330,7 +330,9 @@ impl NodeDbPgHandler {
             return self.handle_deallocate(session_id, sql_trimmed);
         }
 
-        if upper.starts_with("EXPLAIN ") {
+        // `EXPLAIN TIERS ON <collection>` is a statement of its own, answered
+        // by the DDL router below, never a plan of an inner `TIERS ...`.
+        if upper.starts_with("EXPLAIN ") && !upper.starts_with("EXPLAIN TIERS ") {
             return self.handle_explain(identity, session_id, sql_trimmed).await;
         }
 

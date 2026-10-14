@@ -98,11 +98,18 @@ fn classify(plan: &PhysicalPlan) -> Option<DocWrite<'_>> {
                 document_ids: vec![document_id.as_str()],
             },
         }),
-        PhysicalPlan::Document(DocumentOp::BatchInsert {
-            collection,
-            documents,
-            ..
-        }) => Some(DocWrite {
+        PhysicalPlan::Document(
+            DocumentOp::BatchInsert {
+                collection,
+                documents,
+                ..
+            }
+            | DocumentOp::BatchUpsert {
+                collection,
+                documents,
+                ..
+            },
+        ) => Some(DocWrite {
             collection_qualified: collection.as_str(),
             kind: DocWriteKind::Insert {
                 document_ids: documents.iter().map(|(id, _)| id.as_str()).collect(),

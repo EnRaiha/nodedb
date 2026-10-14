@@ -54,11 +54,23 @@ pub fn show_changes(
             now_ms.saturating_sub(86_400 * 1000)
         };
 
-        let limit = find_ascii_case_insensitive(sql, " LIMIT ")
-            .and_then(|pos| sql[pos + 7..].split_whitespace().next())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1000)
-            .min(10_000);
+        // No LIMIT returns every retained change. A LIMIT that is not a
+        // row count is refused by value, never read as a default.
+        let limit = match find_ascii_case_insensitive(sql, " LIMIT ") {
+            None => usize::MAX,
+            Some(pos) => {
+                let text = sql
+                    .get(pos + " LIMIT ".len()..)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_default();
+                text.trim_end_matches(';').parse::<usize>().map_err(|_| {
+                    DdlError::new(
+                        "22023",
+                        format!("SHOW CHANGES LIMIT must be a row count, got '{text}'"),
+                    )
+                })?
+            }
+        };
 
         let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
         authorize_collection(

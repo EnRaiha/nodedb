@@ -45,6 +45,9 @@ pub(super) fn describe_document(op: &DocumentOp) -> PlanKind {
         }
         | DocumentOp::Upsert {
             returning: Some(_), ..
+        }
+        | DocumentOp::BatchUpsert {
+            returning: Some(_), ..
         } => PlanKind::ReturningRows,
 
         // `PointInsert`: `ON CONFLICT DO NOTHING` makes it no-op-capable, so
@@ -67,7 +70,9 @@ pub(super) fn describe_document(op: &DocumentOp) -> PlanKind {
 
         DocumentOp::Truncate { .. } => PlanKind::DmlResult("TRUNCATE"),
 
-        DocumentOp::Upsert { .. } => PlanKind::DmlResult("UPSERT"),
+        DocumentOp::Upsert { .. } | DocumentOp::BatchUpsert { .. } => {
+            PlanKind::DmlResult("UPSERT")
+        }
 
         // Index DDL and catalog maintenance: no row payload, no row count.
         DocumentOp::Register { .. }

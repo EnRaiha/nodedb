@@ -9,7 +9,7 @@
 //! cannot diverge between them — only `resolve_only` differs.
 
 use crate::bridge::envelope::{ErrorCode, Response};
-use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_physical::physical_plan::{DocumentOp, RowSource};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
@@ -26,7 +26,7 @@ impl CoreLoop {
     ) -> Response {
         let DocumentOp::UpdateFromJoin {
             target_collection,
-            source_collection,
+            source,
             source_alias,
             target_join_col,
             source_join_col,
@@ -47,12 +47,15 @@ impl CoreLoop {
                 },
             );
         };
+        let Some(source_rows) = source_rows.as_deref() else {
+            return self.response_error(task, unresolved_source("UPDATE ... FROM", source));
+        };
         self.execute_update_from_join(
             task,
             tid,
             super::super::handlers::update_from_join::UpdateFromJoinParams {
                 target_collection: target_collection.as_str(),
-                source_collection: source_collection.as_str(),
+                source_label: source.label(),
                 source_alias,
                 target_join_col,
                 source_join_col,
@@ -60,7 +63,7 @@ impl CoreLoop {
                 target_filter_bytes: target_filters,
                 returning: returning.as_ref(),
                 resolve_only,
-                source_rows: source_rows.as_deref(),
+                source_rows,
                 rls_filters,
                 rls_write_check,
                 resolved_sum_targets,
@@ -79,7 +82,7 @@ impl CoreLoop {
     ) -> Response {
         let DocumentOp::Merge {
             target_collection,
-            source_collection,
+            source,
             source_alias,
             target_join_col,
             source_join_col,
@@ -103,19 +106,22 @@ impl CoreLoop {
                 },
             );
         };
+        let Some(source_rows) = source_rows.as_deref() else {
+            return self.response_error(task, unresolved_source("MERGE", source));
+        };
         self.execute_merge(
             task,
             tid,
             super::super::handlers::merge::MergeParams {
                 target_collection: target_collection.as_str(),
-                source_collection: source_collection.as_str(),
+                source_label: source.label(),
                 source_alias,
                 target_join_col,
                 source_join_col,
                 clauses,
                 resolve_only,
                 resolved_inserts: resolved_inserts.as_deref(),
-                source_rows: source_rows.as_deref(),
+                source_rows,
                 returning: returning.as_ref(),
                 rls_filters,
                 rls_write_check,
@@ -153,5 +159,18 @@ impl CoreLoop {
                 ),
             },
         }
+    }
+}
+
+/// The error for a join write that reached the Data Plane without its source
+/// rows. The Control Plane reads the source and ships it on every entry
+/// point; the Data Plane holds no read path for a source relation.
+fn unresolved_source(statement: &str, source: &RowSource) -> ErrorCode {
+    ErrorCode::Internal {
+        detail: format!(
+            "{statement}: source '{}' reached the Data Plane without its rows; the Control \
+             Plane must read the source and ship it",
+            source.label()
+        ),
     }
 }

@@ -146,6 +146,13 @@ pub struct TxClass {
     #[serde(default)]
     #[msgpack(default)]
     pub restore_id: u64,
+    /// The roles of the identity whose writes the transaction commits. Every
+    /// participant's redo record carries them, so every replica judges a
+    /// role-guarded state transition against the same set. Empty for a
+    /// transaction no user wrote.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub user_roles: Vec<String>,
     /// Cached participating-vshard set. Re-derived on decode; not serialized.
     #[serde(skip)]
     #[msgpack(ignore)]
@@ -296,6 +303,7 @@ impl TxClass {
             incarnations: Vec::new(),
             multi_part: None,
             restore_id: 0,
+            user_roles: Vec::new(),
             participating_vshards: Vec::new(),
         }
     }
@@ -411,6 +419,11 @@ impl TxClass {
     /// Set the WAL event-source code the transaction's writes carry.
     pub fn set_event_source(&mut self, code: u8) {
         self.event_source = code;
+    }
+
+    /// Set the roles of the identity whose writes the transaction commits.
+    pub fn set_user_roles(&mut self, user_roles: Vec<String>) {
+        self.user_roles = user_roles;
     }
 
     /// Mark the transaction as the re-issue of RESTORE `restore_id`.

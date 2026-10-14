@@ -102,9 +102,9 @@ pub fn fold_calvin_batch(
 /// Shape one task of a completed batch.
 ///
 /// A plan carrying RETURNING yields its rows as protocol-neutral
-/// [`ShapedRows`] when the deposited payload shapes; a multi-row write plans
-/// one task per row, and the caller folds every such task's rows into ONE
-/// result set. Every other task (and a RETURNING task with no shaped payload)
+/// [`ShapedRows`] when the deposited payload shapes; a write the statement
+/// planned as several tasks has the caller fold every such task's rows into
+/// ONE result set. Every other task (and a RETURNING task with no shaped payload)
 /// contributes to the statement's one command tag.
 pub fn calvin_task_outcome(
     plan: &PhysicalPlan,
@@ -112,7 +112,7 @@ pub fn calvin_task_outcome(
     ctx: &CalvinFoldCtx<'_>,
 ) -> crate::Result<CalvinTaskOutcome> {
     let plan_kind = describe_plan(plan);
-    let redaction = QueryRedaction::for_plan(ctx.tenant_id, ctx.auth, plan);
+    let redaction = QueryRedaction::for_plan(ctx.tenant_id, ctx.database_id, ctx.auth, plan);
     if let (PlanKind::ReturningRows, Some(resp)) = (plan_kind, apply_resp)
         && let Ok(ShapeOutcome::Rows(shaped)) =
             shape_response_materialized(MaterializedShapeRequest {

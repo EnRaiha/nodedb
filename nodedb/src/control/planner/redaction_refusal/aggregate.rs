@@ -12,23 +12,10 @@
 use nodedb_physical::physical_plan::AggregateSpec;
 use nodedb_query::expr::SqlExpr;
 
+use crate::bridge::envelope::PhysicalPlan;
+use crate::control::server::response_shape::redaction::plan_source_collections;
+
 use super::lookup::RefusalCtx;
-
-/// One side of a join, as the plan names it.
-pub(super) struct JoinSide<'a> {
-    /// The side's alias, or `None` when the query did not alias it.
-    pub(super) alias: Option<&'a str>,
-    /// The collection the side reads.
-    pub(super) collection: &'a str,
-}
-
-impl JoinSide<'_> {
-    /// The qualifier this side's columns carry in the join's output row: the
-    /// alias when there is one, the collection name otherwise.
-    fn qualifier(&self) -> &str {
-        self.alias.unwrap_or(self.collection)
-    }
-}
 
 /// Refuse when any spec in `specs` aggregates a redacted column of `collection`.
 pub(super) fn refuse_aggregates(
@@ -36,7 +23,15 @@ pub(super) fn refuse_aggregates(
     collection: &nodedb_types::QualifiedCollection,
     specs: &[AggregateSpec],
 ) -> crate::Result<()> {
-    let collection = collection.as_str();
+    refuse_specs(ctx, collection.as_str(), specs)
+}
+
+/// [`refuse_aggregates`] over a collection named by its stored string.
+fn refuse_specs(
+    ctx: &RefusalCtx<'_>,
+    collection: &str,
+    specs: &[AggregateSpec],
+) -> crate::Result<()> {
     if collection.is_empty() {
         return Ok(());
     }
@@ -50,36 +45,71 @@ pub(super) fn refuse_aggregates(
     Ok(())
 }
 
-/// Refuse when a post-join aggregate reads a redacted column of either side.
+/// Refuse when an aggregate over an input plan reads a redacted column of
+/// any relation that input reads.
 ///
-/// Post-join aggregates are `(function, field)` pairs whose `field` may be
-/// qualified with a side's alias. A qualified field is checked against the side
-/// it names; an unqualified one — and one whose qualifier matches neither side
-/// — is checked against both, so an ambiguous name cannot slip past.
-pub(super) fn refuse_join_aggregates(
+/// The aggregate names no collection of its own. Its input's relations are
+/// the ones the result-path masking hook keys on
+/// ([`plan_source_collections`]), each with the qualifier its columns carry:
+/// a join's sides, a post-processed or set-operation body, a named provider
+/// relation, and the sources of rows the coordinator gathered.
+pub(super) fn refuse_input_aggregates(
     ctx: &RefusalCtx<'_>,
-    left: &JoinSide<'_>,
-    right: &JoinSide<'_>,
-    aggregates: &[(String, String)],
+    input: &PhysicalPlan,
+    specs: &[AggregateSpec],
 ) -> crate::Result<()> {
-    for (_function, field) in aggregates {
-        if is_count_star(field) {
+    let sources = plan_source_collections(input, ctx.database_id);
+    for spec in specs {
+        for field in read_fields(spec) {
+            refuse_source_field(ctx, &sources, field)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse when `field` is a redacted column of one of `sources`.
+///
+/// A field qualified with a source's qualifier (`o.ssn`) is checked against
+/// the sources that carry that qualifier. Any other field, unqualified or
+/// with a qualifier no source carries (a derived table's alias, a nested
+/// field path), is checked against every source, so an ambiguous name
+/// cannot slip past. [`RefusalCtx::field_is_redacted`] matches the field as
+/// written and by its column part.
+fn refuse_source_field(
+    ctx: &RefusalCtx<'_>,
+    sources: &[(String, String)],
+    field: &str,
+) -> crate::Result<()> {
+    let qualifier = field.split_once('.').map(|(qualifier, _)| qualifier);
+    let names_a_source = qualifier.is_some_and(|qualifier| {
+        sources
+            .iter()
+            .any(|(source_qualifier, _)| source_qualifier == qualifier)
+    });
+    for (source_qualifier, collection) in sources {
+        if names_a_source && qualifier != Some(source_qualifier.as_str()) {
             continue;
         }
-        let (qualifier, column) = match field.split_once('.') {
-            Some((qualifier, column)) => (Some(qualifier), column),
-            None => (None, field.as_str()),
-        };
-        let names_a_side = qualifier.is_some_and(|qualifier| {
-            qualifier == left.qualifier() || qualifier == right.qualifier()
-        });
-        for side in [left, right] {
-            if names_a_side && qualifier != Some(side.qualifier()) {
-                continue;
-            }
-            if !side.collection.is_empty() && ctx.field_is_redacted(side.collection, column) {
-                return Err(refusal(side.collection, column));
-            }
+        if !collection.is_empty() && ctx.field_is_redacted(collection, field) {
+            return Err(refusal(collection, field));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse when a grouped timeseries scan aggregates a redacted column.
+pub(super) fn refuse_timeseries_aggregates(
+    ctx: &RefusalCtx<'_>,
+    collection: &nodedb_types::QualifiedCollection,
+    aggregates: &[(String, String)],
+) -> crate::Result<()> {
+    let collection = collection.as_str();
+    if collection.is_empty() {
+        return Ok(());
+    }
+    for (_function, field) in aggregates {
+        if !is_count_star(field) && ctx.field_is_redacted(collection, field) {
+            return Err(refusal(collection, field));
         }
     }
     Ok(())

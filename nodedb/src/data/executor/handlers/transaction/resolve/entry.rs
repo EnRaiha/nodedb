@@ -130,6 +130,9 @@ impl CoreLoop {
             // record it resolves here.
             publishes: Vec::new(),
             row_changes,
+            // The commit stamps the committing identity's roles on the
+            // record it resolves here.
+            user_roles: Vec::new(),
         };
         match record.to_bytes() {
             Ok(bytes) => self.response_with_payload(task, bytes),
@@ -1119,7 +1122,9 @@ mod tests {
         let plans = [
             PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                    QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                ),
                 source_alias: "s".to_string(),
                 target_join_col: "id".to_string(),
                 source_join_col: "id".to_string(),
@@ -1134,7 +1139,9 @@ mod tests {
             }),
             PhysicalPlan::Document(DocumentOp::Merge {
                 target_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "t"),
-                source_collection: QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                source: nodedb_physical::physical_plan::RowSource::whole_collection(
+                    QualifiedCollection::new(DatabaseId::DEFAULT, "s"),
+                ),
                 source_alias: "s".to_string(),
                 target_join_col: "id".to_string(),
                 source_join_col: "id".to_string(),
@@ -1181,12 +1188,14 @@ mod tests {
                 collection: "notes",
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
             },
         );
         assert_eq!(staged.status, Status::Ok, "{:?}", staged.error_code);
         let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "notes"),
             documents,
+            if_absent: false,
             surrogates,
             returning: None,
             rls_filters: Vec::new(),
@@ -1839,6 +1848,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         });
         dst.replay_transaction_redo_wal(
             std::slice::from_ref(&seed),
@@ -1915,6 +1925,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         });
         core.replay_transaction_redo_wal(
             std::slice::from_ref(&seed),
@@ -4158,6 +4169,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         });
         core.replay_transaction_redo_wal(
             std::slice::from_ref(&seed),

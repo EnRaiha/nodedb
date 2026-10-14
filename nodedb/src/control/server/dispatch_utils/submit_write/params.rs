@@ -130,6 +130,10 @@ pub(crate) struct SubmitWrite {
     pub txn_id: Option<TxnId>,
     /// DML audit attribution. `None` for system-generated writes.
     pub user_id: Option<Arc<str>>,
+    /// The roles of the identity that wrote the write. The Data Plane judges
+    /// a role-guarded state transition against them. Empty for a write no
+    /// user made.
+    pub user_roles: Vec<String>,
     pub durability: WalDurability,
     pub ordering: WriteOrdering,
     pub change_feed: ChangeFeedOwner,

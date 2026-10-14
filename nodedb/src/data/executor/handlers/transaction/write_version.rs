@@ -166,6 +166,7 @@ impl CoreLoop {
             | DocumentOp::EstimateCount { .. }
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::Upsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::BulkUpdate { .. }
             | DocumentOp::BulkDelete { .. }
@@ -275,6 +276,24 @@ impl CoreLoop {
                     );
                 }
                 if surrogates.is_empty() {
+                    self.note_write(db, tenant, collection.as_str(), None, stamp);
+                }
+            }
+            // Every row of a page carries its bound surrogate. An empty page
+            // records the collection floor only.
+            VectorOp::DirectBatchWrite {
+                collection, rows, ..
+            } => {
+                for row in rows {
+                    self.note_write(
+                        db,
+                        tenant,
+                        collection.as_str(),
+                        Some(KeyRepr::Surrogate(row.surrogate.as_u32())),
+                        stamp,
+                    );
+                }
+                if rows.is_empty() {
                     self.note_write(db, tenant, collection.as_str(), None, stamp);
                 }
             }

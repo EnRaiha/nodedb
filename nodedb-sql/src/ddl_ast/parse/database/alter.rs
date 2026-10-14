@@ -6,10 +6,12 @@
 
 use nodedb_types::AuditDmlMode;
 
+use crate::ddl_ast::parse::clause::ClauseCursor;
 use crate::ddl_ast::statement::{AlterDatabaseOperation, DatabaseStmt, NodedbStatement};
 use crate::error::SqlError;
 
-use super::quota_spec::parse_quota_spec;
+use super::dispatch::db_name;
+use super::quota_spec::parse_quota_pairs;
 
 /// Maximum accepted value for `ALTER DATABASE ... SET IDLE_TIMEOUT = <secs>`,
 /// in seconds. Caps the parser so an administrative typo such as
@@ -19,38 +21,31 @@ use super::quota_spec::parse_quota_spec;
 /// the timeout entirely.
 pub const MAX_IDLE_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
 
+/// Read `<name> <operation>` after `ALTER DATABASE`, then require the end of
+/// the statement.
 pub(super) fn parse_alter_database(
-    parts: &[&str],
-    original: &str,
+    c: &mut ClauseCursor<'_, '_>,
 ) -> Result<NodedbStatement, SqlError> {
-    let name = parts
-        .get(2)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "ALTER DATABASE requires a name".into(),
-        })?
-        .trim_matches('"')
-        .to_string();
+    if c.at_end() {
+        return Err(c.error("ALTER DATABASE requires a name"));
+    }
+    let name = db_name(c, "database name")?;
+    if c.at_end() {
+        return Err(c.error("ALTER DATABASE requires an operation keyword"));
+    }
 
-    let verb = parts
-        .get(3)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "ALTER DATABASE requires an operation keyword".into(),
-        })?
-        .to_uppercase();
-
-    let operation = match verb.as_str() {
-        "RENAME" => parse_rename(parts)?,
-        "SET" => parse_set(parts, original)?,
-        "MATERIALIZE" => AlterDatabaseOperation::Materialize,
-        "PROMOTE" => AlterDatabaseOperation::Promote,
-        other => {
-            return Err(SqlError::Parse {
-                detail: format!("ALTER DATABASE: unknown operation '{other}'"),
-            });
-        }
+    let operation = if c.eat_keyword("RENAME") {
+        parse_rename(c)?
+    } else if c.eat_keyword("SET") {
+        parse_set(c)?
+    } else if c.eat_keyword("MATERIALIZE") {
+        AlterDatabaseOperation::Materialize
+    } else if c.eat_keyword("PROMOTE") {
+        AlterDatabaseOperation::Promote
+    } else {
+        return Err(c.error(format!("unknown operation {}", c.describe_next())));
     };
+    c.finish()?;
 
     Ok(NodedbStatement::Database(DatabaseStmt::AlterDatabase {
         name,
@@ -58,79 +53,64 @@ pub(super) fn parse_alter_database(
     }))
 }
 
-fn parse_rename(parts: &[&str]) -> Result<AlterDatabaseOperation, SqlError> {
-    let to_kw = parts.get(4).map(|w| w.to_uppercase()).unwrap_or_default();
-    if to_kw != "TO" {
-        return Err(SqlError::Parse {
-            detail: format!("ALTER DATABASE RENAME requires keyword 'TO', got '{to_kw}'"),
-        });
+fn parse_rename(c: &mut ClauseCursor<'_, '_>) -> Result<AlterDatabaseOperation, SqlError> {
+    if !c.eat_keyword("TO") {
+        return Err(c.error(format!(
+            "RENAME requires keyword 'TO', got {}",
+            c.describe_next()
+        )));
     }
-    let new_name = parts
-        .get(5)
-        .copied()
-        .ok_or_else(|| SqlError::Parse {
-            detail: "ALTER DATABASE RENAME TO requires a new name".into(),
-        })?
-        .trim_matches('"')
-        .to_string();
+    if c.at_end() {
+        return Err(c.error("RENAME TO requires a new name"));
+    }
+    let new_name = db_name(c, "new name")?;
     Ok(AlterDatabaseOperation::Rename { new_name })
 }
 
-fn parse_set(parts: &[&str], original: &str) -> Result<AlterDatabaseOperation, SqlError> {
-    let target = parts.get(4).map(|w| w.to_uppercase()).unwrap_or_default();
-    match target.as_str() {
-        "QUOTA" => {
-            let spec = parse_quota_spec(original, "ALTER DATABASE SET QUOTA")?;
-            Ok(AlterDatabaseOperation::SetQuota(spec))
-        }
-        "DEFAULT" => Ok(AlterDatabaseOperation::SetDefault),
-        "AUDIT_DML" => parse_set_audit_dml(parts),
-        "IDLE_TIMEOUT" => parse_set_idle_timeout(parts),
-        other => Err(SqlError::Parse {
-            detail: format!("ALTER DATABASE SET: unknown target '{other}'"),
-        }),
+fn parse_set(c: &mut ClauseCursor<'_, '_>) -> Result<AlterDatabaseOperation, SqlError> {
+    if c.eat_keyword("QUOTA") {
+        let inner = c.raw_paren("QUOTA")?;
+        let spec = parse_quota_pairs(inner, "ALTER DATABASE SET QUOTA")?;
+        Ok(AlterDatabaseOperation::SetQuota(spec))
+    } else if c.eat_keyword("DEFAULT") {
+        Ok(AlterDatabaseOperation::SetDefault)
+    } else if c.eat_keyword("AUDIT_DML") {
+        parse_set_audit_dml(c)
+    } else if c.eat_keyword("IDLE_TIMEOUT") {
+        parse_set_idle_timeout(c)
+    } else {
+        Err(c.error(format!("SET: unknown target {}", c.describe_next())))
     }
 }
 
-fn parse_set_audit_dml(parts: &[&str]) -> Result<AlterDatabaseOperation, SqlError> {
-    let eq = parts.get(5).copied().unwrap_or("");
-    if eq != "=" {
-        return Err(SqlError::Parse {
-            detail: format!("ALTER DATABASE SET AUDIT_DML requires '=', got '{eq}'"),
-        });
+/// A `SET <key> = <value>` value: a quoted string or a word.
+fn set_value(c: &mut ClauseCursor<'_, '_>, key: &str) -> Result<String, SqlError> {
+    if !c.eat_punct('=') {
+        return Err(c.error(format!("SET {key} requires '=', got {}", c.describe_next())));
     }
-    let raw = parts.get(6).copied().ok_or_else(|| SqlError::Parse {
-        detail: "ALTER DATABASE SET AUDIT_DML requires a value (NONE, WRITES, ALL)".into(),
+    if let Ok(value) = c.string(key) {
+        return Ok(value);
+    }
+    Ok(c.word(key)?.to_string())
+}
+
+fn parse_set_audit_dml(c: &mut ClauseCursor<'_, '_>) -> Result<AlterDatabaseOperation, SqlError> {
+    let raw = set_value(c, "AUDIT_DML (NONE, WRITES, ALL)")?;
+    let mode = raw.parse::<AuditDmlMode>().map_err(|e| SqlError::Parse {
+        detail: format!("ALTER DATABASE SET AUDIT_DML: {e}"),
     })?;
-    let mode = raw
-        .trim_matches('\'')
-        .trim_matches('"')
-        .parse::<AuditDmlMode>()
-        .map_err(|e| SqlError::Parse {
-            detail: format!("ALTER DATABASE SET AUDIT_DML: {e}"),
-        })?;
     Ok(AlterDatabaseOperation::SetAuditDml(mode))
 }
 
-fn parse_set_idle_timeout(parts: &[&str]) -> Result<AlterDatabaseOperation, SqlError> {
-    let eq = parts.get(5).copied().unwrap_or("");
-    if eq != "=" {
-        return Err(SqlError::Parse {
-            detail: format!("ALTER DATABASE SET IDLE_TIMEOUT requires '=', got '{eq}'"),
-        });
-    }
-    let raw = parts.get(6).copied().ok_or_else(|| SqlError::Parse {
-        detail: "ALTER DATABASE SET IDLE_TIMEOUT requires a non-negative integer (seconds)".into(),
+fn parse_set_idle_timeout(
+    c: &mut ClauseCursor<'_, '_>,
+) -> Result<AlterDatabaseOperation, SqlError> {
+    let raw = set_value(c, "IDLE_TIMEOUT")?;
+    let secs = raw.parse::<u64>().map_err(|_| SqlError::Parse {
+        detail: format!(
+            "ALTER DATABASE SET IDLE_TIMEOUT: invalid value '{raw}', expected non-negative integer"
+        ),
     })?;
-    let secs = raw
-        .trim_matches('\'')
-        .trim_matches('"')
-        .parse::<u64>()
-        .map_err(|_| SqlError::Parse {
-            detail: format!(
-                "ALTER DATABASE SET IDLE_TIMEOUT: invalid value '{raw}', expected non-negative integer"
-            ),
-        })?;
     if secs > MAX_IDLE_TIMEOUT_SECS {
         return Err(SqlError::Parse {
             detail: format!(

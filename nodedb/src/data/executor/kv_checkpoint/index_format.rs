@@ -68,6 +68,10 @@ pub(crate) struct KvCheckpointFieldIndex {
     /// Field position in the schema column list. Held as `u64` rather than the
     /// engine's `usize` so the file does not encode the writer's pointer width.
     pub field_position: u64,
+    /// Whether the index holds every row of the collection. A partial index
+    /// never answers an equality, so losing this flag would turn it into a
+    /// wrong answer.
+    pub complete: bool,
     /// The index's whole B-Tree. Stored rather than rebuilt from the restored
     /// rows because a `backfill=false` registration deliberately omits the rows
     /// that predate it — content is a function of the write history, and
@@ -91,6 +95,8 @@ pub(crate) struct KvCheckpointCompositeIndex {
     pub fields: Vec<String>,
     /// Field positions in the schema column list, parallel to `fields`.
     pub field_positions: Vec<u64>,
+    /// Whether the index holds every row of the collection.
+    pub complete: bool,
     /// The index's whole B-Tree, keyed by built composite key.
     pub entries: Vec<KvCheckpointIndexEntry>,
 }

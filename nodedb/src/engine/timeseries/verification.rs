@@ -9,7 +9,6 @@
 mod tests {
     use crate::engine::timeseries::columnar_memtable::*;
     use crate::engine::timeseries::columnar_segment::*;
-    use crate::engine::timeseries::o3_buffer::*;
     use crate::engine::timeseries::partition_registry::*;
     use crate::engine::timeseries::schema_evolution::*;
     use nodedb_types::timeseries::*;
@@ -53,52 +52,6 @@ mod tests {
         assert_eq!(catalog.get(id2), Some(&k2));
     }
 
-    // ── Data Integrity: O3 correctness ──────────────────────────────
-
-    #[test]
-    fn o3_ingest_and_query_correctness() {
-        // Ingest 1000 rows out of order, query back, verify sorted result.
-        let mut buf = O3Buffer::new(10_000);
-
-        // Generate shuffled timestamps.
-        let mut timestamps: Vec<i64> = (0..1000).map(|i| i * 100).collect();
-        // Deterministic shuffle (swap each element with a "random" earlier one).
-        for i in (1..timestamps.len()).rev() {
-            let j = (i * 7 + 13) % (i + 1);
-            timestamps.swap(i, j);
-        }
-
-        for &ts in &timestamps {
-            buf.insert(O3Row {
-                timestamp_ms: ts,
-                series_id: 1,
-                value: ts as f64,
-                target_partition_start: 0,
-            });
-        }
-        assert_eq!(buf.len(), 1000);
-
-        // Query all rows.
-        let results = buf.query_range(0, 100_000);
-        assert_eq!(results.len(), 1000);
-
-        // Verify sorted order.
-        for w in results.windows(2) {
-            assert!(
-                w[0].timestamp_ms <= w[1].timestamp_ms,
-                "O3 query not sorted: {} > {}",
-                w[0].timestamp_ms,
-                w[1].timestamp_ms
-            );
-        }
-
-        // Verify all original values present.
-        let result_ts: Vec<i64> = results.iter().map(|r| r.timestamp_ms).collect();
-        let mut expected: Vec<i64> = (0..1000).map(|i| i * 100).collect();
-        expected.sort();
-        assert_eq!(result_ts, expected);
-    }
-
     // ── Data Integrity: Mixed-width partition query ──────────────────
 
     #[test]
@@ -110,13 +63,14 @@ mod tests {
         // Partition 1: 1-day width (rows 0-99, ts 1000-1099)
         let mut mt1 = ColumnarMemtable::new_metric(test_memtable_config());
         for i in 0..100 {
-            mt1.ingest_metric(
+            mt1.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1000 + i,
-                    value: i as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1000 + i),
+                    ColumnValue::Float64(i as f64),
+                ],
+            )
+            .unwrap();
         }
         let d1 = mt1.drain();
         writer
@@ -126,13 +80,14 @@ mod tests {
         // Partition 2: 3-day width (rows 100-199, ts 2000-2099)
         let mut mt2 = ColumnarMemtable::new_metric(test_memtable_config());
         for i in 0..100 {
-            mt2.ingest_metric(
+            mt2.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 2000 + i,
-                    value: (100 + i) as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(2000 + i),
+                    ColumnValue::Float64((100 + i) as f64),
+                ],
+            )
+            .unwrap();
         }
         let d2 = mt2.drain();
         writer
@@ -142,13 +97,14 @@ mod tests {
         // Partition 3: 1-week width (rows 200-299, ts 3000-3099)
         let mut mt3 = ColumnarMemtable::new_metric(test_memtable_config());
         for i in 0..100 {
-            mt3.ingest_metric(
+            mt3.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 3000 + i,
-                    value: (200 + i) as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(3000 + i),
+                    ColumnValue::Float64((200 + i) as f64),
+                ],
+            )
+            .unwrap();
         }
         let d3 = mt3.drain();
         writer
@@ -470,13 +426,14 @@ mod tests {
             // Write actual partition data.
             let mut mt = ColumnarMemtable::new_metric(test_memtable_config());
             for i in 0..50 {
-                mt.ingest_metric(
+                mt.ingest_row(
                     1,
-                    MetricSample {
-                        timestamp_ms: start + i,
-                        value: i as f64,
-                    },
-                );
+                    &[
+                        ColumnValue::Timestamp(start + i),
+                        ColumnValue::Float64(i as f64),
+                    ],
+                )
+                .unwrap();
             }
             let drain = mt.drain();
             writer
@@ -513,7 +470,9 @@ mod tests {
 
         // Step 4: Start merge, "crash" mid-merge (state = Merging).
         let mut registry = recovered;
-        registry.mark_merging(day_ms);
+        if let Some(entry) = registry.get_mut(day_ms) {
+            entry.meta.state = PartitionState::Merging;
+        }
         registry
             .persist(tmp.path(), "partition_manifest.json")
             .unwrap();
@@ -541,11 +500,13 @@ mod tests {
             column_stats: std::collections::HashMap::new(),
             max_system_ts: 0,
         };
-        registry.commit_merge(
-            merged_meta,
-            "ts-merged".into(),
-            &[day_ms, 2 * day_ms, 3 * day_ms],
-        );
+        for start in [day_ms, 2 * day_ms, 3 * day_ms] {
+            registry.mark_deleted(start);
+        }
+        registry.insert_partition(PartitionEntry {
+            meta: merged_meta,
+            dir_name: "ts-merged".into(),
+        });
         registry
             .persist(tmp.path(), "partition_manifest.json")
             .unwrap();
@@ -596,13 +557,14 @@ mod tests {
 
         let start = std::time::Instant::now();
         for i in 0..1_000_000u64 {
-            mt.ingest_metric(
+            mt.ingest_row(
                 i % 100,
-                MetricSample {
-                    timestamp_ms: i as i64,
-                    value: i as f64 * 0.001,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(i as i64),
+                    ColumnValue::Float64(i as f64 * 0.001),
+                ],
+            )
+            .unwrap();
         }
         let elapsed = start.elapsed();
         let rows_per_sec = 1_000_000.0 / elapsed.as_secs_f64();

@@ -61,6 +61,9 @@ pub(super) struct StartConfig {
     /// When `Some`, the graph tuning of the core and of `SharedState`. `None`
     /// keeps the defaults.
     pub graph_tuning: Option<nodedb_types::config::tuning::GraphTuning>,
+    /// When `Some`, the PromQL tuning of `SharedState`. `None` keeps the
+    /// defaults.
+    pub promql_tuning: Option<nodedb_types::config::tuning::PromqlTuning>,
 }
 
 impl Default for StartConfig {
@@ -76,6 +79,7 @@ impl Default for StartConfig {
             metering: None,
             backup_root: false,
             graph_tuning: None,
+            promql_tuning: None,
         }
     }
 }
@@ -180,6 +184,20 @@ impl TestServer {
         .await
     }
 
+    /// Spawn a single-core NodeDB server whose Control Plane runs with
+    /// `promql_tuning`, so PromQL limit tests can set a small sample budget.
+    /// All other settings stay at their defaults (trust-mode auth, lockout
+    /// disabled).
+    pub async fn start_with_promql_tuning(
+        promql_tuning: nodedb_types::config::tuning::PromqlTuning,
+    ) -> Self {
+        Self::start_with_config(StartConfig {
+            promql_tuning: Some(promql_tuning),
+            ..Default::default()
+        })
+        .await
+    }
+
     /// Spawn a single-core NodeDB server and connect via pgwire.
     pub(super) async fn start_with_config(cfg: StartConfig) -> Self {
         let graph_tuning = cfg.graph_tuning.clone().unwrap_or_default();
@@ -232,6 +250,9 @@ impl TestServer {
             s.backup_kek = Some(Arc::new([0x42u8; 32]));
             s.governor = init_test_memory_governor();
             s.tuning.graph = graph_tuning.clone();
+            if let Some(promql_tuning) = cfg.promql_tuning {
+                s.tuning.promql = promql_tuning;
+            }
             s.jwks_registry = cfg.jwks_registry;
             if let Some(metering) = cfg.metering {
                 s.metering_config = metering;

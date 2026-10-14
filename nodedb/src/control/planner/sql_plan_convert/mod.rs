@@ -17,6 +17,7 @@ pub mod kv_transfer_field;
 pub mod lateral;
 pub mod output_schema;
 pub mod output_schema_types;
+pub mod row_source;
 pub mod scan;
 pub mod scan_params;
 pub mod set_ops;

@@ -180,45 +180,6 @@ pub(super) async fn scan_page(
     parse_materialize_scan_payload(resp.payload.as_ref())
 }
 
-/// Scan a source collection to completion on its OWN Data-Plane core,
-/// collecting every row as `(source_doc_id, msgpack_body)`. Shared by the
-/// `MERGE` / `UPDATE ... FROM` orchestrators, which ship source rows into
-/// their plan so the Data Plane builds the join-map without a local read of
-/// a possibly-non-resident source.
-///
-/// `txn_id`: `None` scans committed base storage only; `Some(txn)` (staged
-/// expanders) folds the transaction's SOURCE-side staging overlay in too.
-pub(crate) async fn read_all_source_rows(
-    state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    source_collection: &str,
-    txn_id: Option<TxnId>,
-) -> crate::Result<Vec<(String, Vec<u8>)>> {
-    let mut cursor: Vec<u8> = Vec::new();
-    let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
-    loop {
-        let (entries, next_cursor) = scan_source_page(
-            state,
-            tenant_id,
-            database_id,
-            source_collection,
-            &cursor,
-            None,
-            txn_id,
-        )
-        .await?;
-        for (doc_id, _source_surrogate, value) in entries {
-            rows.push((doc_id, value));
-        }
-        if next_cursor.is_empty() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-    Ok(rows)
-}
-
 /// Parse the msgpack payload emitted by `execute_document_materialize_scan`:
 ///   `[next_cursor: bin, entries: [[doc_id: str, surrogate: u32, value_bytes: bin], ...]]`.
 fn parse_materialize_scan_payload(payload: &[u8]) -> crate::Result<ScanPage> {

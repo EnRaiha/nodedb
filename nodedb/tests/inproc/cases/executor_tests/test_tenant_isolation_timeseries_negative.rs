@@ -60,6 +60,8 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: vec![],
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(resp_baseline.status, Status::Ok);
@@ -121,6 +123,8 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             computed_columns: vec![],
+            having: Vec::new(),
+            tiering: None,
         }),
     );
     assert_eq!(resp_after.status, Status::Ok);

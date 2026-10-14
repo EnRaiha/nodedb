@@ -42,12 +42,16 @@ pub(super) struct EntryScope {
     /// The collections the write names, with the incarnations its proposer
     /// planned against.
     pub incarnations: Vec<crate::control::wal_replication::CollectionIncarnation>,
+    /// The roles of the identity that wrote the write, which every replica
+    /// judges a role-guarded state transition against.
+    pub user_roles: Vec<String>,
 }
 
-/// Prepare a generic entry. `exclusive` marks a Raft-native array cell write:
-/// its apply awaits the array-open bootstrap and its own write, so it runs
-/// with nothing else of its group in flight. Every other entry leaves as its
-/// enqueue.
+/// Prepare a generic entry. `exclusive` marks an entry whose apply awaits its
+/// own write, so it runs with nothing else of its group in flight: a
+/// Raft-native array cell write, which also awaits the array-open
+/// bootstrap, and a timeseries aggregate refresh cut. Every other entry
+/// leaves as its enqueue.
 pub(super) fn prepare_generic_entry<'a>(
     ctx: ApplyContext<'a>,
     pos: AppliedPosition,
@@ -84,6 +88,7 @@ async fn enqueue_generic_entry<'a>(
         database_id,
         event_source,
         incarnations,
+        user_roles,
     } = scope;
     let ApplyContext { state, tracker, .. } = ctx;
     let AppliedPosition {
@@ -237,6 +242,9 @@ async fn enqueue_generic_entry<'a>(
             // Auth ran on the proposing node before the entry was
             // proposed; the committed entry carries no session user.
             user_id: None,
+            // The writer's roles travel on the entry, so every replica judges
+            // a role-guarded state transition against the same set.
+            user_roles,
             // The redo record is appended HERE, on this replica, from the
             // committed plan — the leader's WAL LSN is deliberately not
             // carried on the wire, and the memory-only engines have no

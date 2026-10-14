@@ -6,7 +6,6 @@
 //! message), and the single-column `result` output builds a
 //! [`DdlResult::Rows`] directly.
 
-use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::Value;
 use serde_json::{Map, Value as JsonValue};
 
@@ -19,28 +18,6 @@ use super::super::super::result::{DdlError, DdlResult};
 /// Construct a protocol-neutral DDL error (SQLSTATE + message).
 pub fn err(sqlstate: &str, message: &str) -> DdlError {
     DdlError::new(sqlstate, message)
-}
-
-pub fn extract_function_args<'a>(sql: &'a str, func_name: &str) -> Result<Vec<&'a str>, DdlError> {
-    let pos = find_ascii_case_insensitive(sql, func_name)
-        .ok_or_else(|| err("42601", &format!("missing {func_name}")))?;
-    let after = &sql[pos + func_name.len()..];
-    let paren_start = after
-        .find('(')
-        .ok_or_else(|| err("42601", &format!("{func_name} requires (...) arguments")))?;
-    let paren_end = after
-        .rfind(')')
-        .ok_or_else(|| err("42601", "missing closing ')'"))?;
-    let inner = &after[paren_start + 1..paren_end];
-    Ok(inner.split(',').collect())
-}
-
-pub fn clean_arg(s: &str) -> String {
-    s.trim()
-        .trim_matches('\'')
-        .trim_matches('"')
-        .trim()
-        .to_string()
 }
 
 pub fn parse_timestamp_secs(s: &str) -> Result<u64, DdlError> {

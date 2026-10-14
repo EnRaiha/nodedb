@@ -16,6 +16,7 @@ use std::sync::Arc;
 use nodedb_cluster::{MetadataEntry, PendingDdlObject, encode_entry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
+use crate::control::constraint_install::{ConstraintTarget, constraint_targets};
 use crate::control::metadata_proposer::{DdlPrepareLease, MetadataRaftHandle};
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::state::SharedState;
@@ -112,6 +113,9 @@ pub(super) struct PendingDdlHandle<'a> {
     /// releases it. A handle dropped unfinalized releases it from `Drop`.
     lease: DdlPrepareLease<'a>,
     objects: Vec<PendingDdlObject>,
+    /// The collections whose constraint version the reserved DDL changes.
+    /// [`finalize_pending`] installs their constraints once it applied.
+    constraint_targets: Vec<ConstraintTarget>,
 }
 
 impl PendingDdlHandle<'_> {
@@ -202,11 +206,16 @@ async fn propose_pending_buffered<'a>(
     )
     .await;
     match reserved {
-        Ok((log_index, objects)) => Ok(PendingDdlHandle {
+        Ok(Reserved {
+            log_index,
+            objects,
+            constraint_targets,
+        }) => Ok(PendingDdlHandle {
             token: lease.token(),
             log_index,
             lease,
             objects,
+            constraint_targets,
         }),
         Err(error) => {
             lease.release().await;
@@ -215,8 +224,17 @@ async fn propose_pending_buffered<'a>(
     }
 }
 
+/// What [`reserve_buffered`] reserved.
+struct Reserved {
+    log_index: u64,
+    objects: Vec<PendingDdlObject>,
+    /// The collections whose constraint version the reserved DDL changes.
+    constraint_targets: Vec<ConstraintTarget>,
+}
+
 /// Drain, stamp, and reserve `buffered` under the preparation lease `token`.
-/// Returns the reservation's log index and its reserved objects.
+/// Returns the reservation's log index, its reserved objects, and the
+/// collections whose constraint version it changes.
 async fn reserve_buffered(
     state: &SharedState,
     sessions: &SessionStore,
@@ -224,7 +242,7 @@ async fn reserve_buffered(
     handle: &dyn MetadataRaftHandle,
     token: u64,
     buffered: DdlBuffer,
-) -> crate::Result<(u64, Vec<PendingDdlObject>)> {
+) -> crate::Result<Reserved> {
     // Checked under the preparation lease, which every DDL takes: no other
     // role or user change commits between this check and the finalize, so
     // the finalize never applies part of the batch.
@@ -259,6 +277,9 @@ async fn reserve_buffered(
     let entries: Vec<_> = buffered.into_iter().map(|item| item.entry).collect();
     let catalog = state.credentials.catalog();
     let stamped = catalog_entry::descriptor_stamp::stamp_batch(entries, &state.hlc_clock, catalog)?;
+    // Read against the committed rows, which the reservation leaves unchanged
+    // until the finalize applies.
+    let constraint_targets = constraint_targets(catalog, &stamped)?;
 
     let mut objects = Vec::with_capacity(stamped.len());
     for (entry, audit) in stamped.iter().zip(audits) {
@@ -294,7 +315,11 @@ async fn reserve_buffered(
     if !state.pending_ddl.contains(token) {
         return Err(crate::Error::MetadataDdlSuperseded { log_index });
     }
-    Ok((log_index, objects))
+    Ok(Reserved {
+        log_index,
+        objects,
+        constraint_targets,
+    })
 }
 
 /// Commit the objects `handle` reserved: propose `DdlPendingFinalize`, wait
@@ -317,11 +342,16 @@ pub(super) async fn finalize_pending(
         log_index,
         lease,
         objects,
+        constraint_targets,
     } = handle;
     tracing::debug!(token, log_index, "finalizing pending DDL");
     let finalized = finalize_reserved(state, token, &objects).await;
     lease.release().await;
     let (log_index, bears_authorization) = finalized?;
+    // A changed constraint set is live on the collection's data log before
+    // COMMIT returns, so the first CRDT apply after it is not fenced. The
+    // finalize is committed, so a failed install never fails COMMIT.
+    crate::control::constraint_install::install_constraints(state, &constraint_targets).await;
     if bears_authorization {
         super::ddl_authorization::barrier_at(state, log_index).await?;
     }

@@ -172,6 +172,9 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: &[],
+                // A merged CRDT row is never rewritten. Its guards were judged
+                // before the merge or on the merged row.
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::InjectOnly,
             },
         ) {
             Ok(outcome) => outcome,

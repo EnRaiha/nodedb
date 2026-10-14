@@ -2,23 +2,27 @@
 
 //! Protocol-neutral `CREATE CONTINUOUS AGGREGATE` handler.
 //!
-//! The catalog path (`propose_and_apply` for the `PutContinuousAggregate`
-//! entry, then the target-collection `propose_and_apply` +
-//! `register_proposed_collection`), the source-existence / timeseries /
-//! duplicate checks, the def serialization, and the target-collection
-//! descriptor run here. The result is the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! The aggregate is a read-only relation of its own: `SELECT * FROM <name>`
+//! reads its finalized buckets. Collections and continuous aggregates share
+//! one relation namespace, so a name a collection or a catalog table holds
+//! is refused with `42P07`.
+//!
+//! The aggregate's rows are system-derived from every row of its source.
+//! A creator who reads the source through a read policy would expose the
+//! hidden rows in aggregate, so a source with a read policy takes a creator
+//! the policy does not bind: a superuser, a tenant admin, or the source's
+//! owner. Anyone else gets `42501`.
 
 use nodedb_types::DatabaseId;
 
-use crate::control::security::catalog::{StoredCollection, StoredContinuousAggregate};
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::catalog::StoredContinuousAggregate;
+use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::engine::timeseries::continuous_agg::ContinuousAggregateDef;
 
 use super::super::super::catalog::propose_and_apply_async;
 use super::super::super::result::{DdlError, DdlResult};
-use super::super::collection;
+use super::super::read_gate::CollectionReadGate;
 use super::parse::{extract_with_options, parse_create_sql};
 
 fn err(sqlstate: &str, message: String) -> DdlError {
@@ -80,7 +84,7 @@ pub async fn create_continuous_aggregate(
         )
     } else {
         let fake_with_sql = format!("dummy WITH ({with_clause_raw})");
-        let (rp, ret) = extract_with_options(&fake_with_sql.to_uppercase(), &fake_with_sql);
+        let (rp, ret) = extract_with_options(&fake_with_sql.to_uppercase(), &fake_with_sql)?;
         (rp, ret)
     };
 
@@ -95,6 +99,7 @@ pub async fn create_continuous_aggregate(
         refresh_policy,
         retention_period_ms,
         stale: false,
+        incarnation: state.hlc_clock.now(),
     };
 
     // Validate source collection exists and is timeseries.
@@ -125,7 +130,24 @@ pub async fn create_continuous_aggregate(
                 format!("continuous aggregate '{}' already exists", def.name),
             ));
         }
+        // A dropped collection keeps its name until it is purged, so UNDROP
+        // never meets an aggregate in its place.
+        if let Ok(Some(_)) = catalog.get_collection(database_id, tenant_id.as_u64(), &def.name) {
+            return Err(err(
+                "42P07",
+                format!("relation '{}' already exists as a collection", def.name),
+            ));
+        }
+        if crate::control::server::pgwire::catalog::schema::catalog_collection_info(&def.name)
+            .is_some()
+        {
+            return Err(err(
+                "42P07",
+                format!("relation '{}' is a system catalog table", def.name),
+            ));
+        }
     }
+    authorize_source(state, identity, database_id, &def.source)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -156,72 +178,6 @@ pub async fn create_continuous_aggregate(
         crate::control::catalog_entry::CatalogEntry::PutContinuousAggregate(Box::new(stored));
     propose_and_apply_async(state, &entry).await?;
 
-    // Create the target collection so `SELECT * FROM <ca_name>` resolves
-    // like any other relation. Schemaless document by parity with
-    // materialized-view targets; refresh-path writes (when wired) will
-    // upsert rolled-up documents into it. Idempotent when a collection
-    // of the same name already exists.
-    let target_exists = {
-        let catalog = state.credentials.catalog();
-        matches!(
-            catalog.get_collection(database_id, tenant_id.as_u64(), &def.name),
-            Ok(Some(c)) if c.is_active
-        )
-    };
-    if !target_exists {
-        let target = StoredCollection {
-            tenant_id: tenant_id.as_u64(),
-            name: def.name.clone(),
-            owner: identity.username.clone(),
-            created_at: now,
-            deactivated_at_ns: 0,
-            descriptor_version: 0,
-            constraint_version: 0,
-            crdt_signing_required: false,
-            modification_hlc: nodedb_types::Hlc::ZERO,
-            incarnation: nodedb_types::Hlc::ZERO,
-            fields: Vec::new(),
-            field_defs: Vec::new(),
-            event_defs: Vec::new(),
-            collection_type: nodedb_types::CollectionType::document(),
-            timeseries_config: None,
-            conflict_policy: None,
-            is_active: true,
-            append_only: false,
-            hash_chain: false,
-            balanced: None,
-            last_chain_hash: None,
-            period_lock: None,
-            retention_period: None,
-            legal_holds: Vec::new(),
-            state_constraints: Vec::new(),
-            transition_checks: Vec::new(),
-            type_guards: Vec::new(),
-            check_constraints: Vec::new(),
-            materialized_sums: Vec::new(),
-            lvc_enabled: false,
-            bitemporal: false,
-            crdt: false,
-            permission_tree_def: None,
-            indexes: Vec::new(),
-            size_bytes_estimate: 0,
-            primary: nodedb_types::PrimaryEngine::Document,
-            vector_primary: None,
-            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-            database_id,
-            cloned_from: None,
-            clone_status: nodedb_types::CloneStatus::default(),
-            has_implicit_edges: false,
-            declared_primary_key: None,
-        };
-        let coll_entry =
-            crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
-        let outcome = propose_and_apply_async(state, &coll_entry).await?;
-        collection::register_proposed_collection(state, outcome, &target)
-            .await
-            .map_err(|e| DdlError::from_error(&e))?;
-    }
-
     tracing::info!(
         name = def.name,
         source = def.source,
@@ -234,6 +190,43 @@ pub async fn create_continuous_aggregate(
         command: "CREATE CONTINUOUS AGGREGATE".to_string(),
         rows_affected: None,
     }])
+}
+
+/// `identity` reads `source`, and no read policy on `source` binds it.
+fn authorize_source(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    source: &str,
+) -> Result<(), DdlError> {
+    CollectionReadGate::for_request(state, identity, database_id).authorize(source)?;
+    let qualified = nodedb_types::QualifiedCollection::new(database_id, source);
+    if state
+        .rls
+        .read_policies(identity.tenant_id.as_u64(), qualified.as_str())
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let is_owner = state
+        .permissions
+        .get_owner(
+            crate::control::security::catalog::auth_types::object_type::COLLECTION,
+            database_id.as_u64(),
+            identity.tenant_id,
+            source,
+        )
+        .is_some_and(|owner| owner == identity.username);
+    if identity.is_superuser || identity.has_role(&Role::TenantAdmin) || is_owner {
+        return Ok(());
+    }
+    Err(err(
+        "42501",
+        format!(
+            "permission denied to create a continuous aggregate on '{source}': its read policy \
+             binds you, and the aggregate would expose the rows it hides"
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -302,6 +295,63 @@ mod tests {
                     WITH (refresh = '5m')";
         let def = parse_create_sql(sql).unwrap();
         assert_eq!(def.refresh_policy, RefreshPolicy::Periodic(300_000));
+    }
+
+    #[test]
+    fn parse_create_refresh_interval_is_periodic() {
+        let sql = "CREATE CONTINUOUS AGGREGATE m1 ON metrics \
+                    BUCKET '1h' \
+                    AGGREGATE count(*) \
+                    WITH (refresh_interval = '1m')";
+        let def = parse_create_sql(sql).unwrap();
+        assert_eq!(def.refresh_policy, RefreshPolicy::Periodic(60_000));
+    }
+
+    #[test]
+    fn parse_unknown_option_is_refused() {
+        let sql = "CREATE CONTINUOUS AGGREGATE m1 ON metrics \
+                    BUCKET '1h' \
+                    AGGREGATE count(*) \
+                    WITH (refresh_intreval = '1m')";
+        assert!(parse_create_sql(sql).is_err());
+    }
+
+    #[test]
+    fn parse_bad_interval_is_refused() {
+        for with in ["refresh_policy = 'sometimes'", "retention = 'forever'"] {
+            let sql = format!(
+                "CREATE CONTINUOUS AGGREGATE m1 ON metrics BUCKET '1h' \
+                 AGGREGATE count(*) WITH ({with})"
+            );
+            assert!(parse_create_sql(&sql).is_err(), "{with}");
+        }
+    }
+
+    #[test]
+    fn parse_sketch_aggregates_with_numeric_arguments() {
+        let sql = "CREATE CONTINUOUS AGGREGATE m1 ON metrics BUCKET '1h' \
+                    AGGREGATE ts_percentile(cpu, 0.99) AS p99, approx_topk(host, 5), \
+                    approx_count_distinct(host) AS hosts";
+        let def = parse_create_sql(sql).unwrap();
+        assert_eq!(def.aggregates.len(), 3);
+        assert_eq!(def.aggregates[0].function, AggFunction::Percentile(0.99));
+        assert_eq!(def.aggregates[0].output_column, "p99");
+        assert_eq!(def.aggregates[1].function, AggFunction::TopK(5));
+        assert_eq!(def.aggregates[2].function, AggFunction::CountDistinct);
+    }
+
+    #[test]
+    fn parse_aggregate_arity_and_range_are_checked() {
+        for agg in [
+            "sum(a, 1)",
+            "percentile(cpu)",
+            "percentile(cpu, 2.0)",
+            "topk(host, 0)",
+        ] {
+            let sql =
+                format!("CREATE CONTINUOUS AGGREGATE m1 ON metrics BUCKET '1h' AGGREGATE {agg}");
+            assert!(parse_create_sql(&sql).is_err(), "{agg}");
+        }
     }
 
     #[test]

@@ -36,6 +36,72 @@ pub(crate) fn split_values(s: &str) -> Vec<&str> {
     results
 }
 
+/// Split the row list after `VALUES` into the inner text of each tuple.
+///
+/// `('a', 1), ('b', f(2))` → `["'a', 1", "'b', f(2)"]`. Parentheses inside a
+/// quoted string or a nested call are part of their tuple. Text between
+/// tuples other than whitespace and one comma is an error, and so is text
+/// after the last tuple.
+pub(crate) fn split_value_tuples(s: &str) -> Result<Vec<&str>, String> {
+    let bytes = s.as_bytes();
+    let mut tuples = Vec::new();
+    let mut i = 0;
+    let mut expect_comma = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b if b.is_ascii_whitespace() => i += 1,
+            b',' if expect_comma => {
+                expect_comma = false;
+                i += 1;
+            }
+            b'(' if !expect_comma => {
+                let close = tuple_close(bytes, i).ok_or_else(|| {
+                    format!("missing closing ) for VALUES row {}", tuples.len() + 1)
+                })?;
+                tuples.push(&s[i + 1..close]);
+                expect_comma = true;
+                i = close + 1;
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected text in VALUES list at '{}'",
+                    s[i..].chars().take(24).collect::<String>()
+                ));
+            }
+        }
+    }
+    if tuples.is_empty() {
+        return Err("missing VALUES (...)".into());
+    }
+    if !expect_comma {
+        return Err("VALUES list ends with a comma".into());
+    }
+    Ok(tuples)
+}
+
+/// The index of the `)` that closes the `(` at `open`, skipping quoted
+/// strings (`''` is an escaped quote) and nested parentheses.
+fn tuple_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse a SQL literal value to a `serde_json::Value`.
 pub(crate) fn parse_sql_value(val: &str) -> nodedb_types::Value {
     let trimmed = val.trim();
@@ -290,7 +356,27 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_clause, parse_ident_token, parse_sql_value, parse_stream_ident_token};
+    use super::{
+        extract_clause, parse_ident_token, parse_sql_value, parse_stream_ident_token,
+        split_value_tuples,
+    };
+
+    #[test]
+    fn value_tuples_split_on_top_level_parentheses() {
+        let tuples = split_value_tuples("('a', 1), ('b)(', f(2, 3)) ,('it''s', ARRAY[1])")
+            .expect("three rows");
+        assert_eq!(
+            tuples,
+            vec!["'a', 1", "'b)(', f(2, 3)", "'it''s', ARRAY[1]"]
+        );
+    }
+
+    #[test]
+    fn malformed_value_tuples_are_refused() {
+        for input in ["", "('a'), ", "('a') ('b')", "('a'", "('a') ON CONFLICT"] {
+            assert!(split_value_tuples(input).is_err(), "{input}");
+        }
+    }
 
     #[test]
     fn bare_ident_token_lowercases() {

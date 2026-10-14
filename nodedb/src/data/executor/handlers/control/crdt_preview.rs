@@ -93,6 +93,7 @@ impl CoreLoop {
         };
         let result = CrdtPreviewResult {
             post_image_msgpack: preview.post_image_msgpack,
+            pre_image_msgpack: preview.pre_image_msgpack,
             imported_ops,
             frontier_digest,
             trimmed_ops,

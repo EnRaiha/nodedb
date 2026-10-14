@@ -105,6 +105,17 @@ impl DdlError {
         Self::from_public(sqlstate, message, &public)
     }
 
+    /// Build a `DdlError` from a parser refusal. The SQLSTATE is the one the
+    /// planner path gives the same `SqlError`. The message is the parser's
+    /// own text.
+    pub fn from_sql_error(error: nodedb_sql::SqlError, tenant_id: crate::types::TenantId) -> Self {
+        let message = error.to_string();
+        let (_, sqlstate, _) = crate::control::server::pgwire::types::error_to_sqlstate(
+            &crate::control::planner::plan_error_map::map_plan_error(error, tenant_id),
+        );
+        Self::new(sqlstate, message)
+    }
+
     /// Build a `DdlError` from an internal error, with `context` before its
     /// message. The SQLSTATE, code and details stay the error's own, so a
     /// typed Data-Plane refusal keeps its class under the prefix.

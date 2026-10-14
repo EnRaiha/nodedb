@@ -307,6 +307,29 @@ impl AggAccum {
         self.m2 += delta * delta2;
     }
 
+    /// The state of `count` values whose exact total is `sum` and whose
+    /// extremes are `min` / `max`, as a downsampled bucket holds them. The
+    /// running mean is the total's average. The bucket keeps no variance or
+    /// first / last state, so those read as empty.
+    pub fn from_totals(
+        count: u64,
+        sum: ExactSum,
+        min: Option<Value>,
+        max: Option<Value>,
+    ) -> Result<Self, nodedb_query::EvalError> {
+        let mean = sum.avg_f64()?.unwrap_or(0.0);
+        Ok(Self {
+            count,
+            sum,
+            min,
+            max,
+            first: None,
+            last: None,
+            mean,
+            m2: 0.0,
+        })
+    }
+
     /// Increment count without a value (for `COUNT(*)` on non-numeric columns).
     pub fn feed_count_only(&mut self) {
         self.count += 1;

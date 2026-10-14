@@ -155,6 +155,33 @@ impl CoreLoop {
                 sparse_row_to_doc(key, value, format_ref, &identity_column).1
             };
         }
+        // A read of a vector-primary row carries its vector under the vector
+        // field, as a scan does: the page is a source a copy reads rows from.
+        // The clone materializer's raw copy is the stored sidecar alone.
+        if !raw_bodies
+            && matches!(body_format, SparseBodyFormat::VectorSidecar)
+            && let Some(field) =
+                self.vector_primary_field(task.request.database_id.as_u64(), tid, collection)
+        {
+            let coll_key = (
+                task.request.database_id,
+                TenantId::new(tid),
+                collection.to_string(),
+            );
+            for (key, value) in &mut entries {
+                let with_vector = self
+                    .current_primary_vector(txn_id, &coll_key, &field, key.surrogate())
+                    .and_then(|vector| {
+                        crate::data::executor::handlers::vector_row_column::with_vector_column(
+                            value, &field, &vector,
+                        )
+                    });
+                match with_vector {
+                    Ok(row) => *value = row,
+                    Err(e) => return self.response_error(task, e),
+                }
+            }
+        }
 
         // Encode response: [next_cursor: bin, entries: [[str, u32, bin], ...]]
         let mut payload = Vec::with_capacity(

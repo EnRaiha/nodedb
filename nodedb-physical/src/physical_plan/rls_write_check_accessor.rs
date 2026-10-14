@@ -13,7 +13,7 @@ use super::PhysicalPlan;
 use super::columnar::ColumnarOp;
 use super::document::DocumentOp;
 use super::graph::GraphOp;
-use super::kv::KvOp;
+use super::kv::{KvBatchIntent, KvOp};
 use super::timeseries::TimeseriesOp;
 use super::vector::VectorOp;
 
@@ -55,6 +55,16 @@ impl PhysicalPlan {
             })
             | PhysicalPlan::Document(DocumentOp::Upsert {
                 rls_write_check, ..
+            })
+            | PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Kv(KvOp::BatchPut {
+                intent:
+                    KvBatchIntent::Merge {
+                        rls_write_check, ..
+                    },
+                ..
             })
             | PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
                 rls_write_check, ..
@@ -111,6 +121,9 @@ impl PhysicalPlan {
                 rls_write_check, ..
             })
             | PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                rls_write_check, ..
+            })
+            | PhysicalPlan::Vector(VectorOp::DirectBatchWrite {
                 rls_write_check, ..
             })
             | PhysicalPlan::Vector(VectorOp::DirectDelete {

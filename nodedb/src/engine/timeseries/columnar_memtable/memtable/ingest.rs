@@ -1,47 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Row and sample ingest into a [`ColumnarMemtable`].
+//! Row ingest into a [`ColumnarMemtable`].
 
-use nodedb_types::timeseries::{IngestResult, MetricSample, SeriesId};
+use nodedb_types::timeseries::{IngestResult, SeriesId};
 
-use super::super::types::{ColumnData, ColumnType, ColumnValue};
+use super::super::types::{ColumnData, ColumnType, ColumnValue, NULL_SYMBOL_ID};
 use super::table::ColumnarMemtable;
 
 impl ColumnarMemtable {
-    /// Ingest a metric sample into the default (timestamp, value) layout.
-    ///
-    /// For the simple 2-column schema. For multi-column schemas with tags,
-    /// use `ingest_row()` instead.
-    ///
-    /// Does NOT enforce `hard_memory_limit`, for the same reason `ingest_row`
-    /// does not (see its doc): the sole production caller is WAL replay
-    /// (`replay_timeseries_payload`), and a sample reaching here belongs to a
-    /// record that has ALREADY COMMITTED, so refusing it is not backpressure —
-    /// it is silent loss of a durable write. Replay must take the record whole;
-    /// the ceiling lives at the record boundary in the live ingest handler's
-    /// admission gate, never here. NOTE: if a structured-`TimeseriesWalBatch`
-    /// ingest producer is ever added, its replay must gain that same
-    /// record-boundary flush, or a mid-record replay flush would write a
-    /// partition holding part of a record. `replay_timeseries_wal` moves its
-    /// replay cursor past a record only AFTER the record is applied, which
-    /// keeps the partition stamp honest.
-    pub fn ingest_metric(&mut self, series_id: SeriesId, sample: MetricSample) -> IngestResult {
-        // Push to timestamp column.
-        if let ColumnData::Timestamp(ref mut v) = self.columns[self.schema.timestamp_idx] {
-            v.push(sample.timestamp_ms);
-        }
-
-        // Push to value column (assume index 1 for default schema).
-        if self.columns.len() > 1
-            && let ColumnData::Float64(ref mut v) = self.columns[1]
-        {
-            v.push(sample.value);
-        }
-
-        self.update_stats(series_id, sample.timestamp_ms, 16);
-        self.check_flush_state()
-    }
-
     /// Ingest a row with explicit column values.
     ///
     /// `values` must match the schema length. Tag string values are resolved
@@ -126,6 +92,19 @@ impl ColumnarMemtable {
                     }
                     row_bytes += 4;
                 }
+                // A NULL symbol takes no dictionary entry.
+                (ColumnValue::Null, ColumnType::Symbol) => {
+                    if let ColumnData::Symbol(ref mut v) = self.columns[i] {
+                        v.push(NULL_SYMBOL_ID);
+                    }
+                    row_bytes += 4;
+                }
+                (ColumnValue::Null, ColumnType::Float64) => {
+                    if let ColumnData::Float64(ref mut v) = self.columns[i] {
+                        v.push(f64::NAN);
+                    }
+                    row_bytes += 8;
+                }
                 _ => {
                     self.rollback_partial_row(i);
                     return Err(crate::Error::BadRequest {
@@ -197,16 +176,24 @@ mod tests {
         }
     }
 
+    /// Ingest one `(timestamp, value)` row into a metric-layout memtable.
+    fn ingest_sample(
+        mt: &mut ColumnarMemtable,
+        series_id: SeriesId,
+        ts: i64,
+        value: f64,
+    ) -> IngestResult {
+        mt.ingest_row(
+            series_id,
+            &[ColumnValue::Timestamp(ts), ColumnValue::Float64(value)],
+        )
+        .expect("a metric row fits the metric layout")
+    }
+
     #[test]
     fn ingest_simple_metric() {
         let mut mt = ColumnarMemtable::new_metric(default_config());
-        let result = mt.ingest_metric(
-            1,
-            MetricSample {
-                timestamp_ms: 1000,
-                value: 42.5,
-            },
-        );
+        let result = ingest_sample(&mut mt, 1, 1000, 42.5);
         assert_eq!(result, IngestResult::Ok);
         assert_eq!(mt.row_count(), 1);
         assert_eq!(mt.min_ts(), 1000);
@@ -222,13 +209,7 @@ mod tests {
     fn ingest_multiple_metrics() {
         let mut mt = ColumnarMemtable::new_metric(default_config());
         for i in 0..100 {
-            mt.ingest_metric(
-                i % 10,
-                MetricSample {
-                    timestamp_ms: 1000 + i as i64,
-                    value: i as f64,
-                },
-            );
+            ingest_sample(&mut mt, i % 10, 1000 + i as i64, i as f64);
         }
         assert_eq!(mt.row_count(), 100);
         assert_eq!(mt.series_count(), 10);
@@ -318,12 +299,12 @@ mod tests {
     }
 
     #[test]
-    fn ingest_metric_accepts_past_hard_limit() {
-        // A sample reaching the memtable belongs to an already-committed WAL
-        // record; refusing it would silently drop a durable write on replay.
-        // So `ingest_metric` accepts every sample regardless of the ceiling —
-        // it never returns `Rejected`, and the resident footprint overshoots
-        // the hard limit rather than losing data.
+    fn ingest_row_accepts_past_hard_limit() {
+        // A row reaching the memtable belongs to an already-committed WAL
+        // record. Refusing it would drop a durable write on replay. So
+        // `ingest_row` accepts every row regardless of the ceiling. It never
+        // returns `Rejected`, and the resident footprint overshoots the hard
+        // limit.
         let config = ColumnarMemtableConfig {
             max_memory_bytes: 100,
             hard_memory_limit: 200,
@@ -332,24 +313,14 @@ mod tests {
         let mut mt = ColumnarMemtable::new_metric(config);
 
         for i in 0..1000 {
-            let r = mt.ingest_metric(
-                1,
-                MetricSample {
-                    timestamp_ms: i,
-                    value: 1.0,
-                },
-            );
+            let r = ingest_sample(&mut mt, 1, i, 1.0);
             assert_ne!(
                 r,
                 IngestResult::Rejected,
-                "sample {i} must not be rejected — that would drop a durable record on replay"
+                "row {i} must not be rejected — that would drop a durable record on replay"
             );
         }
-        assert_eq!(
-            mt.row_count(),
-            1000,
-            "every sample past the limit is retained"
-        );
+        assert_eq!(mt.row_count(), 1000, "every row past the limit is retained");
         assert!(
             mt.memory_bytes() >= 200,
             "the footprint is allowed to overshoot the hard limit"
@@ -367,13 +338,7 @@ mod tests {
 
         let mut flush_signaled = false;
         for i in 0..100 {
-            let r = mt.ingest_metric(
-                1,
-                MetricSample {
-                    timestamp_ms: i,
-                    value: 1.0,
-                },
-            );
+            let r = ingest_sample(&mut mt, 1, i, 1.0);
             if r == IngestResult::FlushNeeded {
                 flush_signaled = true;
                 break;

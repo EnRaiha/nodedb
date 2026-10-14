@@ -96,6 +96,7 @@ fn document_touched_collections(
         | Truncate { collection, .. }
         | EstimateCount { collection, .. }
         | Upsert { collection, .. }
+        | BatchUpsert { collection, .. }
         | BulkUpdate { collection, .. }
         | BulkDelete { collection, .. }
         | MaterializeScan { collection, .. }
@@ -103,23 +104,31 @@ fn document_touched_collections(
         // source row rides a separate task on its own vShard.
         | ApplyBalanceDelta { collection, .. } => out.push(collection.as_str().to_owned()),
 
+        // The target, plus every collection the source relation reads.
         InsertSelect {
             target_collection,
-            source_collection,
+            source,
             ..
         }
         | UpdateFromJoin {
             target_collection,
-            source_collection,
+            source,
             ..
         }
         | Merge {
             target_collection,
-            source_collection,
+            source,
             ..
         } => {
             out.push(target_collection.as_str().to_owned());
-            out.push(source_collection.as_str().to_owned());
+            match source {
+                nodedb_physical::physical_plan::RowSource::DocumentPages(page) => {
+                    out.push(page.collection.as_str().to_owned());
+                }
+                nodedb_physical::physical_plan::RowSource::Query(query) => {
+                    out.extend(touched_collections(&query.plan));
+                }
+            }
         }
 
         // The wrapped op is the intercepted write verbatim, so it reads
@@ -173,6 +182,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | DirectUpsert { collection, .. }
                 | DirectInsert { collection, .. }
                 | DirectInsertIfAbsent { collection, .. }
+                | DirectBatchWrite { collection, .. }
                 | DirectDelete { collection, .. }
                 | DirectUpdate { collection, .. }
                 | DirectTruncate { collection, .. }
@@ -268,7 +278,10 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
             match op {
                 Scan { collection, .. }
                 | Ingest { collection, .. }
-                | Truncate { collection, .. } => out.push(collection.as_str().to_owned()),
+                | Truncate { collection, .. }
+                | RefreshAggregate { collection, .. }
+                | Partitions { collection, .. }
+                | ReadAggregate { collection, .. } => out.push(collection.as_str().to_owned()),
 
                 // The wrapped ingest is the intercepted write verbatim.
                 ResolveIngest(inner) => {
@@ -310,7 +323,9 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 
                 // `ImportSnapshot` is a whole-tenant Loro import and
                 // `SetConstraints` / `DropConstraints` install validator rules —
-                // none produce per-collection versioned read output.
+                // none produce per-collection versioned read output. A
+                // constraint op still homes to its collection's vShard
+                // (`gateway::home_collection`).
                 GetVersionVector { .. }
                 | ReadConstraints { .. }
                 | ExportDelta { .. }

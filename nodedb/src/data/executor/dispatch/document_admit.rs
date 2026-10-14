@@ -37,6 +37,7 @@ pub(super) fn is_document_write(op: &DocumentOp) -> bool {
             | DocumentOp::BulkDelete { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Upsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::BackfillIndex { .. }
             | DocumentOp::Merge { .. }

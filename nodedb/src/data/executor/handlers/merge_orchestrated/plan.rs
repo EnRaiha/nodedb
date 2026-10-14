@@ -16,9 +16,7 @@ use nodedb_physical::physical_plan::document::merge_types::{
 
 use super::super::identity_guard::IdentitySnapshot;
 use super::super::merge::MergeParams;
-use super::super::merge_helpers::{
-    build_insert_doc, build_merged, build_update_doc, find_arm, json_to_str,
-};
+use super::super::merge_helpers::{build_insert_doc, build_merged, build_update_doc, find_arm};
 
 /// A matched / not-matched-by-source UPDATE arm resolved to a rewrite.
 pub(super) struct MergeUpdate {
@@ -30,6 +28,9 @@ pub(super) struct MergeUpdate {
     /// arm's materialized-sum delta is the difference between the two images —
     /// without both, the arm's whole new value gets credited on top.
     pub(super) old_body: Vec<u8>,
+    /// The fields the arm assigns. Typeguards judge them and the fields a
+    /// guard injects.
+    pub(super) assigned: Vec<String>,
 }
 
 /// A matched / not-matched-by-source DELETE arm resolved to a removal.
@@ -43,7 +44,9 @@ pub(super) struct MergeDelete {
 
 /// A NOT-MATCHED INSERT arm resolved to a new row.
 pub(super) struct MergeInsert {
-    /// Source join value — the key the orchestrator's surrogate map is keyed by.
+    /// The source row's id (its position in the shipped source) — the key
+    /// the orchestrator's surrogate map is keyed by. Unique per row, NULL
+    /// join keys included.
     pub(super) join_key: String,
     /// New document as MessagePack (pre-strict-encoding).
     pub(super) body: Vec<u8>,
@@ -102,10 +105,9 @@ impl CoreLoop {
         txn_id: Option<crate::types::TxnId>,
         params: &MergeParams<'_>,
     ) -> crate::Result<MergePlanActions> {
-        let source_map = self.build_merge_source_map(
-            database_id,
-            tid,
-            params.source_collection,
+        let source = super::super::join_source_map::JoinSource::build(
+            "MERGE",
+            params.source_label,
             params.source_join_col,
             params.source_rows,
         )?;
@@ -116,7 +118,7 @@ impl CoreLoop {
 
         let mut updates: Vec<MergeUpdate> = Vec::new();
         let mut deletes: Vec<MergeDelete> = Vec::new();
-        let mut matched_source_keys: HashSet<String> = HashSet::new();
+        let mut matched_source_rows: HashSet<&str> = HashSet::new();
         // Stand-in "no source row" document for NOT-MATCHED-BY-SOURCE arms,
         // matching the legacy walk's `&serde_json::Value::Null`.
         let null_source = serde_json::Value::Null;
@@ -125,15 +127,11 @@ impl CoreLoop {
             let key = *key;
             let identity = key.to_identity();
             let target_doc = decode_target(&identity, bytes, &strict_schema, &identity_column)?;
-            let join_val = target_doc
-                .get(params.target_join_col)
-                .map(json_to_str)
-                .unwrap_or_default();
-
+            // The source row whose join key a WHERE `=` would match.
             let (arm_kind, source_doc): (MergeClauseKindOp, &serde_json::Value) =
-                if let Some(source_doc) = source_map.get(&join_val) {
-                    matched_source_keys.insert(join_val.clone());
-                    (MergeClauseKindOp::Matched, source_doc)
+                if let Some(source_row) = source.probe(target_doc.get(params.target_join_col)) {
+                    matched_source_rows.insert(source_row.id.as_str());
+                    (MergeClauseKindOp::Matched, &source_row.doc)
                 } else {
                     (MergeClauseKindOp::NotMatchedBySource, &null_source)
                 };
@@ -176,6 +174,9 @@ impl CoreLoop {
                             key,
                             body: encode_doc_body(&updated),
                             old_body: encode_doc_body(&target_doc),
+                            assigned: crate::data::executor::handlers::write_body::assigned_names(
+                                upd,
+                            ),
                         });
                     }
                     MergeActionOp::Delete => deletes.push(MergeDelete {
@@ -188,23 +189,27 @@ impl CoreLoop {
             }
         }
 
-        // Unmatched source rows → NOT-MATCHED INSERT arms.
+        // Unmatched source rows → NOT-MATCHED INSERT arms. A source row whose
+        // join key is NULL matches no target row, so it is NOT MATCHED too.
         let mut inserts: Vec<MergeInsert> = Vec::new();
-        for (src_key, src_doc) in &source_map {
-            if matched_source_keys.contains(src_key.as_str()) {
+        for source_row in source.rows() {
+            if matched_source_rows.contains(source_row.id.as_str()) {
                 continue;
             }
-            if let Some(arm) = find_arm(params.clauses, MergeClauseKindOp::NotMatched, src_doc)?
-                && let MergeActionOp::Insert { columns, values } = &arm.action
+            if let Some(arm) = find_arm(
+                params.clauses,
+                MergeClauseKindOp::NotMatched,
+                &source_row.doc,
+            )? && let MergeActionOp::Insert { columns, values } = &arm.action
             {
                 let body = encode_doc_body(&build_insert_doc(
                     columns,
                     values,
-                    src_doc,
+                    &source_row.doc,
                     params.source_alias,
                 )?);
                 inserts.push(MergeInsert {
-                    join_key: src_key.clone(),
+                    join_key: source_row.id.clone(),
                     body,
                 });
             }

@@ -27,6 +27,7 @@ mod replay_task;
 pub mod response_codec;
 mod row_shape;
 mod scan_normalize;
+mod scan_timeseries;
 mod scan_versioned;
 pub(crate) mod snapshot;
 mod sparse_body_format;

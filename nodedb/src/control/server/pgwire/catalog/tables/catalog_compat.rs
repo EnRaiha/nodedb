@@ -16,9 +16,10 @@ use super::collections::{encode_row, load_collections};
 pub fn pg_attrdef(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
 ) -> crate::Result<Vec<Vec<u8>>> {
     let mut rows = Vec::new();
-    for coll in load_collections(state, identity) {
+    for coll in load_collections(state, identity, database_id) {
         let rel_oid = stable_collection_oid(coll.tenant_id, &coll.name);
         for (index, (_, type_decl)) in coll.fields.iter().enumerate() {
             let (_, _, _, default_expr) =

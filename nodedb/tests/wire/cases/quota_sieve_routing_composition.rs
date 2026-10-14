@@ -29,7 +29,7 @@ async fn database_quota_does_not_break_vector_insert() {
         .exec(
             "CREATE COLLECTION vec_a \
              (id STRING PRIMARY KEY, emb VECTOR(4)) \
-             WITH (engine='vector', dim=4, metric='cosine')",
+             WITH (engine='vector', vector_field='emb', dim=4, metric='cosine')",
         )
         .await
         .unwrap();
@@ -37,9 +37,9 @@ async fn database_quota_does_not_break_vector_insert() {
     server
         .exec(
             "INSERT INTO vec_a (id, emb) VALUES \
-             ('a1', '[1.0, 0.0, 0.0, 0.0]'), \
-             ('a2', '[0.0, 1.0, 0.0, 0.0]'), \
-             ('a3', '[0.0, 0.0, 1.0, 0.0]')",
+             ('a1', ARRAY[1.0, 0.0, 0.0, 0.0]), \
+             ('a2', ARRAY[0.0, 1.0, 0.0, 0.0]), \
+             ('a3', ARRAY[0.0, 0.0, 1.0, 0.0])",
         )
         .await
         .unwrap();
@@ -93,7 +93,7 @@ async fn two_databases_with_quotas_have_independent_vector_state() {
         .exec(
             "CREATE COLLECTION vec_b \
              (id STRING PRIMARY KEY, emb VECTOR(4)) \
-             WITH (engine='vector', dim=4, metric='cosine')",
+             WITH (engine='vector', vector_field='emb', dim=4, metric='cosine')",
         )
         .await
         .unwrap();
@@ -101,7 +101,7 @@ async fn two_databases_with_quotas_have_independent_vector_state() {
     server
         .exec(
             "INSERT INTO vec_b (id, emb) VALUES \
-             ('b1', '[0.5, 0.5, 0.0, 0.0]')",
+             ('b1', ARRAY[0.5, 0.5, 0.0, 0.0])",
         )
         .await
         .unwrap();
@@ -117,7 +117,7 @@ async fn two_databases_with_quotas_have_independent_vector_state() {
         .exec(
             "CREATE COLLECTION vec_a \
              (id STRING PRIMARY KEY, emb VECTOR(4)) \
-             WITH (engine='vector', dim=4, metric='cosine')",
+             WITH (engine='vector', vector_field='emb', dim=4, metric='cosine')",
         )
         .await
         .unwrap();

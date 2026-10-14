@@ -437,6 +437,13 @@ pub struct TsFlushedCollectionBlob {
     pub collection_key: String,
     /// One blob per flushed partition directory.
     pub partitions: Vec<TsFlushedPartitionBlob>,
+    /// The collection's continuous-aggregate image (`cagg.state`), or empty
+    /// when no aggregate is rooted here. Its folded sets name partitions in
+    /// `partitions` by directory name, and the restore keeps those names,
+    /// so the image and the partitions stay in step. It carries the buckets
+    /// folded from partitions raw retention has removed.
+    #[serde(default)]
+    pub cagg_image: Vec<u8>,
 }
 
 /// Wire blob for one flushed partition directory.
@@ -653,6 +660,7 @@ mod tests {
         let blob = TsFlushedCollectionBlob {
             collection_key: "1:42:metrics".to_string(),
             partitions: vec![partition],
+            cagg_image: vec![1, 2, 3],
         };
 
         let bytes = zerompk::to_msgpack_vec(&blob).expect("encode blob");
@@ -667,6 +675,7 @@ mod tests {
         assert_eq!(p.files[0].0, "schema.json");
         assert_eq!(p.files[1].0, "col_ts.col");
         assert_eq!(p.files[1].1, b"\x00\x01\x02");
+        assert_eq!(decoded.cagg_image, vec![1, 2, 3]);
     }
 
     /// Round-trip: `vector_params` and `index_configs` survive msgpack

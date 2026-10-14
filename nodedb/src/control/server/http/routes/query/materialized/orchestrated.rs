@@ -63,7 +63,7 @@ pub(super) async fn run_orchestrated(
         crate::control::insert_select::run_authorized_insert_select(shared, authorize()?).await
     } else if let PhysicalPlan::Document(DocumentOp::Merge {
         target_collection: _,
-        source_collection: _,
+        source: _,
         source_alias: _,
         target_join_col: _,
         source_join_col: _,
@@ -81,7 +81,7 @@ pub(super) async fn run_orchestrated(
         crate::control::merge_orchestrator::run_authorized_merge(shared, authorize()?).await
     } else if let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
         target_collection: _,
-        source_collection: _,
+        source: _,
         source_alias: _,
         target_join_col: _,
         source_join_col: _,

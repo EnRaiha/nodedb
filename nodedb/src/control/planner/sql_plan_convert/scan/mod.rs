@@ -17,6 +17,7 @@ mod timeseries;
 
 pub(in crate::control::planner::sql_plan_convert) use core::{
     DocumentIndexLookupArgs, convert_document_index_lookup, convert_point_get, convert_scan,
+    is_provider_relation,
 };
 pub(in crate::control::planner::sql_plan_convert) use join::convert_join;
 pub(in crate::control::planner::sql_plan_convert) use recursive::{

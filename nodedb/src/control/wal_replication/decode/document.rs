@@ -226,12 +226,56 @@ pub(super) fn doc_upsert(
     })
 }
 
+/// Reconstruct a `BatchUpsert` plan with each row's carried surrogate.
+pub(super) fn batch_upsert(
+    collection: &str,
+    documents: &[(String, Vec<u8>)],
+    surrogates: &[u32],
+    on_conflict_updates: &[(String, UpdateValue)],
+    extras: UpsertExtras<'_>,
+) -> crate::Result<PhysicalPlan> {
+    // `zip` stops at the shorter side, silently truncating rows with no
+    // identity. Refuse here, where the record is visibly malformed.
+    if documents.len() != surrogates.len() {
+        return Err(crate::Error::Serialization {
+            format: "replicated_write".into(),
+            detail: format!(
+                "batch upsert record for '{collection}' carries {} documents but {} \
+                 surrogates; every row must carry its own surrogate",
+                documents.len(),
+                surrogates.len(),
+            ),
+        });
+    }
+    let UpsertExtras {
+        resolved_sum_targets,
+        returning,
+    } = extras;
+    Ok(PhysicalPlan::Document(DocumentOp::BatchUpsert {
+        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
+        documents: documents.to_vec(),
+        surrogates: surrogates
+            .iter()
+            .map(|&raw| nodedb_types::Surrogate::new(raw))
+            .collect(),
+        on_conflict_updates: on_conflict_updates.to_vec(),
+        // No predicate on replay — see `point_delete`.
+        rls_write_check: nodedb_types::RlsWriteCheck::already_decided_elsewhere(),
+        // Carried on the record — see `point_put`.
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
+        // Read off the record — see this module's doc.
+        resolved_sum_targets: plan_targets(resolved_sum_targets),
+    }))
+}
+
 /// Reconstruct a `BatchInsert` plan with each row's carried surrogate
 /// (mirrors `kv::batch_put`).
 pub(super) fn batch_insert(
     collection: &str,
     documents: &[(String, Vec<u8>)],
     surrogates: &[u32],
+    if_absent: bool,
     resolved_sum_targets: &WireSumResolution<'_>,
     deferred_sum_targets: &[String],
     returning: ReturningFields<'_>,
@@ -252,6 +296,7 @@ pub(super) fn batch_insert(
     Ok(PhysicalPlan::Document(DocumentOp::BatchInsert {
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         documents: documents.to_vec(),
+        if_absent,
         surrogates: surrogates
             .iter()
             .map(|&raw| nodedb_types::Surrogate::new(raw))
@@ -327,26 +372,6 @@ pub(super) fn truncate(
         // Read off the record — see this module's doc.
         resolved_sum_targets: plan_targets(resolved_sum_targets),
         declared_primary_key,
-    })
-}
-
-pub(super) fn insert_select(
-    target_collection: &str,
-    source_collection: &str,
-    source_filters: &[u8],
-    source_limit: usize,
-    column_map: &[u8],
-) -> PhysicalPlan {
-    PhysicalPlan::Document(DocumentOp::InsertSelect {
-        target_collection: nodedb_types::QualifiedCollection::from_stored(
-            target_collection.to_owned(),
-        ),
-        source_collection: nodedb_types::QualifiedCollection::from_stored(
-            source_collection.to_owned(),
-        ),
-        source_filters: source_filters.to_vec(),
-        source_limit,
-        column_map: column_map.to_vec(),
     })
 }
 
@@ -674,6 +699,8 @@ mod tests {
         let plan = PhysicalPlan::Document(DocumentOp::BatchInsert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             documents: documents.clone(),
+            // A replica must skip the rows the leader skipped.
+            if_absent: true,
             surrogates: surrogates.clone(),
             returning: None,
             rls_filters: Vec::new(),
@@ -693,8 +720,10 @@ mod tests {
                 collection,
                 documents: decoded_docs,
                 surrogates: decoded_surrogates,
+                if_absent,
                 ..
             }) => {
+                assert!(if_absent, "the skip mode must round-trip");
                 assert_eq!(collection.as_str(), "docs");
                 assert_eq!(
                     decoded_docs, documents,

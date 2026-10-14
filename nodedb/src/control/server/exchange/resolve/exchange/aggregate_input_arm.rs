@@ -34,8 +34,9 @@ pub(super) struct AggregateFields {
 
 /// Resolve an input-sourced `QueryOp::Aggregate`.
 ///
-/// A child that is already a materialized `ProviderScan{provider: None}`
-/// (a catalog source filled by pass 1) passes through unchanged. Any other
+/// A child that is already a materialized `ProviderScan` (a catalog table or
+/// continuous aggregate filled by pass 1, or constant rows) passes through
+/// unchanged. Any other
 /// child — an `Exchange{Gather}` over a sharded body, a `PostProcess`, a
 /// constant result — is materialized on the coordinator and replaced by a
 /// `ProviderScan` over its rows, so the aggregate runs exactly once over the
@@ -76,17 +77,16 @@ pub(super) async fn resolve_aggregate_input(
         })))
     };
 
-    // Fast path: the child is already materialized rows.
-    if matches!(
-        *input,
-        PhysicalPlan::Query(QueryOp::ProviderScan { provider: None, .. })
-    ) {
+    // Fast path: the child is already materialized rows. Pass 1 filled every
+    // named provider and kept its name, so every `ProviderScan` here holds
+    // its rows.
+    if matches!(*input, PhysicalPlan::Query(QueryOp::ProviderScan { .. })) {
         return Ok(rebuild(input));
     }
 
-    let rows = match materialize_child_rows(state, ctx, captures, *input).await? {
-        ChildRows::Rows(rows) => rows,
+    let (rows, sources) = match materialize_child_rows(state, ctx, captures, *input).await? {
+        ChildRows::Rows { rows, sources } => (rows, sources),
         ChildRows::Passthrough(resolved) => return Ok(resolved),
     };
-    Ok(rebuild(Box::new(provider_scan_of_rows(rows))))
+    Ok(rebuild(Box::new(provider_scan_of_rows(rows, sources))))
 }

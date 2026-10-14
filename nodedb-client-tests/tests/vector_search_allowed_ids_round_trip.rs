@@ -21,7 +21,7 @@ async fn seed(remote: &NodeDbRemote) {
         .execute_sql(
             "CREATE COLLECTION allowed_ids_vecs \
              FIELDS (id TEXT, embedding VECTOR(2)) \
-             WITH (engine='vector', m=8, ef_construction=50)",
+             WITH (engine='document_schemaless', m=8, ef_construction=50)",
             &[],
         )
         .await

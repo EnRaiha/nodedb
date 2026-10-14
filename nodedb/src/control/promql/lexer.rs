@@ -50,6 +50,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, PromqlError> {
     let mut tokens = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
+    // Inside `[...]` a `:` separates a subquery's range from its step. A
+    // metric name can start with `:`, but no metric name appears there.
+    let mut bracket_depth = 0usize;
 
     while i < bytes.len() {
         // Skip whitespace.
@@ -81,6 +84,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, PromqlError> {
             let (tok, end) = lex_number_or_duration(bytes, i)?;
             tokens.push(tok);
             i = end;
+            continue;
+        }
+
+        if bytes[i] == b':' && bracket_depth > 0 {
+            tokens.push(Token::Colon);
+            i += 1;
             continue;
         }
 
@@ -144,8 +153,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, PromqlError> {
             b')' => Token::RParen,
             b'{' => Token::LBrace,
             b'}' => Token::RBrace,
-            b'[' => Token::LBracket,
-            b']' => Token::RBracket,
+            b'[' => {
+                bracket_depth += 1;
+                Token::LBracket
+            }
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                Token::RBracket
+            }
             b',' => Token::Comma,
             b':' => Token::Colon,
             _ => {
@@ -166,27 +181,31 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, PromqlError> {
 fn lex_string(bytes: &[u8], start: usize) -> Result<(Token, usize), PromqlError> {
     let quote = bytes[start];
     let mut i = start + 1;
-    let mut s = String::new();
+    // Collected as bytes so a multi-byte UTF-8 character stays one character.
+    let mut s: Vec<u8> = Vec::new();
 
     while i < bytes.len() {
         if bytes[i] == quote {
-            return Ok((Token::String(s), i + 1));
+            let text = String::from_utf8(s).map_err(|_| PromqlError::InvalidString {
+                detail: format!("string starting at position {start} is not valid UTF-8"),
+            })?;
+            return Ok((Token::String(text), i + 1));
         }
         if bytes[i] == b'\\' && quote != b'`' && i + 1 < bytes.len() {
             i += 1;
             match bytes[i] {
-                b'n' => s.push('\n'),
-                b't' => s.push('\t'),
-                b'\\' => s.push('\\'),
-                b'\'' => s.push('\''),
-                b'"' => s.push('"'),
+                b'n' => s.push(b'\n'),
+                b't' => s.push(b'\t'),
+                b'\\' => s.push(b'\\'),
+                b'\'' => s.push(b'\''),
+                b'"' => s.push(b'"'),
                 c => {
-                    s.push('\\');
-                    s.push(c as char);
+                    s.push(b'\\');
+                    s.push(c);
                 }
             }
         } else {
-            s.push(bytes[i] as char);
+            s.push(bytes[i]);
         }
         i += 1;
     }
@@ -332,6 +351,40 @@ mod tests {
     fn string_escapes() {
         let tokens = tokenize(r#""hello\nworld""#).unwrap();
         assert_eq!(tokens[0], Token::String("hello\nworld".into()));
+    }
+
+    #[test]
+    fn subquery_colon_inside_brackets() {
+        let tokens = tokenize("x[10m:1m]").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("x".into()),
+                Token::LBracket,
+                Token::Duration("10m".into()),
+                Token::Colon,
+                Token::Duration("1m".into()),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        let tokens = tokenize("x[5m:]").unwrap();
+        assert_eq!(tokens[3], Token::Colon);
+        assert_eq!(tokens[4], Token::RBracket);
+    }
+
+    #[test]
+    fn colon_metric_names_outside_brackets() {
+        let tokens = tokenize("job:rate5m[5m]").unwrap();
+        assert_eq!(tokens[0], Token::Ident("job:rate5m".into()));
+        let tokens = tokenize(":recorded").unwrap();
+        assert_eq!(tokens[0], Token::Ident(":recorded".into()));
+    }
+
+    #[test]
+    fn multi_byte_string_survives() {
+        let tokens = tokenize(r#""héllo 世界""#).unwrap();
+        assert_eq!(tokens[0], Token::String("héllo 世界".into()));
     }
 
     #[test]

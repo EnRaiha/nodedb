@@ -9,7 +9,7 @@
 use nodedb_query::scan_filter::FilterOp;
 use nodedb_query::simd_filter;
 
-use super::columnar_memtable::{ColumnData, ColumnType};
+use super::columnar_memtable::{ColumnData, ColumnType, NULL_SYMBOL_ID};
 use crate::bridge::scan_filter::ScanFilter;
 
 /// A predicate the grouped scan cannot lower onto typed column vectors.
@@ -40,7 +40,8 @@ impl UnsupportedPredicate {
 /// Bit *i* is set iff row *i* passes ALL filters. Supported shapes: a
 /// single `(column, op, literal)` comparison with `eq`/`ne` on symbol
 /// columns and `eq`/`ne`/`gt`/`gte`/`lt`/`lte` on numeric and time
-/// columns. Every other shape (OR clauses, expressions, `in`, `like`, an
+/// columns, and `IS NULL` / `IS NOT NULL` on any column. A NULL cell
+/// passes neither `eq` nor `ne`. Every other shape (OR clauses, expressions, `in`, `like`, an
 /// unknown column, a literal of the wrong type) is an
 /// [`UnsupportedPredicate`] error.
 pub fn eval_filters_to_bitmask<'a>(
@@ -72,6 +73,17 @@ pub fn eval_filters_to_bitmask<'a>(
         let col_data =
             columns[col_pos].ok_or(UnsupportedPredicate::new(f, "column data not loaded"))?;
 
+        if matches!(f.op, FilterOp::IsNull | FilterOp::IsNotNull) {
+            let nulls = null_bitmask(rt, col_data, row_count);
+            let filter_mask = if f.op == FilterOp::IsNull {
+                nulls
+            } else {
+                simd_filter::bitmask_not(&nulls, row_count)
+            };
+            mask = simd_filter::bitmask_and(&mask, &filter_mask);
+            continue;
+        }
+
         let filter_mask = match col_type {
             ColumnType::Float64 => {
                 let fv = f
@@ -90,10 +102,15 @@ pub fn eval_filters_to_bitmask<'a>(
                         let b = (rt.lte_f64)(slice, fv + f64::EPSILON);
                         simd_filter::bitmask_and(&a, &b)
                     }
+                    // A NaN cell is NULL: neither equal nor unequal. Every
+                    // number is at least -inf; NaN is not.
                     FilterOp::Ne => {
                         let a = (rt.gte_f64)(slice, fv - f64::EPSILON);
                         let b = (rt.lte_f64)(slice, fv + f64::EPSILON);
-                        simd_filter::bitmask_not(&simd_filter::bitmask_and(&a, &b), row_count)
+                        let ne =
+                            simd_filter::bitmask_not(&simd_filter::bitmask_and(&a, &b), row_count);
+                        let not_null = (rt.gte_f64)(slice, f64::NEG_INFINITY);
+                        simd_filter::bitmask_and(&ne, &not_null)
                     }
                     _ => {
                         return Err(UnsupportedPredicate::new(f, "operator on a float column"));
@@ -133,11 +150,14 @@ pub fn eval_filters_to_bitmask<'a>(
                             vec![0u64; simd_filter::words_for(row_count)]
                         }
                     }
+                    // A NULL cell is neither equal nor unequal to a value.
                     FilterOp::Ne => {
-                        if let Some(target_id) = dict.get_id(filter_str) {
-                            (rt.ne_u32)(slice, target_id)
-                        } else {
-                            simd_filter::bitmask_all(row_count)
+                        let not_null = (rt.ne_u32)(slice, NULL_SYMBOL_ID);
+                        match dict.get_id(filter_str) {
+                            Some(target_id) => {
+                                simd_filter::bitmask_and(&(rt.ne_u32)(slice, target_id), &not_null)
+                            }
+                            None => not_null,
                         }
                     }
                     _ => {
@@ -189,6 +209,36 @@ pub fn apply_sparse_skip(
             if word_idx < mask.len() {
                 mask[word_idx] &= !(1u64 << bit_idx);
             }
+        }
+    }
+}
+
+/// The bitmask of rows whose cell is SQL NULL: the NULL symbol id, a NaN
+/// float, or an invalid dictionary cell. Integer and time cells are never
+/// NULL.
+fn null_bitmask(
+    rt: &simd_filter::FilterSimdRuntime,
+    col_data: &ColumnData,
+    row_count: usize,
+) -> Vec<u64> {
+    match col_data {
+        ColumnData::Symbol(ids) => (rt.eq_u32)(&ids[..row_count.min(ids.len())], NULL_SYMBOL_ID),
+        ColumnData::Float64(vals) => {
+            // Every number is at least -inf; NaN is not.
+            let numbers = (rt.gte_f64)(&vals[..row_count.min(vals.len())], f64::NEG_INFINITY);
+            simd_filter::bitmask_not(&numbers, row_count)
+        }
+        ColumnData::DictEncoded { valid, .. } => {
+            let mut nulls = vec![0u64; simd_filter::words_for(row_count)];
+            for (row, ok) in valid.iter().take(row_count).enumerate() {
+                if !ok {
+                    nulls[row / 64] |= 1u64 << (row % 64);
+                }
+            }
+            nulls
+        }
+        ColumnData::Int64(_) | ColumnData::Timestamp(_) => {
+            vec![0u64; simd_filter::words_for(row_count)]
         }
     }
 }

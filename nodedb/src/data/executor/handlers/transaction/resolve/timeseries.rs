@@ -172,7 +172,19 @@ impl CoreLoop {
 
             // Read family: no persisted post-image. The resolve pass is read-only
             // too — the ingest it reports is proposed as its own plan.
-            TimeseriesOp::Scan { .. } | TimeseriesOp::ResolveIngest(_) => Ok(()),
+            TimeseriesOp::Scan { .. }
+            | TimeseriesOp::ResolveIngest(_)
+            | TimeseriesOp::ReadAggregate { .. } => Ok(()),
+
+            // Staging refuses a refresh cut, so none reaches a redo.
+            TimeseriesOp::RefreshAggregate { .. } => Err(crate::Error::FeatureNotSupported {
+                detail: "REFRESH CONTINUOUS AGGREGATE runs outside a transaction".into(),
+            }),
+
+            // Staging refuses partition maintenance, so none reaches a redo.
+            TimeseriesOp::Partitions { .. } => Err(crate::Error::FeatureNotSupported {
+                detail: "SHOW PARTITIONS and REWRITE PARTITIONS run outside a transaction".into(),
+            }),
         }
     }
 }

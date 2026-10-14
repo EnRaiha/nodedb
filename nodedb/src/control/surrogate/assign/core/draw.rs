@@ -1,98 +1,156 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Fresh draws from this node's surrogate registry on
-//! [`super::SurrogateAssigner`]: `mint_candidate`, `assign_fresh` and
-//! `assign_anonymous`.
+//! [`super::SurrogateAssigner`]: `mint_candidates`, `assign_fresh_many`,
+//! `assign_anonymous_many` and their one-surrogate forms.
+//!
+//! A draw of N surrogates takes the registry write lock once and binds all N
+//! in one catalog transaction, so it costs one durable sync.
 //!
 //! A cluster node draws from its reserved batch. When the batch is empty, a
-//! draw awaits the background refill loop's next batch and never blocks the
-//! runtime.
+//! draw commits what it drew, awaits the background refill loop's next batch,
+//! and never blocks the runtime.
 
 use nodedb_types::{CollectionKey, Surrogate, TenantId};
 
 use super::types::SurrogateAssigner;
 
 impl SurrogateAssigner {
-    /// Draw one surrogate under the registry write lock and run `bind` on it
-    /// before the lock is released, then check the flush threshold. Returns
-    /// `None` when this node's reserved batch is empty, after nudging the
-    /// refill loop.
-    fn try_draw<T>(
+    /// Draw surrogates until `out` holds `n` or this node's reserved batch
+    /// runs empty. Returns `false` on an empty batch, after nudging the refill
+    /// loop. The caller holds the registry write lock `registry` came from.
+    fn try_draw_into<P>(
         &self,
-        bind: &mut impl FnMut(Surrogate) -> crate::Result<T>,
-    ) -> crate::Result<Option<T>> {
-        let registry = self.registry_write()?;
-        let Some(surrogate) = self.alloc_locked(&registry)? else {
-            drop(registry);
-            self.refill_notify.notify_one();
-            return Ok(None);
-        };
-        self.nudge_refill_if_low(&registry);
-        let bound = bind(surrogate)?;
-        self.maybe_flush(&registry, self.credential_store.catalog())?;
-        Ok(Some(bound))
+        registry: &crate::control::surrogate::registry::SurrogateRegistry,
+        n: usize,
+        pk_of: &impl Fn(Surrogate) -> P,
+        out: &mut Vec<(Surrogate, P)>,
+    ) -> crate::Result<bool> {
+        while out.len() < n {
+            match self.alloc_locked(registry)? {
+                Some(surrogate) => out.push((surrogate, pk_of(surrogate))),
+                None => {
+                    self.refill_notify.notify_one();
+                    self.nudge_refill_if_low(registry);
+                    return Ok(false);
+                }
+            }
+        }
+        self.nudge_refill_if_low(registry);
+        Ok(true)
     }
 
-    /// [`Self::try_draw`] until it draws. An empty batch is awaited from the
-    /// background refill loop, so the runtime thread never blocks.
-    async fn draw<T>(
+    /// Draw `n` fresh surrogates and bind each under `pk_of(surrogate)` in
+    /// `key`. Every pass binds its draws in one catalog transaction, with the
+    /// due watermark row, before the registry lock releases.
+    async fn draw_bound_many<P: AsRef<[u8]>>(
         &self,
-        mut bind: impl FnMut(Surrogate) -> crate::Result<T>,
-    ) -> crate::Result<T> {
+        key: CollectionKey<'_>,
+        tenant_id: TenantId,
+        n: usize,
+        pk_of: impl Fn(Surrogate) -> P,
+    ) -> crate::Result<Vec<(Surrogate, P)>> {
+        let mut out = Vec::with_capacity(n);
         loop {
-            if let Some(bound) = self.try_draw(&mut bind)? {
-                return Ok(bound);
+            let complete = {
+                let registry = self.registry_write()?;
+                let start = out.len();
+                let complete = self.try_draw_into(&registry, n, &pk_of, &mut out)?;
+                let fresh = &out[start..];
+                if !fresh.is_empty() {
+                    let rows: Vec<(&[u8], Surrogate)> = fresh
+                        .iter()
+                        .map(|(surrogate, pk)| (pk.as_ref(), *surrogate))
+                        .collect();
+                    let hwm = self.due_flush_hwm(&registry);
+                    let bound = self.commit_bindings(key, tenant_id, &rows, hwm)?;
+                    if hwm.is_some() {
+                        self.finish_committed_flush(&registry)?;
+                    }
+                    // A fresh surrogate's own key names no other row. A
+                    // different winner means the catalog binds a key past the
+                    // allocator's watermark.
+                    for (binding, &(_, surrogate)) in bound.iter().zip(&rows) {
+                        if binding.surrogate != surrogate {
+                            return Err(crate::Error::Internal {
+                                detail: format!(
+                                    "fresh surrogate {} in '{}' collides with key bound to {}",
+                                    surrogate.as_u32(),
+                                    key.name(),
+                                    binding.surrogate.as_u32()
+                                ),
+                            });
+                        }
+                    }
+                }
+                complete
+            };
+            if complete {
+                return Ok(out);
             }
             self.await_reserved_batch().await?;
         }
     }
 
-    /// Bind `surrogate` in this node's catalog and WAL under `pk_bytes`.
-    fn bind_drawn(
-        &self,
-        key: CollectionKey<'_>,
-        tenant_id: TenantId,
-        pk_bytes: &[u8],
-        surrogate: Surrogate,
-    ) -> crate::Result<()> {
-        self.credential_store
-            .catalog()
-            .put_surrogate(key, tenant_id, pk_bytes, surrogate)?;
-        self.wal_appender
-            .record_bind_to_wal(key, tenant_id, surrogate.as_u32(), pk_bytes)
-    }
-
-    /// The fresh row identity of `surrogate`: its bound surrogate and the
-    /// identity string the row is keyed by.
-    fn bind_fresh(
-        &self,
-        key: CollectionKey<'_>,
-        tenant_id: TenantId,
-        surrogate: Surrogate,
-    ) -> crate::Result<(Surrogate, String)> {
-        let pk =
-            crate::engine::document::store::RowIdentity::for_surrogate(surrogate).into_string();
-        self.bind_drawn(key, tenant_id, pk.as_bytes(), surrogate)?;
-        Ok((surrogate, pk))
-    }
-
-    /// The anonymous binding of `surrogate`, keyed by its own big-endian
-    /// bytes.
-    fn bind_anonymous(
-        &self,
-        key: CollectionKey<'_>,
-        tenant_id: TenantId,
-        surrogate: Surrogate,
-    ) -> crate::Result<Surrogate> {
-        self.bind_drawn(key, tenant_id, &surrogate.as_u32().to_be_bytes(), surrogate)?;
-        Ok(surrogate)
-    }
-
-    /// Draw a fresh surrogate from the registry and bind nothing. The caller
-    /// binds it: the collection home proposes it in its Raft log
+    /// Draw `n` fresh surrogates from the registry and bind none of them. The
+    /// caller binds them: the collection home proposes them in its Raft log
     /// (`surrogate_exchange::authority`).
+    pub async fn mint_candidates(&self, n: usize) -> crate::Result<Vec<Surrogate>> {
+        let mut out: Vec<(Surrogate, ())> = Vec::with_capacity(n);
+        loop {
+            let complete = {
+                let registry = self.registry_write()?;
+                let start = out.len();
+                let complete = self.try_draw_into(&registry, n, &|_: Surrogate| (), &mut out)?;
+                if out.len() > start {
+                    self.maybe_flush(&registry, self.credential_store.catalog())?;
+                }
+                complete
+            };
+            if complete {
+                return Ok(out.into_iter().map(|(surrogate, ())| surrogate).collect());
+            }
+            self.await_reserved_batch().await?;
+        }
+    }
+
+    /// [`Self::mint_candidates`] for one surrogate.
     pub async fn mint_candidate(&self) -> crate::Result<Surrogate> {
-        self.draw(Ok).await
+        let mut drawn = self.mint_candidates(1).await?;
+        drawn.pop().ok_or_else(|| crate::Error::Internal {
+            detail: "surrogate mint returned no candidate".into(),
+        })
+    }
+
+    /// Allocate `n` fresh surrogates for rows with no content primary key, in
+    /// one catalog transaction per registry pass. Each binds under its
+    /// identity string, as [`Self::assign_fresh`] does.
+    pub async fn assign_fresh_many(
+        &self,
+        key: CollectionKey<'_>,
+        tenant_id: TenantId,
+        n: usize,
+    ) -> crate::Result<Vec<(Surrogate, String)>> {
+        self.draw_bound_many(key, tenant_id, n, |surrogate| {
+            crate::engine::document::store::RowIdentity::for_surrogate(surrogate).into_string()
+        })
+        .await
+    }
+
+    /// Allocate `n` self-keyed surrogates, as [`Self::assign_anonymous`] does,
+    /// in one catalog transaction per registry pass.
+    pub async fn assign_anonymous_many(
+        &self,
+        key: CollectionKey<'_>,
+        tenant_id: TenantId,
+        n: usize,
+    ) -> crate::Result<Vec<Surrogate>> {
+        let drawn = self
+            .draw_bound_many(key, tenant_id, n, |surrogate| {
+                surrogate.as_u32().to_be_bytes()
+            })
+            .await?;
+        Ok(drawn.into_iter().map(|(surrogate, _)| surrogate).collect())
     }
 
     /// Allocate a FRESH surrogate for a row with no content primary key — a
@@ -115,8 +173,10 @@ impl SurrogateAssigner {
         key: CollectionKey<'_>,
         tenant_id: TenantId,
     ) -> crate::Result<(Surrogate, String)> {
-        self.draw(|surrogate| self.bind_fresh(key, tenant_id, surrogate))
-            .await
+        let mut drawn = self.assign_fresh_many(key, tenant_id, 1).await?;
+        drawn.pop().ok_or_else(|| crate::Error::Internal {
+            detail: format!("fresh surrogate draw in '{}' returned nothing", key.name()),
+        })
     }
 
     /// Allocate a fresh surrogate for an entity that has no user-facing
@@ -131,8 +191,13 @@ impl SurrogateAssigner {
         key: CollectionKey<'_>,
         tenant_id: TenantId,
     ) -> crate::Result<Surrogate> {
-        self.draw(|surrogate| self.bind_anonymous(key, tenant_id, surrogate))
-            .await
+        let mut drawn = self.assign_anonymous_many(key, tenant_id, 1).await?;
+        drawn.pop().ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "anonymous surrogate draw in '{}' returned nothing",
+                key.name()
+            ),
+        })
     }
 }
 

@@ -73,6 +73,7 @@ fn document_post_apply_collection(op: &DocumentOp) -> Option<String> {
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::PointDelete { collection, .. }
         | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. }
         | DocumentOp::BulkUpdate { collection, .. }
         | DocumentOp::BulkDelete { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
@@ -88,7 +89,20 @@ fn document_post_apply_collection(op: &DocumentOp) -> Option<String> {
         DocumentOp::ResolvedWrite { mutations, .. } => mutations
             .first()
             .map(|mutation| mutation.collection().to_string()),
-        _ => None,
+        // Reads, index DDL and the Control-Plane-expanded INSERT ... SELECT
+        // write no row the post-apply redo journals.
+        DocumentOp::PointGet { .. }
+        | DocumentOp::Scan { .. }
+        | DocumentOp::RangeScan { .. }
+        | DocumentOp::Register { .. }
+        | DocumentOp::IndexLookup { .. }
+        | DocumentOp::IndexedFetch { .. }
+        | DocumentOp::DropIndex { .. }
+        | DocumentOp::BackfillIndex { .. }
+        | DocumentOp::EstimateCount { .. }
+        | DocumentOp::InsertSelect { .. }
+        | DocumentOp::MaterializeScan { .. }
+        | DocumentOp::ResolveWrite(_) => None,
     }
 }
 

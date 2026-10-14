@@ -4,6 +4,7 @@
 //! incoming value into it (or apply `ON CONFLICT DO UPDATE SET`), persist,
 //! and respond.
 
+use super::merge_body::{MergedUpsert, decode_stored_row, merge_upsert_body};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::submitted_row_image;
@@ -12,7 +13,6 @@ use crate::data::executor::enforcement::write_hook::{self, HookCtx, ImageBody, W
 use crate::data::executor::handlers::point::apply_put::{PointPutParams, VectorIndexDelta};
 use crate::data::executor::handlers::rls_write_gate;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
-use crate::data::executor::handlers::upsert::merge::{apply_on_conflict_updates, merge_values};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::{RowIdentity, StorageKey};
 use nodedb_types::Surrogate;
@@ -70,85 +70,18 @@ impl CoreLoop {
         // gate, the event, the redo entry, and `RETURNING` all name it.
         let document_identity = RowIdentity::from_user_key(document_id);
 
-        // Decode existing document to nodedb_types::Value.
-        let existing_val = if let Some(schema) = strict_schema {
-            // Strict: binary tuple → Value via schema.
-            match crate::data::executor::strict_format::binary_tuple_to_value(
-                &current_bytes,
-                schema,
-            ) {
-                Some(v) => v,
-                None => {
-                    // Fallback: try msgpack (migration case).
-                    match nodedb_types::value_from_msgpack(&current_bytes) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: "failed to decode document for upsert".into(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            // Schemaless: stored as msgpack.
-            match nodedb_types::value_from_msgpack(&current_bytes) {
-                Ok(v) => v,
-                Err(_) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: "failed to decode document for upsert".into(),
-                        },
-                    );
-                }
-            }
-        };
-
-        // Decode incoming value (msgpack → Value).
-        let new_val = match nodedb_types::value_from_msgpack(value) {
-            Ok(v) => v,
-            Err(_) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: "failed to decode upsert value from msgpack".into(),
-                    },
-                );
-            }
-        };
-
-        // Conflict branch: if `ON CONFLICT DO UPDATE SET` assignments
-        // are present, evaluate each against the *existing* row and
-        // apply only those fields. Otherwise fall back to the plain
-        // merge semantics used by `UPSERT INTO` / no-action upserts.
-        let merged = if on_conflict_updates.is_empty() {
-            merge_values(existing_val, new_val)
-        } else {
-            match apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates) {
-                Ok(v) => v,
-                Err(e) => return self.response_error(task, e),
-            }
-        };
-
-        // The merged row as a MessagePack body — the form
-        // `apply_point_put` takes for BOTH storage modes; it encodes the
-        // strict Binary Tuple, and stamps a bitemporal version, itself.
-        // Encoding storage bytes here as well would leave this handler
-        // and the write path each deciding the row's on-disk shape.
-        let merged_body = match nodedb_types::value_to_msgpack(&merged) {
-            Ok(b) => b,
-            Err(_) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: "failed to encode merged upsert value".into(),
-                    },
-                );
-            }
+        // Conflict branch: the `ON CONFLICT DO UPDATE SET` assignments
+        // evaluated against the existing row, else the plain merge
+        // `UPSERT INTO` uses. The fields the merge writes are the ones
+        // typeguards judge.
+        let MergedUpsert {
+            body: merged_body,
+            assigned,
+        } = match decode_stored_row(&current_bytes, strict_schema)
+            .and_then(|existing| merge_upsert_body(existing, value, on_conflict_updates))
+        {
+            Ok(merged) => merged,
+            Err(e) => return self.response_error(task, e),
         };
 
         // Gate the persist on the collection's write policy, decided
@@ -213,6 +146,9 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: task.wal_lsn(),
                 resolved_targets: hook_ctx.resolved_targets,
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::Assigned(
+                    &assigned,
+                ),
             },
         ) {
             Ok(o) => o,

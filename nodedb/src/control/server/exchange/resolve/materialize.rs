@@ -1,37 +1,51 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Pass 1 of plan resolution: catalog provider materialization.
+//! Pass 1 of plan resolution: provider materialization.
 //!
-//! [`materialize_providers`] walks the plan tree and replaces every
-//! `QueryOp::ProviderScan { provider: Some(name), rows: [] }` with a
-//! fully-populated `ProviderScan { provider: None, rows: <encoded> }`.
+//! [`materialize_providers`] walks the plan tree and fills the rows of every
+//! `QueryOp::ProviderScan { provider: Some(name), rows: [] }`. A continuous
+//! aggregate's rows come from the core that owns its root source. Every
+//! other name is a catalog table.
+//!
+//! The filled scan keeps its relation name. The task is authorized again
+//! after resolution, and that check must demand Read on the relation the
+//! rows came from, as the check before resolution did. Without the name, the
+//! scan reads as a constant SELECT, which demands tenant-wide Read, so a user
+//! granted Read on only that relation is refused. The Data Plane reads only
+//! the rows.
 //!
 //! This pass happens per-request, post-cache, so identity-scoped catalog rows
 //! never enter the plan cache.
 
 use nodedb_physical::physical_plan::{ExchangeOp, PhysicalPlan, QueryOp};
+use nodedb_physical::physical_task::PhysicalTask;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::catalog;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::encode_binary_rows;
 
-/// Walk `plan` and replace every `ProviderScan{provider: Some(name), rows: []}`
-/// with `ProviderScan{provider: None, rows: <encoded>}`.
+/// Walk `plan` and fill the rows of every `ProviderScan{provider: Some(name)}`,
+/// keeping `name`.
 ///
 /// The walk is structural: it recurses into `HashJoin` inputs and
 /// `LateralTopK`/`LateralLoop` outer plans, plus `Exchange` children so that
 /// catalog providers nested inside Exchange children are also filled before the
 /// Exchange itself is resolved.
+///
+/// Collection relations list the collections of `database_id`, the database
+/// the read runs in.
 pub(super) async fn materialize_providers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     plan: PhysicalPlan,
 ) -> crate::Result<PhysicalPlan> {
     match plan {
         PhysicalPlan::Query(QueryOp::ProviderScan {
             provider: Some(name),
             rows: _,
+            sources,
             filters,
             projection,
             computed_columns,
@@ -41,11 +55,22 @@ pub(super) async fn materialize_providers(
             offset,
             distinct,
         }) => {
-            let rows = catalog::catalog_rows(&name, state, identity).await?;
+            let rows = match super::cagg_rows::continuous_aggregate_rows(
+                state,
+                identity,
+                database_id,
+                &name,
+            )
+            .await?
+            {
+                Some(rows) => rows,
+                None => catalog::catalog_rows(&name, state, identity, database_id).await?,
+            };
             let encoded = encode_binary_rows(&rows);
             Ok(PhysicalPlan::Query(QueryOp::ProviderScan {
-                provider: None,
+                provider: Some(name),
                 rows: encoded,
+                sources,
                 filters,
                 projection,
                 computed_columns,
@@ -58,7 +83,8 @@ pub(super) async fn materialize_providers(
         }
 
         PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp { child, mode })) => {
-            let child = Box::pin(materialize_providers(state, identity, *child)).await?;
+            let child =
+                Box::pin(materialize_providers(state, identity, database_id, *child)).await?;
             Ok(PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
                 child: Box::new(child),
                 mode,
@@ -81,7 +107,8 @@ pub(super) async fn materialize_providers(
             grouping_sets,
             sort_keys,
         }) => {
-            let input = Box::pin(materialize_providers(state, identity, *input)).await?;
+            let input =
+                Box::pin(materialize_providers(state, identity, database_id, *input)).await?;
             Ok(PhysicalPlan::Query(QueryOp::Aggregate {
                 collection,
                 input: Some(Box::new(input)),
@@ -105,8 +132,6 @@ pub(super) async fn materialize_providers(
             on,
             join_type,
             limit,
-            post_group_by,
-            post_aggregates,
             projection,
             computed_projection,
             join_filters,
@@ -122,25 +147,25 @@ pub(super) async fn materialize_providers(
         }) => {
             let left_input = match left_input {
                 Some(p) => Some(Box::new(
-                    Box::pin(materialize_providers(state, identity, *p)).await?,
+                    Box::pin(materialize_providers(state, identity, database_id, *p)).await?,
                 )),
                 None => None,
             };
             let right_input = match right_input {
                 Some(p) => Some(Box::new(
-                    Box::pin(materialize_providers(state, identity, *p)).await?,
+                    Box::pin(materialize_providers(state, identity, database_id, *p)).await?,
                 )),
                 None => None,
             };
             let left_bitmap = match left_bitmap {
                 Some(p) => Some(Box::new(
-                    Box::pin(materialize_providers(state, identity, *p)).await?,
+                    Box::pin(materialize_providers(state, identity, database_id, *p)).await?,
                 )),
                 None => None,
             };
             let right_bitmap = match right_bitmap {
                 Some(p) => Some(Box::new(
-                    Box::pin(materialize_providers(state, identity, *p)).await?,
+                    Box::pin(materialize_providers(state, identity, database_id, *p)).await?,
                 )),
                 None => None,
             };
@@ -152,8 +177,6 @@ pub(super) async fn materialize_providers(
                 on,
                 join_type,
                 limit,
-                post_group_by,
-                post_aggregates,
                 projection,
                 computed_projection,
                 join_filters,
@@ -181,7 +204,13 @@ pub(super) async fn materialize_providers(
             projection,
             left_join,
         }) => {
-            let outer_plan = Box::pin(materialize_providers(state, identity, *outer_plan)).await?;
+            let outer_plan = Box::pin(materialize_providers(
+                state,
+                identity,
+                database_id,
+                *outer_plan,
+            ))
+            .await?;
             Ok(PhysicalPlan::Query(QueryOp::LateralTopK {
                 outer_plan: Box::new(outer_plan),
                 outer_alias,
@@ -207,7 +236,13 @@ pub(super) async fn materialize_providers(
             left_join,
             outer_row_cap,
         }) => {
-            let outer_plan = Box::pin(materialize_providers(state, identity, *outer_plan)).await?;
+            let outer_plan = Box::pin(materialize_providers(
+                state,
+                identity,
+                database_id,
+                *outer_plan,
+            ))
+            .await?;
             Ok(PhysicalPlan::Query(QueryOp::LateralLoop {
                 outer_plan: Box::new(outer_plan),
                 outer_alias,
@@ -234,7 +269,8 @@ pub(super) async fn materialize_providers(
             offset,
             distinct,
         }) => {
-            let input = Box::pin(materialize_providers(state, identity, *input)).await?;
+            let input =
+                Box::pin(materialize_providers(state, identity, database_id, *input)).await?;
             Ok(PhysicalPlan::Query(QueryOp::PostProcess {
                 input: Box::new(input),
                 filters,
@@ -253,7 +289,9 @@ pub(super) async fn materialize_providers(
         PhysicalPlan::Query(QueryOp::SetOp { inputs, op }) => {
             let mut filled = Vec::with_capacity(inputs.len());
             for input in inputs {
-                filled.push(Box::pin(materialize_providers(state, identity, input)).await?);
+                filled.push(
+                    Box::pin(materialize_providers(state, identity, database_id, input)).await?,
+                );
             }
             Ok(PhysicalPlan::Query(QueryOp::SetOp { inputs: filled, op }))
         }
@@ -262,4 +300,19 @@ pub(super) async fn materialize_providers(
         // pass through unchanged.
         other => Ok(other),
     }
+}
+
+/// `task` with the rows of every provider relation it reads filled for
+/// `identity`.
+///
+/// A transport calls this before it sends a task through the gateway. The
+/// node that runs a forwarded task has no identity to fill the rows with,
+/// so a provider scan that leaves here empty answers no rows there.
+pub(crate) async fn materialize_task_providers(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    mut task: PhysicalTask,
+) -> crate::Result<PhysicalTask> {
+    task.plan = materialize_providers(state, identity, task.database_id, task.plan).await?;
+    Ok(task)
 }

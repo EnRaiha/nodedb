@@ -10,7 +10,9 @@ use nodedb_types::StorageKey;
 
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::returning_rows::vector_stored_rows_payload;
+use crate::data::executor::handlers::returning_rows::{
+    VectorRowColumns, vector_stored_rows_payload,
+};
 use crate::data::executor::handlers::vector_direct_row::VectorDirectIndexSpec;
 use crate::data::executor::handlers::vector_direct_update::{
     VectorDirectUpdateParams, VectorPayloadPatch, VectorPlannedRow,
@@ -86,13 +88,33 @@ impl CoreLoop {
                     .iter()
                     .map(|row| StorageKey::for_surrogate(row.surrogate))
                     .collect();
-                let stored: Vec<(&StorageKey, &[u8])> = keys
+                // The post-image vector: the re-embed, else the node's own.
+                let vectors: Vec<Vec<f32>> = planned
+                    .iter()
+                    .map(|row| match new_vector {
+                        Some(vector) => Ok(vector.to_vec()),
+                        None => self.committed_primary_vector(
+                            database_id,
+                            tid,
+                            collection,
+                            field,
+                            row.surrogate,
+                        ),
+                    })
+                    .collect::<crate::Result<_>>()
+                    .map_err(ErrorCode::from)?;
+                let stored: Vec<(&StorageKey, &[u8], &[f32])> = keys
                     .iter()
                     .zip(planned.iter())
-                    .map(|(key, row)| (key, row.sidecar.as_slice()))
+                    .zip(vectors.iter())
+                    .map(|((key, row), vector)| (key, row.sidecar.as_slice(), vector.as_slice()))
                     .collect();
                 let identity_column = self.identity_column(database_id, tid, collection);
-                vector_stored_rows_payload(spec, rls_filters, &identity_column, &stored)
+                let columns = VectorRowColumns {
+                    identity: &identity_column,
+                    vector: field,
+                };
+                vector_stored_rows_payload(spec, rls_filters, columns, &stored)
                     .map_err(ErrorCode::from)?
             }
             None => response_codec::encode_affected(planned.len() as u64),

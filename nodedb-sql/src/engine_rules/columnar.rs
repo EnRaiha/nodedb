@@ -26,6 +26,16 @@ impl EngineRules for ColumnarRules {
     /// Duplicate PK tombstones the prior row via the segment's delete
     /// bitmap; the new row (or its merged form, when `on_conflict_updates`
     /// is non-empty) is appended. Sort-key semantics are unchanged.
+    fn plan_insert_select(&self, p: InsertSelectParams) -> Result<Vec<SqlPlan>> {
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "INSERT ... SELECT into columnar collection '{}' is not supported; \
+                 the target must be a document collection",
+                p.collection
+            ),
+        })
+    }
+
     fn plan_upsert(&self, p: UpsertParams) -> Result<Vec<SqlPlan>> {
         Ok(vec![SqlPlan::Upsert(UpsertPlan {
             collection: p.collection,
@@ -86,17 +96,16 @@ impl EngineRules for ColumnarRules {
         }])
     }
 
+    /// `UPDATE ... FROM` writes through the document join-update, which
+    /// columnar storage does not take.
     fn plan_update_from(&self, p: UpdateFromParams) -> Result<Vec<SqlPlan>> {
-        Ok(vec![SqlPlan::UpdateFrom {
-            collection: p.collection,
-            engine: EngineType::Columnar,
-            source: p.source,
-            target_join_col: p.target_join_col,
-            source_join_col: p.source_join_col,
-            assignments: p.assignments,
-            target_filters: p.target_filters,
-            returning: p.returning,
-        }])
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "UPDATE ... FROM is not supported on columnar collection '{}'; \
+                 the target must be a document collection",
+                p.collection
+            ),
+        })
     }
 
     fn plan_delete(&self, p: DeleteParams) -> Result<Vec<SqlPlan>> {
@@ -147,7 +156,7 @@ impl EngineRules for ColumnarRules {
             aggregates: p.aggregates,
             having: p.having,
             limit: p.limit,
-            grouping_sets: None,
+            grouping_sets: p.grouping_sets,
             sort_keys: Vec::new(),
         })
     }

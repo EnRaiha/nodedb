@@ -37,7 +37,7 @@
 //! `KvEngine` atomic path, which ignores the overlay's surrogate entirely).
 
 use nodedb_physical::kv_atomic::compute as atomic_compute;
-use nodedb_physical::physical_plan::{KvCounterShape, KvOp};
+use nodedb_physical::physical_plan::{KvBatchIntent, KvCounterShape, KvOp};
 use nodedb_types::Surrogate;
 
 use super::context::StageCtx;
@@ -45,12 +45,23 @@ use super::stage_kv::kv_row_identity;
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::kv::atomic::incr_float_reply;
+use crate::data::executor::handlers::kv::batch_plan::{merge_batch_verb, plan_kv_batch};
 use crate::data::executor::handlers::kv::declared_body::fit_kv_image;
 use crate::data::executor::handlers::transaction::overlay::StagedTtl;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::fitted_counter_f64;
 use crate::types::TxnId;
+
+/// A `KvOp::BatchPut` a transaction stages.
+struct StageKvBatch<'a> {
+    tid: u64,
+    txn_id: TxnId,
+    collection: &'a str,
+    entries: &'a [(Vec<u8>, Vec<u8>)],
+    ttl_ms: u64,
+    intent: &'a KvBatchIntent,
+}
 
 /// FNV-1a 32-bit hash, used only to derive a stable, collection-local overlay
 /// slot for a KV key that has no planner-assigned surrogate. Not a security
@@ -141,8 +152,19 @@ impl CoreLoop {
                 collection,
                 entries,
                 ttl_ms,
+                intent,
                 ..
-            } => self.stage_kv_batch_put(task, tid, txn_id, collection.as_str(), entries, *ttl_ms),
+            } => self.stage_kv_batch_put(
+                task,
+                StageKvBatch {
+                    tid,
+                    txn_id,
+                    collection: collection.as_str(),
+                    entries,
+                    ttl_ms: *ttl_ms,
+                    intent,
+                },
+            ),
             other => unreachable!(
                 "execute_stage_kv_atomic called on a non-atomic KvOp; \
                  caller invariant broken: {other:?}"
@@ -364,25 +386,74 @@ impl CoreLoop {
 
     // ── BatchPut: stage every entry via the same per-key put primitive ──
 
-    fn stage_kv_batch_put(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        txn_id: TxnId,
-        collection: &str,
-        entries: &[(Vec<u8>, Vec<u8>)],
-        ttl_ms: u64,
-    ) -> Response {
-        for (key, value) in entries {
-            let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+    /// Stage a batch put under BASE ∪ OVERLAY, judging each key by the
+    /// batch's intent the way `execute_kv_batch_put` judges it. An `Insert`
+    /// batch with a stored or repeated key stages nothing.
+    fn stage_kv_batch_put(&mut self, task: &ExecutionTask, batch: StageKvBatch<'_>) -> Response {
+        let StageKvBatch {
+            tid,
+            txn_id,
+            collection,
+            entries,
+            ttl_ms,
+            intent,
+        } = batch;
+        let did = task.request.database_id.as_u64();
+        // Every key is read under BASE ∪ OVERLAY, so a row this transaction
+        // staged earlier counts as stored.
+        let rows = match plan_kv_batch(
+            collection,
+            entries,
+            intent,
+            self.declared_columns_of(did, tid, collection),
+            |key| {
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, key);
+                self.resolve_kv_current(&ctx, key)
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
+        if let KvBatchIntent::Merge {
+            rls_write_check, ..
+        } = intent
+        {
+            // Staging produces the row images COMMIT installs, so the write
+            // policy decides them here.
+            for row in &rows {
+                let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, row.key);
+                if let Err(e) = self.stage_admit_write(
+                    rls_write_check,
+                    &row.stored,
+                    &ctx.document_id,
+                    did,
+                    tid,
+                    collection,
+                ) {
+                    return self.response_error(task, e);
+                }
+            }
+        }
+        for row in &rows {
+            let ctx = self.kv_atomic_stage_ctx(task, tid, txn_id, collection, row.key);
             self.stage_kv_ttl_side_effect(&ctx, ttl_ms);
-            if let Err(e) = self.stage_put_capped(&ctx, value.clone()) {
+            if let Err(e) = self.stage_put_capped(&ctx, row.stored.to_vec()) {
                 return self.response_error(task, e);
             }
         }
-        match response_codec::encode_count("inserted", entries.len()) {
-            Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(task, e),
+        match intent {
+            KvBatchIntent::Merge { .. } => {
+                self.response_affected_with_op(task, rows.len() as u64, merge_batch_verb(&rows))
+            }
+            KvBatchIntent::Put
+            | KvBatchIntent::Upsert
+            | KvBatchIntent::Insert
+            | KvBatchIntent::InsertIfAbsent => {
+                match response_codec::encode_count("inserted", rows.len()) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => self.response_error(task, e),
+                }
+            }
         }
     }
 

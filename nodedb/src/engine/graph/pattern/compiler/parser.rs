@@ -5,143 +5,156 @@
 use super::super::ast::*;
 use super::bindings;
 use super::clauses::{parse_order_by, parse_return, parse_where};
-use super::helpers::{
-    find_in_clause, find_next_match_keyword, find_top_level_keyword, split_top_level_commas,
-};
-use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive_from;
+use super::helpers::{bad, find_keyword_all, is_word_byte, split_top_level_commas, top_level_mask};
+
+/// The clauses after the patterns, in the order they must appear.
+const CLAUSES: [&str; 5] = ["IN", "WHERE", "RETURN", "ORDER BY", "LIMIT"];
 
 /// Parse a MATCH query string into a `MatchQuery` AST.
 ///
-/// The input should start with `MATCH` or `OPTIONAL MATCH`.
+/// Grammar: `[OPTIONAL] MATCH <patterns> ... [IN <collection>]
+/// [WHERE <predicates>] [RETURN <columns>] [ORDER BY <columns>]
+/// [LIMIT <n>]`, with an optional trailing `;`. Each clause appears at most
+/// once and in this order. Clause keywords match only at the top level,
+/// never inside a literal, a quoted name, or brackets. Any text a clause
+/// cannot read is a `BadRequest` error.
 pub fn parse(sql: &str) -> crate::Result<MatchQuery> {
-    let mut where_predicates = Vec::new();
-    let mut return_columns = Vec::new();
-    let mut distinct = false;
-    let mut limit = None;
-    let mut order_by = Vec::new();
-    let mut collection = None;
+    let text = sql.trim();
+    let text = text.strip_suffix(';').unwrap_or(text).trim_end();
+    let mask = top_level_mask(text);
 
-    let trimmed = sql.trim();
-    let where_pos = find_top_level_keyword(trimmed, "WHERE");
-    let return_pos = find_top_level_keyword(trimmed, "RETURN");
-    let limit_pos = find_top_level_keyword(trimmed, "LIMIT");
-    let order_pos = find_top_level_keyword(trimmed, "ORDER BY");
-    // `IN 'collection'` clause: appears after the last closing `)` and before RETURN/WHERE.
-    // Use a boundary-aware scan that accepts `)` before `IN`.
-    let in_pos = find_in_clause(trimmed);
-
-    // Extract collection name from `IN 'collection'` if present.
-    if let Some(ip) = in_pos {
-        let after_in = trimmed[ip + 2..].trim();
-        // Strip surrounding quotes.
-        let coll = if (after_in.starts_with('\'') && after_in.contains('\''))
-            || (after_in.starts_with('"') && after_in.contains('"'))
-        {
-            let q = after_in.chars().next().unwrap();
-            let rest = &after_in[1..];
-            rest.find(q).map(|end| rest[..end].to_string())
-        } else {
-            after_in.split_whitespace().next().map(|s| s.to_string())
-        };
-        collection = coll;
+    // `(order index, keyword start, keyword end)` of every clause present.
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    for (index, keyword) in CLAUSES.iter().enumerate().skip(1) {
+        let hits = find_keyword_all(text, &mask, keyword);
+        if hits.len() > 1 {
+            return Err(bad(format!("MATCH: {keyword} given more than once")));
+        }
+        found.extend(hits.into_iter().map(|(s, e)| (index, s, e)));
+    }
+    // `IN` names the collection only between the patterns and the first
+    // other clause. Elsewhere it is part of that clause's text.
+    let first_other = found.iter().map(|f| f.1).min().unwrap_or(text.len());
+    let in_hits: Vec<_> = find_keyword_all(text, &mask, "IN")
+        .into_iter()
+        .filter(|(s, _)| *s < first_other)
+        .collect();
+    if in_hits.len() > 1 {
+        return Err(bad("MATCH: IN given more than once"));
+    }
+    found.extend(in_hits.into_iter().map(|(s, e)| (0, s, e)));
+    found.sort_by_key(|f| f.1);
+    for pair in found.windows(2) {
+        if pair[0].0 > pair[1].0 {
+            return Err(bad(format!(
+                "MATCH: {} must come before {}",
+                CLAUSES[pair[1].0], CLAUSES[pair[0].0]
+            )));
+        }
     }
 
-    let pattern_end = [where_pos, return_pos, limit_pos, order_pos, in_pos]
-        .iter()
-        .filter_map(|&p| p)
-        .min()
-        .unwrap_or(trimmed.len());
+    let pattern_end = found.first().map_or(text.len(), |f| f.1);
+    let mut query = MatchQuery {
+        clauses: parse_match_clauses(&text[..pattern_end])?,
+        where_predicates: Vec::new(),
+        return_columns: Vec::new(),
+        distinct: false,
+        limit: None,
+        order_by: Vec::new(),
+        collection: None,
+    };
 
-    let pattern_section = &trimmed[..pattern_end];
-    let clauses = parse_match_clauses(pattern_section)?;
-
-    if let Some(wp) = where_pos {
-        let where_end = [return_pos, limit_pos, order_pos]
-            .iter()
-            .filter_map(|&p| p)
-            .min()
-            .unwrap_or(trimmed.len());
-        let where_section = &trimmed[wp + 5..where_end].trim();
-        where_predicates = parse_where(where_section)?;
+    for (n, &(index, _, keyword_end)) in found.iter().enumerate() {
+        let section_end = found.get(n + 1).map_or(text.len(), |next| next.1);
+        let section = text[keyword_end..section_end].trim();
+        match index {
+            0 => query.collection = Some(parse_in_target(section)?),
+            1 => query.where_predicates = parse_where(section)?,
+            2 => {
+                let (columns, distinct) = parse_return(section)?;
+                query.return_columns = columns;
+                query.distinct = distinct;
+            }
+            3 => query.order_by = parse_order_by(section)?,
+            _ => {
+                query.limit = Some(section.parse::<usize>().map_err(|_| {
+                    bad(format!(
+                        "MATCH: LIMIT needs a non-negative integer, found '{section}'"
+                    ))
+                })?);
+            }
+        }
     }
-
-    if let Some(rp) = return_pos {
-        let return_end = [limit_pos, order_pos]
-            .iter()
-            .filter_map(|&p| p)
-            .min()
-            .unwrap_or(trimmed.len());
-        let return_section = &trimmed[rp + 6..return_end].trim();
-        let (cols, dist) = parse_return(return_section);
-        return_columns = cols;
-        distinct = dist;
-    }
-
-    if let Some(lp) = limit_pos {
-        let after = trimmed[lp + 5..].trim();
-        let word = after.split_whitespace().next().unwrap_or("");
-        limit = word.parse().ok();
-    }
-
-    if let Some(op) = order_pos {
-        let order_end = limit_pos.unwrap_or(trimmed.len());
-        let order_section = &trimmed[op + 8..order_end].trim();
-        order_by = parse_order_by(order_section);
-    }
-
-    Ok(MatchQuery {
-        clauses,
-        where_predicates,
-        return_columns,
-        distinct,
-        limit,
-        order_by,
-        collection,
-    })
+    Ok(query)
 }
 
-/// Parse MATCH and OPTIONAL MATCH clauses from the pattern section.
+/// Read the collection after `IN`: one quoted string or one bare word.
+fn parse_in_target(section: &str) -> crate::Result<String> {
+    let name = match section.chars().next() {
+        Some(quote @ ('\'' | '"')) => {
+            let rest = section.strip_prefix(quote).unwrap_or(section);
+            let (inner, after) = rest.split_once(quote).ok_or_else(|| {
+                bad(format!(
+                    "MATCH: unclosed quote in IN collection '{section}'"
+                ))
+            })?;
+            if !after.trim().is_empty() {
+                return Err(bad(format!(
+                    "MATCH: unexpected text after the IN collection: '{section}'"
+                )));
+            }
+            inner
+        }
+        _ if section.contains(char::is_whitespace) => {
+            return Err(bad(format!(
+                "MATCH: IN takes one collection name, found '{section}'"
+            )));
+        }
+        _ => section,
+    };
+    if name.is_empty() {
+        return Err(bad("MATCH: IN needs a collection name"));
+    }
+    Ok(name.to_string())
+}
+
+/// Parse MATCH and OPTIONAL MATCH clauses from the pattern section. The
+/// section must start with a clause, and every clause needs a pattern.
 pub(in crate::engine::graph::pattern) fn parse_match_clauses(
     section: &str,
 ) -> crate::Result<Vec<MatchClause>> {
-    let mut clauses = Vec::new();
-    let mut pos = 0;
-    while pos < section.len() {
-        let remaining = &section[pos..];
-        let whitespace = remaining.len() - remaining.trim_start().len();
-        let keyword_start = pos + whitespace;
+    let section = section.trim();
+    let mask = top_level_mask(section);
 
-        let (optional, match_start) =
-            if find_ascii_case_insensitive_from(section, "OPTIONAL MATCH", keyword_start)
-                == Some(keyword_start)
-            {
-                (true, keyword_start + 14)
-            } else if find_ascii_case_insensitive_from(section, "MATCH", keyword_start)
-                == Some(keyword_start)
-            {
-                (false, keyword_start + 5)
-            } else {
-                break;
-            };
+    // `(clause start, pattern start, optional)` per MATCH keyword.
+    let mut starts: Vec<(usize, usize, bool)> = Vec::new();
+    for (s, e) in find_keyword_all(section, &mask, "MATCH") {
+        let before = section[..s].trim_end().as_bytes();
+        let optional = before.len() >= 8
+            && before[before.len() - 8..].eq_ignore_ascii_case(b"OPTIONAL")
+            && (before.len() == 8 || !is_word_byte(before[before.len() - 9]))
+            && mask[before.len() - 8];
+        let clause_start = if optional { before.len() - 8 } else { s };
+        starts.push((clause_start, e, optional));
+    }
 
-        let rest = &section[match_start..];
-        let next_match = find_next_match_keyword(rest)
-            .map(|offset| match_start + offset)
-            .unwrap_or(section.len());
+    match starts.first() {
+        None => return Err(bad("no MATCH clause found")),
+        Some(&(0, _, _)) => {}
+        Some(&(first, _, _)) => {
+            return Err(bad(format!(
+                "MATCH: unexpected text before MATCH: '{}'",
+                section[..first].trim()
+            )));
+        }
+    }
 
-        let pattern_text = section[match_start..next_match].trim();
-        let patterns = parse_pattern_chains(pattern_text)?;
-
+    let mut clauses = Vec::with_capacity(starts.len());
+    for (n, &(_, pattern_start, optional)) in starts.iter().enumerate() {
+        let pattern_end = starts.get(n + 1).map_or(section.len(), |next| next.0);
+        let patterns = parse_pattern_chains(section[pattern_start..pattern_end].trim())?;
         clauses.push(MatchClause { patterns, optional });
-        pos = next_match;
     }
-
-    if clauses.is_empty() {
-        return Err(crate::Error::BadRequest {
-            detail: "no MATCH clause found".to_string(),
-        });
-    }
-
     Ok(clauses)
 }
 
@@ -394,6 +407,93 @@ mod tests {
         assert_eq!(bindings::parse_hop_range("..5").unwrap(), (1, 5));
         assert_eq!(bindings::parse_hop_range("3..").unwrap(), (3, 10));
         assert!(bindings::parse_hop_range("5..2").is_err());
+    }
+
+    fn err(sql: &str) -> String {
+        match parse(sql) {
+            Err(e) => e.to_string(),
+            Ok(q) => panic!("expected an error for {sql}, got {q:?}"),
+        }
+    }
+
+    #[test]
+    fn clauses_out_of_order_are_errors_not_panics() {
+        // The old slicer panicked on both: the RETURN and ORDER BY sections
+        // ended before they began.
+        assert!(err("MATCH (a)-[:K]->(b) RETURN a WHERE a.x = 1").contains("WHERE"));
+        assert!(err("MATCH (a)-[:K]->(b) ORDER BY a.x RETURN a").contains("RETURN"));
+        assert!(err("MATCH (a)-[:K]->(b) RETURN a LIMIT 3 ORDER BY a").contains("ORDER BY"));
+    }
+
+    #[test]
+    fn duplicate_clause_is_an_error() {
+        assert!(err("MATCH (a)-[:K]->(b) WHERE a.x = 1 WHERE b.y = 2 RETURN a").contains("WHERE"));
+    }
+
+    #[test]
+    fn bad_limit_is_an_error() {
+        // The old parser dropped the limit and returned every row.
+        err("MATCH (a)-[:K]->(b) RETURN a LIMIT ten");
+        err("MATCH (a)-[:K]->(b) RETURN a LIMIT 5 6");
+        err("MATCH (a)-[:K]->(b) RETURN a LIMIT -1");
+        assert_eq!(
+            parse("MATCH (a)-[:K]->(b) RETURN a LIMIT 7;")
+                .expect("parses")
+                .limit,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn unclosed_in_quote_is_an_error() {
+        err("MATCH (a)-[:K]->(b) IN 'people RETURN a");
+        err("MATCH (a)-[:K]->(b) IN people extra RETURN a");
+    }
+
+    #[test]
+    fn unknown_or_or_joined_predicates_are_errors() {
+        // The old parser dropped both and matched every row.
+        err("MATCH (a)-[:K]->(b) WHERE a.name LIKE 'x%' RETURN a");
+        err("MATCH (a)-[:K]->(b) WHERE a.x = 1 OR a.x = 2 RETURN a");
+    }
+
+    #[test]
+    fn not_exists_with_two_clauses_is_an_error() {
+        err(
+            "MATCH (a)-[:K]->(b) WHERE NOT EXISTS { MATCH (a)-[:X]->(b) MATCH (b)-[:Y]->(a) } \
+             RETURN a",
+        );
+    }
+
+    #[test]
+    fn keywords_and_operators_inside_literals_are_values() {
+        let q =
+            parse("MATCH (a)-[:K]->(b) WHERE a.note = 'x<y RETURN z' RETURN a").expect("parses");
+        match &q.where_predicates[0] {
+            WherePredicate::Equals { field, value, .. } => {
+                assert_eq!(field, "note");
+                assert_eq!(value, "x<y RETURN z");
+            }
+            other => panic!("expected Equals, got {other:?}"),
+        }
+        assert_eq!(q.return_columns.len(), 1);
+    }
+
+    #[test]
+    fn order_by_direction_is_case_insensitive() {
+        let q =
+            parse("MATCH (a)-[:K]->(b) RETURN a ORDER BY a.name desc, b.age asc").expect("parses");
+        assert_eq!(q.order_by[0].expr, "a.name");
+        assert!(!q.order_by[0].ascending);
+        assert_eq!(q.order_by[1].expr, "b.age");
+        assert!(q.order_by[1].ascending);
+    }
+
+    #[test]
+    fn empty_clause_sections_are_errors() {
+        err("MATCH (a)-[:K]->(b) WHERE RETURN a");
+        err("MATCH (a)-[:K]->(b) RETURN");
+        err("MATCH (a)-[:K]->(b) RETURN a ORDER BY");
     }
 
     #[test]

@@ -104,10 +104,10 @@ fn to_physical_plan(
         | ReplicatedWrite::PointDelete { .. }
         | ReplicatedWrite::PointUpdate { .. }
         | ReplicatedWrite::DocUpsert { .. }
+        | ReplicatedWrite::DocBatchUpsert { .. }
         | ReplicatedWrite::DocBatchInsert { .. }
         | ReplicatedWrite::DocTruncate { .. }
         | ReplicatedWrite::BulkDml { .. }
-        | ReplicatedWrite::InsertSelect { .. }
         | ReplicatedWrite::ApplyBalanceDelta { .. }
         | ReplicatedWrite::DocumentResolvedWrite { .. }
         | ReplicatedWrite::MergeApply { .. }
@@ -156,7 +156,6 @@ fn to_physical_plan(
         | ReplicatedWrite::KvPut { .. }
         | ReplicatedWrite::KvDelete { .. }
         | ReplicatedWrite::KvInsert { .. }
-        | ReplicatedWrite::KvInsertIfAbsent { .. }
         | ReplicatedWrite::KvInsertOnConflictUpdate { .. }
         | ReplicatedWrite::KvBatchPut { .. }
         | ReplicatedWrite::KvExpire { .. }
@@ -191,7 +190,8 @@ fn to_physical_plan(
         | ReplicatedWrite::ColumnarBulkDml { .. }
         | ReplicatedWrite::ColumnarBulkDmlResolved { .. }
         | ReplicatedWrite::ColumnarTruncate { .. }
-        | ReplicatedWrite::TimeseriesTruncate { .. } => {
+        | ReplicatedWrite::TimeseriesTruncate { .. }
+        | ReplicatedWrite::TimeseriesAggregateRefresh { .. } => {
             Ok((entry_columnar_family::decode_arm(write)?, None))
         }
         // Raft-native array cell writes — the cluster SQL DML array path.

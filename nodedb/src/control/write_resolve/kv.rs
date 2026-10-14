@@ -3,7 +3,9 @@
 //! KV implementation of [`EngineWriteResolver`].
 //!
 //! Resolves a governed state-dependent KV write (increment, CAS, field
-//! merge, TTL, transfer), and every predicate UPDATE/DELETE, into
+//! merge, TTL, transfer), every predicate UPDATE/DELETE, and every
+//! conditional insert (`ON CONFLICT DO NOTHING`, a multi-row
+//! `ON CONFLICT DO UPDATE`), into
 //! `KvOp::ResolvedWrite`
 //! — a mutation list plus response payload, since e.g. a `CAS` miss owes a
 //! reply while writing nothing.
@@ -92,6 +94,14 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
         KvOp::PredicateUpdate { collection, .. } | KvOp::PredicateDelete { collection, .. } => {
             collection
         }
+        // A conditional insert always resolves: which rows it writes, and
+        // the bodies a merge stores, depend on stored state. A log record of
+        // the bare op would make a replica or a WAL replay overwrite a row
+        // the leader skipped.
+        KvOp::InsertIfAbsent { collection, .. } => collection,
+        KvOp::BatchPut {
+            collection, intent, ..
+        } if intent.depends_on_stored_rows() => collection,
         // Both collections checked: an identity may give a row up but not
         // receive it — `sole_rls_write_check` would wave the write through.
         KvOp::TransferItem {
@@ -109,7 +119,6 @@ pub(super) fn resolver_for_kv_op(op: &KvOp) -> Option<Box<dyn EngineWriteResolve
         KvOp::Get { .. }
         | KvOp::Put { .. }
         | KvOp::Insert { .. }
-        | KvOp::InsertIfAbsent { .. }
         | KvOp::Scan { .. }
         | KvOp::GetTtl { .. }
         | KvOp::BatchGet { .. }

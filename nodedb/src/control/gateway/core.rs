@@ -64,13 +64,21 @@ pub struct QueryContext {
     pub linearizable: bool,
 }
 
-/// The authorized plan and its write lease. The caller holds the lease until
-/// the plan's outcome returns.
+/// The authorized plan, the roles of the identity that wrote it, and its
+/// write lease. The caller holds the lease until the plan's outcome returns.
 pub(super) fn authorized_plan_for_context(
     ctx: &QueryContext,
     checked: CloneCheckedTask,
-) -> Result<(PhysicalPlan, crate::control::lease::QueryLeaseScope), Error> {
+) -> Result<
+    (
+        PhysicalPlan,
+        Vec<String>,
+        crate::control::lease::QueryLeaseScope,
+    ),
+    Error,
+> {
     let (authorized, lease) = checked.into_parts();
+    let user_roles = authorized.identity().role_names();
     let task = authorized.into_physical_task();
     if task.tenant_id != ctx.tenant_id
         || task.database_id != ctx.database_id
@@ -80,7 +88,7 @@ pub(super) fn authorized_plan_for_context(
             detail: "authorized task scope does not match gateway query context".into(),
         });
     }
-    Ok((task.plan, lease))
+    Ok((task.plan, user_roles, lease))
 }
 
 /// The gateway: routes, dispatches, retries, and caches physical plans.
@@ -174,7 +182,8 @@ impl Gateway {
         ctx: &QueryContext,
         plan: PhysicalPlan,
     ) -> Result<GatewayOutcome, Error> {
-        self.execute_plan_outcome(ctx, plan).await
+        // A trusted internal write carries no caller roles.
+        self.execute_plan_outcome(ctx, plan, &[]).await
     }
 
     /// Execute a pre-planned `PhysicalPlan`, returning the raw payloads, the
@@ -190,15 +199,17 @@ impl Gateway {
         ctx: &QueryContext,
         checked: CloneCheckedTask,
     ) -> Result<GatewayOutcome, Error> {
-        let (plan, _lease) = authorized_plan_for_context(ctx, checked)?;
-        self.execute_plan_outcome(ctx, plan).await
+        let (plan, user_roles, _lease) = authorized_plan_for_context(ctx, checked)?;
+        self.execute_plan_outcome(ctx, plan, &user_roles).await
     }
 
-    /// Execute an authorized plan and keep every route's result detail.
+    /// Execute an authorized plan and keep every route's result detail. A
+    /// write carries `user_roles` to every replica.
     pub(super) async fn execute_plan_outcome(
         &self,
         ctx: &QueryContext,
         plan: PhysicalPlan,
+        user_roles: &[String],
     ) -> Result<GatewayOutcome, Error> {
         let shared = self.shared()?;
         let span = info_span!(
@@ -211,7 +222,7 @@ impl Gateway {
             .collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)
             .await?;
         let result = self
-            .execute_with_version_set(ctx, plan, version_set)
+            .execute_with_version_set(ctx, plan, version_set, user_roles)
             .instrument(span)
             .await;
         // Emit an OTLP span covering the whole gateway execute so an
@@ -235,12 +246,14 @@ impl Gateway {
     ///
     /// Returns the fused/collected payloads alongside every route's per-shard
     /// read watermarks (one `(vshard, watermark_lsn)` per participating shard,
-    /// accumulated across routes — never collapsed).
+    /// accumulated across routes — never collapsed). A write carries
+    /// `user_roles` to every replica.
     pub(super) async fn execute_with_version_set(
         &self,
         ctx: &QueryContext,
         plan: PhysicalPlan,
         version_set: GatewayVersionSet,
+        user_roles: &[String],
     ) -> Result<GatewayOutcome, Error> {
         let shared = self.shared()?;
         let routes = self.compute_routes(plan, ctx)?;
@@ -303,6 +316,7 @@ impl Gateway {
                         version_set: &version_set,
                         txn_id,
                         linearizable,
+                        user_roles,
                     })
                     .await
                 }
@@ -453,6 +467,19 @@ impl Gateway {
             .await
             .tenant_version(tenant_id);
         let rls_version = shared.rls.tenant_version(tenant_id);
+
+        // A continuous aggregate read as a relation folds in its own catalog
+        // version, so a cached plan over it stops matching once it changes.
+        let vs = match catalog {
+            Some(catalog) => super::version_set::with_continuous_aggregates(
+                vs,
+                plan,
+                catalog,
+                database_id.as_u64(),
+                tenant_id,
+            ),
+            None => vs,
+        };
 
         Ok(vs
             .with_extra(

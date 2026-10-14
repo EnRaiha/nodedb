@@ -16,9 +16,9 @@
 //! (only reachable via a future in-transaction timeseries DELETE, not staged
 //! today) has no base row to remove and is skipped.
 //!
-//! Only invoked on the RAW-scan branch (`execute_ts_raw_scan`); the
-//! aggregate / time-bucket branch (`execute_ts_aggregate`) is committed-only
-//! and never merges the overlay (continuous-aggregate correctness).
+//! The raw scan appends the staged rows; the grouped aggregate branch folds
+//! them into its groups (`staged_fold`). Continuous aggregates are built
+//! from flushed memtable drains only, so staged rows never reach them.
 
 use nodedb_types::value::Value;
 
@@ -86,6 +86,16 @@ fn staged_row_to_rmpv(row: &Value) -> rmpv::Value {
     }
 }
 
+/// A transaction's staged rows for one timeseries collection.
+pub(in crate::data::executor) struct StagedTsRows {
+    /// The transaction truncated the collection: no committed row is
+    /// visible to it.
+    pub truncated: bool,
+    /// Staged inserts that pass the time range, WHERE predicate and read
+    /// policy, as `Value::Object` rows keyed by the INSERT's column names.
+    pub rows: Vec<Value>,
+}
+
 impl CoreLoop {
     /// Append this transaction's staged `TimeseriesOp::Ingest` rows to
     /// `results` (base raw-scan rows), each subject to the scan's time-range,
@@ -96,6 +106,28 @@ impl CoreLoop {
         params: TimeseriesOverlayMergeParams<'_>,
         results: &mut Vec<rmpv::Value>,
     ) -> crate::Result<()> {
+        let limit = params.limit;
+        let staged = self.staged_timeseries_rows(params)?;
+        // A staged TRUNCATE hides every base row; staged puts re-enter below.
+        if staged.truncated {
+            results.clear();
+        }
+        for row in &staged.rows {
+            if results.len() >= limit {
+                break;
+            }
+            results.push(staged_row_to_rmpv(row));
+        }
+        Ok(())
+    }
+
+    /// This transaction's staged rows for the collection, each subject to
+    /// the scan's time range, WHERE predicate and read policy, up to
+    /// `limit` rows. Empty when the transaction staged nothing there.
+    pub(in crate::data::executor) fn staged_timeseries_rows(
+        &self,
+        params: TimeseriesOverlayMergeParams<'_>,
+    ) -> crate::Result<StagedTsRows> {
         let TimeseriesOverlayMergeParams {
             txn_id,
             coll_key,
@@ -105,6 +137,10 @@ impl CoreLoop {
             rls_predicates,
             limit,
         } = params;
+        let mut out = StagedTsRows {
+            truncated: false,
+            rows: Vec::new(),
+        };
 
         let time_column = self.ts_time_column(coll_key.0, coll_key.1, &coll_key.2);
         let time_kind = self.ts_time_key_kind(coll_key.0, coll_key.1, &coll_key.2);
@@ -112,15 +148,12 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return Ok(());
+            return Ok(out);
         };
-        // A staged TRUNCATE hides every base row; staged puts re-enter below.
-        if overlay.is_truncated(coll_key) {
-            results.clear();
-        }
+        out.truncated = overlay.is_truncated(coll_key);
 
         for (_surrogate, staged) in overlay.iter_for_collection(coll_key) {
-            if results.len() >= limit {
+            if out.rows.len() >= limit {
                 break;
             }
             // A base timeseries row carries no surrogate, so a staged
@@ -152,8 +185,8 @@ impl CoreLoop {
                 continue;
             }
 
-            results.push(staged_row_to_rmpv(&row));
+            out.rows.push(row);
         }
-        Ok(())
+        Ok(out)
     }
 }

@@ -95,6 +95,9 @@ pub(super) struct PreDispatchContext<'a> {
     pub(super) identity: &'a AuthenticatedIdentity,
     pub(super) auth: &'a AuthContext,
     pub(super) tenant_id: TenantId,
+    /// The database the task runs in, which qualifies the provider
+    /// relations a RETURNING redaction keys rules on.
+    pub(super) database_id: crate::types::DatabaseId,
     pub(super) session_id: SessionId,
     pub(super) plan_kind: PlanKind,
     /// The statement's resolved output columns, when any were announced to the
@@ -183,6 +186,7 @@ impl NodeDbPgHandler {
         let PreDispatchContext {
             auth,
             tenant_id,
+            database_id,
             session_id,
             plan_kind,
             projection,
@@ -191,7 +195,7 @@ impl NodeDbPgHandler {
         } = context;
         // A clone write can carry RETURNING rows, which deliver stored column
         // values as a SELECT does.
-        let redaction = QueryRedaction::for_plan(tenant_id, auth, plan);
+        let redaction = QueryRedaction::for_plan(tenant_id, database_id, auth, plan);
         // A clone write's RETURNING list names stored columns only, never a
         // Control-Plane computed column.
         match shape_payload_no_plan(

@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The `convert_aggregate` entry point. Four lowering shapes:
+//! The `convert_aggregate` entry point. Three lowering shapes:
 //!
-//! - join: `HashJoin` with post-join grouping
-//! - input-sourced body (derived table, constant result, union): the body is
-//!   materialized and the aggregate runs over its rows on the coordinator
-//!   (`input_sourced.rs`)
+//! - input-sourced: a join, a derived table, a constant result, a union, a
+//!   raw timeseries scan, or a scan under a `FOR SYSTEM_TIME` /
+//!   `FOR VALID_TIME` scope. The input lowers to one relation, the
+//!   coordinator materializes it, and the aggregate runs once over its rows
+//!   (`input_sourced.rs`).
 //! - catalog: `ProviderScan` input, coordinator-local
-//! - single collection: per-shard `Aggregate` (timeseries routes through
-//!   `TimeseriesOp::Scan`)
+//! - single collection: per-shard `Aggregate`
 
-use nodedb_sql::types::{EngineType, Filter, SortKey, SqlExpr, SqlPlan};
+use nodedb_sql::types::{Filter, SortKey, SqlExpr, SqlPlan};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
@@ -21,9 +21,8 @@ use super::super::convert::{ConvertContext, db_qualified};
 use super::super::expr::convert_sort_keys;
 use super::super::filter::serialize_filters;
 use super::spec::{
-    InputSourcedTaskParams, agg_expr_to_pair, agg_expr_to_spec, build_input_sourced_aggregate_task,
-    extract_collection_name, extract_scan_alias, group_by_to_specs, group_by_to_strings,
-    inline_join_side, join_side_collection,
+    InputFieldNames, InputSourcedTaskParams, agg_expr_to_spec, build_input_sourced_aggregate_task,
+    group_by_to_specs, group_by_to_strings,
 };
 use nodedb_sql::types::AggregateExpr;
 
@@ -59,132 +58,57 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     // expression.
     let bridge_sort_keys: Vec<SortKeySpec> = convert_sort_keys(sort_keys);
 
-    // Check if aggregating over a join.
-    if let SqlPlan::Join {
-        left,
-        right,
-        on,
-        join_type,
-        limit: join_limit,
-        ..
-    } = input
-    {
-        let mut left_collection = join_side_collection(left, ctx.database_id);
-        let mut right_collection = join_side_collection(right, ctx.database_id);
-        let mut left_alias = extract_scan_alias(left);
-        let mut right_alias = extract_scan_alias(right);
-
-        let group_strs = group_by_to_strings(group_by);
-        let agg_pairs = aggregates.iter().map(agg_expr_to_pair).collect();
-        let left_input = inline_join_side(left, tenant_id, ctx)?;
-        let right_input = inline_join_side(right, tenant_id, ctx)?;
-
-        // RIGHT JOIN → swap sides and convert to LEFT JOIN.
-        let mut on_keys = on.to_vec();
-        let mut left_input = left_input;
-        let mut right_input = right_input;
-        let effective_join_type = if join_type.as_str() == "right" {
-            std::mem::swap(&mut left_collection, &mut right_collection);
-            std::mem::swap(&mut left_alias, &mut right_alias);
-            std::mem::swap(&mut left_input, &mut right_input);
-            on_keys = on_keys.into_iter().map(|(l, r)| (r, l)).collect();
-            "left".to_string()
-        } else {
-            join_type.as_str().to_string()
-        };
-
-        let vshard =
-            nodedb_types::CollectionKey::from_qualified_str(ctx.database_id, &left_collection)?
-                .vshard();
-
-        return Ok(vec![PhysicalTask {
-            tenant_id,
-            vshard_id: vshard,
-            database_id: ctx.database_id,
-            plan: PhysicalPlan::Query(QueryOp::HashJoin {
-                left_collection: nodedb_types::QualifiedCollection::from_stored(left_collection),
-                right_collection: nodedb_types::QualifiedCollection::from_stored(right_collection),
-                left_alias,
-                right_alias,
-                on: on_keys,
-                join_type: effective_join_type,
-                // `Option<usize>` → `usize` sentinel: `usize::MAX` = no SQL
-                // LIMIT (handler bounds output by the byte budget); `Some(n)` =
-                // explicit `LIMIT n`. Mirrors the plain-join converter.
-                limit: join_limit.unwrap_or(usize::MAX),
-                post_group_by: group_strs,
-                post_aggregates: agg_pairs,
-                projection: Vec::new(),
-                computed_projection: Vec::new(),
-                join_filters: Vec::new(),
-                post_filters: Vec::new(),
-                left_input,
-                right_input,
-                left_bitmap: None,
-                right_bitmap: None,
-                // Populated by `rls_injection` after conversion, per side.
-                left_rls_filters: Vec::new(),
-                right_rls_filters: Vec::new(),
-                left_scan_filters: Vec::new(),
-                right_scan_filters: Vec::new(),
-            }),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        }]);
-    }
-
-    // A body with no routing collection (derived table, constant result,
-    // union) is materialized and aggregated on the coordinator.
-    let Some(raw_collection) = extract_collection_name(input) else {
-        return super::input_sourced::convert_input_sourced_aggregate(
-            super::input_sourced::InputSourcedAggregateParams {
-                input,
-                group_by,
-                aggregates,
-                having,
-                limit,
-                grouping_sets,
-                sort_keys: bridge_sort_keys,
-                tenant_id,
-                ctx,
-            },
-        );
-    };
-    let (filters_ref, engine) = match input {
+    // Only a plain current-state scan of one collection aggregates per
+    // shard. Every other input — a join, a derived table, a constant result,
+    // a union, a raw timeseries scan, a temporal scan — lowers to one
+    // relation the coordinator materializes, so the aggregate runs once over
+    // exactly the rows that input produces.
+    let (raw_collection, engine, filters_ref) = match input {
         SqlPlan::Scan {
-            filters, engine, ..
-        } => (filters.as_slice(), Some(*engine)),
-        _ => (&[][..], None),
+            collection,
+            engine,
+            filters,
+            temporal,
+            ..
+        } if !temporal.is_temporal() => (collection.clone(), engine, filters.as_slice()),
+        _ => {
+            return super::input_sourced::convert_input_sourced_aggregate(
+                super::input_sourced::InputSourcedAggregateParams {
+                    input,
+                    group_by,
+                    aggregates,
+                    having,
+                    limit,
+                    grouping_sets,
+                    sort_keys: bridge_sort_keys,
+                    tenant_id,
+                    ctx,
+                },
+            );
+        }
     };
     let filter_bytes = serialize_filters(filters_ref)?;
     let having_bytes = serialize_filters(having)?;
+    let bridge_grouping_sets: Vec<Vec<u32>> = grouping_sets
+        .unwrap_or(&[])
+        .iter()
+        .map(|set| set.iter().map(|&i| i as u32).collect())
+        .collect();
 
-    // Catalog aggregate: the rows are coordinator-materialized, not per-shard.
-    // Lower the catalog source to a `ProviderScan` carried in the aggregate's
-    // `input` so the executor aggregates over those rows instead of scanning a
-    // (non-existent) per-shard collection. `is_sharded_source` sees the
-    // `ProviderScan` input and keeps the aggregate coordinator-local (run once,
-    // never broadcast — broadcasting a catalog COUNT(*) would N×-overcount).
-    // The catalog provider name is the RAW (non-db-qualified) collection name,
-    // matching how plain catalog scans are lowered in `scan/core.rs`.
-    if crate::control::server::pgwire::catalog::schema::catalog_collection_info(&raw_collection)
-        .is_some()
-    {
-        // The input-sourced (catalog) aggregate executor does not expand
-        // ROLLUP / CUBE / GROUPING SETS. Surface the limitation as a typed
-        // error rather than silently returning only the base grouping (which
-        // would be the silent-narrowing class the audit guidance forbids).
-        if grouping_sets.is_some_and(|sets| !sets.is_empty()) {
-            return Err(crate::Error::PlanError {
-                detail: format!(
-                    "ROLLUP / CUBE / GROUPING SETS over catalog table '{raw_collection}' is not \
-                     supported"
-                ),
-            });
-        }
+    // Catalog or continuous-aggregate source: the rows are
+    // coordinator-materialized, not per-shard. Lower the source to a
+    // `ProviderScan` carried in the aggregate's `input` so the executor
+    // aggregates over those rows instead of scanning a per-shard collection.
+    // `is_sharded_source` sees the `ProviderScan` input and keeps the
+    // aggregate coordinator-local (run once, never broadcast — broadcasting a
+    // catalog COUNT(*) would N×-overcount). The provider name is the RAW
+    // (non-db-qualified) collection name, matching how provider scans are
+    // lowered in `scan/core.rs`.
+    if super::super::scan::is_provider_relation(&raw_collection, engine) {
         let provider_scan = PhysicalPlan::Query(QueryOp::ProviderScan {
             provider: Some(raw_collection.clone()),
             rows: Vec::new(),
+            sources: Vec::new(),
             // WHERE predicates on the catalog are applied by the ProviderScan
             // before the rows reach the aggregate.
             filters: filter_bytes,
@@ -206,9 +130,11 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 aggregates,
                 having_bytes,
                 limit,
+                grouping_sets: bridge_grouping_sets,
                 sort_keys: bridge_sort_keys,
+                names: InputFieldNames::Bare,
             },
-        )]);
+        )?]);
     }
 
     let collection = db_qualified(ctx.database_id, &raw_collection);
@@ -217,43 +143,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     let vshard = ctx.collection_key(&raw_collection).vshard();
 
     let group_strs = group_by_to_strings(group_by);
-    let agg_specs: Vec<AggregateSpec> = aggregates.iter().map(agg_expr_to_spec).collect();
-    let agg_pairs: Vec<(String, String)> = aggregates.iter().map(agg_expr_to_pair).collect();
-
-    // Timeseries aggregates: route through TimeseriesOp::Scan with time_range + aggregates.
-    if engine == Some(EngineType::Timeseries) {
-        return Ok(vec![PhysicalTask {
-            tenant_id,
-            vshard_id: vshard,
-            database_id: ctx.database_id,
-            plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
-                collection: qualified_collection,
-                // Derived in the Data Plane against the declared TIME_KEY.
-                time_range: UNBOUNDED_TIME_RANGE,
-                sort_keys: bridge_sort_keys,
-                projection: Vec::new(),
-                limit,
-                filters: filter_bytes,
-                bucket_interval_ms: 0,
-                group_by: group_strs,
-                aggregates: agg_pairs,
-                gap_fill: String::new(),
-                computed_columns: Vec::new(),
-                rls_filters: Vec::new(),
-                system_time: nodedb_types::SystemTimeScope::Current,
-                valid_at_ms: None,
-            }),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        }]);
-    }
-
-    // Convert grouping_sets from usize indices to u32 for wire transport.
-    let bridge_grouping_sets: Vec<Vec<u32>> = grouping_sets
-        .unwrap_or(&[])
+    let agg_specs = aggregates
         .iter()
-        .map(|set| set.iter().map(|&i| i as u32).collect())
-        .collect();
+        .map(agg_expr_to_spec)
+        .collect::<crate::Result<Vec<AggregateSpec>>>()?;
 
     // Distributed shuffle-aggregate eligibility. A whole-aggregate shuffle is
     // only *correct* when there is NO global ORDER BY and NO explicit LIMIT: each
@@ -265,9 +158,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     // sort/limit correctly. HAVING is per-group (disjoint across parts) so it is
     // allowed.
     //
-    // The no-LIMIT sentinel for an aggregate is `10000` (the planner default
-    // applied when no `LIMIT` clause is present; an explicit `LIMIT n` overwrites
-    // it — see `nodedb-sql` `apply_limit`), so `limit == 10000` means "no explicit
+    // The no-LIMIT value for an aggregate is `AGGREGATE_NO_LIMIT` (every
+    // group; an explicit `LIMIT n` overwrites it — see `nodedb-sql`
+    // `apply_limit`), so `limit == AGGREGATE_NO_LIMIT` means "no explicit
     // LIMIT". `grouping_sets` (ROLLUP / CUBE) cannot be shuffled either: the
     // partial-state producer keys on the base GROUP BY columns only. Only honored
     // in cluster mode (single-node has no peers to shuffle across).
@@ -281,7 +174,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     let shuffle_agg_eligible = ctx.cluster_enabled
         && !group_strs.is_empty()
         && bridge_sort_keys.is_empty()
-        && limit == 10000
+        && limit == nodedb_sql::planner::aggregate::AGGREGATE_NO_LIMIT
         && bridge_grouping_sets.is_empty()
         && (ctx.force_shuffle_agg
             || super::cost::cost_model_picks_aggregate_shuffle(ctx, &collection, &group_strs));
@@ -295,7 +188,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     };
     // The Data-Plane aggregate carries group-key specs; the shuffle exchange
     // keys and the cost model above still key on the plain column-name strings.
-    let group_specs = group_by_to_specs(group_by);
+    let group_specs = group_by_to_specs(group_by, InputFieldNames::Bare);
     let aggregate = PhysicalPlan::Query(QueryOp::Aggregate {
         collection: qualified_collection,
         input: None,
@@ -364,9 +257,11 @@ mod tests {
             alias: "tools_count".into(),
             distinct: false,
             grouping_col_index: None,
+            filter_text: None,
+            arg_text: None,
         };
 
-        let spec = agg_expr_to_spec(&agg);
+        let spec = agg_expr_to_spec(&agg).expect("sum is a generic aggregate");
 
         assert_eq!(spec.function, "sum");
         assert_eq!(spec.alias, "sum(*)");
@@ -419,5 +314,88 @@ mod tests {
 
         assert_eq!(computed.len(), 1);
         assert_eq!(computed[0].alias, "age_copy");
+    }
+
+    fn plain_agg(function: &str) -> AggregateExpr {
+        AggregateExpr {
+            function: function.into(),
+            args: vec![SqlExpr::Column {
+                table: None,
+                name: "v".into(),
+            }],
+            alias: format!("{function}(v)"),
+            distinct: false,
+            grouping_col_index: None,
+            filter_text: None,
+            arg_text: None,
+        }
+    }
+
+    /// A function with no generic accumulator is refused, never counted.
+    #[test]
+    fn function_without_generic_accumulator_is_refused() {
+        for function in ["ts_percentile", "ts_correlate", "approx_count"] {
+            assert!(
+                agg_expr_to_spec(&plain_agg(function)).is_err(),
+                "{function} must be refused"
+            );
+        }
+        assert!(agg_expr_to_spec(&plain_agg("ts_stddev")).is_ok());
+    }
+
+    /// GROUPING() the planner did not resolve to a key is refused.
+    #[test]
+    fn unresolved_grouping_is_refused() {
+        let mut agg = plain_agg("grouping");
+        assert!(agg_expr_to_spec(&agg).is_err());
+        agg.grouping_col_index = Some(1);
+        let spec = agg_expr_to_spec(&agg).expect("resolved grouping");
+        assert_eq!(spec.field, "1");
+    }
+
+    /// A parameterized aggregate carries its constant to the Data Plane in
+    /// the typed `param`, beside the plain field: `approx_percentile(v, 0.9)`
+    /// once shipped only `v`, and the Data Plane answered the median.
+    #[test]
+    fn a_parameterized_aggregate_carries_its_constant() {
+        use nodedb_physical::physical_plan::AggregateParam;
+        let column = SqlExpr::Column {
+            table: None,
+            name: "v".into(),
+        };
+        let with_param = |function: &str, param: SqlExpr| {
+            let mut agg = plain_agg(function);
+            agg.args = vec![column.clone(), param];
+            agg_expr_to_spec(&agg)
+        };
+
+        let spec = with_param("approx_percentile", SqlExpr::Literal(SqlValue::Float(0.9)))
+            .expect("percentile");
+        assert_eq!(spec.field, "v");
+        assert_eq!(
+            spec.param,
+            Some(AggregateParam::Percentile { fraction: 0.9 })
+        );
+
+        let spec = with_param("approx_topk", SqlExpr::Literal(SqlValue::Int(3))).expect("topk");
+        assert_eq!(spec.field, "v");
+        assert_eq!(spec.param, Some(AggregateParam::TopK { k: 3 }));
+
+        assert_eq!(
+            agg_expr_to_spec(&plain_agg("sum")).expect("sum").param,
+            None
+        );
+
+        for (function, param) in [
+            ("approx_topk", column.clone()),
+            ("approx_topk", SqlExpr::Literal(SqlValue::Int(0))),
+            ("approx_topk", SqlExpr::Literal(SqlValue::Float(2.5))),
+            ("approx_percentile", SqlExpr::Literal(SqlValue::Float(1.5))),
+        ] {
+            assert!(
+                with_param(function, param.clone()).is_err(),
+                "{function} with {param:?} must be refused"
+            );
+        }
     }
 }

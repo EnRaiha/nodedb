@@ -4,7 +4,7 @@
 
 use nodedb_physical::physical_plan::{KvOp, KvResolvedMutation};
 
-use super::binder::IdentityBinder;
+use super::binder::{BindSlot, IdentityBinder};
 
 pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<()> {
     match op {
@@ -82,10 +82,13 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
                     ),
                 });
             }
-            for ((key, _value), surrogate) in entries.iter().zip(surrogates.iter_mut()) {
-                binder.resolve_in_place(binder.plan_key(collection.as_str())?, key, surrogate)?;
-            }
-            Ok(())
+            let collection_key = binder.plan_key(collection.as_str())?;
+            let slots = entries
+                .iter()
+                .zip(surrogates.iter_mut())
+                .map(|((key, _value), surrogate)| BindSlot::keyed(collection_key, key, surrogate))
+                .collect();
+            binder.resolve_slots_in_place(slots)
         }
         KvOp::Transfer {
             collection,
@@ -95,16 +98,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
             credit_surrogate,
             ..
         } => {
-            binder.resolve_in_place(
-                binder.plan_key(collection.as_str())?,
-                source_key,
-                debit_surrogate,
-            )?;
-            binder.resolve_in_place(
-                binder.plan_key(collection.as_str())?,
-                dest_key,
-                credit_surrogate,
-            )
+            let collection_key = binder.plan_key(collection.as_str())?;
+            binder.resolve_slots_in_place(vec![
+                BindSlot::keyed(collection_key, source_key, debit_surrogate),
+                BindSlot::keyed(collection_key, dest_key, credit_surrogate),
+            ])
         }
         // The moved item lands under `dest_key` in the destination collection.
         KvOp::TransferItem {
@@ -119,6 +117,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
         ),
         KvOp::ResolveWrite(inner) => bind(binder, inner),
         KvOp::ResolvedWrite { mutations, .. } => {
+            let mut slots = Vec::with_capacity(mutations.len());
             for mutation in mutations.iter_mut() {
                 match mutation {
                     KvResolvedMutation::Put {
@@ -126,11 +125,11 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
                         key,
                         surrogate,
                         ..
-                    } => binder.resolve_in_place(
+                    } => slots.push(BindSlot::keyed(
                         binder.plan_key(collection.as_str())?,
                         key,
                         surrogate,
-                    )?,
+                    )),
                     // Named by key; the row's identity was bound when it was put.
                     KvResolvedMutation::Rewrite { .. }
                     | KvResolvedMutation::Delete { .. }
@@ -138,7 +137,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut KvOp) -> crate::Result<
                     | KvResolvedMutation::Persist { .. } => {}
                 }
             }
-            Ok(())
+            binder.resolve_slots_in_place(slots)
         }
         // Key-named ops on existing rows, reads, index maintenance and
         // predicate DML carry no surrogate slot to install.

@@ -14,6 +14,7 @@ use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+use super::returning_rows::VectorRowColumns;
 use super::rls_write_gate;
 
 /// Parameters for [`CoreLoop::execute_vector_direct_delete`].
@@ -53,13 +54,17 @@ impl CoreLoop {
         let identity_column = self.identity_column(database_id, tid, collection);
 
         // No index means no row was ever written: nothing to remove.
+        let columns = VectorRowColumns {
+            identity: &identity_column,
+            vector: field,
+        };
         if !self.vector_collections.contains_key(&index_key) {
             if let Some(spec) = returning {
                 return self.vector_stored_returning_response(
                     task,
                     spec,
                     rls_filters,
-                    &identity_column,
+                    columns,
                     &[],
                 );
             }
@@ -97,10 +102,33 @@ impl CoreLoop {
             }
         }
 
-        let mut removed: Vec<(StorageKey, Vec<u8>)> = Vec::with_capacity(surrogates.len());
+        let mut removed: Vec<(StorageKey, Vec<u8>, Vec<f32>)> =
+            Vec::with_capacity(surrogates.len());
         for (at, surrogate) in surrogates.iter().enumerate() {
+            // The pre-image vector a `RETURNING` reports, read before the
+            // node goes.
+            let vector = match returning {
+                Some(_) => match self.committed_primary_vector(
+                    database_id,
+                    tid,
+                    collection,
+                    field,
+                    *surrogate,
+                ) {
+                    Ok(vector) => vector,
+                    Err(e) => {
+                        // The rows before this one are removed.
+                        let before = &surrogates[..at];
+                        self.finish_vector_direct_write(task, &index_key, tid, collection, before);
+                        return self.response_error(task, e);
+                    }
+                },
+                None => Vec::new(),
+            };
             match self.remove_vector_direct_row(&index_key, tid, collection, *surrogate) {
-                Ok(Some(row)) => removed.push((StorageKey::for_surrogate(*surrogate), row.bytes)),
+                Ok(Some(row)) => {
+                    removed.push((StorageKey::for_surrogate(*surrogate), row.bytes, vector))
+                }
                 Ok(None) => {}
                 Err(e) => {
                     // The failed row stays whole. The rows before it are removed.
@@ -115,15 +143,11 @@ impl CoreLoop {
         }
 
         if let Some(spec) = returning {
-            let rows: Vec<(&StorageKey, &[u8])> =
-                removed.iter().map(|(k, b)| (k, b.as_slice())).collect();
-            return self.vector_stored_returning_response(
-                task,
-                spec,
-                rls_filters,
-                &identity_column,
-                &rows,
-            );
+            let rows: Vec<(&StorageKey, &[u8], &[f32])> = removed
+                .iter()
+                .map(|(k, b, v)| (k, b.as_slice(), v.as_slice()))
+                .collect();
+            return self.vector_stored_returning_response(task, spec, rls_filters, columns, &rows);
         }
         self.response_affected(task, removed.len() as u64)
     }

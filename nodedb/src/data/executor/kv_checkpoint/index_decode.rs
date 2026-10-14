@@ -16,6 +16,7 @@ use crate::data::executor::checkpoint_decode_error::CheckpointDecodeError;
 use crate::data::executor::handlers::kv::sorted_index_compute::{
     BuildSortedIndexDefParams, build_sorted_index_def,
 };
+use crate::engine::kv::index::IndexCoverage;
 use crate::engine::kv::sorted_index::manager::SortedIndexDef;
 
 /// Flattened index content: `(index_key, primary_key)` pairs.
@@ -26,6 +27,7 @@ pub(super) type DecodedIndexEntries = Vec<(Vec<u8>, Vec<u8>)>;
 pub(super) struct DecodedFieldIndex {
     pub field: String,
     pub field_position: usize,
+    pub coverage: IndexCoverage,
     pub entries: DecodedIndexEntries,
 }
 
@@ -34,7 +36,17 @@ pub(super) struct DecodedFieldIndex {
 pub(super) struct DecodedCompositeIndex {
     pub fields: Vec<String>,
     pub field_positions: Vec<usize>,
+    pub coverage: IndexCoverage,
     pub entries: DecodedIndexEntries,
+}
+
+/// The coverage an exported `complete` flag records.
+fn decode_coverage(complete: bool) -> IndexCoverage {
+    if complete {
+        IndexCoverage::Complete
+    } else {
+        IndexCoverage::SinceRegistration
+    }
 }
 
 /// A sorted index ready to install: the rebuilt definition and its tree.
@@ -63,6 +75,7 @@ pub(super) fn decode_kv_indexes(
         fields.push(DecodedFieldIndex {
             field: f.field.clone(),
             field_position: decode_field_position(f.field_position, &f.field)?,
+            coverage: decode_coverage(f.complete),
             entries: flatten_entries(&f.entries),
         });
     }
@@ -83,6 +96,7 @@ pub(super) fn decode_kv_indexes(
         composites.push(DecodedCompositeIndex {
             fields: c.fields.clone(),
             field_positions,
+            coverage: decode_coverage(c.complete),
             entries: flatten_entries(&c.entries),
         });
     }
@@ -235,6 +249,7 @@ mod tests {
             composites: vec![super::super::index_format::KvCheckpointCompositeIndex {
                 fields: vec!["a".into(), "b".into()],
                 field_positions: vec![0],
+                complete: true,
                 entries: Vec::new(),
             }],
             ..Default::default()
@@ -249,6 +264,7 @@ mod tests {
             fields: vec![KvCheckpointFieldIndex {
                 field: "region".into(),
                 field_position: 0,
+                complete: false,
                 entries: vec![KvCheckpointIndexEntry {
                     key: b"us".to_vec(),
                     primary_keys: vec![b"k1".to_vec(), b"k2".to_vec()],
@@ -259,5 +275,10 @@ mod tests {
         let decoded = decode_kv_indexes(&raw).expect("decode");
         assert_eq!(decoded.fields[0].entries.len(), 2);
         assert_eq!(decoded.fields[0].entries[0].0, b"us".to_vec());
+        assert_eq!(
+            decoded.fields[0].coverage,
+            IndexCoverage::SinceRegistration,
+            "a partial index must come back partial"
+        );
     }
 }

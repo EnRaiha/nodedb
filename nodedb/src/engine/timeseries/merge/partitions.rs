@@ -1,392 +1,555 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Merge multiple sealed partitions into a single output partition.
+//! The rows of several sealed partitions of one collection, combined into the
+//! rows of one partition.
+//!
+//! A merge moves rows and never changes them. The result holds exactly the
+//! rows of its sources:
+//!
+//! - **Schema.** The union of the source schemas: the first source's columns
+//!   in its order, then every column a later source adds. A cell a source
+//!   has no column for takes the null its type stores in a memtable (NaN,
+//!   the null symbol, 0), the way a column added by schema evolution
+//!   backfills older rows.
+//! - **Symbols.** One dictionary per symbol column, the union of the
+//!   sources' dictionaries, with no cardinality cap: the tag cap bounds one
+//!   memtable generation, not a partition.
+//! - **Order.** Rows are sorted by time with a stable sort over the sources
+//!   in the order given, so rows with equal timestamps keep that order.
+//! - **Identity.** `interval_ms` is the sources' common interval. The WAL
+//!   LSN is the highest of the sources'. `max_system_ts` is the highest of
+//!   the sources'.
+//!
+//! Sources that cannot combine without changing a row (different time
+//! columns, a column whose type differs, different intervals) are refused
+//! as [`MergeOutcome::Incompatible`]; the caller leaves them unmerged.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use nodedb_types::timeseries::{PartitionMeta, SymbolDictionary};
 
-use crate::engine::timeseries::columnar_memtable::{ColumnData, ColumnType};
-use crate::engine::timeseries::columnar_segment::{
-    ColumnarSegmentReader, ColumnarSegmentWriter, SegmentError,
+use crate::engine::timeseries::columnar_memtable::{
+    ColumnData, ColumnType, ColumnarDrainResult, ColumnarSchema, NULL_SYMBOL_ID,
 };
 
-/// Merge multiple source partitions into one output partition.
+/// One source partition, read whole.
+pub struct MergeSource {
+    pub schema: ColumnarSchema,
+    /// One column per schema column, in schema order.
+    pub columns: Vec<ColumnData>,
+    /// Dictionary of each symbol column that has one, by column index.
+    pub symbol_dicts: HashMap<usize, SymbolDictionary>,
+    pub meta: PartitionMeta,
+}
+
+/// The combined rows, ready for the partition writer.
+pub struct MergedPartition {
+    pub drain: ColumnarDrainResult,
+    pub interval_ms: u64,
+    pub last_flushed_wal_lsn: u64,
+}
+
+/// What a merge of a group produced.
+pub enum MergeOutcome {
+    Merged(MergedPartition),
+    /// The sources cannot combine without changing a row. The text says why.
+    Incompatible(String),
+}
+
+/// Combine `sources`, in the order given, into one partition's rows.
 ///
-/// Reads all columns from each source, concatenates them (sorted by timestamp),
-/// unifies symbol dictionaries, and writes the result.
-pub fn merge_partitions(
-    base_dir: &Path,
-    source_dirs: &[PathBuf],
-    output_name: &str,
-) -> Result<MergeResult, SegmentError> {
-    if source_dirs.is_empty() {
-        return Err(SegmentError::Io("no source partitions to merge".into()));
+/// `Err` is corruption: a column whose length is not the partition's row
+/// count, a symbol id no dictionary holds, or a symbol dictionary that
+/// reached the id space.
+pub fn merge_sources(sources: Vec<MergeSource>) -> crate::Result<MergeOutcome> {
+    let Some(first) = sources.first() else {
+        return Ok(MergeOutcome::Incompatible("no source partitions".into()));
+    };
+    let interval_ms = first.meta.interval_ms;
+    if let Some(other) = sources.iter().find(|s| s.meta.interval_ms != interval_ms) {
+        return Ok(MergeOutcome::Incompatible(format!(
+            "partition intervals differ: {interval_ms} and {}",
+            other.meta.interval_ms
+        )));
     }
+    let schemas: Vec<&ColumnarSchema> = sources.iter().map(|s| &s.schema).collect();
+    let schema = match union_schema(&schemas) {
+        Ok(schema) => schema,
+        Err(reason) => return Ok(MergeOutcome::Incompatible(reason)),
+    };
 
-    // Read schemas — use the first partition's schema as the reference.
-    let ref_schema = ColumnarSegmentReader::read_schema(&source_dirs[0], None)?;
-
-    // Read and concatenate columns from all sources.
-    let mut merged_columns: Vec<ColumnData> = ref_schema
+    let mut columns: Vec<ColumnData> = schema
         .columns
         .iter()
-        .map(|(_, ty)| ColumnData::new_empty(*ty))
+        .map(|(_, ty)| empty_column(*ty))
+        .collect();
+    let mut symbol_dicts: HashMap<usize, SymbolDictionary> = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, ty))| *ty == ColumnType::Symbol)
+        .map(|(i, _)| (i, SymbolDictionary::new()))
         .collect();
 
-    let mut total_rows = 0u64;
-    let mut global_min_ts = i64::MAX;
-    let mut global_max_ts = i64::MIN;
-    let mut total_size = 0u64;
+    let mut row_count = 0u64;
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    let mut max_system_ts = 0i64;
+    let mut last_flushed_wal_lsn = 0u64;
 
-    // Per-column symbol dictionaries: merge as we go.
-    let mut merged_dicts: std::collections::HashMap<usize, SymbolDictionary> =
-        std::collections::HashMap::new();
-    for (i, (_, ty)) in ref_schema.columns.iter().enumerate() {
-        if *ty == ColumnType::Symbol {
-            merged_dicts.insert(i, SymbolDictionary::new());
+    for source in &sources {
+        let rows = usize::try_from(source.meta.row_count).map_err(|_| {
+            corrupt(format!(
+                "a partition row count {} does not fit this platform",
+                source.meta.row_count
+            ))
+        })?;
+        if source.columns.len() != source.schema.columns.len() {
+            return Err(corrupt(format!(
+                "a partition holds {} columns and its schema names {}",
+                source.columns.len(),
+                source.schema.columns.len()
+            )));
         }
+        for (j, (name, ty)) in schema.columns.iter().enumerate() {
+            let Some(src_idx) = source.schema.columns.iter().position(|(n, _)| n == name) else {
+                push_nulls(&mut columns[j], rows);
+                continue;
+            };
+            let data = &source.columns[src_idx];
+            if data.len() != rows {
+                return Err(corrupt(format!(
+                    "column '{name}' holds {} rows and its partition {rows}",
+                    data.len()
+                )));
+            }
+            if *ty == ColumnType::Symbol {
+                let dict = symbol_dicts.get_mut(&j).ok_or_else(|| {
+                    corrupt(format!("symbol column '{name}' has no merged dictionary"))
+                })?;
+                let remapped = remap_symbols(name, data, source.symbol_dicts.get(&src_idx), dict)?;
+                append(&mut columns[j], &remapped, name)?;
+            } else {
+                append(&mut columns[j], data, name)?;
+            }
+        }
+        row_count += source.meta.row_count;
+        min_ts = min_ts.min(source.meta.min_ts);
+        max_ts = max_ts.max(source.meta.max_ts);
+        max_system_ts = max_system_ts.max(source.meta.max_system_ts);
+        last_flushed_wal_lsn = last_flushed_wal_lsn.max(source.meta.last_flushed_wal_lsn);
     }
 
-    for source_dir in source_dirs {
-        let meta = ColumnarSegmentReader::read_meta(source_dir, None)?;
-        total_rows += meta.row_count;
-        if meta.min_ts < global_min_ts {
-            global_min_ts = meta.min_ts;
+    sort_by_time(&mut columns, schema.timestamp_idx)?;
+
+    Ok(MergeOutcome::Merged(MergedPartition {
+        drain: ColumnarDrainResult {
+            columns,
+            schema,
+            symbol_dicts,
+            row_count,
+            min_ts,
+            max_ts,
+            max_system_ts,
+            series_row_counts: HashMap::new(),
+        },
+        interval_ms,
+        last_flushed_wal_lsn,
+    }))
+}
+
+/// Why partitions with these schemas do not combine, or `None` when they
+/// do. A caller checks this on the schemas alone before it reads columns.
+pub fn schema_incompatibility(schemas: &[&ColumnarSchema]) -> Option<String> {
+    union_schema(schemas).err()
+}
+
+/// The union of the source schemas, or why the sources do not combine.
+fn union_schema(schemas: &[&ColumnarSchema]) -> Result<ColumnarSchema, String> {
+    let Some((first, rest)) = schemas.split_first() else {
+        return Err("no source partitions".into());
+    };
+    let time_name = time_column(first)?;
+    let mut columns = first.columns.clone();
+    let mut codecs: Vec<nodedb_codec::ColumnCodec> =
+        (0..first.columns.len()).map(|i| first.codec(i)).collect();
+    for schema in rest {
+        let name = time_column(schema)?;
+        if name != time_name {
+            return Err(format!("time columns differ: '{time_name}' and '{name}'"));
         }
-        if meta.max_ts > global_max_ts {
-            global_max_ts = meta.max_ts;
-        }
-        total_size += meta.size_bytes;
-
-        // Read partition schema for column mapping (handles schema evolution).
-        let part_schema = ColumnarSegmentReader::read_schema(source_dir, None)?;
-
-        for (i, (col_name, col_type)) in ref_schema.columns.iter().enumerate() {
-            // Check if this column exists in the source partition.
-            let source_idx = part_schema.columns.iter().position(|(n, _)| n == col_name);
-
-            match source_idx {
-                Some(_src_i) => {
-                    let col =
-                        ColumnarSegmentReader::read_column(source_dir, col_name, *col_type, None)?;
-
-                    if *col_type == ColumnType::Symbol {
-                        // Remap symbol IDs through merged dictionary.
-                        let source_dict =
-                            ColumnarSegmentReader::read_symbol_dict(source_dir, col_name, None)?;
-                        let merged_dict =
-                            merged_dicts
-                                .get_mut(&i)
-                                .ok_or(SegmentError::Corrupt(format!(
-                                    "missing merged dict for column index {i}"
-                                )))?;
-                        let remap = merged_dict.merge(&source_dict, 100_000);
-
-                        let remapped = remap_symbols(col.as_symbols(), &remap);
-                        merged_columns[i].extend_symbols(&remapped);
-                    } else {
-                        merged_columns[i].extend_from(&col);
-                    }
+        for (i, (col, ty)) in schema.columns.iter().enumerate() {
+            match columns.iter().find(|(n, _)| n == col) {
+                Some((_, held)) if held != ty => {
+                    return Err(format!(
+                        "column '{col}' is {held:?} in one partition and {ty:?} in another"
+                    ));
                 }
+                Some(_) => {}
                 None => {
-                    // Column missing in this source — fill with defaults.
-                    let fill_count = meta.row_count as usize;
-                    merged_columns[i].extend_nulls(fill_count);
+                    columns.push((col.clone(), *ty));
+                    codecs.push(schema.codec(i));
                 }
             }
         }
     }
-
-    // Sort by timestamp column.
-    let ts_idx = ref_schema.timestamp_idx;
-    sort_by_timestamp(&mut merged_columns, ts_idx);
-
-    // Write merged partition.
-    let writer = ColumnarSegmentWriter::new(base_dir);
-
-    // Preserve the merged partition's system-time max so retention's
-    // bitemporal path sees the true latest write time, not just event-time.
-    let max_system_ts = ref_schema
-        .ts_system_idx()
-        .and_then(|idx| merged_columns.get(idx))
-        .map(|col| match col {
-            ColumnData::Timestamp(v) | ColumnData::Int64(v) => v.iter().copied().max().unwrap_or(0),
-            _ => 0,
-        })
-        .unwrap_or(0);
-
-    // Build a drain-like result for the writer.
-    let drain = crate::engine::timeseries::columnar_memtable::ColumnarDrainResult {
-        columns: merged_columns,
-        schema: ref_schema.clone(),
-        symbol_dicts: merged_dicts,
-        row_count: total_rows,
-        min_ts: global_min_ts,
-        max_ts: global_max_ts,
-        max_system_ts,
-        series_row_counts: std::collections::HashMap::new(),
-    };
-
-    let interval_ms = if global_max_ts > global_min_ts {
-        (global_max_ts - global_min_ts) as u64
-    } else {
-        0
-    };
-
-    tracing::debug!(
-        output = output_name,
-        total_rows,
-        total_size,
-        sources = source_dirs.len(),
-        "merge partition written"
-    );
-
-    let meta = writer.write_partition(output_name, &drain.view(), interval_ms, 0, None)?;
-
-    Ok(MergeResult {
-        meta,
-        dir_name: output_name.to_string(),
-        source_count: source_dirs.len(),
+    Ok(ColumnarSchema {
+        columns,
+        timestamp_idx: first.timestamp_idx,
+        codecs,
     })
 }
 
-/// Remap symbol IDs using a remap table.
-fn remap_symbols(ids: &[u32], remap: &[u32]) -> Vec<u32> {
-    ids.iter()
-        .map(|&id| {
-            if (id as usize) < remap.len() {
-                remap[id as usize]
-            } else {
-                u32::MAX // sentinel for unknown
-            }
-        })
-        .collect()
-}
-
-/// Sort all columns by the timestamp column (in-place).
-fn sort_by_timestamp(columns: &mut [ColumnData], ts_idx: usize) {
-    let len = columns[ts_idx].len();
-    if len <= 1 {
-        return;
-    }
-
-    // Build sort indices from timestamp column.
-    let timestamps = columns[ts_idx].as_timestamps();
-    let mut indices: Vec<usize> = (0..len).collect();
-    indices.sort_by_key(|&i| timestamps[i]);
-
-    // Apply permutation to all columns.
-    for col in columns.iter_mut() {
-        col.apply_permutation(&indices);
+/// The name of `schema`'s time column.
+fn time_column(schema: &ColumnarSchema) -> Result<&str, String> {
+    match schema.columns.get(schema.timestamp_idx) {
+        Some((name, ty)) if ty.is_time() => Ok(name.as_str()),
+        _ => Err("a partition schema names no time column".into()),
     }
 }
 
-/// Result of a merge operation.
-#[derive(Debug)]
-pub struct MergeResult {
-    pub meta: PartitionMeta,
-    pub dir_name: String,
-    pub source_count: usize,
+fn empty_column(ty: ColumnType) -> ColumnData {
+    match ty {
+        ColumnType::Timestamp(_) => ColumnData::Timestamp(Vec::new()),
+        ColumnType::Float64 => ColumnData::Float64(Vec::new()),
+        ColumnType::Int64 => ColumnData::Int64(Vec::new()),
+        ColumnType::Symbol => ColumnData::Symbol(Vec::new()),
+    }
 }
 
-// Extension methods for ColumnData needed by merge.
-impl ColumnData {
-    pub(super) fn new_empty(ty: ColumnType) -> Self {
-        match ty {
-            ColumnType::Timestamp(_) => Self::Timestamp(Vec::new()),
-            ColumnType::Float64 => Self::Float64(Vec::new()),
-            ColumnType::Int64 => Self::Int64(Vec::new()),
-            ColumnType::Symbol => Self::Symbol(Vec::new()),
-        }
-    }
-
-    pub(super) fn extend_from(&mut self, other: &ColumnData) {
-        match (self, other) {
-            (Self::Timestamp(a), Self::Timestamp(b)) => a.extend_from_slice(b),
-            (Self::Float64(a), Self::Float64(b)) => a.extend_from_slice(b),
-            (Self::Int64(a), Self::Int64(b)) => a.extend_from_slice(b),
-            (Self::Symbol(a), Self::Symbol(b)) => a.extend_from_slice(b),
-            _ => {} // type mismatch — skip
-        }
-    }
-
-    pub(super) fn extend_symbols(&mut self, ids: &[u32]) {
-        if let Self::Symbol(v) = self {
-            v.extend_from_slice(ids);
-        }
-    }
-
-    pub(super) fn extend_nulls(&mut self, count: usize) {
-        match self {
-            Self::Timestamp(v) => v.extend(std::iter::repeat_n(0i64, count)),
-            Self::Float64(v) => v.extend(std::iter::repeat_n(f64::NAN, count)),
-            Self::Int64(v) => v.extend(std::iter::repeat_n(0i64, count)),
-            Self::Symbol(v) => v.extend(std::iter::repeat_n(u32::MAX, count)),
-            Self::DictEncoded { ids, valid, .. } => {
-                ids.extend(std::iter::repeat_n(u32::MAX, count));
-                valid.extend(std::iter::repeat_n(false, count));
-            }
-        }
-    }
-
-    pub(super) fn apply_permutation(&mut self, indices: &[usize]) {
-        match self {
-            Self::Timestamp(v) => permute_vec(v, indices),
-            Self::Float64(v) => permute_vec(v, indices),
-            Self::Int64(v) => permute_vec(v, indices),
-            Self::Symbol(v) => permute_vec(v, indices),
-            Self::DictEncoded { ids, valid, .. } => {
-                permute_vec(ids, indices);
-                permute_vec(valid, indices);
-            }
+/// Append `rows` nulls, as a memtable backfills a column it gains.
+fn push_nulls(column: &mut ColumnData, rows: usize) {
+    match column {
+        ColumnData::Timestamp(v) | ColumnData::Int64(v) => v.extend(std::iter::repeat_n(0, rows)),
+        ColumnData::Float64(v) => v.extend(std::iter::repeat_n(f64::NAN, rows)),
+        ColumnData::Symbol(v) => v.extend(std::iter::repeat_n(NULL_SYMBOL_ID, rows)),
+        ColumnData::DictEncoded { ids, valid, .. } => {
+            ids.extend(std::iter::repeat_n(NULL_SYMBOL_ID, rows));
+            valid.extend(std::iter::repeat_n(false, rows));
         }
     }
 }
 
-/// Apply a permutation to a Vec in-place.
-fn permute_vec<T: Clone>(v: &mut Vec<T>, indices: &[usize]) {
-    let sorted: Vec<T> = indices.iter().map(|&i| v[i].clone()).collect();
-    *v = sorted;
+/// Append `data` to `column`. The two must hold the same type.
+fn append(column: &mut ColumnData, data: &ColumnData, name: &str) -> crate::Result<()> {
+    match (column, data) {
+        (ColumnData::Timestamp(a), ColumnData::Timestamp(b))
+        | (ColumnData::Int64(a), ColumnData::Int64(b)) => a.extend_from_slice(b),
+        (ColumnData::Float64(a), ColumnData::Float64(b)) => a.extend_from_slice(b),
+        (ColumnData::Symbol(a), ColumnData::Symbol(b)) => a.extend_from_slice(b),
+        _ => {
+            return Err(corrupt(format!(
+                "column '{name}' read back in a form its schema type does not store"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The ids of a source symbol column, renumbered into `merged`.
+fn remap_symbols(
+    name: &str,
+    data: &ColumnData,
+    source_dict: Option<&SymbolDictionary>,
+    merged: &mut SymbolDictionary,
+) -> crate::Result<ColumnData> {
+    let ColumnData::Symbol(ids) = data else {
+        return Err(corrupt(format!(
+            "symbol column '{name}' read back in a form a symbol column does not store"
+        )));
+    };
+    // The id space stops below the null id, so no symbol takes it.
+    let remap = match source_dict {
+        Some(dict) => merged.merge(dict, NULL_SYMBOL_ID),
+        None => Vec::new(),
+    };
+    if remap.contains(&NULL_SYMBOL_ID) {
+        return Err(crate::Error::Storage {
+            engine: "timeseries".into(),
+            detail: format!("merge: symbol column '{name}' reached the symbol id space"),
+        });
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if id == NULL_SYMBOL_ID {
+            out.push(NULL_SYMBOL_ID);
+            continue;
+        }
+        let mapped = remap.get(id as usize).copied().ok_or_else(|| {
+            corrupt(format!(
+                "symbol column '{name}' holds id {id}, which its dictionary does not"
+            ))
+        })?;
+        out.push(mapped);
+    }
+    Ok(ColumnData::Symbol(out))
+}
+
+/// Sort every column by the time column, stably.
+fn sort_by_time(columns: &mut [ColumnData], time_idx: usize) -> crate::Result<()> {
+    let order: Vec<usize> = {
+        let Some(ColumnData::Timestamp(times)) = columns.get(time_idx) else {
+            return Err(corrupt("the time column read back as no time column"));
+        };
+        let mut order: Vec<usize> = (0..times.len()).collect();
+        order.sort_by_key(|&i| times[i]);
+        order
+    };
+    for column in columns.iter_mut() {
+        permute(column, &order);
+    }
+    Ok(())
+}
+
+fn permute(column: &mut ColumnData, order: &[usize]) {
+    fn apply<T: Copy>(values: &mut Vec<T>, order: &[usize]) {
+        *values = order.iter().map(|&i| values[i]).collect();
+    }
+    match column {
+        ColumnData::Timestamp(v) | ColumnData::Int64(v) => apply(v, order),
+        ColumnData::Float64(v) => apply(v, order),
+        ColumnData::Symbol(v) => apply(v, order),
+        ColumnData::DictEncoded { ids, valid, .. } => {
+            apply(ids, order);
+            apply(valid, order);
+        }
+    }
+}
+
+fn corrupt(detail: impl std::fmt::Display) -> crate::Error {
+    crate::Error::SegmentCorrupted {
+        detail: format!("timeseries merge: {detail}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use nodedb_types::timeseries::MetricSample;
-    use tempfile::TempDir;
-
-    use crate::engine::timeseries::columnar_memtable::{
-        ColumnValue, ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema, TimeKind,
-    };
+    use nodedb_types::timeseries::PartitionState;
 
     use super::*;
+    use crate::engine::timeseries::columnar_memtable::TimeKind;
 
     const MILLIS: ColumnType = ColumnType::Timestamp(TimeKind::Millis);
 
-    fn test_config() -> ColumnarMemtableConfig {
-        ColumnarMemtableConfig {
-            max_memory_bytes: 10 * 1024 * 1024,
-            hard_memory_limit: 20 * 1024 * 1024,
-            max_tag_cardinality: 1000,
+    fn meta(min_ts: i64, max_ts: i64, rows: u64, lsn: u64) -> PartitionMeta {
+        PartitionMeta {
+            min_ts,
+            max_ts,
+            row_count: rows,
+            size_bytes: 0,
+            schema_version: 1,
+            state: PartitionState::Sealed,
+            interval_ms: 3_600_000,
+            last_flushed_wal_lsn: lsn,
+            column_stats: HashMap::new(),
+            max_system_ts: 0,
         }
     }
 
-    fn write_test_partition(base_dir: &Path, name: &str, start_ts: i64, count: usize) -> PathBuf {
-        let writer = ColumnarSegmentWriter::new(base_dir);
-        let mut mt = ColumnarMemtable::new_metric(test_config());
-        for i in 0..count {
-            mt.ingest_metric(
-                1,
-                MetricSample {
-                    timestamp_ms: start_ts + i as i64,
-                    value: (start_ts + i as i64) as f64,
-                },
-            );
+    fn source(columns: Vec<(&str, ColumnType, ColumnData)>, meta: PartitionMeta) -> MergeSource {
+        let (schema_cols, data): (Vec<(String, ColumnType)>, Vec<ColumnData>) = columns
+            .into_iter()
+            .map(|(n, t, d)| ((n.to_string(), t), d))
+            .unzip();
+        MergeSource {
+            schema: ColumnarSchema {
+                columns: schema_cols,
+                timestamp_idx: 0,
+                codecs: Vec::new(),
+            },
+            columns: data,
+            symbol_dicts: HashMap::new(),
+            meta,
         }
-        let drain = mt.drain();
-        writer
-            .write_partition(name, &drain.view(), 86_400_000, 0, None)
-            .unwrap();
-        base_dir.join(name)
     }
 
+    fn merged(outcome: MergeOutcome) -> MergedPartition {
+        match outcome {
+            MergeOutcome::Merged(m) => m,
+            MergeOutcome::Incompatible(reason) => panic!("refused: {reason}"),
+        }
+    }
+
+    /// A column only a later source has keeps its values. The earlier
+    /// source's rows read it as null.
     #[test]
-    fn merge_two_simple_partitions() {
-        let tmp = TempDir::new().unwrap();
-        let dir1 = write_test_partition(tmp.path(), "ts-part1", 1000, 50);
-        let dir2 = write_test_partition(tmp.path(), "ts-part2", 2000, 50);
-
-        let result = merge_partitions(tmp.path(), &[dir1, dir2], "ts-merged").unwrap();
-
-        assert_eq!(result.meta.row_count, 100);
-        assert_eq!(result.meta.min_ts, 1000);
-        assert_eq!(result.meta.max_ts, 2049);
-        assert_eq!(result.source_count, 2);
-
-        // Read back merged data.
-        let merged_dir = tmp.path().join("ts-merged");
-        let ts_col =
-            ColumnarSegmentReader::read_column(&merged_dir, "timestamp", MILLIS, None).unwrap();
-        let timestamps = ts_col.as_timestamps();
-        assert_eq!(timestamps.len(), 100);
-        // Should be sorted.
-        for w in timestamps.windows(2) {
-            assert!(w[0] <= w[1], "not sorted: {} > {}", w[0], w[1]);
-        }
-    }
-
-    #[test]
-    fn merge_with_tags() {
-        let tmp = TempDir::new().unwrap();
-        let schema = ColumnarSchema {
-            columns: vec![
-                ("timestamp".into(), MILLIS),
-                ("value".into(), ColumnType::Float64),
-                ("host".into(), ColumnType::Symbol),
+    fn the_schema_is_the_union_of_the_sources() {
+        let a = source(
+            vec![
+                ("ts", MILLIS, ColumnData::Timestamp(vec![1, 3])),
+                (
+                    "v",
+                    ColumnType::Float64,
+                    ColumnData::Float64(vec![1.0, 3.0]),
+                ),
             ],
-            timestamp_idx: 0,
-            codecs: vec![nodedb_codec::ColumnCodec::Auto; 3],
-        };
-
-        // Write two partitions with different host values.
-        let writer = ColumnarSegmentWriter::new(tmp.path());
-        for (part_name, host, start) in [("ts-p1", "host-a", 1000i64), ("ts-p2", "host-b", 2000)] {
-            let mut mt = ColumnarMemtable::new(schema.clone(), test_config());
-            for i in 0..10 {
-                mt.ingest_row(
-                    1,
-                    &[
-                        ColumnValue::Timestamp(start + i),
-                        ColumnValue::Float64(1.0),
-                        ColumnValue::Symbol(host.to_string()),
-                    ],
-                )
-                .unwrap();
-            }
-            let drain = mt.drain();
-            writer
-                .write_partition(part_name, &drain.view(), 86_400_000, 0, None)
-                .unwrap();
-        }
-
-        let result = merge_partitions(
-            tmp.path(),
-            &[tmp.path().join("ts-p1"), tmp.path().join("ts-p2")],
-            "ts-merged-tags",
-        )
-        .unwrap();
-        assert_eq!(result.meta.row_count, 20);
-
-        // Read merged symbol dict — should have both hosts.
-        let merged_dir = tmp.path().join("ts-merged-tags");
-        let dict = ColumnarSegmentReader::read_symbol_dict(&merged_dir, "host", None).unwrap();
-        assert_eq!(dict.len(), 2);
-        assert!(dict.get_id("host-a").is_some());
-        assert!(dict.get_id("host-b").is_some());
+            meta(1, 3, 2, 10),
+        );
+        let b = source(
+            vec![
+                ("ts", MILLIS, ColumnData::Timestamp(vec![2])),
+                ("v", ColumnType::Float64, ColumnData::Float64(vec![2.0])),
+                ("n", ColumnType::Int64, ColumnData::Int64(vec![7])),
+            ],
+            meta(2, 2, 1, 20),
+        );
+        let m = merged(merge_sources(vec![a, b]).expect("merges"));
+        let names: Vec<&str> = m
+            .drain
+            .schema
+            .columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, vec!["ts", "v", "n"]);
+        assert!(matches!(&m.drain.columns[0], ColumnData::Timestamp(v) if v == &[1, 2, 3]));
+        assert!(matches!(&m.drain.columns[2], ColumnData::Int64(v) if v == &[0, 7, 0]));
+        assert_eq!(m.drain.row_count, 3);
+        assert_eq!((m.drain.min_ts, m.drain.max_ts), (1, 3));
+        assert_eq!(m.last_flushed_wal_lsn, 20);
+        assert_eq!(m.interval_ms, 3_600_000);
     }
 
+    /// Rows with equal timestamps keep the order of their sources.
     #[test]
-    fn merge_preserves_timestamp_order() {
-        let tmp = TempDir::new().unwrap();
-        // Partition 2 has earlier timestamps than partition 1.
-        let dir1 = write_test_partition(tmp.path(), "ts-later", 5000, 20);
-        let dir2 = write_test_partition(tmp.path(), "ts-earlier", 1000, 20);
-
-        let merged = merge_partitions(tmp.path(), &[dir1, dir2], "ts-sorted").unwrap();
-        assert_eq!(
-            merged.meta.row_count, 40,
-            "merged partition should have all rows"
+    fn equal_timestamps_keep_source_order() {
+        let a = source(
+            vec![
+                ("ts", MILLIS, ColumnData::Timestamp(vec![5])),
+                ("v", ColumnType::Float64, ColumnData::Float64(vec![1.0])),
+            ],
+            meta(5, 5, 1, 1),
         );
+        let b = source(
+            vec![
+                ("ts", MILLIS, ColumnData::Timestamp(vec![5])),
+                ("v", ColumnType::Float64, ColumnData::Float64(vec![2.0])),
+            ],
+            meta(5, 5, 1, 2),
+        );
+        let m = merged(merge_sources(vec![a, b]).expect("merges"));
+        assert!(matches!(&m.drain.columns[1], ColumnData::Float64(v) if v == &[1.0, 2.0]));
+    }
 
-        let merged_dir = tmp.path().join("ts-sorted");
-        let ts_col =
-            ColumnarSegmentReader::read_column(&merged_dir, "timestamp", MILLIS, None).unwrap();
-        let timestamps = ts_col.as_timestamps();
-        // All timestamps from partition 2 (1000-1019) should come before partition 1 (5000-5019).
-        assert_eq!(timestamps[0], 1000);
-        assert_eq!(timestamps[19], 1019);
-        assert_eq!(timestamps[20], 5000);
+    /// A merged dictionary larger than one memtable generation's tag cap
+    /// keeps every value.
+    #[test]
+    fn symbols_merge_without_a_cardinality_cap() {
+        const PER_SOURCE: u32 = 60_000;
+        let make = |offset: u32, lsn: u64| {
+            let mut dict = SymbolDictionary::new();
+            let mut ids = Vec::new();
+            for i in 0..PER_SOURCE {
+                ids.push(
+                    dict.resolve(&format!("host-{}", offset + i), u32::MAX)
+                        .expect("resolves"),
+                );
+            }
+            let mut s = source(
+                vec![
+                    (
+                        "ts",
+                        MILLIS,
+                        ColumnData::Timestamp((0..i64::from(PER_SOURCE)).collect()),
+                    ),
+                    ("host", ColumnType::Symbol, ColumnData::Symbol(ids)),
+                ],
+                meta(0, i64::from(PER_SOURCE) - 1, u64::from(PER_SOURCE), lsn),
+            );
+            s.symbol_dicts.insert(1, dict);
+            s
+        };
+        let m = merged(merge_sources(vec![make(0, 1), make(PER_SOURCE, 2)]).expect("merges"));
+        let dict = m.drain.symbol_dicts.get(&1).expect("dictionary");
+        assert_eq!(dict.len(), 2 * PER_SOURCE as usize);
+        let ColumnData::Symbol(ids) = &m.drain.columns[1] else {
+            panic!("symbol column");
+        };
+        assert!(ids.iter().all(|&id| id != NULL_SYMBOL_ID));
+    }
+
+    /// A null symbol stays null, and a symbol keeps its string.
+    #[test]
+    fn symbols_keep_their_strings_and_nulls() {
+        let make = |host: &str, ts: i64, lsn: u64| {
+            let mut dict = SymbolDictionary::new();
+            let id = dict.resolve(host, u32::MAX).expect("resolves");
+            let mut s = source(
+                vec![
+                    ("ts", MILLIS, ColumnData::Timestamp(vec![ts, ts + 1])),
+                    (
+                        "host",
+                        ColumnType::Symbol,
+                        ColumnData::Symbol(vec![id, NULL_SYMBOL_ID]),
+                    ),
+                ],
+                meta(ts, ts + 1, 2, lsn),
+            );
+            s.symbol_dicts.insert(1, dict);
+            s
+        };
+        let m = merged(merge_sources(vec![make("a", 0, 1), make("b", 10, 2)]).expect("merges"));
+        let dict = m.drain.symbol_dicts.get(&1).expect("dictionary");
+        let ColumnData::Symbol(ids) = &m.drain.columns[1] else {
+            panic!("symbol column");
+        };
+        let strings: Vec<Option<&str>> = ids
+            .iter()
+            .map(|&id| (id != NULL_SYMBOL_ID).then(|| dict.get(id)).flatten())
+            .collect();
+        assert_eq!(strings, vec![Some("a"), None, Some("b"), None]);
+    }
+
+    /// Sources with different intervals, time columns or column types are
+    /// left unmerged.
+    #[test]
+    fn incompatible_sources_are_refused() {
+        let base = || {
+            source(
+                vec![
+                    ("ts", MILLIS, ColumnData::Timestamp(vec![1])),
+                    ("v", ColumnType::Float64, ColumnData::Float64(vec![1.0])),
+                ],
+                meta(1, 1, 1, 1),
+            )
+        };
+        let mut other_interval = base();
+        other_interval.meta.interval_ms = 1;
+        assert!(matches!(
+            merge_sources(vec![base(), other_interval]),
+            Ok(MergeOutcome::Incompatible(_))
+        ));
+        let other_type = source(
+            vec![
+                ("ts", MILLIS, ColumnData::Timestamp(vec![1])),
+                ("v", ColumnType::Int64, ColumnData::Int64(vec![1])),
+            ],
+            meta(1, 1, 1, 1),
+        );
+        assert!(matches!(
+            merge_sources(vec![base(), other_type]),
+            Ok(MergeOutcome::Incompatible(_))
+        ));
+        let other_time = source(
+            vec![("t2", MILLIS, ColumnData::Timestamp(vec![1]))],
+            meta(1, 1, 1, 1),
+        );
+        assert!(matches!(
+            merge_sources(vec![base(), other_time]),
+            Ok(MergeOutcome::Incompatible(_))
+        ));
+    }
+
+    /// A column whose length is not its partition's row count is corruption.
+    #[test]
+    fn a_short_column_is_corruption() {
+        let bad = source(
+            vec![("ts", MILLIS, ColumnData::Timestamp(vec![1]))],
+            meta(1, 1, 2, 1),
+        );
+        assert!(matches!(
+            merge_sources(vec![bad]),
+            Err(crate::Error::SegmentCorrupted { .. })
+        ));
     }
 }

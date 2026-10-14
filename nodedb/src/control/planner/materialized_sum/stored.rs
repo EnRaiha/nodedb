@@ -166,6 +166,8 @@ pub(super) fn stored_row_scope(
             post_image: PostImage::BodyOrAssigned(value.as_slice()),
             txn_id,
         }),
+        // A page names one stored row per document: see `stored_row_scopes`.
+        DocumentOp::BatchUpsert { .. } => None,
         DocumentOp::PointInsert { .. }
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::ResolveWrite(_)
@@ -188,6 +190,33 @@ pub(super) fn stored_row_scope(
         // Already resolved on the plan the resolve pass read.
         | DocumentOp::ResolvedWrite { .. }
         | DocumentOp::ApplyBalanceDelta { .. } => None,
+    }
+}
+
+/// Every stored row an op rewrites or removes: one per row of a
+/// `BatchUpsert` page, each judged as its `Upsert` is, else the one
+/// [`stored_row_scope`] names.
+pub(super) fn stored_row_scopes(op: &DocumentOp, txn_id: Option<TxnId>) -> Vec<StoredRowScope<'_>> {
+    match op {
+        DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            surrogates,
+            on_conflict_updates,
+            ..
+        } => documents
+            .iter()
+            .zip(surrogates)
+            .map(|((document_id, value), surrogate)| StoredRowScope {
+                collection: collection.as_str(),
+                document_id: document_id.as_str(),
+                surrogate: *surrogate,
+                updates: on_conflict_updates.as_slice(),
+                post_image: PostImage::BodyOrAssigned(value.as_slice()),
+                txn_id,
+            })
+            .collect(),
+        other => stored_row_scope(other, txn_id).into_iter().collect(),
     }
 }
 

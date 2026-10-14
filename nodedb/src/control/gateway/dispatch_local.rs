@@ -29,6 +29,8 @@ pub(super) struct LocalContext<'a> {
     pub(super) trace_id: TraceId,
     pub(super) txn_id: Option<TxnId>,
     pub(super) version_set: &'a GatewayVersionSet,
+    /// Roles of the identity that wrote the statement, carried on the write.
+    pub(super) user_roles: &'a [String],
 }
 
 /// Local dispatch via SPSC bridge.
@@ -46,6 +48,7 @@ pub(super) async fn dispatch_local(
         trace_id,
         txn_id,
         version_set,
+        user_roles,
     } = ctx;
     // Staying on this node does not make the plan fresh: a DDL can bump a
     // descriptor between planning and dispatch, and a drain that times out is
@@ -93,6 +96,7 @@ pub(super) async fn dispatch_local(
             &crate::control::wal_replication::ReplicableWrite::decide_for_replication(&plan)?,
         )?
     {
+        let entry = entry.with_user_roles(user_roles.to_vec());
         let proposer = shared.async_raft_proposer()?;
         let (payload, write_versions) = crate::control::wal_replication::propose_replicated_entry(
             shared,
@@ -120,6 +124,7 @@ pub(super) async fn dispatch_local(
         plan,
         trace_id,
         txn_id,
+        user_roles,
     })
     .await?;
     // The remote sibling turns `ExecuteResponse.error` into `Err`; the local
@@ -144,6 +149,7 @@ struct LocalPlan<'a> {
     plan: PhysicalPlan,
     trace_id: TraceId,
     txn_id: Option<TxnId>,
+    user_roles: &'a [String],
 }
 
 /// Dispatch a plan to this node's cores on the route its class needs.
@@ -169,6 +175,7 @@ async fn dispatch_local_plan(local: LocalPlan<'_>) -> Result<Response, Error> {
         plan,
         trace_id,
         txn_id,
+        user_roles,
     } = local;
     if plan_is_write(&plan) && !is_task_vshard_scoped(&plan) {
         let frontier_mutation = txn_id.is_none()
@@ -184,6 +191,7 @@ async fn dispatch_local_plan(local: LocalPlan<'_>) -> Result<Response, Error> {
             trace_id,
             event_source: crate::event::EventSource::User,
             txn_id,
+            user_roles: user_roles.to_vec(),
         };
         if frontier_mutation {
             return shared

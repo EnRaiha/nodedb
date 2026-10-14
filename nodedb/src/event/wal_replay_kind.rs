@@ -85,7 +85,7 @@ pub(super) fn row_kind(record_type: RecordType) -> Option<RowRecord> {
         | RecordType::LogBatch
         | RecordType::Transaction
         | RecordType::SurrogateAlloc
-        | RecordType::SurrogateBind
+        | RecordType::SurrogateBindBatch
         | RecordType::Checkpoint
         | RecordType::CollectionTombstoned
         | RecordType::TimeAnchor

@@ -254,25 +254,42 @@ fn regen_certs_writes_are_durable() {
 /// partition_dir)`) have the same durability gap as file-level tmp+rename:
 /// the directory entries can reach disk before the contents of the newly
 /// renamed-in directory. The swap helper must fsync both parent directories.
+///
+/// A timeseries partition merge renames its staged partition into place and
+/// removes its sources. The commit manifest that makes it durable is one
+/// atomic file write, and so is the merged partition's rewritten meta.
 #[test]
 fn timeseries_merge_directory_swap_is_durable() {
-    let src = read("nodedb/src/engine/timeseries/merge/o3.rs");
+    let src = read("nodedb/src/data/executor/handlers/timeseries/merge_commit.rs");
     assert!(
         src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
         "timeseries merge directory swap must fsync the parent directory \
          after renames — otherwise the new partition dir's inode can be \
          visible before its contents are on stable storage."
     );
+    for rel in [
+        "nodedb/src/data/executor/handlers/timeseries/merge_commit.rs",
+        "nodedb/src/data/executor/handlers/timeseries/partition_merge.rs",
+    ] {
+        assert_durable_checkpoint_writer(rel);
+    }
 }
 
 #[test]
 fn timeseries_ddl_partition_swap_is_durable() {
-    let src = read("nodedb/src/control/server/shared/ddl/neutral/timeseries/rewrite.rs");
-    assert!(
-        src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
-        "timeseries DDL partition rewrite directory swap must fsync the \
-         parent directory after renames."
-    );
+    // The owning Data Plane core performs the `REWRITE PARTITIONS` swap, and
+    // boot recovery renames an interrupted swap's backup back into place.
+    for rel in [
+        "nodedb/src/data/executor/handlers/timeseries/partition_rewrite.rs",
+        "nodedb/src/data/executor/timeseries_checkpoint/rewrite_recovery.rs",
+    ] {
+        let src = read(rel);
+        assert!(
+            src.contains("atomic_swap_dirs_fsync") || src.contains("fsync_directory"),
+            "{rel}: a timeseries partition rewrite directory swap must fsync \
+             the parent directory after renames."
+        );
+    }
 }
 
 /// Checkpoint reads are consumed once and then superseded by the in-memory

@@ -26,8 +26,9 @@ use crate::control::server::exchange::read_scope::ReadScope;
 /// post-processor returns it.
 ///
 /// The merged rows are embedded as a `ProviderScan{provider: None}` with an
-/// empty relational tail; the enclosing post-processor or input-sourced
-/// aggregate supplies its own tail over these rows.
+/// empty relational tail and every branch's requirements as its sources; the
+/// enclosing post-processor or input-sourced aggregate supplies its own tail
+/// over these rows.
 pub(super) async fn resolve_set_op(
     state: &SharedState,
     ctx: ReadScope,
@@ -43,16 +44,26 @@ pub(super) async fn resolve_set_op(
     let materialized = futures::future::try_join_all(branches).await?;
 
     let mut payloads = Vec::with_capacity(materialized.len());
+    let mut sources = Vec::new();
     for (rows, branch_captures) in materialized {
         captures.extend(branch_captures);
         match rows {
-            ChildRows::Rows(rows) => payloads.push(rows),
+            ChildRows::Rows {
+                rows,
+                sources: branch_sources,
+            } => {
+                payloads.push(rows);
+                sources.extend(branch_sources);
+            }
             ChildRows::Passthrough(resolved) => return Ok(resolved),
         }
     }
 
+    // The merged rows carry the requirements of every branch.
     let merged = merge_set_op_rows(&payloads, op);
-    Ok(Resolved::Plan(Box::new(provider_scan_of_rows(merged))))
+    Ok(Resolved::Plan(Box::new(provider_scan_of_rows(
+        merged, sources,
+    ))))
 }
 
 /// Merge materialized branch payloads with `op`. Each payload is one msgpack

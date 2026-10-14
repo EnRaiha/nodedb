@@ -12,10 +12,6 @@ use std::collections::{HashMap, HashSet};
 use nodedb_physical::physical_plan::AggregateSpec;
 use nodedb_types::Value;
 
-/// Maximum items collected by materializing aggregates (`array_agg`,
-/// `array_agg_distinct`, `percentile_cont`, `string_agg`).
-pub(super) const ARRAY_AGG_CAP: usize = 10_000;
-
 /// Per-(group, aggregate-spec) running accumulator.
 ///
 /// Encodes as MessagePack so that partial states can be spilled to disk by
@@ -45,25 +41,28 @@ pub(crate) enum AggAccum {
     Hll {
         hll: nodedb_types::approx::HyperLogLog,
     },
-    /// approx_percentile: t-digest.
+    /// approx_percentile: t-digest and the requested percentile.
     TDigest {
         digest: nodedb_types::approx::TDigest,
+        pct: f64,
     },
     /// approx_topk: space-saving.
     TopK {
         ss: nodedb_types::approx::SpaceSaving,
         k: usize,
     },
-    /// array_agg (capped).
+    /// array_agg: every non-NULL input value. Memory: O(group rows), held
+    /// to the group-by memory budget by the spiller, like `count_distinct`.
     ArrayAgg { values: Vec<Value> },
-    /// array_agg_distinct (capped).
+    /// array_agg_distinct: each distinct value once, in first-seen order,
+    /// paired with its raw msgpack bytes so a merge dedups by the same key.
     ArrayAggDistinct {
         seen: HashSet<Vec<u8>>,
-        values: Vec<Value>,
+        values: Vec<(Vec<u8>, Value)>,
     },
-    /// percentile_cont (capped).
+    /// percentile_cont: every input value.
     PercentileCont { values: Vec<f64>, pct: f64 },
-    /// string_agg / group_concat (capped).
+    /// string_agg / group_concat: every input string.
     StringAgg { parts: Vec<String> },
 }
 
@@ -77,10 +76,15 @@ pub(crate) struct GroupState {
 }
 
 impl GroupState {
-    pub(crate) fn new(aggregates: &[AggregateSpec]) -> Self {
-        Self {
-            accums: aggregates.iter().map(AggAccum::new).collect(),
-        }
+    /// The zero state of one group. An aggregate without an accumulator is
+    /// an error naming it.
+    pub(crate) fn new(aggregates: &[AggregateSpec]) -> crate::Result<Self> {
+        Ok(Self {
+            accums: aggregates
+                .iter()
+                .map(AggAccum::new)
+                .collect::<crate::Result<Vec<_>>>()?,
+        })
     }
 
     pub(crate) fn feed(

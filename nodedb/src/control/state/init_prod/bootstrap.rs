@@ -178,7 +178,7 @@ pub(super) fn run(
             let hwm = catalog.get_surrogate_hwm()?;
             // The singleton is flushed lazily and no engine contributes a
             // "surrogate durable through" floor to WAL truncation, so a
-            // checkpoint can truncate the `SurrogateAlloc` / `SurrogateBind`
+            // checkpoint can truncate the `SurrogateAlloc` / `SurrogateBindBatch`
             // records that cover a stale singleton. Take the
             // highest surrogate any live binding refers to as a floor the
             // allocator can never start below — re-issuing one already bound to

@@ -284,9 +284,14 @@ pub async fn delete_edge(
             tenant_id,
             database_id,
         };
-        let response = crate::control::write_resolve::run_write_resolve(state, ctx, &*resolver)
-            .await
-            .map_err(|e| DdlError::from_error(&e))?;
+        let response = crate::control::write_resolve::run_write_resolve(
+            state,
+            ctx,
+            &*resolver,
+            &identity.role_names(),
+        )
+        .await
+        .map_err(|e| DdlError::from_error(&e))?;
         return Ok(vec![DdlResult::Status {
             command: "DELETE EDGE".to_string(),
             rows_affected: Some(response_affected(&response)?),
@@ -342,6 +347,7 @@ pub async fn delete_edge(
 pub async fn set_node_labels(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     node_id: String,
     labels: Vec<String>,
     remove: bool,
@@ -372,7 +378,7 @@ pub async fn set_node_labels(
         crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
             state,
             tenant_id,
-            DatabaseId::DEFAULT,
+            database_id,
             vshard_id,
             plan,
             crate::event::EventSource::User,

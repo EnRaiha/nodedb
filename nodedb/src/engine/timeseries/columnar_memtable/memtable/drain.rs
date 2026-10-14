@@ -2,7 +2,7 @@
 
 //! Taking rows out of a [`ColumnarMemtable`]: flush view, drain, truncate.
 
-use nodedb_types::timeseries::SymbolDictionary;
+use nodedb_types::timeseries::{SeriesId, SeriesKey, SymbolDictionary};
 
 use super::super::types::{
     ColumnData, ColumnType, ColumnarDrainResult, ColumnarFlushView, max_system_ts_of,
@@ -84,13 +84,13 @@ impl ColumnarMemtable {
         result
     }
 
-    /// Truncate this memtable back to `n` rows.
+    /// Truncate this memtable back to its first `n` rows.
     ///
-    /// Used during transaction rollback to reverse a `TimeseriesIngest` operation.
-    /// All column vectors are truncated; aggregate stats are recomputed from the
-    /// surviving rows. `series_row_counts` is rebuilt from scratch so per-series
-    /// cardinality remains consistent.
-    pub fn truncate_to(&mut self, n: u64) {
+    /// Every column is truncated. Time range, memory and the per-series
+    /// counts are recomputed from the rows that stay. `known` is each series
+    /// the memtable counted with its catalog key: a row's series is derived
+    /// from its tags as ingest derives it ([`Self::recount_series`]).
+    pub fn truncate_to(&mut self, n: u64, known: &[(SeriesId, SeriesKey)]) {
         if n >= self.row_count {
             return;
         }
@@ -112,8 +112,7 @@ impl ColumnarMemtable {
         if n == 0 {
             self.min_ts = i64::MAX;
             self.max_ts = i64::MIN;
-            self.series_row_counts.clear();
-        } else if let ColumnData::Timestamp(ts) = &self.columns[ts_idx] {
+        } else if let Some(ColumnData::Timestamp(ts)) = self.columns.get(ts_idx) {
             self.min_ts = ts.iter().copied().min().unwrap_or(i64::MAX);
             self.max_ts = ts.iter().copied().max().unwrap_or(i64::MIN);
         }
@@ -133,13 +132,66 @@ impl ColumnarMemtable {
                 } => ids.capacity() * 4 + valid.capacity() + dictionary.len() * 32,
             })
             .sum();
+        self.recount_series(known);
+    }
+
+    /// Remove the first `n` rows, the rows a committed flush holds, and keep
+    /// the rows ingested after it.
+    ///
+    /// Time range, memory and the per-series counts are recomputed from the
+    /// rows that stay. `known` is each series the memtable counted with its
+    /// catalog key: a row's series is derived from its tags as ingest derives
+    /// it ([`Self::recount_series`]).
+    pub fn drain_front(&mut self, n: u64, known: &[(SeriesId, SeriesKey)]) {
+        if n >= self.row_count {
+            self.drain();
+            return;
+        }
+        let n_usize = n as usize;
+        for col in &mut self.columns {
+            match col {
+                ColumnData::Timestamp(v) | ColumnData::Int64(v) => {
+                    *v = v.split_off(n_usize.min(v.len()));
+                }
+                ColumnData::Float64(v) => {
+                    *v = v.split_off(n_usize.min(v.len()));
+                }
+                ColumnData::Symbol(v) => {
+                    *v = v.split_off(n_usize.min(v.len()));
+                }
+                ColumnData::DictEncoded { ids, valid, .. } => {
+                    *ids = ids.split_off(n_usize.min(ids.len()));
+                    *valid = valid.split_off(n_usize.min(valid.len()));
+                }
+            }
+        }
+        self.row_count -= n;
+        let ts_idx = self.schema.timestamp_idx;
+        if let Some(ColumnData::Timestamp(ts)) = self.columns.get(ts_idx) {
+            self.min_ts = ts.iter().copied().min().unwrap_or(i64::MAX);
+            self.max_ts = ts.iter().copied().max().unwrap_or(i64::MIN);
+        }
+        self.memory_bytes = self
+            .columns
+            .iter()
+            .map(|c| match c {
+                ColumnData::Timestamp(v) | ColumnData::Int64(v) => v.capacity() * 8,
+                ColumnData::Float64(v) => v.capacity() * 8,
+                ColumnData::Symbol(v) => v.capacity() * 4,
+                ColumnData::DictEncoded {
+                    ids,
+                    valid,
+                    dictionary,
+                    ..
+                } => ids.capacity() * 4 + valid.capacity() + dictionary.len() * 32,
+            })
+            .sum();
+        self.recount_series(known);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::timeseries::MetricSample;
-
     use super::super::super::types::ColumnarMemtableConfig;
     use super::*;
 
@@ -155,13 +207,15 @@ mod tests {
     fn drain_returns_data_and_resets() {
         let mut mt = ColumnarMemtable::new_metric(default_config());
         for i in 0..50 {
-            mt.ingest_metric(
+            use super::super::super::types::ColumnValue;
+            mt.ingest_row(
                 1,
-                MetricSample {
-                    timestamp_ms: 1000 + i,
-                    value: i as f64,
-                },
-            );
+                &[
+                    ColumnValue::Timestamp(1000 + i),
+                    ColumnValue::Float64(i as f64),
+                ],
+            )
+            .expect("ingest");
         }
         assert_eq!(mt.row_count(), 50);
 
@@ -176,5 +230,102 @@ mod tests {
         // Memtable is reset.
         assert_eq!(mt.row_count(), 0);
         assert!(mt.is_empty());
+    }
+
+    #[test]
+    fn drain_front_keeps_the_later_rows() {
+        use super::super::super::types::{ColumnType, ColumnValue, ColumnarSchema, TimeKind};
+
+        let schema = ColumnarSchema {
+            columns: vec![
+                ("ts".into(), ColumnType::Timestamp(TimeKind::Millis)),
+                ("host".into(), ColumnType::Symbol),
+                ("value".into(), ColumnType::Float64),
+            ],
+            timestamp_idx: 0,
+            codecs: Vec::new(),
+        };
+        let key = |host: &str| SeriesKey::new("cpu", vec![("host".into(), host.into())]);
+        let known = vec![(1, key("a")), (2, key("b")), (3, key("c"))];
+        let mut mt = ColumnarMemtable::new(schema, default_config());
+        // Rows 0..4 are hosts a and b, rows 4..10 hosts b and c.
+        let hosts = ["a", "a", "b", "a", "b", "c", "c", "b", "c", "c"];
+        for (i, host) in hosts.iter().enumerate() {
+            let series = match *host {
+                "a" => 1,
+                "b" => 2,
+                _ => 3,
+            };
+            mt.ingest_row(
+                series,
+                &[
+                    ColumnValue::Timestamp(1000 + i as i64),
+                    ColumnValue::Symbol((*host).into()),
+                    ColumnValue::Float64(i as f64),
+                ],
+            )
+            .expect("ingest");
+        }
+        assert_eq!(mt.series_count(), 3);
+
+        mt.drain_front(4, &known);
+        assert_eq!(mt.row_count(), 6);
+        assert_eq!((mt.min_ts(), mt.max_ts()), (1004, 1009));
+        assert_eq!(mt.series_count(), 2, "host a has no row left");
+        let mut ids = mt.series_ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3]);
+        let rest = mt.drain();
+        assert_eq!(rest.columns[0].len(), 6);
+        assert_eq!(rest.columns[0].as_timestamps()[0], 1004);
+        assert_eq!(rest.series_row_counts.get(&2), Some(&2));
+        assert_eq!(rest.series_row_counts.get(&3), Some(&4));
+
+        let mut metric = ColumnarMemtable::new_metric(default_config());
+        metric
+            .ingest_row(1, &[ColumnValue::Timestamp(5), ColumnValue::Float64(0.0)])
+            .expect("ingest");
+        metric.drain_front(1, &[]);
+        assert!(metric.is_empty());
+        assert_eq!(metric.series_count(), 0);
+    }
+
+    #[test]
+    fn truncate_to_recounts_the_series_of_the_rows_kept() {
+        use super::super::super::types::{ColumnType, ColumnValue, ColumnarSchema, TimeKind};
+
+        let schema = ColumnarSchema {
+            columns: vec![
+                ("ts".into(), ColumnType::Timestamp(TimeKind::Millis)),
+                ("host".into(), ColumnType::Symbol),
+                ("value".into(), ColumnType::Float64),
+            ],
+            timestamp_idx: 0,
+            codecs: Vec::new(),
+        };
+        let key = |host: &str| SeriesKey::new("cpu", vec![("host".into(), host.into())]);
+        let known = vec![(1, key("a")), (2, key("b"))];
+        let mut mt = ColumnarMemtable::new(schema, default_config());
+        for (i, (series, host)) in [(1, "a"), (1, "a"), (2, "b")].iter().enumerate() {
+            mt.ingest_row(
+                *series,
+                &[
+                    ColumnValue::Timestamp(1000 + i as i64),
+                    ColumnValue::Symbol((*host).into()),
+                    ColumnValue::Float64(0.0),
+                ],
+            )
+            .expect("ingest");
+        }
+        assert_eq!(mt.series_count(), 2);
+
+        mt.truncate_to(2, &known);
+        assert_eq!(mt.row_count(), 2);
+        assert_eq!((mt.min_ts(), mt.max_ts()), (1000, 1001));
+        assert_eq!(mt.series_ids(), vec![1], "host b has no row left");
+
+        mt.truncate_to(0, &known);
+        assert!(mt.is_empty());
+        assert_eq!(mt.series_count(), 0);
     }
 }

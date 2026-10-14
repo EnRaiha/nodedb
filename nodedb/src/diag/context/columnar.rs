@@ -5,6 +5,41 @@
 use faultbox::DomainContext;
 use faultbox::serde_json::{Value, json};
 
+/// A committed multi-partition timeseries flush whose install did not finish.
+pub(in crate::diag) struct TimeseriesFlushNotInstalled<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    /// The error class: the error text before its first colon.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for TimeseriesFlushNotInstalled<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.timeseries_flush_not_installed"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The class names the cause. The collection and the flush are the
+        // occurrence, so every retry of one cause collapses into one report.
+        format!("cause={}", self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "database_id": self.database_id,
+            "tenant_id": self.tenant_id,
+            "collection": self.collection,
+            "error_class": self.error_class,
+            "consequence": "the flush is committed and its rows stay in the memtable. \
+                            The next flush and every maintenance tick retry the install, \
+                            and the collection takes no new flush until one succeeds",
+            "operator_action": "inspect the collection directory for a full or \
+                                unwritable disk",
+        })
+    }
+}
+
 /// A flushed columnar segment whose bytes do not open or decode.
 pub(in crate::diag) struct ColumnarSegmentCorrupt<'a> {
     /// Collection that owns the segment.
@@ -83,6 +118,39 @@ impl DomainContext for TimeseriesPartitionUnreadable<'_> {
             "operator_action": "inspect the named partition directory for a missing or \
                                 damaged file. Restore the collection from a snapshot if \
                                 the file cannot be recovered",
+        })
+    }
+}
+
+/// A timeseries memtable the idle maintenance flush could not write.
+pub(in crate::diag) struct TimeseriesIdleFlushFailed<'a> {
+    pub database_id: u64,
+    pub tenant_id: u64,
+    pub collection: &'a str,
+    /// The error class: the error text before its first colon.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for TimeseriesIdleFlushFailed<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.timeseries_idle_flush_failed"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The class names the bug. The collection is the occurrence.
+        format!("cause={}", self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "database_id": self.database_id,
+            "tenant_id": self.tenant_id,
+            "collection": self.collection,
+            "error_class": self.error_class,
+            "consequence": "the rows stay in the memtable and the WAL behind them stays. \
+                            The next ingest, idle tick, or checkpoint retries the flush",
+            "operator_action": "inspect the collection directory for a full or \
+                                unwritable disk",
         })
     }
 }

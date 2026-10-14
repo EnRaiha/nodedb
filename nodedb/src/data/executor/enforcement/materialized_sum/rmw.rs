@@ -177,6 +177,9 @@ impl CoreLoop {
                 unique: crate::data::executor::enforcement::unique::UniqueJudge::Row,
                 wal_lsn: params.wal_lsn,
                 resolved_targets: &[],
+                // A derived write carries no user intent: guards inject, and
+                // nothing the user wrote is judged.
+                guards: crate::data::executor::enforcement::typeguard::GuardScope::InjectOnly,
             },
         );
         let outcome = match put {

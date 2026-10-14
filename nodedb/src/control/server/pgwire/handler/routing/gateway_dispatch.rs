@@ -95,7 +95,11 @@ impl NodeDbPgHandler {
             auth,
         } = params;
         // Resolved once for the whole forwarded task set, before the loop.
-        let redaction = QueryRedaction::for_plans(tenant_id, auth, tasks.iter().map(|t| &t.plan));
+        let redaction = QueryRedaction::for_plans(
+            tenant_id,
+            auth,
+            tasks.iter().map(|t| (&t.plan, t.database_id)),
+        );
         let shaping = GatewayShaping {
             tenant_id,
             database_id,
@@ -138,6 +142,22 @@ impl NodeDbPgHandler {
             let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
                 &self.state.audit,
             ));
+            // A provider relation's rows are filled here, where the identity
+            // is. The node the task forwards to cannot fill them.
+            let task = crate::control::server::exchange::resolve::materialize_task_providers(
+                &self.state,
+                identity,
+                task,
+            )
+            .await
+            .map_err(|e| {
+                let (severity, code, message) = super::super::super::types::error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
             let checked =
                 match crate::control::server::shared::clone_write::intercept_and_authorize(
                     crate::control::server::shared::clone_write::InterceptAndAuthorizeParams {

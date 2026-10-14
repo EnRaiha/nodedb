@@ -293,6 +293,9 @@ impl Default for ColumnarMemtableConfig {
     }
 }
 
+/// The symbol id a NULL symbol cell stores. No dictionary entry has it.
+pub const NULL_SYMBOL_ID: u32 = u32::MAX;
+
 /// Value types for `ingest_row()`. A resolved timeseries ingest records its
 /// rows in this form.
 #[derive(Debug, Clone, PartialEq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -301,6 +304,10 @@ pub enum ColumnValue {
     Float64(f64),
     Int64(i64),
     Symbol(String),
+    /// SQL NULL. A symbol column stores [`NULL_SYMBOL_ID`] and a float
+    /// column stores NaN. Integer and time columns have no NULL and refuse
+    /// it.
+    Null,
 }
 
 /// Result of draining the columnar memtable.

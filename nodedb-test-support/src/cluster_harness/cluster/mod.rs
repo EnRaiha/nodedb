@@ -6,6 +6,7 @@
 //! [`types`]; spawn-variant convenience wrappers in [`spawn_variants`];
 //! the bringup body in [`bringup`]; the readiness barriers in [`ready`];
 //! the apply-convergence barriers in [`convergence`];
+//! the authorization-lease barrier in [`lease`];
 //! the in-place restart in [`restart`]; post-spawn membership + DDL helpers
 //! in [`membership`]; data-group leadership moves and waits in
 //! [`leadership`].
@@ -13,6 +14,7 @@
 mod bringup;
 mod convergence;
 mod leadership;
+mod lease;
 mod membership;
 mod ready;
 mod restart;

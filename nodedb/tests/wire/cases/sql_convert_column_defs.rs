@@ -86,3 +86,23 @@ async fn convert_refuses_a_default_naming_an_unknown_function() {
         )
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn convert_refuses_a_default_reading_another_column() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE COLLECTION conv_cross_default")
+        .await
+        .unwrap();
+
+    // A column DEFAULT is evaluated with no row in scope, so one that reads
+    // another column could never produce a value.
+    server
+        .expect_error(
+            "CONVERT COLLECTION conv_cross_default TO document_strict \
+             (id TEXT PRIMARY KEY, status TEXT, lowered TEXT DEFAULT LOWER(status))",
+            "0A000",
+        )
+        .await;
+}

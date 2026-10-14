@@ -8,11 +8,13 @@ use nodedb_sql::parser::preprocess::lex::{
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::DdlError;
-use crate::control::server::shared::ddl::sql_parse::{parse_sql_value, split_values};
+use crate::control::server::shared::ddl::sql_parse::{
+    parse_sql_value, split_value_tuples, split_values,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
-use super::types::{ParsedInsert, ddl_err};
+use super::types::{ParsedInsert, ParsedRow, ddl_err};
 
 const RETURNING_KEYWORD: &str = "RETURNING";
 
@@ -121,12 +123,11 @@ fn with_returning(
     })
 }
 
-/// Parse the `(cols) VALUES (vals)` form.
+/// Parse the `(cols) VALUES (row), (row), ...` form into one row per tuple.
 ///
 /// Any trailing `RETURNING` is already gone — [`parse_write_statement`] splits
-/// it off before either form is examined. That matters here: the value list is
-/// located by a REVERSE search for `)`, which a `RETURNING upper(x)` would
-/// otherwise capture, swallowing the real values.
+/// it off before either form is examined. Text after the last tuple is
+/// refused, so a `RETURNING upper(x)` left in place would fail the statement.
 fn parse_values_form(
     sql: &str,
     keyword: &str,
@@ -155,29 +156,40 @@ fn parse_values_form(
     let cols_str = &sql[first_open + 1..first_close];
     let columns: Vec<&str> = cols_str.split(',').map(|c| c.trim()).collect();
 
-    let after_values = sql[values_kw + 6..].trim_start();
-    let vals_open = match after_values.find('(') {
-        Some(p) => p,
-        None => return Some(Err(ddl_err("42601", "missing VALUES (...)"))),
+    let tuples = match split_value_tuples(sql[values_kw + 6..].trim_end().trim_end_matches(';')) {
+        Ok(tuples) => tuples,
+        Err(detail) => return Some(Err(ddl_err("42601", detail))),
     };
-    let vals_close = match after_values.rfind(')') {
-        Some(p) => p,
-        None => return Some(Err(ddl_err("42601", "missing closing ) for VALUES"))),
-    };
-    let vals_str = &after_values[vals_open + 1..vals_close];
-    let values: Vec<&str> = split_values(vals_str);
+    let mut rows = Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        match parse_row(&columns, tuple) {
+            Ok(row) => rows.push(row),
+            Err(error) => return Some(Err(error)),
+        }
+    }
 
+    Some(Ok(ParsedInsert {
+        coll_name: coll_name.to_string(),
+        rows,
+        // Stamped by `parse_write_statement`, which owns the split.
+        returning_clause: None,
+        collection_type: coll_type,
+    }))
+}
+
+/// One `VALUES` tuple matched against the column list.
+fn parse_row(columns: &[&str], tuple: &str) -> Result<ParsedRow, DdlError> {
+    let values: Vec<&str> = split_values(tuple);
     if columns.len() != values.len() {
-        return Some(Err(ddl_err(
+        return Err(ddl_err(
             "42601",
             format!(
                 "column count ({}) doesn't match value count ({})",
                 columns.len(),
                 values.len()
             ),
-        )));
+        ));
     }
-
     let mut doc_id = String::new();
     let mut fields = HashMap::new();
     for (col, val) in columns.iter().zip(values.iter()) {
@@ -191,19 +203,10 @@ fn parse_values_form(
         }
         fields.insert(col.to_string(), parse_sql_value(val));
     }
-
     if doc_id.is_empty() {
         doc_id = nodedb_types::id_gen::uuid_v7();
     }
-
-    Some(Ok(ParsedInsert {
-        coll_name: coll_name.to_string(),
-        doc_id,
-        fields,
-        // Stamped by `parse_write_statement`, which owns the split.
-        returning_clause: None,
-        collection_type: coll_type,
-    }))
+    Ok(ParsedRow { doc_id, fields })
 }
 
 #[cfg(test)]
@@ -217,8 +220,22 @@ mod tests {
             .expect("statement should be recognized")
             .expect("statement should parse");
         assert_eq!(
-            parsed.fields.get("a"),
+            parsed.rows[0].fields.get("a"),
             Some(&nodedb_types::Value::Integer(42))
+        );
+    }
+
+    #[test]
+    fn every_values_row_parses_in_order() {
+        let sql = "UPSERT INTO c (key, n) VALUES ('a', 2), ('b', 3);";
+        let parsed = parse_values_form(sql, "UPSERT INTO ", "c", None)
+            .expect("statement should be recognized")
+            .expect("statement should parse");
+        let keys: Vec<&str> = parsed.rows.iter().map(|row| row.doc_id.as_str()).collect();
+        assert_eq!(keys, vec!["a", "b"]);
+        assert_eq!(
+            parsed.rows[1].fields.get("n"),
+            Some(&nodedb_types::Value::Integer(3))
         );
     }
 }

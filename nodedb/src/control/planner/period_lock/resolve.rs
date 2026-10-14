@@ -98,11 +98,16 @@ pub async fn resolve_period_lock_targets(
             continue;
         };
 
-        // `BatchInsert` carries a whole page of documents, each with its own
-        // period value, rather than the single value every other gated shape
-        // carries — resolved and pushed here, distinctly from the singular
-        // path below.
+        // A `BatchInsert` or `BatchUpsert` page carries one document per row,
+        // each with its own period value, rather than the single value every
+        // other gated shape carries. It is resolved and pushed here, apart
+        // from the singular path below.
         if let DocumentOp::BatchInsert {
+            documents,
+            resolved_sum_targets,
+            ..
+        }
+        | DocumentOp::BatchUpsert {
             documents,
             resolved_sum_targets,
             ..

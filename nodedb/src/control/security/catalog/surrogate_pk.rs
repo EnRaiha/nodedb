@@ -194,7 +194,7 @@ impl SystemCatalog {
     ///
     /// This is the allocator's boot floor of last resort. The `surrogate_hwm`
     /// singleton is flushed lazily (batched by op count and elapsed time), so a
-    /// crash can leave it stale; the WAL's `SurrogateAlloc` / `SurrogateBind`
+    /// crash can leave it stale; the WAL's `SurrogateAlloc` / `SurrogateBindBatch`
     /// records normally cover the gap, but nothing contributes a "surrogate
     /// durable through" floor to WAL truncation, so a checkpoint can truncate
     /// past those records while the singleton still lags. Seeding from the

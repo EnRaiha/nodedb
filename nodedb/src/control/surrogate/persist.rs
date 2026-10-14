@@ -13,12 +13,9 @@
 //! reads `load()` and seeds a fresh registry via
 //! `SurrogateRegistry::from_persisted_hwm`.
 //!
-//! ## S2 follow-up (not in this tier)
-//!
-//! S2 will additionally append a `RecordType::SurrogateAlloc` WAL record
-//! at every checkpoint so post-crash replay can rebuild the hwm even if
-//! the redb table has fallen behind. The record kind is reserved
-//! (`51 | 0x8000`) but not emitted yet.
+//! The production checkpoint also appends a `RecordType::SurrogateAlloc`
+//! WAL record, so boot replay rebuilds the hwm when the redb table has
+//! fallen behind.
 
 use std::sync::Arc;
 

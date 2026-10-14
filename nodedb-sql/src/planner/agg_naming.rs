@@ -49,8 +49,20 @@ pub fn aggregate_field_name(a: &AggregateExpr) -> String {
 
 /// The canonical output-column key an aggregate's value is stored under in a
 /// finalized group row.
+///
+/// A computed argument is named by its source text and a `FILTER` clause is
+/// appended, so `SUM(a * 2)`, `SUM(b * 3)` and `COUNT(*) FILTER (WHERE ...)`
+/// each land under their own key.
 pub fn aggregate_output_key(a: &AggregateExpr) -> String {
-    nodedb_query::agg_key::canonical_agg_key(&aggregate_function_name(a), &aggregate_field_name(a))
+    let arg = a
+        .arg_text
+        .clone()
+        .unwrap_or_else(|| aggregate_field_name(a));
+    let base = nodedb_query::agg_key::canonical_agg_key(&aggregate_function_name(a), &arg);
+    match &a.filter_text {
+        None => base,
+        Some(text) => format!("{base} filter (where {text})"),
+    }
 }
 
 /// The internal name of a computed (non-column) GROUP BY key: a stable

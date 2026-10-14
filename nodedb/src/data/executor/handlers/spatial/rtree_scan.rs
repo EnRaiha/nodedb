@@ -112,8 +112,8 @@ impl CoreLoop {
         let tid_id = crate::types::TenantId::new(tid);
         let spatial_key = (db_id, tid_id, collection.to_string(), field.to_string());
         let has_index = self.spatial_indexes.contains_key(&spatial_key);
-        let limit = if limit == 0 { 1000 } else { limit };
-
+        // `limit` is the statement's LIMIT, `usize::MAX` without one. A
+        // `LIMIT 0` returns no rows.
         // No R-tree: full scan with predicate post-filter.
         if !has_index {
             return self.spatial_full_scan(SpatialFullScanParams {

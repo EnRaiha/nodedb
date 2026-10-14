@@ -42,13 +42,47 @@ impl SurrogateAssigner {
             return Ok(());
         }
         if registry.should_flush() {
-            let combined = CombinedPersist {
-                catalog,
-                wal_appender: self.wal_appender.as_ref(),
-                raft_shared: self.shared.get().and_then(|w| w.upgrade()),
-            };
-            registry.flush(&combined)?;
+            self.flush_with(registry, Some(catalog))?;
         }
+        Ok(())
+    }
+
+    /// The watermark a binding batch writes in its own catalog transaction:
+    /// `Some(hwm)` when a `Local`-mode registry's flush threshold has tripped.
+    /// The caller commits the row with its bindings, then calls
+    /// [`Self::finish_committed_flush`] under the same registry lock.
+    pub(in crate::control::surrogate::assign) fn due_flush_hwm(
+        &self,
+        registry: &SurrogateRegistry,
+    ) -> Option<u32> {
+        if registry.mode().is_cluster() || !registry.should_flush() {
+            return None;
+        }
+        Some(registry.current_hwm())
+    }
+
+    /// Complete a flush whose catalog watermark row committed with a binding
+    /// batch: append the WAL record, propose to peers, and reset the flush
+    /// counters. Writes no catalog row.
+    pub(in crate::control::surrogate::assign) fn finish_committed_flush(
+        &self,
+        registry: &SurrogateRegistry,
+    ) -> crate::Result<()> {
+        self.flush_with(registry, None)
+    }
+
+    fn flush_with(
+        &self,
+        registry: &SurrogateRegistry,
+        catalog: Option<&SystemCatalog>,
+    ) -> crate::Result<()> {
+        let combined = CombinedPersist {
+            catalog,
+            load_from: self.credential_store.catalog(),
+            wal_appender: self.wal_appender.as_ref(),
+            raft_shared: self.shared.get().and_then(|w| w.upgrade()),
+        };
+        registry.flush(&combined)?;
         Ok(())
     }
 }
@@ -58,7 +92,11 @@ impl SurrogateAssigner {
 /// the node is in cluster mode, also proposes `SurrogateAlloc { hwm }`
 /// to the metadata Raft group so followers advance their in-memory HWM.
 struct CombinedPersist<'a> {
-    catalog: &'a SystemCatalog,
+    /// The catalog the checkpoint writes the watermark row to. `None` when
+    /// the row already committed with a binding batch.
+    catalog: Option<&'a SystemCatalog>,
+    /// The catalog `load` reads.
+    load_from: &'a SystemCatalog,
     wal_appender: &'a dyn SurrogateWalAppender,
     /// Present when the Raft cluster is active; drives the Raft propose.
     raft_shared: Option<Arc<SharedState>>,
@@ -66,7 +104,9 @@ struct CombinedPersist<'a> {
 
 impl SurrogateHwmPersist for CombinedPersist<'_> {
     fn checkpoint(&self, hwm: u32) -> crate::Result<()> {
-        self.catalog.put_surrogate_hwm(hwm)?;
+        if let Some(catalog) = self.catalog {
+            catalog.put_surrogate_hwm(hwm)?;
+        }
         self.wal_appender.record_alloc_to_wal(hwm)?;
         // Propose to Raft when in cluster mode so followers advance their
         // in-memory HWM. This is dispatched off the caller's thread and
@@ -91,7 +131,7 @@ impl SurrogateHwmPersist for CombinedPersist<'_> {
     }
 
     fn load(&self) -> crate::Result<u32> {
-        self.catalog.get_surrogate_hwm()
+        self.load_from.get_surrogate_hwm()
     }
 }
 

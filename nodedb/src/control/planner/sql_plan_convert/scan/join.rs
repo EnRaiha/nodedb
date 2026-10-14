@@ -38,6 +38,24 @@ fn serialize_join_condition(
     })
 }
 
+/// The qualifier a join side's columns carry in the merged row.
+///
+/// It is the name SQL qualifies the side's columns with, and the planner
+/// rewrites every column reference over the join to it: the scan alias when
+/// the query gives one, else the bare relation name. This holds for a
+/// collection scanned by name and for an embedded catalog or temporal scan.
+/// An `ARRAY_*` table function side names no relation in its plan, so its
+/// columns stay unqualified, and the planner leaves references to it bare.
+fn side_qualifier(plan: &SqlPlan) -> Option<String> {
+    // A derived table side is a one-definition CTE whose outer query scans
+    // the derived alias. Its rows come from the body, embedded as the join
+    // input, and its columns are qualified by the alias.
+    if let SqlPlan::Cte(cte) = plan {
+        return side_qualifier(&cte.outer);
+    }
+    extract_scan_alias(plan).or_else(|| super::super::aggregate::extract_collection_name(plan))
+}
+
 fn shuffle_supports_join_tail(
     projection: &[JoinProjection],
     computed_projection: &[u8],
@@ -80,7 +98,9 @@ fn bitmap_hint_to_plan(hint: &BitmapHint, database_id: DatabaseId) -> Option<Box
         value: value_str,
         filters: Vec::new(),
         projection: Vec::new(),
-        limit: 10_000,
+        // The bitmap must hold every matching row, or the join drops rows
+        // past the cut. The fetch is bounded by the scan byte budget alone.
+        limit: usize::MAX,
         offset: 0,
     })))
 }
@@ -112,8 +132,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
     // from `left_input` / `right_input`.
     let mut left_raw = super::super::aggregate::extract_collection_name(left);
     let mut right_raw = super::super::aggregate::extract_collection_name(right);
-    let mut left_alias = extract_scan_alias(left);
-    let mut right_alias = extract_scan_alias(right);
+    let mut left_alias = side_qualifier(left);
+    let mut right_alias = side_qualifier(right);
     let join_projection = extract_join_projection_specs(projection);
     let computed_projection = serialize_join_computed_projection(projection)?;
     let join_filter_bytes = serialize_join_condition(condition)?;
@@ -237,8 +257,6 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         // an explicit limit and bounds a no-LIMIT join by the memory byte
         // budget (surfacing `ResourcesExhausted`) rather than truncating.
         limit: limit.unwrap_or(usize::MAX),
-        post_group_by: Vec::new(),
-        post_aggregates: Vec::new(),
         projection: join_projection,
         computed_projection,
         join_filters: join_filter_bytes,

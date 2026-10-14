@@ -59,9 +59,26 @@ pub enum MetaOp {
     /// Remove a continuous aggregate from this core's manager.
     UnregisterContinuousAggregate { name: String },
 
-    /// List all continuous aggregates from this core's manager.
-    /// Returns JSON-serialized `Vec<AggregateInfo>`.
+    /// List the request tenant's continuous aggregates from this core's
+    /// manager. Returns MessagePack-encoded `Vec<AggregateInfo>`.
     ListContinuousAggregates,
+
+    /// Boot registered every continuous aggregate the catalog holds on this
+    /// core. The core drops every persisted image entry of an aggregate
+    /// that is not registered, and writes the images.
+    ContinuousAggregatesRegistered,
+
+    /// Wait until the refresh cut `refresh_id` of the named continuous
+    /// aggregate is fully folded. `collection` is the aggregate's root
+    /// source collection: the wait runs on the core that owns its vShard,
+    /// where the cut applied. The core holds the request and answers it
+    /// from its tick, so the fold runs under the per-tick budget while the
+    /// core serves other requests. The request deadline bounds the wait.
+    AwaitContinuousAggregateRefresh {
+        collection: QualifiedCollection,
+        name: String,
+        refresh_id: u64,
+    },
 
     /// Convert a collection's storage mode.
     ///
@@ -208,9 +225,16 @@ pub enum MetaOp {
 
     /// Enforce retention on a timeseries collection: drop segments older than
     /// the cutoff. Called by the retention policy enforcement loop.
+    ///
+    /// `aggregates` lists every continuous aggregate the catalog roots at
+    /// `collection`. Retention folds an expiring partition into those
+    /// aggregates before it removes it, so the core refuses the pass while
+    /// one of them is not registered on it at that incarnation. The loop
+    /// retries on its next pass.
     EnforceTimeseriesRetention {
         collection: QualifiedCollection,
         max_age_ms: i64,
+        aggregates: Vec<super::timeseries::AggregateIncarnation>,
     },
 
     /// Bitemporal audit-retention purge for the graph edge store.
@@ -245,10 +269,17 @@ pub enum MetaOp {
     /// column version has been superseded by a later partition is removed.
     /// Non-bitemporal columnar collections are a no-op (collection is
     /// expected to be flagged bitemporal by the caller).
+    ///
+    /// `aggregates` lists every continuous aggregate the catalog roots at
+    /// `collection`, as in `EnforceTimeseriesRetention`. A timeseries
+    /// collection's purge removes partitions, so the core refuses it while
+    /// one of them is not registered on it at that incarnation. A plain
+    /// columnar collection roots no aggregate, and its list is empty.
     TemporalPurgeColumnar {
         tenant_id: u64,
         collection: QualifiedCollection,
         cutoff_system_ms: i64,
+        aggregates: Vec<super::timeseries::AggregateIncarnation>,
     },
 
     /// Bitemporal audit-retention purge for CRDT (Loro-backed) collections.

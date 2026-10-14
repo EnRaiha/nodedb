@@ -138,6 +138,30 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
                 rls_filters,
             },
         ),
+        DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            surrogates,
+            on_conflict_updates,
+            // Leader already decided every row; the record carries the rows.
+            rls_write_check: _,
+            returning,
+            rls_filters,
+            // See `PointPut`.
+            resolved_sum_targets,
+        } => document::batch_upsert(
+            collection.as_str(),
+            document::PageRows {
+                documents,
+                surrogates,
+            },
+            on_conflict_updates,
+            resolved_sum_targets,
+            WireReturning {
+                returning: encode_returning(returning),
+                rls_filters,
+            },
+        ),
         DocumentOp::BulkDelete {
             collection,
             filters,
@@ -184,23 +208,10 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             rls_filters,
             declared_primary_key.as_deref(),
         ),
-        DocumentOp::InsertSelect {
-            target_collection,
-            source_collection,
-            source_filters,
-            source_limit,
-            column_map,
-        } => document::insert_select(
-            target_collection.as_str(),
-            source_collection.as_str(),
-            source_filters,
-            *source_limit,
-            column_map,
-        ),
-
         DocumentOp::BatchInsert {
             collection,
             documents,
+            if_absent,
             surrogates,
             returning,
             rls_filters,
@@ -209,8 +220,11 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             deferred_sum_targets,
         } => document::batch_insert(
             collection.as_str(),
-            documents,
-            surrogates,
+            document::BatchRows {
+                documents,
+                surrogates,
+                if_absent: *if_absent,
+            },
             resolved_sum_targets,
             deferred_sum_targets,
             encode_returning(returning),
@@ -223,7 +237,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         // replica re-derives the same classification in Raft order.
         DocumentOp::Merge {
             target_collection,
-            source_collection,
+            source,
             source_alias,
             target_join_col,
             source_join_col,
@@ -239,7 +253,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         } => document_join::merge_apply(
             JoinFields {
                 target_collection: target_collection.as_str(),
-                source_collection: source_collection.as_str(),
+                source,
                 source_alias,
                 target_join_col,
                 source_join_col,
@@ -261,7 +275,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         // map builds from the shipped rows on every replica.
         DocumentOp::UpdateFromJoin {
             target_collection,
-            source_collection,
+            source,
             source_alias,
             target_join_col,
             source_join_col,
@@ -276,7 +290,7 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
         } => document_join::update_from_join_apply(
             JoinFields {
                 target_collection: target_collection.as_str(),
-                source_collection: source_collection.as_str(),
+                source,
                 source_alias,
                 target_join_col,
                 source_join_col,
@@ -292,8 +306,10 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
             },
         ),
         // The unresolved shape every Control-Plane entry point intercepts:
-        // its orchestrator resolves it, then proposes the resolved shape above.
-        DocumentOp::Merge {
+        // its orchestrator resolves it, then proposes the resolved shape above
+        // (an `INSERT ... SELECT` proposes `BatchInsert` pages).
+        DocumentOp::InsertSelect { .. }
+        | DocumentOp::Merge {
             resolved_inserts: None,
             ..
         }

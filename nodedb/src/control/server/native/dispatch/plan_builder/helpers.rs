@@ -54,6 +54,21 @@ pub(in crate::control::server::native::dispatch) fn declared_primary_key(
     )
 }
 
+/// The row limit a native read requests. No `limit` field reads every
+/// matching row (`usize::MAX`): the Data Plane bounds that read by its scan
+/// byte budget and fails loudly past it, never with a silent default cut. A
+/// limit too large for this platform is refused by value.
+pub(in crate::control::server::native::dispatch) fn requested_limit(
+    fields: &TextFields,
+) -> crate::Result<usize> {
+    match fields.limit {
+        None => Ok(usize::MAX),
+        Some(limit) => usize::try_from(limit).map_err(|_| crate::Error::BadRequest {
+            detail: format!("limit {limit} does not fit this platform"),
+        }),
+    }
+}
+
 /// Extract document_id from request fields.
 pub(in crate::control::server::native::dispatch) fn require_doc_id(
     fields: &TextFields,
@@ -157,6 +172,20 @@ pub(super) async fn existing_surrogates(
 mod tests {
     use super::parse_direction;
     use crate::engine::graph::edge_store::Direction;
+
+    /// A native read without a limit plans no row cap: the columnar,
+    /// timeseries, document, spatial, and recursive builders once planned a
+    /// default of 100 to 10,000 rows and silently returned that prefix.
+    #[test]
+    fn an_absent_limit_reads_every_row() {
+        let fields = nodedb_types::protocol::TextFields::default();
+        assert_eq!(super::requested_limit(&fields).unwrap(), usize::MAX);
+        let fields = nodedb_types::protocol::TextFields {
+            limit: Some(10_500),
+            ..Default::default()
+        };
+        assert_eq!(super::requested_limit(&fields).unwrap(), 10_500);
+    }
 
     #[test]
     fn an_absent_direction_is_out() {

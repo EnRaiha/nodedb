@@ -166,6 +166,45 @@ impl CoreLoop {
                     self.stage_document_upsert(&ctx, value, on_conflict_updates, rls_write_check);
                 Self::stage_result(&resp)
             }
+            // A page stages each row as its `Upsert` stages, in page order:
+            // a key an earlier row staged is read back from the overlay.
+            PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection,
+                documents,
+                surrogates,
+                on_conflict_updates,
+                rls_write_check,
+                ..
+            }) => {
+                if documents.len() != surrogates.len() {
+                    return Err(ErrorCode::Internal {
+                        detail: format!(
+                            "batch upsert into '{}' carries {} documents but {} surrogates",
+                            collection.as_str(),
+                            documents.len(),
+                            surrogates.len()
+                        ),
+                    });
+                }
+                for ((document_id, value), surrogate) in documents.iter().zip(surrogates) {
+                    let ctx = StageCtx::new(
+                        task,
+                        tid,
+                        txn_id,
+                        collection.as_str(),
+                        RowIdentity::from_user_key(document_id.as_str()),
+                        *surrogate,
+                    );
+                    let resp = self.stage_document_upsert(
+                        &ctx,
+                        value,
+                        on_conflict_updates,
+                        rls_write_check,
+                    );
+                    Self::stage_result(&resp)?;
+                }
+                affected_reply(documents.len()).map_err(ErrorCode::from)
+            }
             PhysicalPlan::Document(DocumentOp::BulkDelete {
                 collection,
                 ollp_predicted_surrogates,
@@ -208,6 +247,7 @@ impl CoreLoop {
                 collection,
                 documents,
                 surrogates,
+                if_absent,
                 ..
             }) => {
                 let resp = self.stage_document_batch_insert(StageBatchInsertParams {
@@ -217,6 +257,7 @@ impl CoreLoop {
                     collection: collection.as_str(),
                     documents,
                     surrogates,
+                    if_absent: *if_absent,
                 });
                 Self::stage_result(&resp)
             }
@@ -326,6 +367,22 @@ impl CoreLoop {
                 let resp = self.execute_stage_vector(task, tid, txn_id, op);
                 Self::stage_result(&resp)
             }
+            // A page stages each row as the point write of its intent, in
+            // page order: a key an earlier row staged is read back from the
+            // overlay.
+            PhysicalPlan::Vector(op @ VectorOp::DirectBatchWrite { .. }) => {
+                let points = op
+                    .direct_batch_point_writes()
+                    .ok_or_else(|| ErrorCode::Internal {
+                        detail: "a vector page expanded to no point writes".into(),
+                    })?;
+                let mut affected = 0usize;
+                for point in &points {
+                    let resp = self.execute_stage_vector(task, tid, txn_id, point);
+                    affected += staged_affected(&Self::stage_result(&resp)?)?;
+                }
+                affected_reply(affected).map_err(ErrorCode::from)
+            }
             PhysicalPlan::Crdt(op @ (CrdtOp::DocUpsert { .. } | CrdtOp::DocDelete { .. })) => {
                 let resp = self.execute_stage_crdt(task, tid, txn_id, op);
                 Self::stage_result(&resp)
@@ -420,4 +477,14 @@ impl CoreLoop {
 /// The `{"affected": n}` reply of a Calvin bulk stage.
 fn affected_reply(affected: usize) -> crate::Result<Vec<u8>> {
     response_codec::encode_count("affected", affected)
+}
+
+/// The row count a staged point write replied with.
+fn staged_affected(payload: &[u8]) -> Result<usize, ErrorCode> {
+    nodedb_query::msgpack_scan::extract_field(payload, 0, "affected")
+        .and_then(|(start, _)| nodedb_query::msgpack_scan::reader::read_i64(payload, start))
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| ErrorCode::Internal {
+            detail: "a staged vector row replied without an affected count".into(),
+        })
 }

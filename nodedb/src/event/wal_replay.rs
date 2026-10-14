@@ -557,6 +557,7 @@ mod tests {
                 change("o1", RedoRowKind::Update),
                 change("o2", RedoRowKind::NoChange),
             ],
+            user_roles: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -605,6 +606,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -666,6 +668,7 @@ mod tests {
             }],
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let record = make_sourced_record(
             RecordType::TransactionRedo,
@@ -709,6 +712,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -953,6 +957,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -1119,6 +1124,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let record = make_record(
             RecordType::TransactionRedo,
@@ -1238,6 +1244,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let bytes = redo.to_bytes().unwrap();
         for (source, document, other) in [
@@ -1292,6 +1299,7 @@ mod tests {
                 position: None,
             }],
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         };
         let record = make_sourced_record(
             RecordType::TransactionRedo,

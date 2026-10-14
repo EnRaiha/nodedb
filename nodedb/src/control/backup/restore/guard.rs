@@ -377,6 +377,7 @@ async fn remote_tenant_marks(
         txn_id: None,
         vshard_id: None,
         read_groups: Vec::new(),
+        user_roles: Vec::new(),
     });
     let response = tokio::time::timeout_at(deadline, transport.send_rpc(node_id, request))
         .await

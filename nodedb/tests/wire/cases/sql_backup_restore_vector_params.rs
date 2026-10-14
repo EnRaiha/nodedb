@@ -83,7 +83,7 @@ async fn backup_restore_preserves_vector_index_metric() {
     // Source server: collection with a NON-DEFAULT metric.
     let srv_a = TestServer::start().await;
     srv_a
-        .exec("CREATE COLLECTION vec_params WITH (engine='vector')")
+        .exec("CREATE COLLECTION vec_params WITH (engine='document_schemaless')")
         .await
         .expect("CREATE COLLECTION vec_params on srvA");
     // `CREATE VECTOR INDEX ... METRIC ...` dispatches `VectorOp::SetParams`

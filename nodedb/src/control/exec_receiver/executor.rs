@@ -179,14 +179,11 @@ impl LocalPlanExecutor {
         //
         // Only a vShard-scoped plan carries its vShard on the wire. For a
         // replicable write, re-derive the vShard as a pure
-        // function of the plan's primary collection, matching the gateway
+        // function of the plan's home collection, matching the gateway
         // router's `CollectionHomed` arm (`vshard_for_collection`). The plan
         // carries the database-qualified name, de-qualified into the
         // canonical key before hashing.
-        let vshard_raw = match crate::control::gateway::version_set::touched_collections(&plan)
-            .into_iter()
-            .next()
-        {
+        let vshard_raw = match crate::control::gateway::home_collection::home_collection(&plan) {
             Some(name) => match nodedb_types::CollectionKey::from_qualified_str(database_id, &name)
             {
                 Ok(key) => nodedb_cluster::routing::vshard_for_collection(key),
@@ -247,6 +244,9 @@ impl LocalPlanExecutor {
                     });
                 }
                 Ok(Some(entry)) => {
+                    // The coordinator's roles ride the entry, so every
+                    // replica judges a role-guarded transition the same way.
+                    let entry = entry.with_user_roles(req.user_roles.clone());
                     return match crate::control::wal_replication::propose_replicated_entry(
                         &self.state,
                         proposer,

@@ -182,6 +182,7 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
         },
         E::PlanError { detail: text() },
         E::FeatureNotSupported { detail: text() },
+        E::WrongObjectType { detail: text() },
         E::UndefinedFunction { name: "f".into() },
         E::UndefinedObject {
             kind: "sequence",

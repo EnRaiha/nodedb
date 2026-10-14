@@ -120,9 +120,14 @@ impl Resolver {
             self.look_up(key, binds, into).await?;
             return self.look_up(key, lookups, into).await;
         }
-        for _ in 0..fresh {
-            let drawn = self.assigner.assign_fresh(key, self.tenant_id).await?;
-            into.push_fresh(key, drawn);
+        if fresh > 0 {
+            let drawn = self
+                .assigner
+                .assign_fresh_many(key, self.tenant_id, fresh)
+                .await?;
+            for identity in drawn {
+                into.push_fresh(key, identity);
+            }
         }
         if !binds.is_empty() {
             let bound = self

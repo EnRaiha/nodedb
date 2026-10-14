@@ -25,8 +25,6 @@ pub(super) struct HashJoinFields {
     pub on: Vec<(String, String)>,
     pub join_type: String,
     pub limit: usize,
-    pub post_group_by: Vec<String>,
-    pub post_aggregates: Vec<(String, String)>,
     pub projection: Vec<nodedb_physical::physical_plan::JoinProjection>,
     pub computed_projection: Vec<u8>,
     pub join_filters: Vec<u8>,
@@ -57,8 +55,6 @@ pub(super) async fn resolve_hash_join(
         on,
         join_type,
         limit,
-        post_group_by,
-        post_aggregates,
         projection,
         computed_projection,
         join_filters,
@@ -67,14 +63,31 @@ pub(super) async fn resolve_hash_join(
         mut right_input,
         left_bitmap,
         right_bitmap,
-        left_rls_filters,
+        mut left_rls_filters,
         right_rls_filters,
-        left_scan_filters,
+        mut left_scan_filters,
         right_scan_filters,
     } = fields;
 
-    let left_input = resolve_join_input(state, ctx, left_input, captures).await?;
+    let mut left_input = resolve_join_input(state, ctx, left_input, captures).await?;
     right_input = resolve_join_input(state, ctx, right_input, captures).await?;
+
+    // Inside a transaction the by-name probe side reads its own staged
+    // writes through the collection's engine scan. The scan applies the
+    // side's policy and predicates, so the embedded side carries neither.
+    if left_input.is_none() {
+        left_input = super::txn_source_arm::txn_join_side(
+            state,
+            ctx,
+            captures,
+            ScanSide::join_side(&left_collection, &left_rls_filters, &left_scan_filters),
+        )
+        .await?;
+        if left_input.is_some() {
+            left_rls_filters.clear();
+            left_scan_filters.clear();
+        }
+    }
 
     // Cross-node build-side gather.
     //
@@ -115,8 +128,6 @@ pub(super) async fn resolve_hash_join(
             on,
             join_type,
             limit,
-            post_group_by,
-            post_aggregates,
             projection,
             computed_projection,
             join_filters,

@@ -323,6 +323,7 @@ fn batch_insert_docs(
                 collection,
             ),
             documents,
+            if_absent: false,
             surrogates,
             returning: None,
             rls_filters: Vec::new(),

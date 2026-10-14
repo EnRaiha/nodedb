@@ -15,6 +15,7 @@ use super::super::collection;
 use super::super::maintenance;
 use super::super::tree_ops;
 use super::super::version_history;
+use super::route_tokens::RouteTokens;
 
 pub(super) async fn try_string(
     state: &SharedState,
@@ -48,7 +49,7 @@ pub(super) async fn try_string(
             sql,
         ));
     }
-    if upper.contains("AT VERSION") && upper.starts_with("SELECT") {
+    if is_select_at_version(sql) {
         return Some(
             version_history::at_version::select_at_version(state, identity, database_id, sql).await,
         );
@@ -56,7 +57,7 @@ pub(super) async fn try_string(
     if upper.starts_with("SELECT DIFF(") || upper.starts_with("SELECT DIFF (") {
         return Some(version_history::diff::select_diff(state, identity, database_id, sql).await);
     }
-    if upper.starts_with("RESTORE ") && upper.contains("SET VERSION") {
+    if is_restore_set_version(sql) {
         if restore_forbidden_in_transaction(txn_ctx) {
             return Some(Err(DdlError::from_error(
                 &crate::Error::CrdtApplyForbiddenInTransaction,
@@ -161,28 +162,26 @@ pub(super) async fn try_string(
 
     // Vector index lifecycle: SHOW VECTOR INDEX / ALTER VECTOR INDEX. None of
     // these are dispatched from a typed AST arm — the router recognizes all
-    // four by string prefix from the raw SQL, before the parse gate. The
-    // ` SEAL` / ` COMPACT` / ` SET ` sub-clause guards are checked in this
-    // order.
+    // four from the raw SQL, before the parse gate. An `ALTER VECTOR INDEX
+    // ON <collection>.<column>` form is chosen by the clause after the target.
     if upper.starts_with("SHOW VECTOR INDEX ") {
         return Some(
             maintenance::handle_show_vector_index(state, identity, database_id, sql).await,
         );
     }
-    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SEAL") {
-        return Some(
-            maintenance::handle_alter_vector_index_seal(state, identity, database_id, sql).await,
-        );
-    }
-    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" COMPACT") {
-        return Some(
-            maintenance::handle_alter_vector_index_compact(state, identity, database_id, sql).await,
-        );
-    }
-    if upper.starts_with("ALTER VECTOR INDEX ") && upper.contains(" SET ") {
-        return Some(
-            maintenance::handle_alter_vector_index_set(state, identity, database_id, sql).await,
-        );
+    if let Some(clause) = alter_vector_index_clause(sql) {
+        return Some(match clause {
+            VectorIndexClause::Seal => {
+                maintenance::handle_alter_vector_index_seal(state, identity, database_id, sql).await
+            }
+            VectorIndexClause::Compact => {
+                maintenance::handle_alter_vector_index_compact(state, identity, database_id, sql)
+                    .await
+            }
+            VectorIndexClause::Set => {
+                maintenance::handle_alter_vector_index_set(state, identity, database_id, sql).await
+            }
+        });
     }
 
     // Vector model metadata. None of these are dispatched from a typed AST arm —
@@ -192,7 +191,7 @@ pub(super) async fn try_string(
     // recognizes all three by string prefix from the raw SQL, before the parse
     // gate. The `SET VECTOR METADATA ON` guard precedes the typed parse gate
     // below, so the typed `AlterCollection` dispatch never shadows it.
-    if upper.starts_with("ALTER COLLECTION ") && upper.contains("SET VECTOR METADATA ON") {
+    if is_set_vector_metadata(sql) {
         return Some(
             collection::handle_set_vector_metadata(state, identity, sql, database_id).await,
         );
@@ -271,10 +270,133 @@ fn restore_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
     txn_ctx.sessions.transaction_state(txn_ctx.session_id) != TransactionState::Idle
 }
 
+/// `SELECT ... FROM <collection> AT VERSION '<checkpoint>' ...`: the clause
+/// follows the collection name.
+fn is_select_at_version(sql: &str) -> bool {
+    let tokens = RouteTokens::new(sql);
+    tokens.leads_with(&["SELECT"])
+        && tokens
+            .top_level_word_from(1, "FROM")
+            .is_some_and(|from| tokens.phrase_at(tokens.skip_name(from + 1), &["AT", "VERSION"]))
+}
+
+/// `RESTORE <collection> SET VERSION = '<checkpoint>' ...`.
+fn is_restore_set_version(sql: &str) -> bool {
+    let tokens = RouteTokens::new(sql);
+    tokens.leads_with(&["RESTORE"]) && tokens.phrase_at(tokens.skip_name(1), &["SET", "VERSION"])
+}
+
+/// `ALTER COLLECTION <collection> SET VECTOR METADATA ON <column> ...`.
+fn is_set_vector_metadata(sql: &str) -> bool {
+    let tokens = RouteTokens::new(sql);
+    tokens.leads_with(&["ALTER", "COLLECTION"])
+        && tokens.phrase_at(tokens.skip_name(2), &["SET", "VECTOR", "METADATA", "ON"])
+}
+
+/// The clause of an `ALTER VECTOR INDEX ON <collection>.<column>` form.
+#[derive(Debug, PartialEq, Eq)]
+enum VectorIndexClause {
+    Seal,
+    Compact,
+    Set,
+}
+
+/// The index name between `INDEX` and `ON` is optional: `ALTER VECTOR INDEX
+/// [<name>] ON <target> <clause>`. The handler resolves the index from the
+/// target either way.
+fn alter_vector_index_clause(sql: &str) -> Option<VectorIndexClause> {
+    let tokens = RouteTokens::new(sql);
+    if !tokens.leads_with(&["ALTER", "VECTOR", "INDEX"]) {
+        return None;
+    }
+    let on = if tokens.phrase_at(3, &["ON"]) {
+        3
+    } else {
+        tokens.skip_name(3)
+    };
+    if !tokens.phrase_at(on, &["ON"]) {
+        return None;
+    }
+    let clause = tokens.skip_name(on + 1);
+    [
+        ("SEAL", VectorIndexClause::Seal),
+        ("COMPACT", VectorIndexClause::Compact),
+        ("SET", VectorIndexClause::Set),
+    ]
+    .into_iter()
+    .find(|(word, _)| tokens.phrase_at(clause, &[word]))
+    .map(|(_, clause)| clause)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::server::shared::session::{SessionId, SessionStore};
+
+    #[test]
+    fn at_version_is_routed_on_the_clause_after_the_collection() {
+        assert!(is_select_at_version(
+            "SELECT * FROM docs AT VERSION 'ckpt' WHERE id = 'd1'"
+        ));
+        // The phrase inside a literal is data.
+        assert!(!is_select_at_version(
+            "SELECT * FROM docs WHERE note = 'AT VERSION 3'"
+        ));
+        // A column named `at` aliased `version` is no clause.
+        assert!(!is_select_at_version("SELECT at version FROM docs"));
+    }
+
+    #[test]
+    fn restore_is_routed_on_the_clause_after_the_collection() {
+        assert!(is_restore_set_version(
+            "RESTORE docs SET VERSION = 'ckpt' WHERE id = 'd1'"
+        ));
+        assert!(!is_restore_set_version("RESTORE DATABASE 'set version'"));
+    }
+
+    #[test]
+    fn set_vector_metadata_is_routed_on_the_clause_after_the_collection() {
+        assert!(is_set_vector_metadata(
+            "ALTER COLLECTION docs SET VECTOR METADATA ON emb (model = 'm')"
+        ));
+        assert!(!is_set_vector_metadata(
+            "ALTER COLLECTION docs SET (note = 'SET VECTOR METADATA ON x')"
+        ));
+    }
+
+    #[test]
+    fn vector_index_clauses_are_routed_after_the_target() {
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX ON docs.emb SEAL"),
+            Some(VectorIndexClause::Seal)
+        );
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX ON docs.emb COMPACT"),
+            Some(VectorIndexClause::Compact)
+        );
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX ON docs.emb SET (ef_search = 64)"),
+            Some(VectorIndexClause::Set)
+        );
+        // A collection named `seal` sets parameters; it does not seal.
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX ON seal.emb SET (ef_search = 64)"),
+            Some(VectorIndexClause::Set)
+        );
+        // A named index routes on the clause after its target too.
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX idx ON docs SET (m = 32)"),
+            Some(VectorIndexClause::Set)
+        );
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX idx ON docs.emb SEAL"),
+            Some(VectorIndexClause::Seal)
+        );
+        assert_eq!(
+            alter_vector_index_clause("ALTER VECTOR INDEX idx SEAL"),
+            None
+        );
+    }
 
     #[test]
     fn restore_is_forbidden_in_active_or_failed_transactions() {

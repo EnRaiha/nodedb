@@ -86,7 +86,8 @@ pub async fn restore_version(
         "sql".into(),
         &state.rls,
         &audit,
-    );
+    )
+    .with_type_guards_from(state.credentials.catalog(), database_id);
     crate::control::crdt_admission::dispatch_crdt_restore_admitted(
         state,
         crate::control::crdt_admission::CrdtRestoreAdmissionRequest {
@@ -285,6 +286,7 @@ mod tests {
     ) {
         let preview = zerompk::to_msgpack_vec(&nodedb_types::CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
+            pre_image_msgpack: vec![0xc0],
             imported_ops: 1,
             trimmed_ops: 0,
             frontier_digest: core.digest,

@@ -136,12 +136,14 @@ impl Scope<'_> {
             SqlPlan::TimeseriesScan(TimeseriesScanPlan {
                 aggregates,
                 filters,
+                having,
                 projection,
                 sort_keys,
                 ..
             }) => {
                 self.aggregates(aggregates)?;
                 self.filters(filters)?;
+                self.filters(having)?;
                 self.projection(projection)?;
                 self.sort_keys(sort_keys)
             }

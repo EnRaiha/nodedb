@@ -325,10 +325,12 @@ mod tests {
                 TsFlushedCollectionBlob {
                     collection_key: format!("0:{TID}:alpha"),
                     partitions: vec![],
+                    cagg_image: Vec::new(),
                 },
                 TsFlushedCollectionBlob {
                     collection_key: format!("0:{TID}:beta"),
                     partitions: vec![],
+                    cagg_image: Vec::new(),
                 },
             ],
             kv_tables: vec![(format!("0:{TID}:alpha"), b"a".to_vec())],

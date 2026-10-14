@@ -54,6 +54,8 @@ impl NodeDbPgHandler {
             database_id: task.database_id,
             plan: task.plan,
             user_id: None,
+            // The transaction's redo record carries the committing roles.
+            user_roles: Vec::new(),
             txn_id,
             // No per-task TTL instant (see `flush_transaction_buffer`), so a TTL-bearing
             // KV write falls back to `epoch_system_ms` at apply time.

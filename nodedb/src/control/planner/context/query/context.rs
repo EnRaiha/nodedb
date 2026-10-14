@@ -123,6 +123,7 @@ impl QueryContext {
                 array_catalog: state.array_catalog.clone(),
                 shared: None,
                 retention_policy_registry: retention.clone(),
+                sequence_registry: Some(Arc::clone(&state.sequence_registry)),
             },
             retention_registry: retention,
             // `SharedState` owns the array catalog from construction, so every
@@ -165,6 +166,7 @@ impl QueryContext {
                 array_catalog: state.array_catalog.clone(),
                 shared: Some(Arc::downgrade(state)),
                 retention_policy_registry: retention.clone(),
+                sequence_registry: Some(Arc::clone(&state.sequence_registry)),
             },
             retention_registry: retention,
             array_catalog: Some(state.array_catalog.clone()),

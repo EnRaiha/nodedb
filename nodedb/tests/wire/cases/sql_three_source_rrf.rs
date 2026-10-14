@@ -392,3 +392,39 @@ async fn rrf_score_triple_returns_the_text_leg_error() {
         "the error must be the text leg's own error, as syntax_error; got: {err}"
     );
 }
+
+// ── The BM25 leg searches the field the statement names ─────────────────────
+
+/// `BM25 '<query>' ON '<field>'` searches the index of that field. A field
+/// that holds no text, while the collection holds other text, is refused by
+/// name instead of being searched as the whole document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_rag_fusion_bm25_leg_searches_the_named_field() {
+    let server = TestServer::start().await;
+    create_triple_collection(&server, "t3_rag_field").await;
+    server
+        .exec(
+            "CREATE VECTOR INDEX idx_t3_rag_field_emb ON t3_rag_field \
+             METRIC cosine DIM 3 VECTOR_FIELD 'embedding'",
+        )
+        .await
+        .ok(); // index may already exist from create_triple_collection
+
+    let err = server
+        .query_text(
+            "GRAPH RAG FUSION ON t3_rag_field \
+             QUERY ARRAY[1.0, 0.0, 0.0] \
+             VECTOR_FIELD 'embedding' \
+             VECTOR_TOP_K 10 \
+             BM25 'alpha' ON 'nosuchfield' \
+             EXPANSION_DEPTH 1 \
+             FINAL_TOP_K 10 \
+             RRF_K (60.0, 35.0, 50.0)",
+        )
+        .await
+        .expect_err("a BM25 leg on a field with no text must be refused");
+    assert!(
+        err.contains("nosuchfield"),
+        "the error must name the BM25 field; got: {err}"
+    );
+}

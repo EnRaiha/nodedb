@@ -119,7 +119,7 @@ impl NodeDbPgHandler {
         // gate.
         if dependent_task.is_none() {
             // Static (non-OLLP) path: delegate to the protocol-neutral
-            // `dispatch_tasks_to_calvin` helper, supplying the session-derived
+            // `dispatch_authorized_tasks_to_calvin` helper, supplying the session-derived
             // inputs (cross-shard mode, in-block state) it needs as parameters.
             // The helper classifies, rejects cross-shard writes inside an
             // explicit transaction block, builds the static TxClass, and routes

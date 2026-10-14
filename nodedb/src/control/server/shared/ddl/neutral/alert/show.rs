@@ -167,7 +167,7 @@ pub fn show_alert_status(
         let mut row = Map::new();
         row.insert(
             "group_key".to_string(),
-            JsonValue::String(group_key.clone()),
+            JsonValue::String(group_key.to_string()),
         );
         row.insert(
             "status".to_string(),

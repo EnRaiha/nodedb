@@ -9,6 +9,7 @@
 mod comma_lateral;
 mod cte_catalog;
 mod derived_from;
+mod derived_output;
 mod entry;
 mod entry_ann;
 pub mod helpers;
@@ -22,9 +23,11 @@ mod text_options;
 mod where_search;
 
 pub(crate) use cte_catalog::CteCatalog;
+pub(crate) use derived_output::rekey_join_output;
 pub use entry::{plan_query, plan_statement_query};
 pub use helpers::{
     convert_projection, convert_where_to_filters, extract_float, extract_func_args,
     extract_string_literal, qualified_name,
 };
 pub(crate) use order_by::select_output_aliases;
+pub(crate) use select_stmt::has_aggregation;

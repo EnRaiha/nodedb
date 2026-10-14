@@ -114,6 +114,26 @@ pub fn cmp_numeric(a: Numeric, b: Numeric) -> Ordering {
     }
 }
 
+/// The `f64` a numeric reading rounds to, by the same conversion
+/// [`cmp_numeric`] uses for a decimal against a float. Two readings
+/// [`cmp_numeric`] orders `Equal` round to the same `f64`, with `-0.0` read
+/// as `0.0` and every NaN as one NaN. Distinct readings can share an `f64`,
+/// so this is a hash bucket, never an equality.
+pub fn numeric_bucket_bits(n: Numeric) -> u64 {
+    let f = match n {
+        Numeric::Int(i) => i as f64,
+        Numeric::Decimal(d) => d.as_f64(),
+        Numeric::Float(f) => f,
+    };
+    if f.is_nan() {
+        f64::NAN.to_bits()
+    } else if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
+    }
+}
+
 /// Equality of two numeric readings for a coerced `=`: [`cmp_numeric`]
 /// orders the pair `Equal`. Exact for every pair, as PostgreSQL float `=`
 /// is, and NaN equals NaN.

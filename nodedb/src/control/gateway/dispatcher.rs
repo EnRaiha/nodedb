@@ -58,6 +58,10 @@ pub struct DispatchRouteParams<'a> {
     /// The route is a leg of a linearizable read (see
     /// `QueryContext::linearizable`).
     pub linearizable: bool,
+    /// Roles of the identity that wrote the statement. A write carries them
+    /// to every replica, which judges a role-guarded state transition
+    /// against them. Empty for a read or a system write.
+    pub user_roles: &'a [String],
 }
 
 /// Dispatch a single route and return the raw payload bytes.
@@ -74,6 +78,7 @@ pub(crate) async fn dispatch_route(
         version_set,
         txn_id,
         linearizable,
+        user_roles,
     } = params;
     reject_unadmitted_crdt_apply(&route.plan)?;
     let read_groups = linearizable_read_groups(shared, &route, linearizable)?;
@@ -89,6 +94,7 @@ pub(crate) async fn dispatch_route(
                     trace_id,
                     txn_id,
                     version_set,
+                    user_roles,
                 },
             )
             .await
@@ -107,6 +113,7 @@ pub(crate) async fn dispatch_route(
                 txn_id,
                 linearizable,
                 read_groups,
+                user_roles: user_roles.to_vec(),
             })
             .await
         }
@@ -211,6 +218,8 @@ pub(crate) async fn dispatch_route_stream(
                 txn_id: None,
                 linearizable,
                 read_groups,
+                // A streamed route is a read: no role is judged.
+                user_roles: Vec::new(),
             })
             .await
         }

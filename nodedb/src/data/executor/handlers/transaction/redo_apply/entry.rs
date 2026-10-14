@@ -130,9 +130,16 @@ impl CoreLoop {
         // is final on every replica.
         let check_scope =
             RedoApplyScope::new(RedoApplyPass::Validate, committed.sum_targets.to_vec());
-        if let Err(error) =
-            self.validate_redo_document_ops(database_id, tid, &doc_ops, &check_scope, origin)
-        {
+        // A role-guarded transition is judged against the roles the record
+        // carries, so every replica reaches the same verdict.
+        if let Err(error) = self.validate_redo_document_ops(
+            database_id,
+            tid,
+            &doc_ops,
+            &check_scope,
+            origin,
+            &redo.user_roles,
+        ) {
             return self.response_error(task, error);
         }
         let kv_images = self.kv_prior_images(database_id, tid, kv_ops(&redo.ops));
@@ -313,6 +320,7 @@ mod tests {
             row_sources: Vec::new(),
             publishes: Vec::new(),
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo")
@@ -380,6 +388,7 @@ mod tests {
                 position: None,
             }],
             row_changes: Vec::new(),
+            user_roles: Vec::new(),
         }
         .to_bytes()
         .expect("encode redo");
@@ -504,20 +513,16 @@ mod tests {
     }
 
     fn metric_samples_sub(collection: &str, timestamp_ms: i64, value: f64) -> RedoSubRecord {
-        let batch = nodedb_types::timeseries::TimeseriesWalBatch {
-            collection: collection.to_string(),
-            samples: vec![(1u64, timestamp_ms, value)],
-            provenance: None,
-        };
-        let batch_bytes = zerompk::to_msgpack_vec(&batch).expect("encode samples");
+        // ILP timestamps are nanoseconds.
+        let line = format!("{collection} value={value} {}", timestamp_ms * 1_000_000);
         RedoSubRecord {
             record_type: RecordType::TimeseriesBatch as u32,
             payload: crate::control::server::wal_dispatch::encode_timeseries_ingest_payload(
                 crate::control::server::wal_dispatch::TimeseriesIngestRecord {
                     collection,
-                    payload: &batch_bytes,
+                    payload: line.as_bytes(),
                     provenance: None,
-                    format: "samples",
+                    format: "ilp",
                     default_timestamp_ms: 0,
                 },
             )

@@ -987,10 +987,7 @@ mod tests {
             .expect("seed written row");
 
         let rate = serde_json::json!({"rate_id": "r1", "amount": 80});
-        let source_rows = vec![(
-            nodedb_types::StorageKey::for_surrogate(Surrogate(9)).to_string(),
-            doc_format::encode_to_msgpack(&rate),
-        )];
+        let source_rows = vec![doc_format::encode_to_msgpack(&rate)];
 
         let updates = vec![("amount".to_string(), literal(serde_json::json!(80)))];
         let resolved = resolved_onto_target(&[(ACCOUNT_A, SURROGATE_A)]);
@@ -1000,7 +997,7 @@ mod tests {
             TID,
             UpdateFromJoinParams {
                 target_collection: SOURCE,
-                source_collection: JOIN_SOURCE,
+                source_label: JOIN_SOURCE,
                 source_alias: "r",
                 target_join_col: "rate_id",
                 source_join_col: "rate_id",
@@ -1008,7 +1005,7 @@ mod tests {
                 target_filter_bytes: &[],
                 returning: None,
                 resolve_only: false,
-                source_rows: Some(source_rows.as_slice()),
+                source_rows: source_rows.as_slice(),
                 rls_filters: &[],
                 rls_write_check: &nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 resolved_sum_targets: &resolved,
@@ -1056,6 +1053,7 @@ mod tests {
                 collection: SOURCE,
                 documents: &documents,
                 surrogates: &surrogates,
+                if_absent: false,
                 returning: None,
                 rls_filters: &[],
                 resolved_sum_targets: &resolved,

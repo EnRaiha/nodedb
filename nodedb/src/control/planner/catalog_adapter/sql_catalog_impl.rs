@@ -51,7 +51,14 @@ impl SqlCatalog for OriginCatalog {
             .ok()
             .flatten()
         else {
-            return Ok(None);
+            // Collections and continuous aggregates share one relation
+            // namespace, so a name no collection holds can be an aggregate.
+            return super::cagg_relation::continuous_aggregate_relation(
+                catalog,
+                self.database_id,
+                self.tenant_id,
+                name,
+            );
         };
         if !stored.is_active {
             // Soft-deleted: surface a distinct error so the pgwire

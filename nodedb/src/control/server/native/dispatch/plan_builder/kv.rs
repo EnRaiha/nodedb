@@ -134,6 +134,7 @@ pub(crate) async fn build_batch_put(
         collection: QualifiedCollection::new(ctx.database_id(), collection),
         entries,
         ttl_ms,
+        intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
         surrogates,
         returning: None,
         rls_filters: Vec::new(),
