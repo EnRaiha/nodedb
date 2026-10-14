@@ -60,6 +60,17 @@ const MAX_WRITES: u32 = 40;
 /// The backup object, under the shared backup root.
 const OBJECT: &str = "calvin_cut/default.ndbb";
 
+/// How long one awaited step after the gate's release gets. It stays under
+/// the test runner's kill timeout, so a hang names its step.
+const AWAIT_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Await `fut`, or panic naming `step` once [`AWAIT_DEADLINE`] passes.
+async fn within<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(AWAIT_DEADLINE, fut)
+        .await
+        .unwrap_or_else(|_| panic!("{step} did not finish within {AWAIT_DEADLINE:?}"))
+}
+
 /// Every row `sql` returns through `client`, each column as text.
 async fn rows(client: &tokio_postgres::Client, sql: &str) -> Vec<Vec<String>> {
     client
@@ -281,27 +292,41 @@ async fn a_backup_during_calvin_commits_restores_whole_transactions() {
     );
 
     std::fs::write(&release, b"release").expect("release the held redo");
-    held.await
+    within("the held transaction after the gate's release", held)
+        .await
         .expect("held transaction task")
         .unwrap_or_else(|e| panic!("the held transaction: {e}"));
-    backup
+    within("BACKUP DATABASE after the gate's release", backup)
         .await
         .expect("backup task")
         .unwrap_or_else(|e| panic!("BACKUP DATABASE: {e}"));
     stop.store(true, Ordering::Relaxed);
-    for writer in writers {
-        let written = writer.await.expect("writer task");
+    for (idx, writer) in writers.into_iter().enumerate() {
+        let written = within(&format!("writer {idx} after the stop"), writer)
+            .await
+            .expect("writer task");
         assert!(written > 0, "every writer committed while the backup ran");
     }
     drop(gate);
     assert!(root.join(OBJECT).exists(), "the backup wrote its object");
-    fx.cluster.shutdown().await;
+    within("the source cluster's shutdown", fx.cluster.shutdown()).await;
 
-    let target = TestCluster::spawn_three_with_backup_root(root.clone())
-        .await
-        .expect("target cluster");
-    exec(&target, &format!("RESTORE DATABASE default FROM '{uri}'")).await;
+    let target = within(
+        "the target cluster's start",
+        TestCluster::spawn_three_with_backup_root(root.clone()),
+    )
+    .await
+    .expect("target cluster");
+    within(
+        "RESTORE DATABASE",
+        exec(&target, &format!("RESTORE DATABASE default FROM '{uri}'")),
+    )
+    .await;
     target.wait_for_full_apply_convergence(STEP_DEADLINE).await;
-    assert_whole_transactions(&target, &accts, &entries).await;
-    target.shutdown().await;
+    within(
+        "reading the restored collections",
+        assert_whole_transactions(&target, &accts, &entries),
+    )
+    .await;
+    within("the target cluster's shutdown", target.shutdown()).await;
 }

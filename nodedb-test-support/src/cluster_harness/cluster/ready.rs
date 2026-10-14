@@ -95,6 +95,11 @@ impl TestCluster {
             || self.data_groups_settled(bar),
         )
         .await;
+
+        // Each node held a lease when it spawned, but the cluster formed
+        // after that. A new metadata term grants no lease until its floors
+        // load, and the floor load waits for the Calvin sequencer to elect.
+        self.wait_for_authorization_leases().await;
     }
 
     /// Every data group's leader, as a replica's Raft reports it:
