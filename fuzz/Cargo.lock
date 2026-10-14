@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-codec"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lz4_flex",
  "nalgebra",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-columnar"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crc32c",
  "nodedb-codec",
@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-fts"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "crc32c",
@@ -2078,7 +2078,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-mem"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "nodedb-types",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-query"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "nodedb-fts",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-spatial"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "h3o",
  "nodedb-mem",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-sql"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "hex",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-strict"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arrow",
  "nodedb-types",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-types"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "bytemuck",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-wal"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "crc32c",
