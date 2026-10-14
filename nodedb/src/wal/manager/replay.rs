@@ -17,6 +17,11 @@ impl WalManager {
     /// does not parse as WAL records is treated as fatal corruption, not as an
     /// empty WAL. The WAL replay path is lenient (stops at the first invalid
     /// record) — this method is the complementary hard check run at startup.
+    ///
+    /// A segment whose records are in a WAL format this build cannot read is
+    /// reported as a version gap rather than as corruption. Its answer is to
+    /// start the store with the build that wrote the segment, or to re-create
+    /// the data directory; corruption calls for repair.
     pub fn validate_for_startup(&self) -> crate::Result<()> {
         let segments =
             nodedb_wal::segment::discover_segments(&self.wal_dir).map_err(crate::Error::Wal)?;
@@ -47,7 +52,16 @@ impl WalManager {
                 continue;
             }
 
-            let info = nodedb_wal::recovery::recover(&seg.path).map_err(crate::Error::Wal)?;
+            let info = nodedb_wal::recovery::recover(&seg.path).map_err(|error| match error {
+                nodedb_wal::error::WalError::SegmentFormatVersion {
+                    path,
+                    version,
+                    supported,
+                } => crate::Error::VersionCompat {
+                    detail: version_gap_detail(&path, version, supported),
+                },
+                other => crate::Error::Wal(other),
+            })?;
 
             if info.end_offset == 0 {
                 return Err(crate::Error::SegmentCorrupted {
@@ -207,11 +221,28 @@ impl WalManager {
     }
 }
 
+/// The operator-facing text for a store whose records are in a WAL format this
+/// build cannot read.
+///
+/// One text, because the same store is refused from two places: the open fails
+/// on the newest segment, and startup validation finds the gap in any segment
+/// behind it. It names the segment, both versions, and the actions that exist.
+/// No WAL format migration tool exists, so naming one would send an operator
+/// looking for something they cannot find.
+pub(crate) fn version_gap_detail(path: &str, version: u16, supported: u16) -> String {
+    format!(
+        "WAL segment '{path}' holds records in WAL format version {version}; this build reads \
+         version {supported}. Start the store with the build that wrote that segment, or re-create \
+         the data directory and load the data again"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{DatabaseId, TenantId, VShardId};
     use crate::wal::manager::NO_APPLY_KEY;
+    use nodedb_wal::record::{RecordType, WAL_FORMAT_VERSION, WAL_MAGIC, WalRecordArgs};
 
     fn put(wal: &WalManager, payload: &[u8]) -> Lsn {
         wal.appender(NO_APPLY_KEY)
@@ -260,5 +291,269 @@ mod tests {
             3
         );
         assert!(wal.time_anchors().lsn_at_or_before(first_ns - 1).is_err());
+    }
+
+    /// One record sealed in format `version`: header, then payload, with the
+    /// checksum computed over the declared version.
+    ///
+    /// The framing is this build's, which a version-1 writer never produced,
+    /// because its record type field was 16 bits wide and this one is 32. The
+    /// checksum matches the declared version, as it does for a record another
+    /// build wrote, so the reader judges a format gap and not damage.
+    fn record_with_format_version(lsn: u64, version: u16) -> Vec<u8> {
+        let mut record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::Put as u32,
+            lsn,
+            tenant_id: 1,
+            vshard_id: 0,
+            database_id: 0,
+            payload: vec![7u8; 16],
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("build a record");
+        record.header.format_version = version;
+        record.header.crc32c = record.header.compute_checksum(&record.payload);
+        let mut bytes = record.header.to_bytes().to_vec();
+        bytes.extend_from_slice(&record.payload);
+        bytes
+    }
+
+    /// A segment whose first record declares `version`.
+    fn write_segment_with_format_version(
+        path: &std::path::Path,
+        first_lsn: u64,
+        version: u16,
+    ) -> std::path::PathBuf {
+        let bytes = record_with_format_version(first_lsn, version);
+        let segment = nodedb_wal::segment::segment_path(path, first_lsn);
+        std::fs::write(&segment, &bytes).expect("write the segment");
+        segment
+    }
+
+    /// An encrypted store keeps its first record behind the preamble, so the
+    /// version has to be read from behind it too.
+    #[test]
+    fn a_store_with_a_preamble_says_which_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        {
+            let wal = WalManager::open_for_testing(&path).expect("open wal");
+            put(&wal, b"a");
+            wal.sync().expect("sync");
+        }
+        let wal = WalManager::open_for_testing(&path).expect("reopen wal");
+        let newest = nodedb_wal::segment::discover_segments(&path)
+            .expect("discover segments")
+            .last()
+            .expect("the boot's own segment")
+            .first_lsn;
+
+        // A real preamble, not a zeroed one: the reader validates its own
+        // version field and would reject a malformed preamble for the wrong
+        // reason.
+        let mut bytes = nodedb_wal::preamble::SegmentPreamble::new_wal([9, 9, 9, 9])
+            .to_bytes()
+            .to_vec();
+        bytes.extend_from_slice(&record_with_format_version(newest + 1_000, 1));
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 1_000),
+            &bytes,
+        )
+        .expect("write an encrypted-format segment");
+        // A newer segment, so the one above is not the tail the gate tolerates.
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 2_000),
+            vec![0u8; 64 * 1024],
+        )
+        .expect("write a newer segment");
+
+        let error = wal
+            .validate_for_startup()
+            .expect_err("an older format behind a preamble must be refused");
+        let text = format!("{error}");
+        assert!(
+            text.contains("version 1"),
+            "the version sits behind the preamble and the message must still name it: {text}"
+        );
+        assert!(
+            text.contains(&format!("reads version {WAL_FORMAT_VERSION}")),
+            "the message must name the version this build reads: {text}"
+        );
+    }
+
+    /// A torn write that persists the magic and leaves the version zeroed is
+    /// not a format gap, and must not turn a bootable store into a refused one.
+    #[test]
+    fn a_zeroed_version_is_not_a_format_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        {
+            let wal = WalManager::open_for_testing(&path).expect("open wal");
+            put(&wal, b"a");
+            wal.sync().expect("sync");
+        }
+        let wal = WalManager::open_for_testing(&path).expect("reopen wal");
+        let newest = nodedb_wal::segment::discover_segments(&path)
+            .expect("discover segments")
+            .last()
+            .expect("the boot's own segment")
+            .first_lsn;
+
+        // The magic of a real record, the version bytes never written.
+        let mut bytes = vec![0u8; 64 * 1024];
+        bytes[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 1_000),
+            &bytes,
+        )
+        .expect("write a torn newest segment");
+
+        assert!(
+            wal.validate_for_startup().is_ok(),
+            "a zeroed version is uninitialised bytes, not a format this build cannot read"
+        );
+    }
+
+    /// A valid store, then a newer segment written in an older format.
+    fn store_with_an_older_newest_segment(
+        path: &std::path::Path,
+        version: u16,
+    ) -> (WalManager, std::path::PathBuf) {
+        {
+            let wal = WalManager::open_for_testing(path).expect("open wal");
+            put(&wal, b"a");
+            wal.sync().expect("sync");
+        }
+        let wal = WalManager::open_for_testing(path).expect("reopen wal");
+        let newest = nodedb_wal::segment::discover_segments(path)
+            .expect("discover segments")
+            .last()
+            .expect("the boot's own segment")
+            .first_lsn;
+        let segment = write_segment_with_format_version(path, newest + 1_000, version);
+        (wal, segment)
+    }
+
+    /// The newest segment is the one the open recovers, so a store in another
+    /// format fails there, before validation runs. The refusal names the
+    /// segment and both versions: that is what tells a store written by another
+    /// build apart from a damaged one.
+    #[test]
+    fn the_open_refuses_a_newest_segment_in_another_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let (_wal, segment) = store_with_an_older_newest_segment(&path, 1);
+
+        let error = match WalManager::open_for_testing(&path) {
+            Ok(_) => panic!("a store written in another format must not open"),
+            Err(error) => error,
+        };
+        let text = format!("{error}");
+
+        assert!(
+            text.contains(&segment.display().to_string()),
+            "the refusal must name the segment: {text}"
+        );
+        assert!(
+            text.contains("version 1"),
+            "the refusal must name the version it found: {text}"
+        );
+        assert!(
+            text.contains(&format!("reads version {WAL_FORMAT_VERSION}")),
+            "the refusal must name the version this build reads: {text}"
+        );
+        assert!(
+            !text.contains("corrupted"),
+            "a format gap is not corruption: {text}"
+        );
+    }
+
+    /// The same gap behind the newest segment is out of the open's reach, so
+    /// startup validation is what finds it. That message also names the actions
+    /// that exist, which the WAL layer cannot know.
+    #[test]
+    fn validation_names_a_gap_behind_the_newest_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let (wal, segment) = store_with_an_older_newest_segment(&path, 1);
+        let newest = nodedb_wal::segment::discover_segments(&path)
+            .expect("discover segments")
+            .last()
+            .expect("a segment")
+            .first_lsn;
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 1_000),
+            vec![0u8; 64 * 1024],
+        )
+        .expect("write a newer segment");
+
+        let error = wal
+            .validate_for_startup()
+            .expect_err("a gap behind the tail is still a gap");
+        let text = format!("{error}");
+
+        assert!(
+            text.contains(&segment.display().to_string()),
+            "the message must name the segment: {text}"
+        );
+        assert!(
+            text.contains("version 1"),
+            "the message must name the version it found, and it named none: {text}"
+        );
+        assert!(
+            text.contains(&format!("reads version {WAL_FORMAT_VERSION}")),
+            "the message must name the version this build reads: {text}"
+        );
+        assert!(
+            !text.contains("corrupted"),
+            "a format gap is reported as a version gap, never as corruption: {text}"
+        );
+        assert!(
+            text.contains("re-create the data directory"),
+            "the message must name an action that exists: {text}"
+        );
+    }
+
+    /// The other side of the same branch: a segment that is not a WAL at all is
+    /// still corruption, and still says so.
+    #[test]
+    fn a_segment_that_is_not_a_wal_still_says_corrupted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        {
+            let wal = WalManager::open_for_testing(&path).expect("open wal");
+            put(&wal, b"a");
+            wal.sync().expect("sync");
+        }
+        let wal = WalManager::open_for_testing(&path).expect("reopen wal");
+        let newest = nodedb_wal::segment::discover_segments(&path)
+            .expect("discover segments")
+            .last()
+            .expect("a segment")
+            .first_lsn;
+        // No magic at all, which is what a truncated or overwritten file looks
+        // like, as opposed to a file another version wrote. A newer segment
+        // follows it so this one is not the tail, because the tail is the one
+        // case the gate tolerates.
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 1_000),
+            vec![0u8; 64 * 1024],
+        )
+        .expect("write a segment with no framing");
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, newest + 2_000),
+            vec![0u8; 64 * 1024],
+        )
+        .expect("write a newer zero-filled segment");
+
+        let error = wal
+            .validate_for_startup()
+            .expect_err("a segment with no framing must be refused");
+        let text = format!("{error}");
+        assert!(
+            text.contains("corrupted"),
+            "a segment that is not a WAL is corruption: {text}"
+        );
     }
 }

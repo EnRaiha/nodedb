@@ -463,7 +463,10 @@ pub fn replay_from_limit_dir(
         // the `from_lsn` filter — continuity is a property of the log, not of
         // the caller's window into it.
         let mut last_lsn = 0u64;
-        while let Some(record) = reader.next_record()? {
+        while let Some(record) = reader
+            .next_record()
+            .map_err(|error| error.with_segment_path(&seg.path))?
+        {
             last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
                 records.push(record);
