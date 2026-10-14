@@ -9,25 +9,82 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+---
+
+## [0.6.0] - 2026-10-15
+
+A correctness release. Statements that returned a plausible wrong answer now return the right one or a typed error, and cluster recovery, restore and Calvin transactions survive crashes and leader moves.
+
 ### ⚠️ Breaking changes
 
-- Native-protocol `SELECT` returns nested objects and arrays as structured values, not JSON text. `nodedb_types::conversion::json_to_value_display` is replaced by `json_to_value_ref`.
-- JWT `metadata` claims keep their JSON type instead of being coerced to strings.
-- `document_get` for a missing id returns `Ok(None)` instead of a serialization error.
-- **`[server] single_node_calvin` is removed.** A server without a `[cluster]` section always runs the single-node Calvin sequencer, so cross-core (cross-vShard) transactions always commit atomically. A config that still sets the key fails to load as an unknown field. Remove the line.
+- **A 0.5.0 data directory cannot be opened by 0.6.0.** The WAL format, row identity, time encoding, full-text keys and columnar footers changed. Dump and reload. Startup names the WAL format version it found instead of reporting corruption.
+- **Sync and native protocols changed.** Upgrade Lite and `nodedb-client` with the server.
+- **SQL refuses what it used to accept silently:**
+  - an unknown or ambiguous column returns `42703` / `42702` at plan time;
+  - a NULL `PRIMARY KEY` returns `23502`, and a duplicate key returns `23505`;
+  - a value outside a declared `DECIMAL(p,s)`, `SMALLINT`, `INT` or `REAL` width is refused;
+  - a narrowing `ALTER COLUMN TYPE` is refused.
+- **Some queries return different results:**
+  - `time_bucket` returns an ISO-8601 instant;
+  - `stddev` and `variance` use sample semantics, as in PostgreSQL;
+  - KV sorted indexes order numbers by value;
+  - aggregates inside a transaction count its own writes.
+- **Typed errors keep their SQLSTATE across nodes** instead of collapsing to `XX000`. A full dispatch queue returns `57P03`, and HTTP returns `503` with `Retry-After`.
+- **Multi-row `INSERT` and `UPSERT` are atomic** on KV, document and vector-primary collections. A row that fails writes nothing.
+- **Config:**
+  - an invalid `NODEDB_*` value aborts startup;
+  - `${VAR}` in the TOML file expands;
+  - `[server] single_node_calvin`, `quic_keep_alive_secs` and `quic_idle_timeout_secs` are removed;
+  - `rpc_timeout_secs` has a 500 ms floor.
+- **The minimum Rust version is 1.96.**
 
 ### Added
 
-- `CREATE [UNIQUE] INDEX IF NOT EXISTS`.
-- `[server] sync_host` / `NODEDB_SYNC_HOST` — loopback bind address for the sync listener alone.
+- **Backup and restore:**
+  - per-database consistent-cut backups, scheduled and verified, to local or remote storage;
+  - selective restore by database;
+  - point-in-time restore with `nodedb restore`.
+- **Leader-lease linearizable reads.**
+- **Sequences:** `nextval`, `currval`, `setval` and `SERIAL`, evaluated per row.
+- **SQL:**
+  - `EXISTS` / `NOT EXISTS`;
+  - expressions over derived tables, CTEs and derived tables as join sides;
+  - `CROSS JOIN`;
+  - `FILTER (WHERE …)`, `HAVING` and grouping sets on timeseries aggregates.
+- **SQL write forms:**
+  - `RETURNING` on KV `UPDATE` / `DELETE`;
+  - `CREATE [UNIQUE] INDEX IF NOT EXISTS`;
+  - one real command tag per DML statement on every engine and protocol.
+- **Continuous aggregates are queryable relations.** `REFRESH CONTINUOUS AGGREGATE` runs on any node.
+- **`engine='vector'`** creates a vector-primary collection.
+- **`[tuning.startup]`** sets `raft_ready_timeout_ms` (default 30 s) and `data_group_recovery_timeout_ms` (default 60 s). A boot wait fails only when it makes no progress for that long.
+- **`[server] sync_host` / `NODEDB_SYNC_HOST`** sets the sync listener's bind address.
 
 ### Fixed
 
-- The published container image could not start: it ships `NODEDB_HOST=0.0.0.0` and the sync listener refuses a non-loopback bind. Sync no longer follows a routable `server.host`, and its port is no longer published from the image or compose file.
-- Native error frames authored as a bare SQLSTATE carried no numeric code, so DDL refusals arrived as generic internal errors and `is_retriable()` answered wrongly.
-- JWT bearer authentication over the HTTP API panicked the handler and dropped the connection. Cluster credential fetch on a token-authenticated join and JWKS setup at startup blocked the same way.
-- Refused native `document_put`, `document_delete`, `graph_insert_edge`, `graph_delete_edge` and CRDT movable-list operations returned success; `graph_traverse` and `vector_search` read an error reply as an empty result.
-- `CREATE INDEX IF NOT EXISTS` was misparsed as an index named `if` on a collection named `exists`.
+- **Restore and recovery:** restore dropped committed rows, graph edges and arrays. A crash during snapshot install left a half-installed group.
+- **Cross-shard Calvin transactions** lost state on a leader move or restart.
+- **Cluster writes:**
+  - a write inside a transaction on a non-owning coordinator survived `ROLLBACK`;
+  - `MERGE`, `UPDATE … FROM` and `INSERT … SELECT` wrote to non-owning nodes.
+- **`INSERT … SELECT`, `MERGE` and `UPDATE … FROM`** stopped silently at 10,000 rows.
+- **Typeguards** were skipped on some write paths.
+- **Query results:**
+  - joins and aggregates bypassed row-level security;
+  - `TRUNCATE` left KV, columnar, timeseries, spatial and vector-primary rows in place;
+  - unknown identifiers returned NULL rows.
+- **Time keys** used mixed units, so cross-node joins dropped every row.
+- **Server crashes:**
+  - `CREATE VECTOR INDEX` and `CREATE SORTED INDEX` crashed the server with a stack overflow;
+  - JWT bearer authentication over HTTP panicked the handler.
+- **The published container image** could not start.
+- **Write cost:** a multi-row write paid one fsync per row.
+
+### Security
+
+- `rustls` 0.23.46: RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349.
+- Wasmtime 49.0.1: RUSTSEC-2026-0315, RUSTSEC-2026-0316.
+- `quinn-proto` 0.11.19 and `ruzstd` 0.9.1: RUSTSEC-2026-0338, RUSTSEC-2026-0340, RUSTSEC-2026-0343, RUSTSEC-2026-0344.
 
 ---
 
@@ -288,6 +345,7 @@ NodeDB 0.4.0 is a substantial distributed-correctness and durability release. It
 
 ---
 
+[0.6.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.6.0
 [0.5.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.3.0
