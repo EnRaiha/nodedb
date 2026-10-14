@@ -11,7 +11,9 @@ impl WalManager {
     ///
     /// Returns `Err` if any non-empty segment contains no valid WAL records —
     /// a reliable signal that the segment was corrupted (wrong magic, truncated
-    /// header, etc.) rather than simply rolled over empty.
+    /// header, etc.) rather than simply rolled over empty. The newest segment
+    /// passes when it holds only what a crash leaves behind: zeros, or a torn
+    /// first record.
     ///
     /// This check is intentionally strict: a segment file with content that
     /// does not parse as WAL records is treated as fatal corruption, not as an
@@ -26,7 +28,7 @@ impl WalManager {
         let segments =
             nodedb_wal::segment::discover_segments(&self.wal_dir).map_err(crate::Error::Wal)?;
 
-        for seg in &segments {
+        for (idx, seg) in segments.iter().enumerate() {
             let file_len = std::fs::metadata(&seg.path).map(|m| m.len()).unwrap_or(0);
 
             if file_len == 0 {
@@ -64,6 +66,20 @@ impl WalManager {
             })?;
 
             if info.end_offset == 0 {
+                // This check covers only segments without a preamble. A
+                // segment that opens with one reports its end at the end of the
+                // preamble, never at 0, even when no record follows it.
+                //
+                // A crash can leave the newest segment holding only zeros or a
+                // torn first record, and the next boot resumes that file.
+                // Refusing it would refuse every later boot too. Any other
+                // content, or any older segment without a record, is
+                // corruption: replay would skip whatever it held.
+                if idx + 1 == segments.len()
+                    && nodedb_wal::holds_only_crash_residue(&seg.path).map_err(crate::Error::Wal)?
+                {
+                    continue;
+                }
                 return Err(crate::Error::SegmentCorrupted {
                     detail: format!(
                         "WAL segment '{}' is non-empty ({file_len} bytes) but contains no valid \
@@ -329,6 +345,99 @@ mod tests {
         let segment = nodedb_wal::segment::segment_path(path, first_lsn);
         std::fs::write(&segment, &bytes).expect("write the segment");
         segment
+    }
+
+    /// A valid store, then a newest segment holding no parseable record: the
+    /// zero-filled pages a crash can leave behind, which the next boot resumes.
+    fn wal_with_a_recordless_newest_segment(path: &std::path::Path) -> WalManager {
+        {
+            let wal = WalManager::open_for_testing(path).expect("open wal");
+            put(&wal, b"a");
+            wal.sync().expect("sync");
+        }
+
+        let wal = WalManager::open_for_testing(path).expect("reopen wal");
+        let newest = nodedb_wal::segment::discover_segments(path)
+            .expect("discover segments")
+            .last()
+            .expect("the boot's own segment")
+            .first_lsn;
+        // Written after open on purpose: open resumes the newest segment and may
+        // rewrite its preamble, and the state under test is the one the gate
+        // then reads back.
+        std::fs::write(
+            nodedb_wal::segment::segment_path(path, newest + 1_000),
+            vec![0u8; 64 * 1024],
+        )
+        .expect("write a zero-filled segment");
+        wal
+    }
+
+    #[test]
+    fn a_recordless_newest_segment_does_not_block_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let wal = wal_with_a_recordless_newest_segment(&path);
+
+        assert!(
+            wal.validate_for_startup().is_ok(),
+            "the newest segment holds no committed record, which torn_tail already warns \
+             about, and the next boot resumes it. Refusing it here makes the store \
+             permanently unbootable"
+        );
+    }
+
+    /// A newest segment holding bytes no crash leaves behind is corruption,
+    /// not a torn tail.
+    #[test]
+    fn a_newest_segment_of_junk_blocks_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let wal = wal_with_a_recordless_newest_segment(&path);
+        let newest = nodedb_wal::segment::discover_segments(&path)
+            .expect("discover segments")
+            .last()
+            .expect("the zero-filled segment")
+            .path
+            .clone();
+        std::fs::write(&newest, b"NDBS-not-a-wal-record").expect("write junk");
+
+        let error = wal
+            .validate_for_startup()
+            .expect_err("junk in the newest segment must be refused");
+        assert!(
+            matches!(error, crate::Error::SegmentCorrupted { .. }),
+            "junk is corruption: {error}"
+        );
+    }
+
+    #[test]
+    fn a_segment_with_no_records_behind_the_newest_still_blocks_startup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let wal = wal_with_a_recordless_newest_segment(&path);
+        let segments = nodedb_wal::segment::discover_segments(&path).expect("discover segments");
+        let recordless = segments.last().expect("the zero-filled segment");
+        // A newer zero-filled segment becomes the newest, so the first one sits
+        // behind it: nothing resumes that file, and the gate refuses it.
+        std::fs::write(
+            nodedb_wal::segment::segment_path(&path, recordless.first_lsn + 2_000),
+            vec![0u8; 64 * 1024],
+        )
+        .expect("write a newer zero-filled segment");
+
+        let error = wal
+            .validate_for_startup()
+            .expect_err("a record-less segment behind the newest must be refused");
+        assert!(
+            matches!(error, crate::Error::SegmentCorrupted { .. }),
+            "a record-less segment behind the newest is corruption: {error}"
+        );
+        let text = format!("{error}");
+        assert!(
+            text.contains(&recordless.path.display().to_string()),
+            "the refusal must name the record-less segment: {text}"
+        );
     }
 
     /// An encrypted store keeps its first record behind the preamble, so the

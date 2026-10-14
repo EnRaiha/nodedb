@@ -1172,4 +1172,39 @@ mod tests {
             Ok(_) => panic!("opened a WAL whose last segment reissues LSNs"),
         }
     }
+
+    /// A newest segment whose first record has the record magic and a zeroed
+    /// version is a torn write, not a format this build cannot read. Opening
+    /// over it must succeed, and the writer must keep working, because the
+    /// writer's open is the first thing a boot does.
+    #[test]
+    fn open_accepts_a_newest_segment_with_a_zeroed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let next = {
+            let mut wal = SegmentedWal::open(test_config(dir.path())).unwrap();
+            wal.append(RecordType::Put as u32, 1, 0, 0, b"a").unwrap();
+            wal.sync().unwrap();
+            wal.next_lsn()
+        };
+
+        // A rollover that crashed before its first record: the new segment is
+        // named for the next LSN and holds the magic with nothing behind it.
+        // Written after the close, so the open has to read this state back.
+        let mut bytes = vec![0u8; 64 * 1024];
+        bytes[0..4].copy_from_slice(&crate::record::WAL_MAGIC.to_le_bytes());
+        std::fs::write(segment_path(dir.path(), next), &bytes).unwrap();
+
+        let mut wal = SegmentedWal::open(test_config(dir.path()))
+            .expect("a torn newest segment is not a format this build cannot read");
+        let lsn = wal.append(RecordType::Put as u32, 1, 0, 0, b"b").unwrap();
+        assert_eq!(
+            lsn, next,
+            "the writer has to keep working over the torn tail, not just open"
+        );
+        wal.sync().unwrap();
+        drop(wal);
+        let (records, _) = replay_from_limit_dir(dir.path(), 0, usize::MAX, None)
+            .expect("the resumed log replays without a gap");
+        assert_eq!(records.len(), 2, "both records replay");
+    }
 }
