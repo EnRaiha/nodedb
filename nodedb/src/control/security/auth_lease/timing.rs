@@ -60,11 +60,16 @@ impl LeaseTiming {
         self.lease.saturating_sub(self.reply_margin)
     }
 
-    /// How long a planning path waits for the next renewal once it found
-    /// the lease lapsed: one renewal interval for the next round to start,
-    /// plus the reply margin for it to finish.
+    /// How long a planning path waits for a renewal once it found the lease
+    /// lapsed.
+    ///
+    /// A lease lapses when a round runs long, and that round is still in
+    /// flight. The grace covers one whole round: up to one renewal interval
+    /// for its coverage wait, plus the holder's read timeout for its reply.
+    /// A round that the leader answers in time then admits the statement.
+    /// The wait holds no guard, and the lease check after it decides.
     pub fn lapse_grace(&self) -> Duration {
-        self.renew_every + self.reply_margin
+        self.renew_every + self.rpc_read_timeout(Duration::ZERO)
     }
 
     /// The holder's read timeout for an RPC whose leader handler first waits
@@ -101,7 +106,18 @@ mod tests {
         assert_eq!(timing.skew_margin, Duration::from_millis(50));
         assert_eq!(timing.renew_every, Duration::from_millis(50));
         assert_eq!(timing.reply_margin, Duration::from_millis(50));
-        assert_eq!(timing.lapse_grace(), Duration::from_millis(100));
+        assert_eq!(timing.lapse_grace(), Duration::from_millis(200));
+    }
+
+    /// The grace outlasts a renewal round that started just before the
+    /// lease lapsed: its coverage wait plus its reply's read timeout.
+    #[test]
+    fn the_grace_covers_one_renewal_round_in_flight() {
+        let timing = LeaseTiming::from_raft(Duration::from_millis(500), Duration::from_millis(50))
+            .expect("timing");
+        let longest_round = timing.renew_every + timing.rpc_read_timeout(Duration::ZERO);
+        assert!(timing.lapse_grace() >= longest_round);
+        assert_eq!(timing.lapse_grace(), Duration::from_millis(550));
     }
 
     /// The leader's reply deadline ends strictly inside the holder's read
