@@ -629,7 +629,24 @@ Every value must be positive. `verdict_stall_warn_ms` has a floor of `4`.
 After a restart, a scheduler re-applies epochs up to the highest epoch it
 applied before. The client gateway opens only after every scheduler on the
 node reaches that epoch. The wait shares the data-group recovery bound, and
-startup fails when the bound expires.
+startup fails when no scheduler makes progress for that long.
+
+**Startup bounds** (config file only):
+
+| Config field                                    | Default |
+| ----------------------------------------------- | ------- |
+| `tuning.startup.raft_ready_timeout_ms`          | `30000` |
+| `tuning.startup.data_group_recovery_timeout_ms` | `60000` |
+
+Boot fails when a wait makes no progress for its bound. A long replay that
+keeps applying entries never fails.
+
+- `raft_ready_timeout_ms` bounds the metadata raft group's replay.
+- `data_group_recovery_timeout_ms` bounds the data raft groups' replay, then
+  the Calvin scheduler catch-up.
+
+Each value must be between `1` and `86400000` (one day). Both keys belong under
+`[tuning.startup]`. Startup refuses them under `[server]`.
 
 **Observability settings:**
 

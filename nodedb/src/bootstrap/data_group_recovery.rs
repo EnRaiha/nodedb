@@ -17,8 +17,10 @@
 //!
 //! This gate closes that window: startup is held until every locally hosted
 //! data group has elected a leader, committed through the end of its retained
-//! log, and applied that log on this node. It fails closed — a timeout aborts
-//! startup rather than opening a gateway that would serve incomplete state.
+//! log, and applied that log on this node. It fails closed: a wait that makes
+//! no progress for the configured bound aborts startup rather than opening a
+//! gateway that would serve incomplete state. A replay that keeps applying
+//! entries keeps the wait open, however long the backlog is.
 //!
 //! A group whose replica here awaits a snapshot install does not hold startup.
 //! Its data diverged from the log, so it applies nothing until a snapshot
@@ -28,18 +30,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nodedb_raft::ReplicaState;
+use nodedb_types::config::tuning::DataGroupRecoveryTimeout;
 use tracing::{debug, info, warn};
 
+use crate::bootstrap::stall_clock::StallClock;
 use crate::control::state::SharedState;
 
 /// How often the Raft status snapshot is re-read while waiting. Elections take
 /// seconds, so a coarse poll costs nothing and avoids a busy loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Upper bound on the whole wait. Generous relative to a randomized election
-/// timeout plus replay of a retained log, but finite: a group that cannot elect
-/// or cannot apply is a failure, not a reason to hang forever.
-pub const DATA_GROUP_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// True when `group_id` names a data group whose log carries user writes that
 /// must be replayed into the Data Plane before queries are served.
@@ -151,6 +150,19 @@ fn group_recovery(progress: GroupProgress) -> GroupRecovery {
 struct PendingGroup {
     group_id: u64,
     wait: GroupWait,
+    progress: GroupProgress,
+}
+
+impl PendingGroup {
+    /// The measures the stall clock reads: whether the group has a leader,
+    /// how far its log is committed, and how far this node applied it.
+    fn measures(&self) -> [u64; 3] {
+        [
+            u64::from(self.progress.leader_id != 0),
+            self.progress.commit_index,
+            self.progress.host_applied,
+        ]
+    }
 }
 
 impl std::fmt::Display for PendingGroup {
@@ -205,6 +217,7 @@ fn gate_view(
             GroupRecovery::Pending(wait) => view.pending.push(PendingGroup {
                 group_id: status.group_id,
                 wait,
+                progress,
             }),
         }
     }
@@ -215,13 +228,21 @@ fn gate_view(
 /// Raft log on this node. A group awaiting a snapshot install does not hold it.
 /// On success it sets `SharedState::data_groups_replayed`.
 ///
+/// `stall_timeout` bounds how long the wait can go without progress. Progress
+/// is a pending group electing a leader, committing more of its log, applying
+/// more of it on this node, or finishing. A group that cannot elect or cannot
+/// apply fails the wait. A group that keeps applying never does.
+///
 /// Refuses when `start_raft` installed no Raft status source.
-pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Result<()> {
+pub async fn await_data_group_recovery(
+    shared: &Arc<SharedState>,
+    stall_timeout: DataGroupRecoveryTimeout,
+) -> anyhow::Result<()> {
     let Some(status_fn) = shared.raft_status_fn.get() else {
         anyhow::bail!("data group recovery: no Raft status source: start_raft has not run");
     };
     let status_fn = Arc::clone(status_fn);
-    let deadline = Instant::now() + DATA_GROUP_RECOVERY_TIMEOUT;
+    let mut clock = StallClock::<3>::new(stall_timeout.0, Instant::now());
 
     loop {
         let view = gate_view(status_fn(), |group_id| {
@@ -242,7 +263,14 @@ pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Res
             return Ok(());
         }
 
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        clock.observe(
+            now,
+            view.pending
+                .iter()
+                .map(|pending| (pending.group_id, pending.measures())),
+        );
+        if clock.stalled(now) {
             let detail = view
                 .pending
                 .iter()
@@ -250,7 +278,8 @@ pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Res
                 .collect::<Vec<_>>()
                 .join("; ");
             return Err(anyhow::anyhow!(
-                "data raft group recovery timeout after {DATA_GROUP_RECOVERY_TIMEOUT:?}: {detail}"
+                "data raft group recovery made no progress for {:?}: {detail}",
+                clock.bound()
             ));
         }
 
@@ -266,7 +295,10 @@ pub async fn await_data_group_recovery(shared: &Arc<SharedState>) -> anyhow::Res
 /// watch until it succeeds, without holding the caller. A host that brings
 /// nodes up one at a time uses it: a group here elects only once its peers
 /// run. Each failed attempt is logged, and the next one starts at once.
-pub fn spawn_data_group_recovery(shared: &Arc<SharedState>) {
+pub fn spawn_data_group_recovery(
+    shared: &Arc<SharedState>,
+    stall_timeout: DataGroupRecoveryTimeout,
+) {
     let task_shared = Arc::clone(shared);
     crate::control::shutdown::spawn_loop(
         &shared.loop_registry,
@@ -278,7 +310,7 @@ pub fn spawn_data_group_recovery(shared: &Arc<SharedState>) {
                 tokio::select! {
                     biased;
                     _ = shutdown.wait_cancelled() => break,
-                    recovered = await_data_group_recovery(&task_shared) => match recovered {
+                    recovered = await_data_group_recovery(&task_shared, stall_timeout) => match recovered {
                         Ok(()) => break,
                         Err(error) => warn!(%error, "data raft group recovery did not finish; retrying"),
                     },

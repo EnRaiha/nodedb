@@ -396,6 +396,7 @@ impl Scheduler {
     ) {
         self.metrics.update_last_applied_epoch(watermark);
         self.ledger.fold(watermark);
+        self.caught_up.report_watermark(watermark);
         self.shared
             .calvin
             .last_applied_epoch

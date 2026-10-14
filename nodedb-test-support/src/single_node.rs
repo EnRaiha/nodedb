@@ -118,8 +118,16 @@ pub async fn start(
     };
     // The harness cores replay their WAL before they report ready, so no
     // replay receiver is owed here.
-    nodedb::bootstrap::cluster_ready::await_cluster_ready(shared, ready_rx, Vec::new(), gates)
-        .await?;
+    let startup = nodedb_types::config::tuning::StartupTuning::default();
+    nodedb::bootstrap::cluster_ready::await_cluster_ready(
+        shared,
+        ready_rx,
+        Vec::new(),
+        gates,
+        startup.raft_ready_timeout(),
+        startup.data_group_recovery_timeout(),
+    )
+    .await?;
     Ok(raft)
 }
 

@@ -12,14 +12,17 @@
 //! caught up. A scheduler with nothing to rebuild reports at once, and a node
 //! that runs no scheduler passes at once. A vShard whose scheduler halted can
 //! never catch up, so its halt fails the wait at once. The wait shares the
-//! data-group recovery bound and fails closed when the bound expires.
+//! data-group recovery bound as a stall bound: it fails closed when no lagging
+//! scheduler advances its fully-applied watermark or catches up for that long.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info};
 
-use crate::bootstrap::data_group_recovery::DATA_GROUP_RECOVERY_TIMEOUT;
+use nodedb_types::config::tuning::DataGroupRecoveryTimeout;
+
+use crate::bootstrap::stall_clock::StallClock;
 use crate::control::cluster::CalvinApplyHalt;
 use crate::control::state::SharedState;
 
@@ -67,14 +70,28 @@ fn describe_lagging(lagging: &[u32]) -> String {
 }
 
 /// Hold startup until every Calvin scheduler on this node reaches its rebuild
-/// target.
-pub async fn await_calvin_catch_up(shared: &Arc<SharedState>) -> anyhow::Result<()> {
+/// target. Fails once `stall_timeout` passes with no lagging scheduler
+/// advancing its watermark or catching up.
+pub async fn await_calvin_catch_up(
+    shared: &Arc<SharedState>,
+    stall_timeout: DataGroupRecoveryTimeout,
+) -> anyhow::Result<()> {
     let registry = &shared.calvin.caught_up;
-    let deadline = Instant::now() + DATA_GROUP_RECOVERY_TIMEOUT;
+    let mut clock = StallClock::<1>::new(stall_timeout.0, Instant::now());
 
     loop {
         let halt = shared.sequencer_halt.apply_halt().report();
-        match catch_up_wait(registry.lagging(), halt) {
+        let schedulers = registry.lagging_schedulers();
+        let now = Instant::now();
+        clock.observe(
+            now,
+            schedulers.iter().map(|lagging| {
+                let mark = lagging.watermark.map_or(0, |w| w.saturating_add(1));
+                (u64::from(lagging.vshard_id), [mark])
+            }),
+        );
+        let lagging = schedulers.iter().map(|lagging| lagging.vshard_id).collect();
+        match catch_up_wait(lagging, halt) {
             None => {
                 info!("every calvin scheduler reached its rebuild target");
                 return Ok(());
@@ -92,10 +109,11 @@ pub async fn await_calvin_catch_up(shared: &Arc<SharedState>) -> anyhow::Result<
                 ));
             }
             Some(CatchUpWait::Lagging(lagging)) => {
-                if Instant::now() >= deadline {
+                if clock.stalled(now) {
                     return Err(anyhow::anyhow!(
-                        "calvin scheduler catch-up timeout after \
-                         {DATA_GROUP_RECOVERY_TIMEOUT:?}: {} behind their rebuild target",
+                        "calvin scheduler catch-up made no progress for {:?}: {} behind their \
+                         rebuild target",
+                        clock.bound(),
                         describe_lagging(&lagging)
                     ));
                 }
@@ -174,7 +192,7 @@ mod tests {
         );
         let (dispatcher, _data_sides) = crate::bridge::Dispatcher::new(1, 64);
         let shared = SharedState::new(dispatcher, wal).expect("build shared state");
-        await_calvin_catch_up(&shared)
+        await_calvin_catch_up(&shared, DataGroupRecoveryTimeout(Duration::from_secs(1)))
             .await
             .expect("no scheduler holds the gate");
     }

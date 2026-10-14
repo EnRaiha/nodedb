@@ -104,9 +104,13 @@ pub(crate) async fn boot_with_core(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .take();
-    crate::bootstrap::cluster_ready::await_raft_ready(&state, ready)
-        .await
-        .expect("the metadata group applies its first entry");
+    crate::bootstrap::cluster_ready::await_raft_ready(
+        &state,
+        ready,
+        nodedb_types::config::tuning::StartupTuning::default().raft_ready_timeout(),
+    )
+    .await
+    .expect("the metadata group applies its first entry");
 
     OneNodeCluster {
         state,

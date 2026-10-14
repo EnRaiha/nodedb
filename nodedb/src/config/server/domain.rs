@@ -34,6 +34,18 @@ pub(super) const REDO_ENTRY_ENVELOPE_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_REDO_ENTRY_BYTES: usize =
     nodedb_cluster::rpc_codec::MAX_RPC_PAYLOAD_SIZE as usize - REDO_ENTRY_ENVELOPE_BYTES;
 
+/// Smallest boot bound a caller can set, in milliseconds.
+///
+/// A zero bound fails every boot on its first poll: the wait is over before the
+/// group it waits for can answer.
+pub(super) const MIN_STARTUP_BOUND_MS: u64 = 1;
+
+/// Largest boot bound, in milliseconds: one day.
+///
+/// A bound past this stops being a bound: a stuck group and a healthy one are
+/// indistinguishable for the whole window.
+pub(super) const MAX_STARTUP_BOUND_MS: u64 = 86_400_000;
+
 /// Rejects an endpoint that carries no `http://` or `https://` host.
 pub(super) fn otlp_endpoint_has_host(raw: &str) -> bool {
     raw.strip_prefix("http://")
@@ -50,6 +62,22 @@ fn reject(field: &str, value: impl std::fmt::Display, expected: &str) -> crate::
 pub(super) fn positive_u64(value: u64, field: &str) -> crate::Result<()> {
     if value == 0 {
         return Err(reject(field, value, "a positive integer"));
+    }
+    Ok(())
+}
+
+/// A boot bound, in milliseconds, inside the range a boot can wait for.
+///
+/// Zero fails every boot on its first poll: the wait is over before the group it
+/// waits for can answer. A bound near `u64::MAX` is not a bound at all, and the
+/// server refuses it here instead of letting a stuck boot look healthy.
+fn startup_bound(value: u64, field: &str) -> crate::Result<()> {
+    if !(MIN_STARTUP_BOUND_MS..=MAX_STARTUP_BOUND_MS).contains(&value) {
+        return Err(reject(
+            field,
+            value,
+            &format!("a bound from {MIN_STARTUP_BOUND_MS} to {MAX_STARTUP_BOUND_MS} ms (one day)"),
+        ));
     }
     Ok(())
 }
@@ -87,6 +115,16 @@ pub(super) fn validate_domain(config: &ServerConfig) -> crate::Result<()> {
     )?;
     super::pitr::validate_pitr(config)?;
     super::backup::validate_backup(config)?;
+
+    let s = &config.tuning.startup;
+    startup_bound(
+        s.raft_ready_timeout_ms,
+        "tuning.startup.raft_ready_timeout_ms",
+    )?;
+    startup_bound(
+        s.data_group_recovery_timeout_ms,
+        "tuning.startup.data_group_recovery_timeout_ms",
+    )?;
 
     let ts = &config.tuning.timeseries;
     positive_usize(
