@@ -6,7 +6,7 @@
 //! whole plan afterwards.
 
 use crate::bridge::envelope::PhysicalPlan;
-use nodedb_physical::physical_plan::{KvCounterShape, KvOp, ReturningSpec};
+use nodedb_physical::physical_plan::{KvBatchIntent, KvCounterShape, KvOp, ReturningSpec};
 use nodedb_types::RlsWriteCheck;
 use nodedb_types::sync::wire::SyncProvenance;
 
@@ -94,27 +94,6 @@ pub(super) fn insert(
     }))
 }
 
-pub(super) fn insert_if_absent(
-    collection: &str,
-    key: &[u8],
-    value: &[u8],
-    ttl_ms: u64,
-    surrogate: u32,
-    returning: ReturningFields<'_>,
-) -> crate::Result<PhysicalPlan> {
-    let surrogate = nodedb_types::Surrogate::new(surrogate);
-    Ok(PhysicalPlan::Kv(KvOp::InsertIfAbsent {
-        collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
-        key: key.to_vec(),
-        value: value.to_vec(),
-        ttl_ms,
-        surrogate,
-        // Carried on the record — see `put`.
-        returning: returning.returning,
-        rls_filters: returning.rls_filters.to_vec(),
-    }))
-}
-
 /// The stored entry an `INSERT ... ON CONFLICT DO UPDATE` record carries.
 pub(super) struct ConflictEntry<'a> {
     pub key: &'a [u8],
@@ -156,6 +135,7 @@ pub(super) fn batch_put(
     collection: &str,
     entries: &[(Vec<u8>, Vec<u8>)],
     ttl_ms: u64,
+    intent: KvBatchIntent,
     surrogates: &[u32],
     returning: ReturningFields<'_>,
 ) -> crate::Result<PhysicalPlan> {
@@ -163,6 +143,7 @@ pub(super) fn batch_put(
         collection: nodedb_types::QualifiedCollection::from_stored(collection.to_owned()),
         entries: entries.to_vec(),
         ttl_ms,
+        intent,
         surrogates: surrogates
             .iter()
             .map(|&raw| nodedb_types::Surrogate::new(raw))

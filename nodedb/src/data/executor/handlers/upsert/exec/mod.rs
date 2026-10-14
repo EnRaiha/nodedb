@@ -4,8 +4,12 @@
 //! and hands off to [`overwrite`] (merge into an existing row) or [`insert`]
 //! (no existing row, insert fresh).
 
+mod batch;
+mod batch_plan;
 mod dispatch;
 mod insert;
+mod merge_body;
 mod overwrite;
 
 pub(in crate::data::executor) use dispatch::UpsertParams;
+pub(in crate::data::executor) use merge_body::{decode_stored_row, merge_upsert_body};

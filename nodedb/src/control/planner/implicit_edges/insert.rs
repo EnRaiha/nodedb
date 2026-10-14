@@ -54,11 +54,18 @@ pub async fn append_implicit_edge_tasks(
                     edges.push(edge);
                 }
             }
-            PhysicalPlan::Document(DocumentOp::BatchInsert {
-                collection,
-                documents,
-                ..
-            }) => {
+            PhysicalPlan::Document(
+                DocumentOp::BatchInsert {
+                    collection,
+                    documents,
+                    ..
+                }
+                | DocumentOp::BatchUpsert {
+                    collection,
+                    documents,
+                    ..
+                },
+            ) => {
                 for (_doc_id, value) in documents {
                     if let Some(edge) = extract_edge(collection.as_str(), value) {
                         edges.push(edge);

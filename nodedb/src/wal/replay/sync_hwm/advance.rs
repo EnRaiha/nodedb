@@ -118,7 +118,7 @@ pub fn replay_sync_hwm_records(
             | RecordType::TimeAnchor
             | RecordType::TemporalPurge
             | RecordType::SurrogateAlloc
-            | RecordType::SurrogateBind
+            | RecordType::SurrogateBindBatch
             | RecordType::FtsIndex
             | RecordType::FtsDelete
             | RecordType::SpatialPut

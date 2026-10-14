@@ -61,6 +61,12 @@ pub(super) fn add_keys(keys: &mut WriteKeys, op: &VectorOp) -> crate::Result<()>
             surrogates,
             ..
         } => keys.vector_rows(collection.as_str(), surrogates.iter().map(|s| s.as_u32())),
+        VectorOp::DirectBatchWrite {
+            collection, rows, ..
+        } => keys.vector_rows(
+            collection.as_str(),
+            rows.iter().map(|row| row.surrogate.as_u32()),
+        ),
         VectorOp::DirectDelete {
             collection,
             targets,

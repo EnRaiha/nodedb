@@ -10,6 +10,19 @@ use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// The refusal of a SQL `INSERT` whose key is already stored, or repeated
+/// earlier in the same statement: `unique_violation` (SQLSTATE 23505).
+pub(in crate::data::executor) fn kv_duplicate_key(collection: &str, key: &[u8]) -> crate::Error {
+    let key_str = String::from_utf8_lossy(key);
+    crate::Error::RejectedConstraint {
+        collection: collection.to_string(),
+        constraint: "unique".to_string(),
+        detail: format!(
+            "duplicate key value '{key_str}' violates primary-key uniqueness on '{collection}'"
+        ),
+    }
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_put(
         &mut self,
@@ -120,18 +133,7 @@ impl CoreLoop {
             .get(did, tid, collection, key, now_ms)
             .is_some()
         {
-            let key_str = String::from_utf8_lossy(key);
-            return self.response_error(
-                task,
-                crate::Error::RejectedConstraint {
-                    collection: collection.to_string(),
-                    constraint: "unique".to_string(),
-                    detail: format!(
-                        "duplicate key value '{key_str}' violates primary-key \
-                         uniqueness on '{collection}'"
-                    ),
-                },
-            );
+            return self.response_error(task, kv_duplicate_key(collection, key));
         }
 
         if let Err(e) = self.kv_engine.put(crate::engine::kv::KvPutParams {

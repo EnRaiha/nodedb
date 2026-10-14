@@ -54,6 +54,12 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
             documents,
             surrogates,
             ..
+        }
+        | DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            surrogates,
+            ..
         } => {
             // `zip` truncates silently; a row with no identity is a
             // malformed plan, refused here.
@@ -61,7 +67,7 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut DocumentOp) -> crate::R
                 return Err(crate::Error::Serialization {
                     format: "physical_plan".into(),
                     detail: format!(
-                        "batch insert into '{}' carries {} documents but {} surrogates; every \
+                        "document page into '{}' carries {} documents but {} surrogates; every \
                          row must carry its own surrogate",
                         collection.as_str(),
                         documents.len(),

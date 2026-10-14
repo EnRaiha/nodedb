@@ -220,20 +220,22 @@ pub enum RecordType {
     /// every per-engine index keyed on Surrogate.
     SurrogateAlloc = 51 | 0x8000,
 
-    /// Surrogate ↔ PK binding record.
+    /// Surrogate ↔ PK binding batch record.
     ///
-    /// Emitted by `SurrogateAssigner::assign` immediately after the
-    /// catalog two-table txn that writes `_system.surrogate_pk{,_rev}`,
-    /// so a crash between the catalog write and the next hwm checkpoint
-    /// still recovers the binding on replay (idempotent re-apply).
+    /// Emitted by the surrogate assigner after the catalog txn that writes
+    /// `_system.surrogate_pk{,_rev}`. One record carries the bindings one
+    /// call wrote for one collection. A batch larger than one double-write
+    /// slot splits into several records. Replay re-applies every binding
+    /// idempotently.
     ///
-    /// Payload: zerompk-encoded `SurrogateBindPayload {
-    /// surrogate: u32, collection: String, pk_bytes: Vec<u8> }`.
+    /// Payload: `SurrogateBindBatchPayload { collection: String,
+    /// entries: Vec<(u32, Vec<u8>)> }`, little-endian. The header carries
+    /// `(database_id, tenant_id)`.
     ///
     /// Required: skipping a bind on replay would leave the catalog
     /// behind the registry hwm, so a subsequent insert with the same
     /// user PK would allocate a fresh surrogate and break identity.
-    SurrogateBind = 52 | 0x8000,
+    SurrogateBindBatch = 52 | 0x8000,
 
     /// Checkpoint marker — indicates a consistent snapshot point.
     Checkpoint = 100 | 0x8000,
@@ -454,7 +456,7 @@ impl RecordType {
             x if x == 50 | 0x8000 => Some(Self::Transaction),
             x if x == 58 | 0x8000 => Some(Self::TransactionRedo),
             x if x == 51 | 0x8000 => Some(Self::SurrogateAlloc),
-            x if x == 52 | 0x8000 => Some(Self::SurrogateBind),
+            x if x == 52 | 0x8000 => Some(Self::SurrogateBindBatch),
             30 => Some(Self::TimeseriesBatch),
             31 => Some(Self::LogBatch),
             x if x == 40 | 0x8000 => Some(Self::ArrayPut),
@@ -552,7 +554,7 @@ mod tests {
             RecordType::Transaction,
             RecordType::TransactionRedo,
             RecordType::SurrogateAlloc,
-            RecordType::SurrogateBind,
+            RecordType::SurrogateBindBatch,
             RecordType::Checkpoint,
             RecordType::CollectionTombstoned,
             RecordType::TimeAnchor,

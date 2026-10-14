@@ -64,10 +64,11 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // `Merge`/`UpdateFromJoin`/`InsertSelect` never reach the log — the
         // session expander stages them as point ops, and the log has no
         // encoder for their unresolved form. The expander also reshapes a
-        // `BatchInsert` page into point inserts, which stage like any other
-        // point write.
+        // `BatchInsert` page into point inserts and a `BatchUpsert` page into
+        // point upserts, which stage like any other point write.
         PhysicalPlan::Document(
             DocumentOp::BatchInsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::Merge { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::InsertSelect { .. },
@@ -111,6 +112,11 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | VectorOp::DirectTruncate { .. }
             | VectorOp::DirectUpdate { .. },
         ) => true,
+
+        // The session expander reshapes a page into the point writes of its
+        // intent, which stage like any other point write. The log has no
+        // encoder for the unresolved page.
+        PhysicalPlan::Vector(VectorOp::DirectBatchWrite { .. }) => true,
 
         // DDL/Alter, not encoded.
         PhysicalPlan::Vector(
@@ -476,12 +482,22 @@ mod tests {
         )
     }
 
-    /// A write whose rows a predicate names. It resolves to rows before it is
-    /// logged, so the log encoder refuses its raw form.
+    /// A write whose rows a predicate names, or whose rows depend on the rows
+    /// stored. It resolves to rows before it is logged, so the log encoder
+    /// refuses its raw form. Inside a transaction it stages into the overlay,
+    /// and COMMIT logs the redo record the overlay resolves to, never the raw
+    /// form.
     fn resolves_before_log(plan: &PhysicalPlan) -> bool {
+        if let PhysicalPlan::Kv(KvOp::BatchPut { intent, .. }) = plan {
+            return intent.depends_on_stored_rows();
+        }
         matches!(
             plan,
-            PhysicalPlan::Kv(KvOp::PredicateUpdate { .. } | KvOp::PredicateDelete { .. })
+            PhysicalPlan::Kv(
+                KvOp::PredicateUpdate { .. }
+                    | KvOp::PredicateDelete { .. }
+                    | KvOp::InsertIfAbsent { .. }
+            ) | PhysicalPlan::Vector(VectorOp::DirectBatchWrite { .. })
                 | PhysicalPlan::Vector(
                     VectorOp::DirectDelete {
                         targets: nodedb_physical::physical_plan::VectorWriteTargets::Predicate(_),
@@ -676,6 +692,16 @@ mod tests {
                 value: Vec::new(),
                 on_conflict_updates: Vec::new(),
                 surrogate: Surrogate::new(1),
+                rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+                returning: None,
+                rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
+            }),
+            PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+                documents: vec![("d".into(), Vec::new()), ("e".into(), Vec::new())],
+                surrogates: vec![Surrogate::new(1), Surrogate::new(2)],
+                on_conflict_updates: Vec::new(),
                 rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
                 returning: None,
                 rls_filters: Vec::new(),
@@ -1352,6 +1378,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 entries: Vec::new(),
                 ttl_ms: 0,
+                intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
                 surrogates: Vec::new(),
                 returning: None,
                 rls_filters: Vec::new(),

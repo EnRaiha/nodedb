@@ -137,6 +137,28 @@ pub(super) fn decode_arm(write: &ReplicatedWrite) -> crate::Result<PhysicalPlan>
                 },
             },
         )),
+        ReplicatedWrite::DocBatchUpsert {
+            collection,
+            documents,
+            surrogates,
+            on_conflict_updates,
+            resolved_sum_targets,
+            resolved_sum_target_bindings,
+            returning,
+            rls_filters,
+        } => document::batch_upsert(
+            collection,
+            documents,
+            surrogates,
+            on_conflict_updates,
+            UpsertExtras {
+                resolved_sum_targets: &sums(resolved_sum_target_bindings, resolved_sum_targets),
+                returning: ReturningFields {
+                    returning: decode_returning(returning)?,
+                    rls_filters,
+                },
+            },
+        ),
         ReplicatedWrite::DocBatchInsert {
             collection,
             documents,

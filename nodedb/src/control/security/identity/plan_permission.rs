@@ -176,6 +176,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | VectorOp::DirectUpsert { .. }
             | VectorOp::DirectInsert { .. }
             | VectorOp::DirectInsertIfAbsent { .. }
+            | VectorOp::DirectBatchWrite { .. }
             | VectorOp::DirectDelete { .. }
             | VectorOp::DirectTruncate { .. }
             | VectorOp::DirectUpdate { .. }
@@ -193,6 +194,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::BulkDelete { .. }
             | DocumentOp::UpdateFromJoin { .. }
             | DocumentOp::Upsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::InsertSelect { .. }
             | DocumentOp::Truncate { .. }
             | DocumentOp::Merge { .. }

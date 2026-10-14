@@ -14,7 +14,7 @@ use super::wire_shapes::{
 use crate::wal::RedoStreamId;
 use nodedb_physical::physical_plan::document::MergeClauseOp;
 use nodedb_physical::physical_plan::{
-    ColumnarInsertIntent, CrdtWriteVerb, KvCounterShape, RowSource, UpdateValue,
+    ColumnarInsertIntent, CrdtWriteVerb, KvBatchIntent, KvCounterShape, RowSource, UpdateValue,
     VectorDirectWriteIntent, VectorResolvedMutation,
 };
 use nodedb_types::{PayloadIndexKind, Surrogate, VectorQuantization, VectorStorageDtype};
@@ -124,6 +124,25 @@ pub enum ReplicatedWrite {
         value: Vec<u8>,
         on_conflict_updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
         surrogate: u32,
+        /// See `PointPut::resolved_sum_targets`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<(String, u32)>,
+        /// See `PointPut::resolved_sum_target_bindings`.
+        #[serde(default)]
+        resolved_sum_target_bindings: Vec<ReplicatedSumTarget>,
+        /// See `PointPut::returning`.
+        #[serde(default)]
+        returning: Option<Vec<u8>>,
+        /// See `PointPut::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
+    },
+    /// See `DocumentOp::BatchUpsert`: every replica judges the page alike.
+    DocBatchUpsert {
+        collection: String,
+        documents: Vec<(String, Vec<u8>)>,
+        surrogates: Vec<u32>,
+        on_conflict_updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
         /// See `PointPut::resolved_sum_targets`.
         #[serde(default)]
         resolved_sum_targets: Vec<(String, u32)>,
@@ -448,21 +467,6 @@ pub enum ReplicatedWrite {
         #[serde(default)]
         rls_filters: Vec<u8>,
     },
-    KvInsertIfAbsent {
-        collection: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        ttl_ms: u64,
-        surrogate: u32,
-        /// See `KvPut::resolved_now_ms`.
-        resolved_now_ms: Option<u64>,
-        /// See `ReplicatedWrite::PointPut::returning`.
-        #[serde(default)]
-        returning: Option<Vec<u8>>,
-        /// See `ReplicatedWrite::PointPut::rls_filters`.
-        #[serde(default)]
-        rls_filters: Vec<u8>,
-    },
     KvInsertOnConflictUpdate {
         collection: String,
         key: Vec<u8>,
@@ -483,6 +487,9 @@ pub enum ReplicatedWrite {
         collection: String,
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         ttl_ms: u64,
+        /// See `KvOp::BatchPut::intent`. Every replica judges a stored key
+        /// by the same rule.
+        intent: KvBatchIntent,
         surrogates: Vec<u32>,
         /// See `KvPut::resolved_now_ms`.
         resolved_now_ms: Option<u64>,

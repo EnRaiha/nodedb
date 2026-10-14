@@ -262,18 +262,9 @@ impl CoreLoop {
         ttl_ms: u64,
     ) -> Response {
         if self.stage_kv_pk_present(ctx, key) {
-            let key_str = String::from_utf8_lossy(key);
             return self.response_error(
                 ctx.task,
-                crate::Error::RejectedConstraint {
-                    collection: ctx.collection.to_string(),
-                    constraint: "unique".to_string(),
-                    detail: format!(
-                        "duplicate key value '{key_str}' violates primary-key \
-                         uniqueness on '{}'",
-                        ctx.collection
-                    ),
-                },
+                crate::data::executor::handlers::kv::crud::kv_duplicate_key(ctx.collection, key),
             );
         }
         self.stage_kv_ttl_side_effect(ctx, ttl_ms);

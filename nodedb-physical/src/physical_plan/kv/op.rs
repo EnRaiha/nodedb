@@ -4,6 +4,7 @@
 
 use nodedb_types::{QualifiedCollection, RlsWriteCheck, Surrogate};
 
+use super::batch_intent::KvBatchIntent;
 use super::counter_shape::KvCounterShape;
 use super::resolved_mutation::KvResolvedMutation;
 use super::sorted_read::{SortedIndexRead, SortedIndexSpec};
@@ -222,13 +223,18 @@ pub enum KvOp {
         rls_filters: Vec<u8>,
     },
 
-    /// Batch put: insert/update multiple key-value pairs atomically.
+    /// Batch put: write multiple key-value pairs atomically, as one request
+    /// and one durable write. A multi-row SQL `INSERT` / `UPSERT` lowers to
+    /// it, with `intent` set to the statement's rule for a stored key.
     BatchPut {
         collection: QualifiedCollection,
         /// `(key, value)` pairs.
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         /// Per-key TTL override in milliseconds. 0 = use collection default.
         ttl_ms: u64,
+        /// What a key already stored, or repeated in `entries`, does.
+        #[serde(default)]
+        intent: KvBatchIntent,
         /// Stable cross-engine identity for each entry, same order and
         /// length as `entries`, assigned by the CP-side `SurrogateAssigner`
         /// from `(collection, key)` -- the same mechanism `Put`/`Insert`

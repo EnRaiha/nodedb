@@ -183,6 +183,7 @@ fn document_point_key(op: &DocumentOp) -> Option<LockKey> {
         }),
         // Multi-row and cross-collection writes have no single point identity.
         DocumentOp::BatchInsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         // N rows, each with its own identity; never admitted through this gate — the
         // write-resolve orchestrator proposes it directly with a content precondition.
         | DocumentOp::ResolvedWrite { .. }
@@ -314,6 +315,7 @@ fn vector_point_key(op: &VectorOp) -> Option<LockKey> {
         // Every row of the collection: no single stable identity.
         VectorOp::DirectTruncate { .. } => None,
         VectorOp::BatchInsert { .. }
+        | VectorOp::DirectBatchWrite { .. }
         | VectorOp::Delete { .. }
         | VectorOp::SparseInsert { .. }
         | VectorOp::SparseDelete { .. }
@@ -455,6 +457,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "counters"),
                 entries: vec![(b"k1".to_vec(), vec![]), (b"k2".to_vec(), vec![])],
                 ttl_ms: 0,
+                intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
                 surrogates: vec![],
                 returning: None,
                 rls_filters: Vec::new(),

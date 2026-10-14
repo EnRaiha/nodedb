@@ -117,6 +117,15 @@ fn classify_document_op(op: &DocumentOp) -> Option<DmlWriteInfo> {
             new_fields: None, // Batch — individual rows not available here
             needs_existence_probe: false,
         }),
+        // Each row inserts or updates by whether its key is stored, so the
+        // page names both events.
+        DocumentOp::BatchUpsert { collection, .. } => Some(DmlWriteInfo {
+            collection: collection.to_string(),
+            document_id: None,
+            event: DmlEvent::Insert,
+            new_fields: None,
+            needs_existence_probe: true,
+        }),
         DocumentOp::BulkUpdate { collection, .. } => Some(DmlWriteInfo {
             collection: collection.to_string(),
             document_id: None,

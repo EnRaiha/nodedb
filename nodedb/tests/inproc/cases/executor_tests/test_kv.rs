@@ -175,6 +175,7 @@ fn kv_batch_put_and_get() {
             ),
             entries,
             ttl_ms: 0,
+            intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
             surrogates,
             returning: None,
             rls_filters: Vec::new(),

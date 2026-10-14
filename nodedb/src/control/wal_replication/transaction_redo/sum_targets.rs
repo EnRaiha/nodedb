@@ -99,6 +99,11 @@ fn document_sum_targets(op: &DocumentOp) -> Option<SumTargetSlots<'_>> {
             resolved_sum_targets,
             ..
         }
+        | DocumentOp::BatchUpsert {
+            collection,
+            resolved_sum_targets,
+            ..
+        }
         | DocumentOp::BulkUpdate {
             collection,
             resolved_sum_targets,

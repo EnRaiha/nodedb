@@ -72,13 +72,26 @@ struct Failing {
     retry_at: Instant,
 }
 
+/// How far an owner fired a partition past its committed cursor.
+#[derive(Debug, Clone, Copy)]
+struct Ahead {
+    /// The lease the events fired under.
+    lease: Lease,
+    /// The last event fired.
+    position: CdcOffset,
+    /// Whether one of those events ran an action. Its cursor commit is due
+    /// at once. Events with no action wait for [`IDLE_CURSOR_COMMIT`].
+    acted: bool,
+}
+
 /// What this node's firing task keeps between passes, per partition.
 #[derive(Debug, Default)]
 pub struct FiringState {
-    /// Events fired past the committed cursor, under the lease that fired
-    /// them. A cursor commit that did not land leaves them here, so the same
-    /// owner does not fire them again. A new lease starts from the cursor.
-    ahead: HashMap<u32, (Lease, CdcOffset)>,
+    /// Events fired past the committed cursor. A cursor commit that did not
+    /// land, or one deferred over events with no action, leaves them here,
+    /// so the same owner does not fire them again. A new lease starts from
+    /// the cursor.
+    ahead: HashMap<u32, Ahead>,
     /// The event holding each partition's cursor on a failed action.
     failing: HashMap<u32, Failing>,
     /// When each partition's cursor was last committed.
@@ -90,15 +103,40 @@ impl FiringState {
     /// `cursor`.
     fn resume(&self, partition: u32, lease: Lease, cursor: CdcOffset) -> CdcOffset {
         match self.ahead.get(&partition) {
-            Some((fired_under, position)) if *fired_under == lease && *position > cursor => {
-                *position
-            }
+            Some(ahead) if ahead.lease == lease && ahead.position > cursor => ahead.position,
             _ => cursor,
         }
     }
 
-    fn record(&mut self, partition: u32, lease: Lease, position: CdcOffset) {
-        self.ahead.insert(partition, (lease, position));
+    /// Record `position` as fired under `lease`. `acted` says whether it ran
+    /// an action. The events fired before it under the same lease keep
+    /// theirs.
+    fn record(&mut self, partition: u32, lease: Lease, position: CdcOffset, acted: bool) {
+        let acted = acted || self.owes_acted_commit(partition, lease);
+        self.ahead.insert(
+            partition,
+            Ahead {
+                lease,
+                position,
+                acted,
+            },
+        );
+    }
+
+    /// Whether the events fired past the cursor under `lease` ran an action
+    /// whose cursor commit has not landed.
+    fn owes_acted_commit(&self, partition: u32, lease: Lease) -> bool {
+        self.ahead
+            .get(&partition)
+            .is_some_and(|ahead| ahead.lease == lease && ahead.acted)
+    }
+
+    /// The cursor commit over everything fired on `partition` landed.
+    fn committed(&mut self, partition: u32) {
+        self.committed_at.insert(partition, Instant::now());
+        if let Some(ahead) = self.ahead.get_mut(&partition) {
+            ahead.acted = false;
+        }
     }
 
     /// Whether the cursor over events with no action is due a commit.
@@ -209,7 +247,7 @@ async fn retry_failing(
     }
     let remaining = dead_letter_spent(state, scratch.take_all());
     if remaining.is_empty() {
-        firing.record(partition, lease, failing.position);
+        firing.record(partition, lease, failing.position, true);
         return false;
     }
     firing.failing.insert(
@@ -280,9 +318,10 @@ async fn fire_partition(
         resumed,
         cursor,
     } = owner;
-    // Events fired earlier under this lease whose cursor commit did not land.
+    // Events fired earlier under this lease whose cursor commit did not land
+    // or waits. They make the commit due at once only when one ran an action.
     let mut last = (resumed > cursor).then_some(resumed);
-    let mut acted = last.is_some();
+    let mut acted = last.is_some() && firing.owes_acted_commit(partition, lease);
     let mut fired = 0;
     for (position, action) in held {
         if delivery_lease(state, partition) != Some(lease) {
@@ -300,7 +339,7 @@ async fn fire_partition(
                 );
                 fired += 1;
                 last = Some(position);
-                firing.record(partition, lease, position);
+                firing.record(partition, lease, position, false);
                 continue;
             }
         };
@@ -330,7 +369,7 @@ async fn fire_partition(
         }
         fired += 1;
         last = Some(position);
-        firing.record(partition, lease, position);
+        firing.record(partition, lease, position, acted);
     }
     let Some(through) = last else {
         return fired;
@@ -355,7 +394,7 @@ async fn fire_partition(
     }
     match commit_fired(state, partition, through).await {
         Ok(()) => {
-            firing.committed_at.insert(partition, Instant::now());
+            firing.committed(partition);
             fired
         }
         Err(error) => {
@@ -411,7 +450,7 @@ mod tests {
         let mut firing = FiringState::default();
         assert_eq!(firing.resume(3, (1, 4), cursor), cursor);
 
-        firing.record(3, (1, 4), fired);
+        firing.record(3, (1, 4), fired, false);
         assert_eq!(firing.resume(3, (1, 4), cursor), fired);
         // A later term is a new lease: it starts from the cursor.
         assert_eq!(firing.resume(3, (1, 5), cursor), cursor);
@@ -428,5 +467,27 @@ mod tests {
         assert!(firing.idle_commit_due(7));
         firing.committed_at.insert(7, Instant::now());
         assert!(!firing.idle_commit_due(7));
+    }
+
+    /// Events with no action deferred past the cursor do not make the next
+    /// pass commit at once. An event that ran an action does, until the
+    /// commit lands.
+    #[test]
+    fn only_an_acted_event_owes_an_immediate_commit() {
+        let lease = (1, 4);
+        let mut firing = FiringState::default();
+        firing.record(3, lease, CdcOffset::data_event(0, 5, 1), false);
+        firing.record(3, lease, CdcOffset::data_event(0, 6, 1), false);
+        assert!(!firing.owes_acted_commit(3, lease));
+
+        firing.record(3, lease, CdcOffset::data_event(0, 7, 1), true);
+        firing.record(3, lease, CdcOffset::data_event(0, 8, 1), false);
+        assert!(firing.owes_acted_commit(3, lease));
+        // Another lease owes nothing for this lease's events.
+        assert!(!firing.owes_acted_commit(3, (1, 5)));
+
+        firing.committed(3);
+        assert!(!firing.owes_acted_commit(3, lease));
+        assert!(!firing.idle_commit_due(3));
     }
 }

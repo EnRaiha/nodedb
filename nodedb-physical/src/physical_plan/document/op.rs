@@ -408,6 +408,39 @@ pub enum DocumentOp {
         resolved_sum_targets: Vec<ResolvedSumTarget>,
     },
 
+    /// Multi-row `UPSERT` / `INSERT ... ON CONFLICT DO UPDATE`: every row of
+    /// one statement, applied as one page in one redb transaction.
+    ///
+    /// Each row is judged as an `Upsert` judges it: an absent key stores the
+    /// row, a stored key stores the merge. A key the page names twice merges
+    /// into the body its earlier row stored. Any row's refusal leaves the
+    /// whole page unwritten. Inside a transaction the page expands into one
+    /// `Upsert` per row.
+    BatchUpsert {
+        collection: QualifiedCollection,
+        /// `(document_id, value_bytes)` pairs, in statement order.
+        documents: Vec<(String, Vec<u8>)>,
+        /// Per-row surrogates, parallel to `documents`. Never
+        /// `Surrogate::ZERO`: a page that carries one is refused.
+        surrogates: Vec<Surrogate>,
+        /// See `Upsert::on_conflict_updates`. One clause for every row.
+        on_conflict_updates: Vec<(String, UpdateValue)>,
+        /// See `Upsert::rls_write_check`. Decided against each row's body
+        /// that persists.
+        rls_write_check: RlsWriteCheck,
+        /// When `Some`, return one row per row of the page — the STORED
+        /// post-image of each, in `documents` order.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// See `PointDelete::rls_filters`.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
+        /// See `PointPut::resolved_sum_targets`. One entry per distinct pair
+        /// across `documents`.
+        #[serde(default)]
+        resolved_sum_targets: Vec<ResolvedSumTarget>,
+    },
+
     /// Update target rows matched by a join with a source relation: build a
     /// merged doc per matching target row (source fields qualified
     /// `<alias>.<field>`), evaluate `updates`, write back.

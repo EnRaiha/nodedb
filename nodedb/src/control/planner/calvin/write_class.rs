@@ -33,6 +33,7 @@ fn document_is_write(op: &DocumentOp) -> bool {
         | DocumentOp::BatchInsert { .. }
         | DocumentOp::InsertSelect { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         // `UpdateFromJoin` is `Unroutable` in `plan_vshard` (no enforced
@@ -180,6 +181,7 @@ fn vector_is_write(op: &VectorOp) -> bool {
         | VectorOp::DirectUpsert { .. }
         | VectorOp::DirectInsert { .. }
         | VectorOp::DirectInsertIfAbsent { .. }
+        | VectorOp::DirectBatchWrite { .. }
         | VectorOp::DirectDelete { .. }
         | VectorOp::DirectTruncate { .. }
         | VectorOp::DirectUpdate { .. }

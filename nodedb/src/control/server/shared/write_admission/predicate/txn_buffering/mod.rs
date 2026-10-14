@@ -20,7 +20,8 @@
 //! fixing those is a separate, later change.
 //!
 //! One documented set of arms is the exception:
-//! `DocumentOp::{Merge, UpdateFromJoin, InsertSelect}` and `CrdtOp::RestoreToVersion`
+//! `DocumentOp::{Merge, UpdateFromJoin, InsertSelect}`,
+//! `VectorOp::DirectBatchWrite` and `CrdtOp::RestoreToVersion`
 //! classify `true` here even though `to_replicated_entry` has no encoder arm
 //! for any of them — a deliberate divergence from the oracle (see the
 //! equivalence test below, which pins the divergence explicitly rather than
@@ -43,16 +44,15 @@
 //! three (see `control/wal_replication/encode/crdt.rs::encode`), so they do
 //! not diverge from the oracle and are covered by
 //! `crdt_variants_match_oracle` below.
-//! `DocumentOp::BatchInsert` and `CrdtOp::{SetConstraints, DropConstraints}`
-//! were also in this exception list, but `to_replicated_entry` now has
-//! encoder arms for all three (see
+//! `DocumentOp::{BatchInsert, BatchUpsert}` and
+//! `CrdtOp::{SetConstraints, DropConstraints}` are likewise NOT in this
+//! exception list: `to_replicated_entry` has encoder arms for all four (see
 //! `control/wal_replication/encode/document.rs::encode` and
-//! `control/wal_replication/encode/crdt.rs::encode`), so they too no longer
-//! diverge from the oracle and were moved into `document_variants_match_oracle`
-//! / `crdt_variants_match_oracle` below. Without buffering,
-//! each of these executed immediately against base state inside an explicit
-//! transaction, was visible before COMMIT, and survived ROLLBACK: a
-//! correctness bug, not a classification nuance. Closing it has two
+//! `control/wal_replication/encode/crdt.rs::encode`), so they do not diverge
+//! from the oracle and are covered by `document_variants_match_oracle` /
+//! `crdt_variants_match_oracle` below. Without buffering, each of these
+//! would execute at once against base state inside an explicit transaction,
+//! be visible before COMMIT, and survive ROLLBACK. Buffering has two
 //! documented consequences:
 //!
 //! 1. RYOW LOSS: a `Buffered` plan does not stage into the per-transaction

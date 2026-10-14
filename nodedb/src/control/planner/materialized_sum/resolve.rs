@@ -16,7 +16,7 @@ use super::resolve_target::ResolvedTargets;
 use super::settle::{
     SettleInput, co_resident_target_keys, omit_shipped, settle_cross_shard_images,
 };
-use super::stored::stored_row_scope;
+use super::stored::stored_row_scopes;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::server::surrogate_exchange::lookup_surrogate_routed;
 use crate::control::state::SharedState;
@@ -89,11 +89,11 @@ pub async fn resolve_materialized_sum_targets(
         // end before the resolution is written back through `&mut op`.
         let outcome = {
             let carried = value_carrying(op);
-            let stored = stored_row_scope(op, read_txn);
+            let stored = stored_row_scopes(op, read_txn);
             // The two classifications name the same collection when both apply;
             // an op that is neither carries no join value at all and is skipped.
             let Some(collection) = stored
-                .as_ref()
+                .first()
                 .map(|scope| scope.collection)
                 .or_else(|| carried.as_ref().map(|(collection, _)| *collection))
             else {
@@ -125,27 +125,38 @@ pub async fn resolve_materialized_sum_targets(
             // join values it addresses AND for the pre-image a cross-shard
             // delta is folded from. One read, one snapshot: settling from a
             // second read will total a different one.
-            match &stored {
-                None => (resolved.into_vec(), None),
-                Some(scope) => {
-                    let images = super::stored::extend_with_stored_row(
-                        state,
-                        &bindings,
-                        scope,
-                        &mut resolved,
-                        tenant_id,
-                        database_id,
-                        trace_id,
-                    )
-                    .await?;
-                    let mut resolved = resolved.into_vec();
+            if stored.is_empty() {
+                (resolved.into_vec(), Vec::new())
+            } else {
+                let mut images = Vec::with_capacity(stored.len());
+                for scope in &stored {
+                    images.push(
+                        super::stored::extend_with_stored_row(
+                            state,
+                            &bindings,
+                            scope,
+                            &mut resolved,
+                            tenant_id,
+                            database_id,
+                            trace_id,
+                        )
+                        .await?,
+                    );
+                }
+                let mut resolved = resolved.into_vec();
+                // Every row settles against the whole resolution, before any
+                // shipped value leaves it.
+                let mut settlements = Vec::with_capacity(stored.len());
+                let mut shipped = Vec::new();
+                let mut still_needed = Vec::new();
+                for (scope, images) in stored.iter().zip(&images) {
                     let input = SettleInput {
                         source_collection: collection,
                         images: &images.images,
                         source_row: Some(scope.surrogate),
                         read_version: images.read_version,
                     };
-                    let settlement = settle_cross_shard_images(
+                    let mut settlement = settle_cross_shard_images(
                         &bindings,
                         &input,
                         &resolved,
@@ -153,22 +164,21 @@ pub async fn resolve_materialized_sum_targets(
                         tenant_id,
                         database_id,
                     )?;
-                    // The resolution the source op keeps is the one the source
-                    // core can still apply. Removing the shipped values IS the
-                    // deferral: what is left resolved is exactly what no
-                    // sibling task carries.
-                    omit_shipped(
-                        &mut resolved,
-                        &settlement.shipped,
-                        &co_resident_target_keys(&bindings, &input, database_id)?,
-                    );
-                    (resolved, Some(settlement))
+                    shipped.append(&mut settlement.shipped);
+                    still_needed.extend(co_resident_target_keys(&bindings, &input, database_id)?);
+                    settlements.push(settlement);
                 }
+                // The resolution the source op keeps is the one the source
+                // core can still apply. Removing the shipped values IS the
+                // deferral: what is left resolved is exactly what no sibling
+                // task carries.
+                omit_shipped(&mut resolved, &shipped, &still_needed);
+                (resolved, settlements)
             }
         };
-        let (resolved, settlement) = outcome;
+        let (resolved, settlements) = outcome;
         set_resolved(op, resolved);
-        if let Some(settlement) = settlement {
+        for settlement in settlements {
             appended.extend(settlement.tasks);
             reads.extend(settlement.reads);
         }
@@ -196,6 +206,11 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
             collection,
             documents,
             ..
+        }
+        | DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            ..
         } => Some((
             collection.as_str(),
             documents.iter().map(|(_, v)| v.as_slice()).collect(),
@@ -203,7 +218,7 @@ fn value_carrying(op: &DocumentOp) -> Option<(&str, Vec<&[u8]>)> {
         // No row body at plan time: a delete names a row it does not carry, and
         // an update carries field assignments rather than a whole row. Their
         // join values come off the STORED row instead — see
-        // [`stored_row_scope`].
+        // [`stored_row_scopes`].
         DocumentOp::PointDelete { .. } | DocumentOp::PointUpdate { .. } => None,
         // Predicate-driven and read-only ops.
         DocumentOp::ResolveWrite(_)
@@ -249,6 +264,10 @@ fn set_resolved(op: &mut DocumentOp, resolved: Vec<ResolvedSumTarget>) {
             ..
         }
         | DocumentOp::BatchInsert {
+            resolved_sum_targets,
+            ..
+        }
+        | DocumentOp::BatchUpsert {
             resolved_sum_targets,
             ..
         }

@@ -160,6 +160,7 @@ fn kv_protocol_command_sequence() {
                 (b"c".to_vec(), b"3".to_vec()),
             ],
             ttl_ms: 0,
+            intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
             surrogates: [b"a", b"b", b"c"]
                 .into_iter()
                 .map(|key| nodedb_test_support::kv_rows::kv_row_surrogate(key))

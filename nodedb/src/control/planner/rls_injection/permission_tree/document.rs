@@ -70,6 +70,7 @@ pub(super) fn apply_document(ctx: &PermCtx<'_>, op: &mut DocumentOp) -> crate::R
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. }
         // Named directly like the point writes; its row is still a row of
         // the target collection.
         | DocumentOp::ApplyBalanceDelta { collection, .. } => {

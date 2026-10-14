@@ -399,6 +399,44 @@ pub enum VectorOp {
         rls_filters: Vec<u8>,
     },
 
+    /// Multi-row vector-primary `INSERT` / `INSERT ... ON CONFLICT` /
+    /// `UPSERT`: one statement, one page. Every row is judged before any
+    /// row lands, so the page lands whole or not at all.
+    ///
+    /// Each row means what one `DirectInsert` / `DirectInsertIfAbsent` /
+    /// `DirectUpsert` of the same `intent` means, applied in page order. A
+    /// key the page names twice is judged against the body its earlier row
+    /// produced, and is stored once, with the final body.
+    ///
+    /// The page always resolves to a [`VectorOp::ResolvedDirectWrite`]
+    /// before it is logged or replicated: the record names the rows the page
+    /// stores, so replay never judges existence again.
+    DirectBatchWrite {
+        collection: QualifiedCollection,
+        /// Vector column name; keys the HNSW index.
+        field: String,
+        /// What an existing key means for every row of the page.
+        intent: super::write::VectorDirectWriteIntent,
+        /// The rows, in statement order.
+        rows: Vec<super::write::VectorDirectRow>,
+        quantization: nodedb_types::VectorQuantization,
+        storage_dtype: nodedb_types::VectorStorageDtype,
+        payload_indexes: Vec<(String, nodedb_types::PayloadIndexKind)>,
+        /// When `Some`, return one row per row the page writes, each its
+        /// key's stored post-image.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
+        /// Read filters gating the rows `returning` emits.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
+        /// See `DirectUpsert::on_conflict_updates`. Only an `Upsert` page
+        /// carries one; one clause for every row.
+        #[serde(default)]
+        on_conflict_updates: Vec<(String, UpdateValue)>,
+        /// See `DirectUpsert::rls_write_check`.
+        rls_write_check: nodedb_types::RlsWriteCheck,
+    },
+
     /// Vector-primary `DELETE`. Removes the HNSW node, its payload bitmap
     /// entries, and the payload sidecar row of every targeted surrogate.
     /// Reports the number of rows that existed.
@@ -459,8 +497,9 @@ pub enum VectorOp {
     /// would apply, and the response payload it would return, without
     /// applying anything.
     ///
-    /// Wraps a [`VectorOp::DirectDelete`], [`VectorOp::DirectUpdate`], or
-    /// [`VectorOp::DirectUpsert`] verbatim, live write predicate included —
+    /// Wraps a [`VectorOp::DirectDelete`], [`VectorOp::DirectUpdate`],
+    /// [`VectorOp::DirectUpsert`], or [`VectorOp::DirectBatchWrite`]
+    /// verbatim, live write predicate included —
     /// the handler resolves the targets, reads each row's sidecar, computes
     /// the post-image, and decides the policy here, where the writing
     /// identity is still available. A follower has none, so the predicate

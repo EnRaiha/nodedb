@@ -4,6 +4,7 @@
 
 mod apply;
 mod atomic_ops;
+mod batch_ops;
 mod context;
 mod dispatch;
 mod predicate_ops;

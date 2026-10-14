@@ -16,6 +16,9 @@ use super::layout::{DWB_CAPACITY, DWB_SLOT_STRIDE, SLOT_PREFIX_SIZE, SlotPrefix,
 impl DoubleWriteBuffer {
     /// Try to recover a WAL record by LSN from the double-write buffer.
     ///
+    /// Reads the slots on disk only. A record staged since the last flush is
+    /// not visible here until that flush writes its slot.
+    ///
     /// When two slots hold the same LSN — a crash between the DWB fsync and
     /// the WAL fsync leaves an LSN durable here but absent from the WAL, so
     /// recovery hands that LSN to a *different* record — the copy with the

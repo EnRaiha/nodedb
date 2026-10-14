@@ -389,6 +389,7 @@ impl CoreLoop {
             | DocumentOp::PointGet { .. }
             | DocumentOp::Scan { .. }
             | DocumentOp::BatchInsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::RangeScan { .. }
             | DocumentOp::Register { .. }
             | DocumentOp::IndexLookup { .. }

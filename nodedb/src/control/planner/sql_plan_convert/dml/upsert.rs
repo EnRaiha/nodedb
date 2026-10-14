@@ -99,6 +99,14 @@ pub(in super::super) fn convert_upsert(
         declared_primary_key_name(ctx, collection)?
     };
 
+    // A multi-row document upsert lowers to ONE `BatchUpsert` page: one
+    // Data-Plane request and one replicated write for the statement, its
+    // rows judged as `Upsert` judges each. A single row stays an `Upsert`. A
+    // CRDT collection converges row by row through `DocUpsert`.
+    let paged = !is_crdt && rows.len() > 1 && matches!(route, WriteRoute::Document);
+    let mut page_documents: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut page_surrogates: Vec<nodedb_types::Surrogate> = Vec::new();
+
     for row in rows {
         match route {
             WriteRoute::Document => {
@@ -117,6 +125,11 @@ pub(in super::super) fn convert_upsert(
                     on_conflict_updates,
                     &doc_id,
                 )?;
+                if paged {
+                    page_documents.push((doc_id, value_bytes));
+                    page_surrogates.push(surrogate);
+                    continue;
+                }
                 let plan = if is_crdt {
                     PhysicalPlan::Crdt(CrdtOp::DocUpsert {
                         collection: qualified_collection.clone(),
@@ -158,6 +171,30 @@ pub(in super::super) fn convert_upsert(
                 columnar_rows.push(row);
             }
         }
+    }
+
+    if !page_documents.is_empty() {
+        tasks.push(PhysicalTask {
+            tenant_id,
+            vshard_id: vshard,
+            database_id: ctx.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection: qualified_collection.clone(),
+                documents: page_documents,
+                surrogates: page_surrogates,
+                on_conflict_updates: on_conflict_values.clone(),
+                // Filled in by the RLS injection pass, which runs after
+                // conversion.
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                rls_filters: Vec::new(),
+                // Filled in by the protocol layer's RETURNING injection.
+                returning: None,
+                // Filled by the materialized-sum resolution pass.
+                resolved_sum_targets: Vec::new(),
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        });
     }
 
     if !columnar_rows.is_empty() {

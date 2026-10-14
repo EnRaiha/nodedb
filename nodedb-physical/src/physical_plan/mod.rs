@@ -66,8 +66,8 @@ pub use graph::{
     RagLegs, RagStage, RagTextHit, RagVectorHit, WccSuperstepPlan, WccSuperstepResult,
 };
 pub use kv::{
-    KvCounterShape, KvOp, KvResolveOutcome, KvResolvedMutation, SortedIndexRead, SortedIndexSpec,
-    TransferAmount,
+    KvBatchIntent, KvCounterShape, KvOp, KvResolveOutcome, KvResolvedMutation, SortedIndexRead,
+    SortedIndexSpec, TransferAmount,
 };
 pub use meta::MetaOp;
 pub use meta_home::{HomeAnswer, HomeVersion, HomeVersionProbe};
@@ -87,7 +87,7 @@ pub use timeseries::{
     UNBOUNDED_TIME_RANGE,
 };
 pub use vector::{
-    VectorDirectWriteIntent, VectorOp, VectorResolveOutcome, VectorResolvedMutation,
-    VectorWriteTargets,
+    VectorDirectRow, VectorDirectWriteIntent, VectorOp, VectorResolveOutcome,
+    VectorResolvedMutation, VectorWriteTargets,
 };
 pub use wire::{decode, encode};

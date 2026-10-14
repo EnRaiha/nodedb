@@ -6,7 +6,7 @@
 //!   - `SurrogateAlloc` (the hwm) is Raft-replicated via
 //!     `MetadataEntry::SurrogateAlloc`.  Every node persists the hwm
 //!     to `_system.surrogate_hwm` in its local redb catalog on apply.
-//!   - `SurrogateBind` (individual pk↔surrogate mappings) is NOT
+//!   - `SurrogateBindBatch` (pk↔surrogate mapping WAL records) is NOT
 //!     Raft-replicated; each node re-derives bindings from the
 //!     engine-write WAL replay path.
 //!

@@ -171,6 +171,7 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
         PhysicalPlan::Vector(VectorOp::DirectUpsert { returning, .. })
         | PhysicalPlan::Vector(VectorOp::DirectInsert { returning, .. })
         | PhysicalPlan::Vector(VectorOp::DirectInsertIfAbsent { returning, .. })
+        | PhysicalPlan::Vector(VectorOp::DirectBatchWrite { returning, .. })
         | PhysicalPlan::Vector(VectorOp::DirectDelete { returning, .. })
         | PhysicalPlan::Vector(VectorOp::DirectUpdate { returning, .. }) => {
             *returning = Some(spec);
@@ -182,6 +183,9 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             *returning = Some(spec);
         }
         PhysicalPlan::Document(DocumentOp::Upsert { returning, .. }) => {
+            *returning = Some(spec);
+        }
+        PhysicalPlan::Document(DocumentOp::BatchUpsert { returning, .. }) => {
             *returning = Some(spec);
         }
         PhysicalPlan::Document(DocumentOp::PointUpdate { returning, .. }) => {

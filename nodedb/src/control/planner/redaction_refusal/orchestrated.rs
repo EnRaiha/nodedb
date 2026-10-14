@@ -39,6 +39,7 @@ pub(super) fn orchestrated_source(op: &DocumentOp) -> Option<(&'static str, &Row
         | DocumentOp::BulkUpdate { .. }
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Upsert { .. }
+        | DocumentOp::BatchUpsert { .. }
         | DocumentOp::Truncate { .. }
         | DocumentOp::EstimateCount { .. }
         | DocumentOp::MaterializeScan { .. }

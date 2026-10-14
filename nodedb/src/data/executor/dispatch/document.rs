@@ -324,6 +324,8 @@ impl CoreLoop {
                 },
             ),
 
+            DocumentOp::BatchUpsert { .. } => self.dispatch_upsert_batch(task, tid, op),
+
             DocumentOp::Truncate {
                 collection,
                 restart_identity: _,

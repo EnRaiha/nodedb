@@ -127,6 +127,7 @@ fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. }
         | DocumentOp::BulkUpdate { collection, .. }
         | DocumentOp::BulkDelete { collection, .. }
         | DocumentOp::Truncate { collection, .. }
@@ -235,6 +236,7 @@ fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
         | VectorOp::DirectUpsert { collection, .. }
         | VectorOp::DirectInsert { collection, .. }
         | VectorOp::DirectInsertIfAbsent { collection, .. }
+        | VectorOp::DirectBatchWrite { collection, .. }
         | VectorOp::DirectDelete { collection, .. }
         | VectorOp::DirectTruncate { collection, .. }
         | VectorOp::DirectUpdate { collection, .. } => collection_routing(database_id, collection),

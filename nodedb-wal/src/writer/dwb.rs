@@ -80,11 +80,29 @@ impl WalWriter {
 
     /// Make the mirrored batch durable ahead of the WAL's own fsync.
     ///
+    /// The staged slots are written first. A failed slot write detaches the
+    /// DWB as a failed record write does, and every staged record that would
+    /// have reached a slot is counted unprotected.
+    ///
     /// A failed DWB fsync leaves the batch mirrored only in the page cache, so
     /// its records are unprotected even though they reached slots. The WAL
     /// sync continues regardless — the WAL's own fsync is what decides
     /// durability — and the lost protection is recorded.
     pub(super) fn flush_dwb(&mut self) {
+        let staged = self
+            .double_write
+            .as_ref()
+            .map_or(0, |dwb| dwb.staged_slots());
+        let written = self.double_write.as_mut().map(|dwb| dwb.write_staged());
+        if let Some(Err(e)) = written {
+            tracing::warn!(error = %e, staged, "DWB slot write failed, detaching DWB");
+            self.double_write = None;
+            self.degrade_dwb(DwbDegradation::WriteFailed);
+            for _ in 0..staged {
+                self.note_unprotected();
+            }
+            return;
+        }
         let flushed = self.double_write.as_mut().map(|dwb| dwb.flush());
         if let Some(Err(e)) = flushed {
             tracing::warn!(error = %e, "DWB flush failed, detaching DWB");

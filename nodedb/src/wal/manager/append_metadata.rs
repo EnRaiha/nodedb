@@ -58,31 +58,42 @@ impl WalAppender<'_> {
         )
     }
 
-    /// Append a `SurrogateBind` record. Emitted by
-    /// `SurrogateAssigner::assign` immediately after the catalog
-    /// two-table txn that writes `_system.surrogate_pk{,_rev}`, so the
-    /// binding survives a crash before the next hwm checkpoint. The
-    /// record is durably persisted before `assign` returns.
+    /// Append the `(surrogate, pk_bytes)` bindings of one collection as
+    /// `SurrogateBindBatch` records. Emitted by the surrogate assigner after
+    /// the catalog txn that writes `_system.surrogate_pk{,_rev}`.
+    ///
+    /// Each record fits one double-write slot, so a batch costs one slot
+    /// write per record, never one per binding. The caller syncs. An empty
+    /// `binds` appends nothing. Returns the LSN of every appended record.
     /// `vshard_id` is `0` — surrogate bindings are node-global metadata.
-    pub fn append_surrogate_bind(
+    pub fn append_surrogate_binds(
         &self,
         database_id: DatabaseId,
         tenant_id: TenantId,
-        surrogate: u32,
         collection: &str,
-        pk_bytes: &[u8],
-    ) -> crate::Result<Lsn> {
-        let payload =
-            nodedb_wal::record::SurrogateBindPayload::new(surrogate, collection, pk_bytes.to_vec())
-                .to_bytes()
-                .map_err(crate::Error::Wal)?;
-        self.append_record(
-            RecordType::SurrogateBind,
-            tenant_id,
-            VShardId::new(0),
-            database_id,
-            &payload,
+        binds: &[(u32, &[u8])],
+    ) -> crate::Result<Vec<Lsn>> {
+        let max_payload = self
+            .max_payload()
+            .min(nodedb_wal::record::SURROGATE_BIND_PAYLOAD_MAX);
+        let payloads = nodedb_wal::record::SurrogateBindBatchPayload::encode_chunks(
+            collection,
+            binds,
+            max_payload,
         )
+        .map_err(crate::Error::Wal)?;
+        payloads
+            .iter()
+            .map(|payload| {
+                self.append_record(
+                    RecordType::SurrogateBindBatch,
+                    tenant_id,
+                    VShardId::new(0),
+                    database_id,
+                    payload,
+                )
+            })
+            .collect()
     }
 
     /// Append a payload-free `ProposalApplied` marker carrying this

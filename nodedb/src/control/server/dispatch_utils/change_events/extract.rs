@@ -7,8 +7,8 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::change_stream::ChangeOperation;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, DocumentResolvedMutation, KvOp, KvResolvedMutation,
-    MetaOp, TimeseriesOp, VectorOp, VectorResolvedMutation, VectorWriteTargets,
+    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, DocumentResolvedMutation, MetaOp, TimeseriesOp,
+    VectorOp, VectorResolvedMutation, VectorWriteTargets,
 };
 use nodedb_types::{RowIdentity, StorageKey};
 
@@ -75,11 +75,6 @@ fn vector_resolved_change_meta(
         .collect()
 }
 
-/// A KV row's identity is its key bytes, rendered as text for the subscriber.
-fn kv_identity(key: &[u8]) -> RowIdentity {
-    RowIdentity::from_user_key(String::from_utf8_lossy(key))
-}
-
 /// Extract write metadata from a physical plan for change event publishing.
 ///
 /// One `(collection, identity, op)` tuple per row change; empty for reads/DDL.
@@ -138,6 +133,21 @@ pub(super) fn extract_write_metadata(
             RowIdentity::from_user_key(document_id.clone()),
             ChangeOperation::Insert,
         )],
+        // One event per row of the page, reported like a point `Upsert`.
+        PhysicalPlan::Document(DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            ..
+        }) => documents
+            .iter()
+            .map(|(document_id, _)| {
+                (
+                    collection.to_string(),
+                    RowIdentity::from_user_key(document_id.clone()),
+                    ChangeOperation::Insert,
+                )
+            })
+            .collect(),
         PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. }) => {
             vec![(collection.to_string(), every_row(), ChangeOperation::Insert)]
         }
@@ -213,113 +223,7 @@ pub(super) fn extract_write_metadata(
             | TimeseriesOp::ReadAggregate { .. },
         ) => Vec::new(),
 
-        // KV engine write operations.
-        PhysicalPlan::Kv(KvOp::Put {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::Insert {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::InsertIfAbsent {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::InsertOnConflictUpdate {
-            collection, key, ..
-        }) => vec![(
-            collection.to_string(),
-            kv_identity(key),
-            ChangeOperation::Insert,
-        )],
-        PhysicalPlan::Kv(KvOp::Delete { collection, .. })
-        // Predicate keys are decided in the Data Plane, so this reports one event with "*".
-        | PhysicalPlan::Kv(KvOp::PredicateDelete { collection, .. }) => {
-            vec![(collection.to_string(), every_row(), ChangeOperation::Delete)]
-        }
-        PhysicalPlan::Kv(KvOp::PredicateUpdate { collection, .. }) => {
-            vec![(collection.to_string(), every_row(), ChangeOperation::Update)]
-        }
-        PhysicalPlan::Kv(KvOp::FieldSet {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::Incr {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::IncrFloat {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::Cas {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::GetSet {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::Expire {
-            collection, key, ..
-        })
-        | PhysicalPlan::Kv(KvOp::Persist {
-            collection, key, ..
-        }) => vec![(
-            collection.to_string(),
-            kv_identity(key),
-            ChangeOperation::Update,
-        )],
-        PhysicalPlan::Kv(KvOp::BatchPut { collection, .. }) => {
-            vec![(collection.to_string(), every_row(), ChangeOperation::Insert)]
-        }
-        PhysicalPlan::Kv(KvOp::Truncate { collection, .. }) => {
-            vec![(collection.to_string(), every_row(), ChangeOperation::Delete)]
-        }
-        // Debits + credits two keys in the same collection; not individually addressable,
-        // so reported as one event with document_id="*" like other batch ops.
-        PhysicalPlan::Kv(KvOp::Transfer { collection, .. }) => {
-            vec![(collection.to_string(), every_row(), ChangeOperation::Update)]
-        }
-        // Spans two collections (delete source, insert dest) — the only write here
-        // that can't be a single tuple, so it reports two.
-        PhysicalPlan::Kv(KvOp::TransferItem {
-            source_collection,
-            dest_collection,
-            item_key,
-            dest_key,
-            ..
-        }) => vec![
-            (
-                source_collection.to_string(),
-                kv_identity(item_key),
-                ChangeOperation::Delete,
-            ),
-            (
-                dest_collection.to_string(),
-                kv_identity(dest_key),
-                ChangeOperation::Insert,
-            ),
-        ],
-        // Reports one event per mutation, naming every collection/key touched — can
-        // span two collections (a resolved `TransferItem`).
-        PhysicalPlan::Kv(KvOp::ResolvedWrite { mutations, .. }) => mutations
-            .iter()
-            .map(|mutation| {
-                let operation = match mutation {
-                    KvResolvedMutation::Delete { .. } => ChangeOperation::Delete,
-                    // Precondition: absent row = insert, present row = update.
-                    KvResolvedMutation::Put { precondition, .. } => match precondition {
-                        Some(_) => ChangeOperation::Update,
-                        None => ChangeOperation::Insert,
-                    },
-                    KvResolvedMutation::Rewrite { .. }
-                    | KvResolvedMutation::Expire { .. }
-                    | KvResolvedMutation::Persist { .. } => ChangeOperation::Update,
-                };
-                (
-                    mutation.collection().to_string(),
-                    kv_identity(mutation.key()),
-                    operation,
-                )
-            })
-            .collect(),
-
-        // Remaining KvOp variants are reads or catalog-only — no row changed.
-        PhysicalPlan::Kv(_) => Vec::new(),
+        PhysicalPlan::Kv(op) => super::kv::kv_change_meta(op),
 
         // `spatial` rows are stored via the same `ColumnarOp` path as `columnar`.
         PhysicalPlan::Columnar(ColumnarOp::Insert { collection, .. }) => {
@@ -378,6 +282,19 @@ pub(super) fn extract_write_metadata(
             StorageKey::for_surrogate(*surrogate).to_identity(),
             ChangeOperation::Insert,
         )],
+        // One event per row of the page, reported like its point write.
+        PhysicalPlan::Vector(VectorOp::DirectBatchWrite {
+            collection, rows, ..
+        }) => rows
+            .iter()
+            .map(|row| {
+                (
+                    collection.to_string(),
+                    StorageKey::for_surrogate(row.surrogate).to_identity(),
+                    ChangeOperation::Insert,
+                )
+            })
+            .collect(),
         PhysicalPlan::Vector(VectorOp::DirectDelete {
             collection,
             targets,
@@ -504,7 +421,7 @@ mod tests {
     use super::*;
     use nodedb_array::types::ArrayId;
     use nodedb_physical::physical_plan::ClusterArrayOp;
-    use nodedb_physical::physical_plan::{ColumnarInsertIntent, GraphOp};
+    use nodedb_physical::physical_plan::{ColumnarInsertIntent, GraphOp, KvOp};
     use nodedb_types::{
         DatabaseId, QualifiedCollection, Surrogate, VectorQuantization, VectorStorageDtype,
     };

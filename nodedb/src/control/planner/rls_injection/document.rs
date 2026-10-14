@@ -164,6 +164,12 @@ pub(super) fn inject_document(ctx: &RlsCtx<'_>, op: &mut DocumentOp) -> crate::R
             rls_write_check,
             rls_filters,
             ..
+        }
+        | DocumentOp::BatchUpsert {
+            collection,
+            rls_write_check,
+            rls_filters,
+            ..
         } => {
             ctx.set_write_check(collection, rls_write_check)?;
             ctx.set_post_filters(collection, rls_filters)

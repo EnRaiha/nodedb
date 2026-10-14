@@ -168,6 +168,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 DocumentOp::PointUpdate { collection, .. }
                 | DocumentOp::PointDelete { collection, .. }
                 | DocumentOp::Upsert { collection, .. }
+                | DocumentOp::BatchUpsert { collection, .. }
                 | DocumentOp::BulkUpdate { collection, .. }
                 | DocumentOp::BulkDelete { collection, .. } => {
                     add_collection_requirement(collection.as_str(), Permission::Read, out);

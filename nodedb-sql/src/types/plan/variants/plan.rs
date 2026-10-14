@@ -447,9 +447,10 @@ pub enum SqlPlan {
     ///
     /// Emitted by the planner instead of the generic `Insert` / `Upsert`
     /// variants when the target collection has `primary =
-    /// PrimaryEngine::Vector`. Each row lowers to one of
+    /// PrimaryEngine::Vector`. A single row lowers to one of
     /// `VectorOp::DirectInsert` / `DirectInsertIfAbsent` / `DirectUpsert`
-    /// per `intent`, bypassing full-document MessagePack encoding.
+    /// per `intent`. Several rows lower to one `VectorOp::DirectBatchWrite`
+    /// page. Both bypass full-document MessagePack encoding.
     VectorPrimaryInsert(VectorPrimaryInsertPlan),
     /// DELETE on a vector-primary collection.
     ///

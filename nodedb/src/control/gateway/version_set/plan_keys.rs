@@ -96,6 +96,7 @@ fn document_touched_collections(
         | Truncate { collection, .. }
         | EstimateCount { collection, .. }
         | Upsert { collection, .. }
+        | BatchUpsert { collection, .. }
         | BulkUpdate { collection, .. }
         | BulkDelete { collection, .. }
         | MaterializeScan { collection, .. }
@@ -181,6 +182,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | DirectUpsert { collection, .. }
                 | DirectInsert { collection, .. }
                 | DirectInsertIfAbsent { collection, .. }
+                | DirectBatchWrite { collection, .. }
                 | DirectDelete { collection, .. }
                 | DirectUpdate { collection, .. }
                 | DirectTruncate { collection, .. }

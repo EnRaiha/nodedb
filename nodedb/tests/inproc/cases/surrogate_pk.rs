@@ -251,7 +251,7 @@ async fn flush_emits_wal_record_at_threshold() {
         .load(std::sync::atomic::Ordering::Acquire);
     assert_eq!(
         bind_calls as usize, n,
-        "expected one SurrogateBind per fresh allocation"
+        "expected one bound entry per fresh allocation"
     );
     let cat = creds.catalog();
     let persisted = cat.get_surrogate_hwm().unwrap();

@@ -3,7 +3,8 @@
 //! Document implementation of [`EngineWriteResolver`].
 //!
 //! Resolves a governed deferred document write — `PointUpdate`, `PointDelete`,
-//! `Upsert`, `BulkUpdate`, `BulkDelete` — into `DocumentOp::ResolvedWrite`.
+//! `Upsert`, `BatchUpsert`, `BulkUpdate`, `BulkDelete` — into
+//! `DocumentOp::ResolvedWrite`.
 //! `Merge` / `UpdateFromJoin` are excluded (already expanded inside an open
 //! Calvin-locked transaction); every mutation here carries its own precondition.
 
@@ -43,6 +44,11 @@ pub(super) fn resolver_for_document_op(op: &DocumentOp) -> Option<Box<dyn Engine
             ..
         }
         | DocumentOp::Upsert {
+            collection,
+            rls_write_check,
+            ..
+        }
+        | DocumentOp::BatchUpsert {
             collection,
             rls_write_check,
             ..

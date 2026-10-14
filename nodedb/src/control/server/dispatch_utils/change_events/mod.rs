@@ -5,6 +5,7 @@
 
 mod cluster_array;
 mod extract;
+mod kv;
 mod publish;
 mod redo;
 

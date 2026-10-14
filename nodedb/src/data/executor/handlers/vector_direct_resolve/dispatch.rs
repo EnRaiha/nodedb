@@ -4,7 +4,8 @@
 //! wrapped vector-primary write would apply and reply, mutating nothing —
 //! run before proposing a governed `DELETE` / `UPDATE` / conflict-patching
 //! `UPSERT`, since a follower has no writing identity to decide the policy
-//! and re-deriving after commit risks a different answer per replica.
+//! and re-deriving after commit risks a different answer per replica. A
+//! multi-row page resolves too, so its record names the rows it stores.
 //! Read-only, so this takes `&self`.
 
 use nodedb_physical::physical_plan::VectorOp;
@@ -106,6 +107,7 @@ impl CoreLoop {
                 returning: returning.as_ref(),
                 rls_filters,
             }),
+            VectorOp::DirectBatchWrite { .. } => self.resolve_vector_direct_batch(task, tid, inner),
             // Every other op is unwrapped by `resolver_for_plan` already.
             VectorOp::Search { .. }
             | VectorOp::Insert { .. }
@@ -131,7 +133,8 @@ impl CoreLoop {
             | VectorOp::ResolveDirectWrite(_)
             | VectorOp::ResolvedDirectWrite { .. } => Err(ErrorCode::Internal {
                 detail: "vector resolve-direct-write wraps an op with no governed row image; \
-                         only DirectDelete, DirectUpdate, and DirectUpsert resolve"
+                         only DirectDelete, DirectUpdate, DirectUpsert, and DirectBatchWrite \
+                         resolve"
                     .to_owned(),
             }),
         };

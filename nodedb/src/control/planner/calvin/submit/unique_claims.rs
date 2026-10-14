@@ -154,6 +154,7 @@ fn claiming_collection(op: &DocumentOp) -> Option<&str> {
         DocumentOp::PointPut { collection, .. }
         | DocumentOp::PointInsert { collection, .. }
         | DocumentOp::Upsert { collection, .. }
+        | DocumentOp::BatchUpsert { collection, .. }
         | DocumentOp::BatchInsert { collection, .. }
         | DocumentOp::PointUpdate { collection, .. }
         | DocumentOp::ApplyBalanceDelta { collection, .. } => Some(collection.as_str()),
@@ -207,6 +208,16 @@ impl Claims {
                 for (_, body) in documents {
                     self.add_body(collection, body, paths);
                 }
+            }
+            DocumentOp::BatchUpsert {
+                documents,
+                on_conflict_updates,
+                ..
+            } => {
+                for (_, body) in documents {
+                    self.add_body(collection, body, paths);
+                }
+                self.add_updates(collection, on_conflict_updates, paths);
             }
             DocumentOp::PointUpdate { updates, .. } => {
                 self.add_updates(collection, updates, paths);

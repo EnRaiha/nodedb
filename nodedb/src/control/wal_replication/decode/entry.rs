@@ -104,6 +104,7 @@ fn to_physical_plan(
         | ReplicatedWrite::PointDelete { .. }
         | ReplicatedWrite::PointUpdate { .. }
         | ReplicatedWrite::DocUpsert { .. }
+        | ReplicatedWrite::DocBatchUpsert { .. }
         | ReplicatedWrite::DocBatchInsert { .. }
         | ReplicatedWrite::DocTruncate { .. }
         | ReplicatedWrite::BulkDml { .. }
@@ -155,7 +156,6 @@ fn to_physical_plan(
         | ReplicatedWrite::KvPut { .. }
         | ReplicatedWrite::KvDelete { .. }
         | ReplicatedWrite::KvInsert { .. }
-        | ReplicatedWrite::KvInsertIfAbsent { .. }
         | ReplicatedWrite::KvInsertOnConflictUpdate { .. }
         | ReplicatedWrite::KvBatchPut { .. }
         | ReplicatedWrite::KvExpire { .. }

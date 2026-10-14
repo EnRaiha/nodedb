@@ -139,6 +139,7 @@ mod tests {
                 (b"b".to_vec(), b"2".to_vec()),
             ],
             ttl_ms: 0,
+            intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
             surrogates,
             returning: None,
             rls_filters: Vec::new(),

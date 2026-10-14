@@ -2,7 +2,7 @@
 
 //! `KvOp` classification.
 
-use nodedb_physical::physical_plan::{KvOp, SortedIndexRead};
+use nodedb_physical::physical_plan::{KvBatchIntent, KvOp, SortedIndexRead};
 
 use super::kind::PlanKind;
 
@@ -43,16 +43,27 @@ pub(super) fn describe_kv(op: &KvOp) -> PlanKind {
         } => PlanKind::ReturningRows,
 
         // The SQL `UPSERT` statement, tagged like `DocumentOp::Upsert`.
-        KvOp::Put { .. } => PlanKind::DmlResult("UPSERT"),
+        KvOp::Put { .. }
+        | KvOp::BatchPut {
+            intent: KvBatchIntent::Upsert,
+            ..
+        } => PlanKind::DmlResult("UPSERT"),
 
         // `InsertIfAbsent`: `ON CONFLICT DO NOTHING` makes it no-op-capable,
         // so the count must come from the write's response.
-        KvOp::Insert { .. } | KvOp::InsertIfAbsent { .. } | KvOp::BatchPut { .. } => {
-            PlanKind::DmlResult("INSERT")
-        }
+        KvOp::Insert { .. }
+        | KvOp::InsertIfAbsent { .. }
+        | KvOp::BatchPut {
+            intent: KvBatchIntent::Put | KvBatchIntent::Insert | KvBatchIntent::InsertIfAbsent,
+            ..
+        } => PlanKind::DmlResult("INSERT"),
 
         // Insert-vs-update is decided by the handler; the payload says which.
-        KvOp::InsertOnConflictUpdate { .. } => PlanKind::DmlResultByOp,
+        KvOp::InsertOnConflictUpdate { .. }
+        | KvOp::BatchPut {
+            intent: KvBatchIntent::Merge { .. },
+            ..
+        } => PlanKind::DmlResultByOp,
 
         // Reports `{"affected": n}`. `FieldSet` is the keyed UPDATE.
         KvOp::FieldSet { .. } | KvOp::PredicateUpdate { .. } => PlanKind::DmlResult("UPDATE"),

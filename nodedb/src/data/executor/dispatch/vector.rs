@@ -22,6 +22,7 @@ impl CoreLoop {
                 | VectorOp::DirectUpsert { .. }
                 | VectorOp::DirectInsert { .. }
                 | VectorOp::DirectInsertIfAbsent { .. }
+                | VectorOp::DirectBatchWrite { .. }
                 | VectorOp::DirectUpdate { .. }
                 | VectorOp::ResolvedDirectWrite { .. }
         );
@@ -372,6 +373,7 @@ impl CoreLoop {
                     rls_filters,
                 },
             ),
+            VectorOp::DirectBatchWrite { .. } => self.execute_vector_direct_batch(task, tid, op),
             VectorOp::DirectDelete {
                 collection,
                 field,

@@ -22,9 +22,10 @@ use crate::control::planner::calvin::write_class::{
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::plan_admission::append_sum_and_period_targets;
+use crate::control::server::shared::sql::conflict_tag_fold::ConflictTagFold;
 use crate::control::state::SharedState;
 use crate::control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops;
-use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_physical::physical_plan::{DocumentOp, VectorOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// Outcome of [`route_in_tx_expander`].
@@ -123,6 +124,20 @@ pub(crate) async fn expand_in_tx(
                 expand_batch_insert(task).map_err(StagingGateError::Dispatch)?,
                 StagedTagKind::Insert,
             )));
+        }
+        // Same for an upsert page: each row stages, fires its row bodies and
+        // replays at COMMIT as the `Upsert` it is.
+        PhysicalPlan::Document(DocumentOp::BatchUpsert { .. }) => {
+            return Ok(Some((
+                super::expand_pages::expand_batch_upsert(task)
+                    .map_err(StagingGateError::Dispatch)?,
+                StagedTagKind::Upsert,
+            )));
+        }
+        // Same for a vector-primary page: each row stages as the point
+        // write of the page's intent.
+        PhysicalPlan::Vector(VectorOp::DirectBatchWrite { .. }) => {
+            return Ok(super::expand_pages::expand_vector_page(task));
         }
         _ => return Ok(None),
     };
@@ -226,6 +241,7 @@ where
     // a row the statement never named.
     let has_user_write = plans_have_user_write(ops.iter().map(|op| &op.plan));
     let mut affected = 0usize;
+    let mut tag = ConflictTagFold::default();
     for op in ops {
         let counts = plan_counts_toward_statement_tag(&op.plan, has_user_write);
         // A removed row of an edge-bearing collection carries its node's edge
@@ -241,6 +257,7 @@ where
         let outcome = stage_write(state, sessions, session_id, op, &dispatch).await?;
         if counts {
             affected += outcome.affected;
+            tag.note(outcome.kind);
         }
         super::node_delete_stage::stage_node_delete_tasks(
             state,
@@ -253,7 +270,7 @@ where
     }
 
     Ok(InTxnRoute::Staged(StagedWriteOutcome {
-        kind,
+        kind: tag.fold(kind),
         affected,
         payload: Vec::new(),
         returning_rows: Vec::new(),

@@ -148,6 +148,16 @@ mod tests {
                 rls_filters: Vec::new(),
                 resolved_sum_targets: Vec::new(),
             }),
+            PhysicalPlan::Document(DocumentOp::BatchUpsert {
+                collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
+                documents: Vec::new(),
+                surrogates: Vec::new(),
+                on_conflict_updates: Vec::new(),
+                rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+                returning: spec(),
+                rls_filters: Vec::new(),
+                resolved_sum_targets: Vec::new(),
+            }),
         ];
         for plan in &plans {
             assert!(
@@ -212,6 +222,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 entries: Vec::new(),
                 ttl_ms: 0,
+                intent: nodedb_physical::physical_plan::KvBatchIntent::Insert,
                 surrogates: Vec::new(),
                 returning: spec(),
                 rls_filters: Vec::new(),

@@ -63,8 +63,14 @@ pub(super) fn add_keys(keys: &mut WriteKeys, op: &DocumentOp) -> crate::Result<(
             }
             keys.row_id(collection.as_str(), document_id);
         }
-        // Every row it inserts, by surrogate and row id.
+        // Every row it writes, by surrogate and row id.
         DocumentOp::BatchInsert {
+            collection,
+            documents,
+            surrogates,
+            ..
+        }
+        | DocumentOp::BatchUpsert {
             collection,
             documents,
             surrogates,

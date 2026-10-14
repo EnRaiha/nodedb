@@ -158,7 +158,7 @@ impl SurrogateAssigner {
     }
 
     /// Write `rows` first-wins and the due watermark `hwm` in one catalog
-    /// transaction, then append a WAL bind record for every row it inserted.
+    /// transaction, then append the rows it inserted as WAL bind batch records.
     /// The caller holds the registry write lock.
     pub(super) fn commit_bindings(
         &self,

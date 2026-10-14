@@ -251,6 +251,8 @@ impl CoreLoop {
             | VectorOp::MultiVectorInsert { .. }
             | VectorOp::MultiVectorDelete { .. }
             | VectorOp::MultiVectorScoreSearch { .. }
+            // The session expands a page into its point writes first.
+            | VectorOp::DirectBatchWrite { .. }
             // Autocommit-then-Raft by construction, never staged.
             | VectorOp::ResolveDirectWrite(_)
             | VectorOp::ResolvedDirectWrite { .. } => self.stage_not_point_write(task),

@@ -111,6 +111,28 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
             ctx.set_post_filters(collection, rls_filters)
         }
 
+        // Admit each row's proposed image, as a point write of the page's
+        // intent admits it. A conflict patch produces its merged image on
+        // the Data Plane, so the predicate ships for that path.
+        VectorOp::DirectBatchWrite {
+            collection,
+            rows,
+            rls_filters,
+            on_conflict_updates,
+            rls_write_check,
+            ..
+        } => {
+            for row in rows.iter() {
+                ctx.admit_write_value_map_image(collection, &row.payload)?;
+            }
+            if on_conflict_updates.is_empty() {
+                *rls_write_check = nodedb_types::RlsWriteCheck::decided_earlier_in_request();
+            } else {
+                ctx.set_write_check(collection, rls_write_check)?;
+            }
+            ctx.set_post_filters(collection, rls_filters)
+        }
+
         // Ship the predicate and gate `RETURNING` as a read: the removed row
         // or the patched post-image exists only where it is persisted, and
         // the rows the clause hands back are bounded by the same read policy a

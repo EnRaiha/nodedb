@@ -127,6 +127,7 @@ async fn intercept(
             | DocumentOp::PointInsert { .. }
             | DocumentOp::PointPut { .. }
             | DocumentOp::Upsert { .. }
+            | DocumentOp::BatchUpsert { .. }
             | DocumentOp::BatchInsert { .. },
         ) => Shape::Document,
         PhysicalPlan::Kv(KvOp::FieldSet { .. } | KvOp::Delete { .. }) => Shape::KvMutate,

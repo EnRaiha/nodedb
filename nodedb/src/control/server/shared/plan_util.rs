@@ -25,6 +25,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Vector(VectorOp::DirectUpsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::DirectInsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::DirectInsertIfAbsent { collection, .. })
+        | PhysicalPlan::Vector(VectorOp::DirectBatchWrite { collection, .. })
         | PhysicalPlan::Vector(VectorOp::DirectDelete { collection, .. })
         | PhysicalPlan::Vector(VectorOp::DirectTruncate { collection, .. })
         | PhysicalPlan::Vector(VectorOp::DirectUpdate { collection, .. })
@@ -63,6 +64,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. })
         | PhysicalPlan::Document(DocumentOp::Upsert { collection, .. })
+        | PhysicalPlan::Document(DocumentOp::BatchUpsert { collection, .. })
         | PhysicalPlan::Document(DocumentOp::InsertSelect {
             target_collection: collection,
             ..

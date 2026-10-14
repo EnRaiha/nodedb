@@ -17,8 +17,7 @@ use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::stored_body::StoredBodyInput;
 use crate::data::executor::handlers::rls_write_gate;
-use crate::data::executor::handlers::upsert::merge::{apply_on_conflict_updates, merge_values};
-use crate::data::executor::strict_format;
+use crate::data::executor::handlers::upsert::{decode_stored_row, merge_upsert_body};
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::RowIdentity;
 
@@ -80,7 +79,7 @@ impl CoreLoop {
         };
         let (body, precondition) = match existing {
             Some(current_bytes) => {
-                let merged = self.merge_upsert_body(
+                let merged = self.merged_upsert_body(
                     &current_bytes,
                     value,
                     on_conflict_updates,
@@ -147,41 +146,14 @@ impl CoreLoop {
 
     /// The merged body an upsert's conflict branch stores, as MessagePack —
     /// the same decode → merge → encode `execute_upsert_overwrite` performs.
-    fn merge_upsert_body(
+    pub(super) fn merged_upsert_body(
         &self,
         current_bytes: &[u8],
         value: &[u8],
         on_conflict_updates: &[(String, UpdateValue)],
         strict_schema: Option<&nodedb_types::columnar::StrictSchema>,
     ) -> Result<Vec<u8>, ErrorCode> {
-        let existing_val = match strict_schema {
-            Some(schema) => match strict_format::binary_tuple_to_value(current_bytes, schema) {
-                Some(v) => v,
-                // Migration case: a pre-strict row is still MessagePack.
-                None => nodedb_types::value_from_msgpack(current_bytes).map_err(|_| {
-                    ErrorCode::Internal {
-                        detail: "failed to decode document for upsert".into(),
-                    }
-                })?,
-            },
-            None => nodedb_types::value_from_msgpack(current_bytes).map_err(|_| {
-                ErrorCode::Internal {
-                    detail: "failed to decode document for upsert".into(),
-                }
-            })?,
-        };
-        let new_val = nodedb_types::value_from_msgpack(value).map_err(|_| ErrorCode::Internal {
-            detail: "failed to decode upsert value from msgpack".into(),
-        })?;
-
-        let merged = if on_conflict_updates.is_empty() {
-            merge_values(existing_val, new_val)
-        } else {
-            apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates)
-                .map_err(ErrorCode::from)?
-        };
-        nodedb_types::value_to_msgpack(&merged).map_err(|_| ErrorCode::Internal {
-            detail: "failed to encode merged upsert value".into(),
-        })
+        let existing = decode_stored_row(current_bytes, strict_schema)?;
+        Ok(merge_upsert_body(existing, value, on_conflict_updates)?.body)
     }
 }

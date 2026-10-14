@@ -19,6 +19,10 @@ pub(super) struct CatalogInputs {
     pub(super) shared: Option<std::sync::Weak<crate::control::state::SharedState>>,
     pub(super) retention_policy_registry:
         Option<Arc<crate::engine::timeseries::retention_policy::RetentionPolicyRegistry>>,
+    /// The node-wide sequence counters a column DEFAULT that calls `nextval`
+    /// draws from. A context built with a weak `shared` reads them from
+    /// there instead.
+    pub(super) sequence_registry: Option<Arc<crate::control::sequence::SequenceRegistry>>,
 }
 
 impl CatalogInputs {
@@ -37,13 +41,17 @@ impl CatalogInputs {
                 self.retention_policy_registry.clone(),
             )
         } else {
-            super::super::catalog_adapter::OriginCatalog::new(
+            let catalog = super::super::catalog_adapter::OriginCatalog::new(
                 Arc::clone(&self.credentials),
                 self.array_catalog.clone(),
                 tenant_id,
                 database_id,
                 self.retention_policy_registry.clone(),
-            )
+            );
+            match &self.sequence_registry {
+                Some(registry) => catalog.with_sequence_registry(Arc::clone(registry)),
+                None => catalog,
+            }
         }
     }
 }

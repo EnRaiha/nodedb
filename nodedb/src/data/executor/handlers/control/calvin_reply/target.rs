@@ -104,6 +104,12 @@ pub(super) fn returning_target(plan: &PhysicalPlan) -> Option<ReturningTarget<'_
                 rls_filters,
                 ..
             }
+            | DocumentOp::BatchUpsert {
+                collection,
+                returning: Some(spec),
+                rls_filters,
+                ..
+            }
             | DocumentOp::BulkUpdate {
                 collection,
                 returning: Some(spec),
@@ -221,6 +227,13 @@ pub(super) fn returning_target(plan: &PhysicalPlan) -> Option<ReturningTarget<'_
                 ..
             }
             | VectorOp::DirectInsertIfAbsent {
+                collection,
+                field,
+                returning: Some(spec),
+                rls_filters,
+                ..
+            }
+            | VectorOp::DirectBatchWrite {
                 collection,
                 field,
                 returning: Some(spec),

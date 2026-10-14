@@ -5,5 +5,5 @@ pub mod bind;
 pub mod dispatch;
 
 pub use alloc::apply_surrogate_alloc;
-pub use bind::apply_surrogate_bind;
+pub use bind::apply_surrogate_bind_batch;
 pub use dispatch::{ReplayStats, replay_surrogate_records};

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! `SqlPlan::KvInsert` → `PhysicalTask` lowering.
+//!
+//! A multi-row statement lowers to one `KvOp::BatchPut`. A single-row
+//! statement lowers to one point op.
 
 use nodedb_sql::types::{KvInsertIntent, SqlExpr, SqlValue};
 use nodedb_types::CollectionType;
@@ -56,18 +59,61 @@ pub(in super::super) fn convert_kv_insert(
     };
     let vshard = collection_key.vshard();
     let ttl_ms = ttl_secs * 1000;
+    let task = |plan: KvOp| PhysicalTask {
+        tenant_id,
+        vshard_id: vshard,
+        database_id: ctx.database_id,
+        plan: PhysicalPlan::Kv(plan),
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    // A multi-row statement lowers to ONE `BatchPut`: one Data-Plane request
+    // and one replicated write for the statement, its rows judged as the
+    // point op judges each. A single row stays a point op.
+    let batch_intent = match intent {
+        _ if entries.len() < 2 => None,
+        KvInsertIntent::Insert => Some(KvBatchIntent::Insert),
+        KvInsertIntent::InsertIfAbsent => Some(KvBatchIntent::InsertIfAbsent),
+        KvInsertIntent::Put if key_column.is_some() => Some(KvBatchIntent::Merge {
+            updates: update_values.clone(),
+            // Filled by the RLS injection pass, which runs after plan
+            // conversion.
+            rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
+        }),
+        KvInsertIntent::Put => Some(KvBatchIntent::Upsert),
+    };
+    if let Some(batch_intent) = batch_intent {
+        let mut batch = Vec::with_capacity(entries.len());
+        let mut surrogates = Vec::with_capacity(entries.len());
+        for (key_val, value_cols) in entries {
+            let key = kv_entry_key(collection, key_val)?;
+            if let Some(key_column) = key_column.as_deref() {
+                check_assignments_keep_key(
+                    collection,
+                    key_column,
+                    on_conflict_updates,
+                    &sql_value_to_string(key_val),
+                )?;
+            }
+            surrogates.push(assign_for_pk(ctx, collection_key, &key)?);
+            batch.push((key, kv_entry_value(value_cols)?));
+        }
+        return Ok(vec![task(KvOp::BatchPut {
+            collection: qualified_collection,
+            entries: batch,
+            ttl_ms,
+            intent: batch_intent,
+            surrogates,
+            // Both filled in after conversion: the RETURNING spec by the
+            // protocol layer's injection pass, the read filter by the RLS
+            // injection pass.
+            returning: None,
+            rls_filters: Vec::new(),
+        })]);
+    }
     let mut tasks = Vec::with_capacity(entries.len());
     for (key_val, value_cols) in entries {
-        // A declared PRIMARY KEY implies NOT NULL. The planner substitutes
-        // `SqlValue::Null` for a column the statement omitted, so this also
-        // catches an omitted key, not only an explicit `NULL` literal.
-        if matches!(key_val, SqlValue::Null) {
-            return Err(crate::Error::RejectedConstraint {
-                collection: collection.to_string(),
-                constraint: "not_null".to_string(),
-                detail: "primary key cannot be NULL or omitted".to_string(),
-            });
-        }
+        let key = kv_entry_key(collection, key_val)?;
         if let Some(key_column) = key_column.as_deref() {
             check_assignments_keep_key(
                 collection,
@@ -76,18 +122,7 @@ pub(in super::super) fn convert_kv_insert(
                 &sql_value_to_string(key_val),
             )?;
         }
-        let key = sql_value_to_bytes(key_val)?;
-        let value = if value_cols.len() == 1 && value_cols[0].0 == "value" {
-            sql_value_to_bytes(&value_cols[0].1)?
-        } else {
-            let mut buf = Vec::with_capacity(value_cols.len() * 32);
-            write_msgpack_map_header(&mut buf, value_cols.len());
-            for (col, val) in value_cols {
-                write_msgpack_str(&mut buf, col);
-                write_msgpack_value(&mut buf, val);
-            }
-            buf
-        };
+        let value = kv_entry_value(value_cols)?;
         let surrogate = assign_for_pk(ctx, collection_key, &key)?;
         let op = match intent {
             KvInsertIntent::Insert => KvOp::Insert {
@@ -146,16 +181,40 @@ pub(in super::super) fn convert_kv_insert(
                 provenance: None,
             },
         };
-        tasks.push(PhysicalTask {
-            tenant_id,
-            vshard_id: vshard,
-            database_id: ctx.database_id,
-            plan: PhysicalPlan::Kv(op),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        });
+        tasks.push(task(op));
     }
     Ok(tasks)
+}
+
+/// The stored key of one row. A declared PRIMARY KEY implies NOT NULL. The
+/// planner substitutes `SqlValue::Null` for a column the statement omitted,
+/// so this also refuses an omitted key, not only an explicit `NULL` literal.
+fn kv_entry_key(collection: &str, key_val: &SqlValue) -> crate::Result<Vec<u8>> {
+    if matches!(key_val, SqlValue::Null) {
+        return Err(crate::Error::RejectedConstraint {
+            collection: collection.to_string(),
+            constraint: "not_null".to_string(),
+            detail: "primary key cannot be NULL or omitted".to_string(),
+        });
+    }
+    sql_value_to_bytes(key_val)
+}
+
+/// The stored body of one row: the raw bytes of a lone `value` column, else
+/// a msgpack map of the row's value columns.
+fn kv_entry_value(value_cols: &[(String, SqlValue)]) -> crate::Result<Vec<u8>> {
+    if let [(column, value)] = value_cols
+        && column == "value"
+    {
+        return sql_value_to_bytes(value);
+    }
+    let mut buf = Vec::with_capacity(value_cols.len() * 32);
+    write_msgpack_map_header(&mut buf, value_cols.len());
+    for (col, val) in value_cols {
+        write_msgpack_str(&mut buf, col);
+        write_msgpack_value(&mut buf, val);
+    }
+    Ok(buf)
 }
 
 /// The column a KV collection's key is read from: its schema's primary-key

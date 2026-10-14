@@ -63,6 +63,7 @@ pub(super) fn apply_vector(ctx: &PermCtx<'_>, op: &mut VectorOp) -> crate::Resul
         | VectorOp::DirectUpsert { collection, .. }
         | VectorOp::DirectInsert { collection, .. }
         | VectorOp::DirectInsertIfAbsent { collection, .. }
+        | VectorOp::DirectBatchWrite { collection, .. }
         | VectorOp::DirectUpdate { collection, .. } => {
             ctx.authorize(collection, PermTreeLevel::Write)
         }

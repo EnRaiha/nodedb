@@ -191,17 +191,19 @@ impl CoreLoop {
                 collection,
                 entries,
                 ttl_ms,
+                intent,
                 surrogates,
                 returning,
                 rls_filters,
             } => self.execute_kv_batch_put(
                 task,
-                super::batch::KvBatchPutArgs {
+                super::batch_put::KvBatchPutArgs {
                     did,
                     tid,
                     collection: collection.as_str(),
                     entries,
                     ttl_ms: *ttl_ms,
+                    intent,
                     surrogates,
                     returning: returning.as_ref(),
                     rls_filters,

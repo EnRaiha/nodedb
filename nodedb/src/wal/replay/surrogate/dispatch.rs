@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Dispatch loop for replaying `SurrogateAlloc` / `SurrogateBind` WAL records.
+//! Dispatch loop for replaying `SurrogateAlloc` / `SurrogateBindBatch` WAL
+//! records.
 
 use nodedb_types::{DatabaseId, TenantId};
-use nodedb_wal::record::{RecordType, SurrogateBindPayload};
+use nodedb_wal::record::{RecordType, SurrogateBindBatchPayload};
 use nodedb_wal::{TombstoneSet, WalRecord};
 
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::surrogate::SurrogateRegistryHandle;
 
-use super::{apply_surrogate_alloc, apply_surrogate_bind};
+use super::{apply_surrogate_alloc, apply_surrogate_bind_batch};
 
-/// Replay every `SurrogateAlloc` and `SurrogateBind` record in `records`
+/// Replay every `SurrogateAlloc` and `SurrogateBindBatch` record in `records`
 /// into the live `SurrogateRegistry` + `SystemCatalog`. Run once at
 /// startup, after the registry has been seeded from the catalog hwm row
 /// and after the catalog has been opened — replay then advances both
@@ -44,25 +45,21 @@ pub fn replay_surrogate_records(
                 apply_surrogate_alloc(&record.payload, registry)?;
                 stats.allocs += 1;
             }
-            RecordType::SurrogateBind => {
+            RecordType::SurrogateBindBatch => {
                 let db = DatabaseId::new(record.header.database_id);
                 let tenant = TenantId::new(record.header.tenant_id);
-                // Decoded here only to read the collection name for the gate;
-                // `apply_surrogate_bind` decodes the payload itself so the
-                // authoritative parse stays in one place.
-                let parsed = SurrogateBindPayload::from_bytes(&record.payload)
+                let batch = SurrogateBindBatchPayload::from_bytes(&record.payload)
                     .map_err(crate::Error::Wal)?;
-                // A bind names its collection by the bare catalog name.
+                // A bind batch names its collection by the bare catalog name.
                 if tombstones.is_key_tombstoned(
-                    nodedb_types::CollectionKey::from_bare(db, &parsed.collection),
+                    nodedb_types::CollectionKey::from_bare(db, &batch.collection),
                     record.header.tenant_id,
                     record.header.lsn,
                 ) {
-                    stats.binds_skipped += 1;
+                    stats.binds_skipped += batch.entries.len();
                     continue;
                 }
-                apply_surrogate_bind(&record.payload, db, tenant, catalog, registry)?;
-                stats.binds += 1;
+                stats.binds += apply_surrogate_bind_batch(&batch, db, tenant, catalog, registry)?;
             }
             RecordType::Noop
             | RecordType::Put
@@ -88,7 +85,7 @@ pub fn replay_surrogate_records(
             // `ListMove`'s dispatch arms, all `surrogate: _`).
             | RecordType::CrdtListOp
             // CrdtDocOp carries the row's own surrogate, but that surrogate was
-            // allocated upstream and made durable via SurrogateAlloc/Bind — this
+            // allocated upstream and made durable via SurrogateAlloc/BindBatch — this
             // record never allocates one, so it does not advance the hwm here.
             | RecordType::CrdtDocOp
             | RecordType::TimeseriesBatch
@@ -140,8 +137,9 @@ pub fn replay_surrogate_records(
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReplayStats {
     pub allocs: usize,
+    /// Bindings applied, counted per `(surrogate, pk)` entry, not per record.
     pub binds: usize,
-    /// Binds skipped because their collection was dropped at or after the
+    /// Bindings skipped because their collection was dropped at or after the
     /// record's LSN.
     pub binds_skipped: usize,
 }
@@ -154,11 +152,16 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     fn bind_record(lsn: u64, collection: &str, pk: &[u8], surrogate: u32) -> WalRecord {
-        let payload = SurrogateBindPayload::new(surrogate, collection, pk.to_vec())
+        batch_record(lsn, collection, &[(surrogate, pk)])
+    }
+
+    fn batch_record(lsn: u64, collection: &str, entries: &[(u32, &[u8])]) -> WalRecord {
+        let entries = entries.iter().map(|&(s, pk)| (s, pk.to_vec())).collect();
+        let payload = SurrogateBindBatchPayload::new(collection, entries)
             .to_bytes()
             .expect("encode bind payload");
         WalRecord::new(WalRecordArgs {
-            record_type: RecordType::SurrogateBind as u32,
+            record_type: RecordType::SurrogateBindBatch as u32,
             lsn,
             tenant_id: 0,
             vshard_id: 0,
@@ -273,6 +276,7 @@ mod tests {
         let records = vec![bind_record(10, "users", b"alice", 7)];
         replay_surrogate_records(&records, &cat, &reg, &TombstoneSet::new()).expect("first");
         let hwm_after_first = reg.read().expect("read lock").current_hwm();
+        assert_eq!(hwm_after_first, 7);
         replay_surrogate_records(&records, &cat, &reg, &TombstoneSet::new()).expect("second");
         assert_eq!(
             reg.read().expect("read lock").current_hwm(),
@@ -286,6 +290,93 @@ mod tests {
             )
             .unwrap(),
             Some(nodedb_types::Surrogate::new(7))
+        );
+    }
+
+    fn users_surrogate(cat: &SystemCatalog, pk: &[u8]) -> Option<nodedb_types::Surrogate> {
+        cat.get_surrogate_for_pk(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            TenantId::new(0),
+            pk,
+        )
+        .unwrap()
+    }
+
+    /// One batch record replays every binding it carries, and the stats
+    /// count bindings, not records.
+    #[test]
+    fn batch_record_applies_every_entry() {
+        let (_dir, cat, reg) = open_test();
+        let pks: Vec<Vec<u8>> = (0..2_000u32)
+            .map(|i| format!("k{i}").into_bytes())
+            .collect();
+        let entries: Vec<(u32, &[u8])> = pks
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| (i as u32 + 1, pk.as_slice()))
+            .collect();
+        let stats = replay_surrogate_records(
+            &[batch_record(10, "users", &entries)],
+            &cat,
+            &reg,
+            &TombstoneSet::new(),
+        )
+        .expect("replay");
+        assert_eq!(stats.binds, 2_000);
+        assert_eq!(stats.binds_skipped, 0);
+        for &(surrogate, pk) in &entries {
+            assert_eq!(
+                users_surrogate(&cat, pk),
+                Some(nodedb_types::Surrogate::new(surrogate))
+            );
+        }
+        assert_eq!(reg.read().expect("read lock").current_hwm(), 2_000);
+    }
+
+    #[test]
+    fn tombstoned_batch_skips_every_entry() {
+        let (_dir, cat, reg) = open_test();
+        let mut tombstones = TombstoneSet::new();
+        tombstones.insert(
+            nodedb_types::CollectionKey::from_bare(DatabaseId::DEFAULT, "users"),
+            0,
+            50,
+        );
+        let entries: Vec<(u32, &[u8])> = vec![
+            (1, b"a".as_slice()),
+            (2, b"b".as_slice()),
+            (3, b"c".as_slice()),
+        ];
+        let stats = replay_surrogate_records(
+            &[batch_record(10, "users", &entries)],
+            &cat,
+            &reg,
+            &tombstones,
+        )
+        .expect("replay");
+        assert_eq!(stats.binds, 0);
+        assert_eq!(stats.binds_skipped, 3);
+        assert_eq!(users_surrogate(&cat, b"a"), None);
+    }
+
+    /// Batches replay in WAL order, so a later binding of a key wins.
+    #[test]
+    fn later_batch_overwrites_earlier_binding() {
+        let (_dir, cat, reg) = open_test();
+        let records = vec![
+            batch_record(10, "users", &[(4, b"a".as_slice()), (5, b"b".as_slice())]),
+            batch_record(11, "users", &[(9, b"a".as_slice())]),
+        ];
+        let stats =
+            replay_surrogate_records(&records, &cat, &reg, &TombstoneSet::new()).expect("replay");
+        assert_eq!(stats.binds, 3);
+        assert_eq!(
+            users_surrogate(&cat, b"a"),
+            Some(nodedb_types::Surrogate::new(9))
+        );
+        assert_eq!(
+            users_surrogate(&cat, b"b"),
+            Some(nodedb_types::Surrogate::new(5))
         );
     }
 }

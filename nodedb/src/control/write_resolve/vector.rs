@@ -7,7 +7,7 @@
 //! sidecar it read so the apply refuses a resolution that drifted.
 //!
 //! A write resolves when it carries a live write predicate, a row predicate,
-//! or a patch expression. The sidecar store is written through while the
+//! or a patch expression, and a multi-row page always resolves. The sidecar store is written through while the
 //! index restores from its checkpoint, so replay runs against newer sidecars.
 //! A log record therefore names rows and their values, never something
 //! replay evaluates again.
@@ -131,6 +131,25 @@ pub(super) fn resolver_for_vector_op(op: &VectorOp) -> Option<Box<dyn EngineWrit
                 },
             )
         }
+        // A page always resolves: whether a row lands depends on the rows
+        // stored and on the page's earlier rows, and the record names only
+        // the rows the page stores.
+        VectorOp::DirectBatchWrite {
+            collection,
+            field,
+            quantization,
+            storage_dtype,
+            payload_indexes,
+            ..
+        } => (
+            collection,
+            field,
+            ResolvedIndexSettings {
+                quantization: *quantization,
+                storage_dtype: *storage_dtype,
+                payload_indexes: payload_indexes.clone(),
+            },
+        ),
         // Decided Control-Plane-side against the payload image.
         VectorOp::DirectInsert { .. }
         | VectorOp::DirectInsertIfAbsent { .. }
@@ -294,6 +313,27 @@ mod tests {
         }
         let literal = UpdateValue::Literal(vec![0x01]);
         assert!(resolver_for_vector_op(&update(rows(), literal)).is_none());
+    }
+
+    /// A multi-row page resolves with no predicate and no expression: the
+    /// rows it stores depend on the rows already stored.
+    #[test]
+    fn a_page_always_resolves() {
+        let page = VectorOp::DirectBatchWrite {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "vecs"),
+            field: "emb".into(),
+            intent: nodedb_physical::physical_plan::VectorDirectWriteIntent::InsertIfAbsent,
+            rows: Vec::new(),
+            quantization: nodedb_types::VectorQuantization::None,
+            storage_dtype: nodedb_types::VectorStorageDtype::F32,
+            payload_indexes: Vec::new(),
+            returning: None,
+            rls_filters: Vec::new(),
+            on_conflict_updates: Vec::new(),
+            rls_write_check: RlsWriteCheck::NoPolicyApplies,
+        };
+        let resolver = resolver_for_vector_op(&page).expect("a page resolves before logging");
+        assert_eq!(resolver.collection(), "vecs");
     }
 
     /// A live write predicate, a row predicate, or a patch expression is

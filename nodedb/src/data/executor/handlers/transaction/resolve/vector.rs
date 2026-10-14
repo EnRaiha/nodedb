@@ -218,6 +218,15 @@ pub(super) fn serialize_vector_op(
             );
             Ok(())
         }
+        // A transaction stages a page as its point writes, so the overlay
+        // never holds a page. A page here was never staged.
+        VectorOp::DirectBatchWrite { collection, .. } => Err(crate::Error::PlanError {
+            detail: format!(
+                "a vector-primary page for '{}' reached transaction resolve unstaged; a \
+                 transaction stages each row of a page as its own point write",
+                collection.as_str()
+            ),
+        }),
         VectorOp::DirectUpdate {
             collection,
             field,

@@ -215,6 +215,7 @@ fn entry_scope(write: &ReplicatedWrite, database_id: crate::types::DatabaseId) -
         | ReplicatedWrite::PointDelete { .. }
         | ReplicatedWrite::PointUpdate { .. }
         | ReplicatedWrite::DocUpsert { .. }
+        | ReplicatedWrite::DocBatchUpsert { .. }
         | ReplicatedWrite::DocBatchInsert { .. }
         | ReplicatedWrite::VectorInsert { .. }
         | ReplicatedWrite::VectorBatchInsert { .. }
@@ -242,7 +243,6 @@ fn entry_scope(write: &ReplicatedWrite, database_id: crate::types::DatabaseId) -
         | ReplicatedWrite::KvPut { .. }
         | ReplicatedWrite::KvDelete { .. }
         | ReplicatedWrite::KvInsert { .. }
-        | ReplicatedWrite::KvInsertIfAbsent { .. }
         | ReplicatedWrite::KvInsertOnConflictUpdate { .. }
         | ReplicatedWrite::KvBatchPut { .. }
         | ReplicatedWrite::KvExpire { .. }

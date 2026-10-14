@@ -55,6 +55,7 @@ fn batch_kv(ctx: &mut TestCtx, collection: &str, count: usize) -> String {
             ),
             entries,
             ttl_ms: 0,
+            intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
             surrogates,
             returning: None,
             rls_filters: Vec::new(),

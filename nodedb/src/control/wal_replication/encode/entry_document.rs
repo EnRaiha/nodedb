@@ -138,6 +138,30 @@ pub(super) fn document_write(op: &DocumentOp) -> Option<ReplicatedWrite> {
                 rls_filters,
             },
         ),
+        DocumentOp::BatchUpsert {
+            collection,
+            documents,
+            surrogates,
+            on_conflict_updates,
+            // Leader already decided every row; the record carries the rows.
+            rls_write_check: _,
+            returning,
+            rls_filters,
+            // See `PointPut`.
+            resolved_sum_targets,
+        } => document::batch_upsert(
+            collection.as_str(),
+            document::PageRows {
+                documents,
+                surrogates,
+            },
+            on_conflict_updates,
+            resolved_sum_targets,
+            WireReturning {
+                returning: encode_returning(returning),
+                rls_filters,
+            },
+        ),
         DocumentOp::BulkDelete {
             collection,
             filters,

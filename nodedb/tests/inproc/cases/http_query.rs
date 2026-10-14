@@ -239,10 +239,19 @@ async fn query_stream_returns_all_rows_across_chunks() {
     srv.exec("CREATE COLLECTION http_stream WITH (engine='document_schemaless')")
         .await
         .expect("create collection");
-    for i in 0..ROW_COUNT {
-        srv.exec(&format!("INSERT INTO http_stream {{ id: 'r{i}', n: {i} }}"))
-            .await
-            .unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+    // Seed in multi-row statements. The sink under test is the streaming
+    // SELECT, so the seed pays one durable commit per chunk, not per row.
+    const SEED_CHUNK: usize = 500;
+    for start in (0..ROW_COUNT).step_by(SEED_CHUNK) {
+        let values: Vec<String> = (start..(start + SEED_CHUNK).min(ROW_COUNT))
+            .map(|i| format!("('r{i}', {i})"))
+            .collect();
+        srv.exec(&format!(
+            "INSERT INTO http_stream (id, n) VALUES {}",
+            values.join(", ")
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("insert chunk at {start} failed: {e}"));
     }
 
     // No ORDER BY / DISTINCT / OFFSET / aggregate → streamable unordered scan.

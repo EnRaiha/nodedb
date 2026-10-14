@@ -2,7 +2,7 @@
 
 //! `VectorOp` and `TextOp` classification.
 
-use nodedb_physical::physical_plan::{TextOp, VectorOp};
+use nodedb_physical::physical_plan::{TextOp, VectorDirectWriteIntent, VectorOp};
 
 use super::kind::PlanKind;
 
@@ -15,6 +15,9 @@ pub(super) fn describe_vector(op: &VectorOp) -> PlanKind {
             returning: Some(_), ..
         }
         | VectorOp::DirectInsertIfAbsent {
+            returning: Some(_), ..
+        }
+        | VectorOp::DirectBatchWrite {
             returning: Some(_), ..
         }
         | VectorOp::DirectDelete {
@@ -34,6 +37,20 @@ pub(super) fn describe_vector(op: &VectorOp) -> PlanKind {
             ..
         } if !on_conflict_updates.is_empty() => PlanKind::DmlResultByOp,
         VectorOp::DirectUpsert { .. } => PlanKind::DmlResult("UPSERT"),
+        // A page tags as its point write of the same intent.
+        VectorOp::DirectBatchWrite {
+            intent: VectorDirectWriteIntent::Insert | VectorDirectWriteIntent::InsertIfAbsent,
+            ..
+        } => PlanKind::DmlResult("INSERT"),
+        VectorOp::DirectBatchWrite {
+            intent: VectorDirectWriteIntent::Upsert,
+            on_conflict_updates,
+            ..
+        } if !on_conflict_updates.is_empty() => PlanKind::DmlResultByOp,
+        VectorOp::DirectBatchWrite {
+            intent: VectorDirectWriteIntent::Upsert,
+            ..
+        } => PlanKind::DmlResult("UPSERT"),
         VectorOp::DirectDelete { .. } => PlanKind::DmlResult("DELETE"),
         VectorOp::DirectTruncate { .. } => PlanKind::DmlResult("TRUNCATE"),
         VectorOp::DirectUpdate { .. } => PlanKind::DmlResult("UPDATE"),

@@ -73,6 +73,16 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut VectorOp) -> crate::Res
             pk_bytes,
             surrogate,
         ),
+        VectorOp::DirectBatchWrite {
+            collection, rows, ..
+        } => {
+            let key = binder.plan_key(collection.as_str())?;
+            let slots = rows
+                .iter_mut()
+                .map(|row| keyed_or_self_slot(key, &row.pk_bytes, &mut row.surrogate))
+                .collect();
+            binder.resolve_slots_in_place(slots)
+        }
         VectorOp::ResolveDirectWrite(inner) => bind(binder, inner),
         VectorOp::ResolvedDirectWrite {
             collection,

@@ -7,8 +7,9 @@
 //! Every protocol's statement loop routes each task through
 //! [`route_txn_task`]:
 //!
-//! 1. An in-transaction `MERGE`, `UPDATE ... FROM`, `INSERT ... SELECT` or
-//!    `BatchInsert` page expands into the point ops it writes, and so does a
+//! 1. An in-transaction `MERGE`, `UPDATE ... FROM`, `INSERT ... SELECT`,
+//!    `BatchInsert` or `BatchUpsert` page or vector-primary page expands
+//!    into the point ops it writes, and so does a
 //!    predicate `UPDATE` or `DELETE` whose collection fires a row body
 //!    (`predicate`). Each op takes the steps below on its own.
 //! 2. A point write fires its INSTEAD OF and BEFORE bodies (`row_triggers`).
@@ -54,6 +55,7 @@ use crate::control::trigger::{DmlEvent, SyncFire, TriggerScope};
 use super::joined::task_events;
 use super::predicate::expand_predicate_write;
 use super::row_triggers::{BeforeOutcome, RowWrite, fire_after, fire_before};
+use crate::control::server::shared::sql::conflict_tag_fold::ConflictTagFold;
 use crate::control::server::shared::sql::staging_predicates::StagedTagKind;
 
 /// What one statement task routed through its transaction needs.
@@ -192,12 +194,14 @@ where
     let has_user_write = plans_have_user_write(ops.iter().map(|op| &op.plan));
     let mut affected = 0usize;
     let mut returning_rows = Vec::new();
+    let mut tag = ConflictTagFold::default();
     for op in ops {
         let counts = plan_counts_toward_statement_tag(&op.plan, has_user_write);
         match route_point(ctx, op, expanded, dispatch).await? {
             TxnTaskOutcome::Staged(outcome) => {
                 if counts {
                     affected += outcome.affected;
+                    tag.note(outcome.kind);
                 }
                 returning_rows.extend(outcome.returning_rows);
             }
@@ -218,7 +222,7 @@ where
         }
     }
     Ok(TxnTaskOutcome::Staged(StagedWriteOutcome {
-        kind,
+        kind: tag.fold(kind),
         affected,
         payload: Vec::new(),
         returning_rows,
@@ -337,17 +341,22 @@ async fn fire_after_changed(
 
 /// Refuse a write that asks for `RETURNING` rows its transaction cannot
 /// answer at the statement, before anything stages. A Document point write,
-/// `UPSERT`, predicate `UPDATE` / `DELETE` and `BatchInsert` page answer from
-/// the rows they stage. Every other write stages or buffers without a row
-/// image.
+/// `UPSERT`, predicate `UPDATE` / `DELETE` and a `BatchInsert` or
+/// `BatchUpsert` page answer from the rows they stage. Every other write
+/// stages or buffers without a row image.
 fn refuse_unanswerable_returning(plan: &PhysicalPlan) -> Result<(), StagingGateError> {
     let answers = stages_returning(plan)
         || matches!(
             plan,
-            PhysicalPlan::Document(DocumentOp::BatchInsert {
-                returning: Some(_),
-                ..
-            })
+            PhysicalPlan::Document(
+                DocumentOp::BatchInsert {
+                    returning: Some(_),
+                    ..
+                } | DocumentOp::BatchUpsert {
+                    returning: Some(_),
+                    ..
+                }
+            )
         );
     if matches!(describe_plan(plan), PlanKind::ReturningRows) && !answers {
         return Err(StagingGateError::Dispatch(

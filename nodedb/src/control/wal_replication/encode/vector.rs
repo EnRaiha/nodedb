@@ -218,6 +218,17 @@ pub(super) fn encode(op: &VectorOp) -> crate::Result<Option<ReplicatedWrite>> {
             returning,
             rls_filters,
         })?,
+        // A page replicates only as the `ResolvedDirectWrite` it resolves
+        // to, so no follower judges existence again.
+        VectorOp::DirectBatchWrite { collection, .. } => {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "a vector-primary page for '{}' reached replication unresolved; every page \
+                     resolves to the rows it stores before it is proposed",
+                    collection.as_str()
+                ),
+            });
+        }
         VectorOp::DirectDelete {
             collection,
             field,

@@ -165,6 +165,32 @@ pub(super) fn upsert(
     }
 }
 
+/// The rows of a page record: `(document_id, value)` pairs and one surrogate
+/// per row.
+pub(super) struct PageRows<'a> {
+    pub documents: &'a [(String, Vec<u8>)],
+    pub surrogates: &'a [Surrogate],
+}
+
+pub(super) fn batch_upsert(
+    collection: &str,
+    rows: PageRows<'_>,
+    on_conflict_updates: &[(String, UpdateValue)],
+    resolved_sum_targets: &[ResolvedSumTarget],
+    returning: WireReturning<'_>,
+) -> ReplicatedWrite {
+    ReplicatedWrite::DocBatchUpsert {
+        collection: collection.to_owned(),
+        documents: rows.documents.to_vec(),
+        surrogates: rows.surrogates.iter().map(|s| s.as_u32()).collect(),
+        on_conflict_updates: on_conflict_updates.to_vec(),
+        resolved_sum_targets: wire_targets(resolved_sum_targets),
+        resolved_sum_target_bindings: wire_target_bindings(resolved_sum_targets),
+        returning: returning.returning,
+        rls_filters: returning.rls_filters.to_vec(),
+    }
+}
+
 /// The rows of a batch insert record and how a present key is judged.
 pub(super) struct BatchRows<'a> {
     pub documents: &'a [(String, Vec<u8>)],

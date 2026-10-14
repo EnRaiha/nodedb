@@ -28,15 +28,15 @@ async fn streaming_select_returns_all_rows_across_chunks() {
         .unwrap();
 
     // Batched: the row count and the server's `stream_chunk_size` are what
-    // this test pins, not the per-statement round trip. One statement per row
-    // costs ~20ms each and dominates the runtime without adding coverage.
+    // this test pins, not the per-statement round trip. Each batch is one
+    // multi-row statement, so it pays one durable commit, not one per row.
     for chunk_start in (0..ROW_COUNT).step_by(INSERT_BATCH) {
         let chunk_end = (chunk_start + INSERT_BATCH).min(ROW_COUNT);
-        let batch = (chunk_start..chunk_end)
-            .map(|i| format!("INSERT INTO stream_doc {{ id: 'r{i}', n: {i} }}"))
+        let values = (chunk_start..chunk_end)
+            .map(|i| format!("('r{i}', {i})"))
             .collect::<Vec<_>>()
-            .join("; ");
-        srv.exec(&batch)
+            .join(", ");
+        srv.exec(&format!("INSERT INTO stream_doc (id, n) VALUES {values}"))
             .await
             .unwrap_or_else(|e| panic!("insert batch at {chunk_start} failed: {e}"));
     }

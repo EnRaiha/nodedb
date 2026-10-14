@@ -223,6 +223,18 @@ pub(crate) fn wal_append_vector_op(
             })?;
             Some(wal.append_vector_direct_upsert(tenant_id, vshard_id, database_id, &entry)?)
         }
+        // A page logs only as the `ResolvedDirectWrite` it resolves to: a
+        // record that re-judged existence on replay would store rows the
+        // committed page skipped or refused.
+        VectorOp::DirectBatchWrite { collection, .. } => {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "a vector-primary page for '{}' reached the WAL unresolved; every page \
+                     resolves to the rows it stores before it is logged",
+                    collection.as_str()
+                ),
+            });
+        }
         VectorOp::DirectDelete {
             collection,
             field,

@@ -242,6 +242,7 @@ fn rollback_matrix_kv_batch_put_then_doc_fail() {
                     (b"k_b".to_vec(), b"b_new".to_vec()),
                 ],
                 ttl_ms: 0,
+                intent: nodedb_physical::physical_plan::KvBatchIntent::Put,
                 surrogates: [b"k_a".as_slice(), b"k_b".as_slice()]
                     .into_iter()
                     .map(nodedb_test_support::kv_rows::kv_row_surrogate)

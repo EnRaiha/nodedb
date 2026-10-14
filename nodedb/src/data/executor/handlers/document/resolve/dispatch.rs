@@ -2,22 +2,23 @@
 
 //! Fill the resolvers' params from the wrapped point/bulk write op.
 //!
-//! Called from `DocumentOp::ResolveWrite`'s dispatch for the five ops whose
+//! Called from `DocumentOp::ResolveWrite`'s dispatch for the six ops whose
 //! resolution is a mutation list rather than a classification: `PointUpdate`,
-//! `PointDelete`, `Upsert`, `BulkUpdate`, `BulkDelete`.
+//! `PointDelete`, `Upsert`, `BatchUpsert`, `BulkUpdate`, `BulkDelete`.
 
 use nodedb_physical::physical_plan::{DocumentOp, DocumentResolveOutcome};
 
 use super::bulk::{ResolveBulkDelete, ResolveBulkUpdate};
 use super::point::{ResolvePointDelete, ResolvePointUpdate};
 use super::upsert::ResolveUpsert;
+use super::upsert_batch::ResolveUpsertBatch;
 use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
     /// Resolve `inner` to the mutations it would apply, or `None` when it is
-    /// not one of the five point/bulk write ops. `None` is not a refusal —
+    /// not one of the six point/page/bulk write ops. `None` is not a refusal —
     /// the two join-driven ops resolve to a classification instead.
     pub(in crate::data::executor) fn resolve_document_point_write(
         &self,
@@ -93,6 +94,29 @@ impl CoreLoop {
                     document_id,
                     surrogate: *surrogate,
                     value,
+                    on_conflict_updates,
+                    returning: returning.as_ref(),
+                    rls_filters,
+                    rls_write_check,
+                    resolved_sum_targets,
+                },
+            ),
+            DocumentOp::BatchUpsert {
+                collection,
+                documents,
+                surrogates,
+                on_conflict_updates,
+                rls_write_check,
+                returning,
+                rls_filters,
+                resolved_sum_targets,
+            } => self.resolve_upsert_batch(
+                task,
+                ResolveUpsertBatch {
+                    tid,
+                    collection: collection.as_str(),
+                    documents,
+                    surrogates,
                     on_conflict_updates,
                     returning: returning.as_ref(),
                     rls_filters,
