@@ -108,6 +108,6 @@ pub use time_anchors::TimeAnchors;
 #[cfg(not(target_arch = "wasm32"))]
 pub use tombstone::{CollectionTombstonePayload, MAX_COLLECTION_NAME_LEN};
 #[cfg(not(target_arch = "wasm32"))]
-pub use torn_tail::{TailVerdict, verify_committed_prefix};
+pub use torn_tail::{TailVerdict, holds_only_crash_residue, verify_committed_prefix};
 #[cfg(not(target_arch = "wasm32"))]
 pub use writer::WalWriter;

@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use crate::error::{Result, WalError};
+use crate::error::Result;
 use crate::reader::WalReader;
 
 /// Result of scanning a WAL file for recovery.
@@ -76,11 +76,11 @@ pub fn recover(path: &Path) -> Result<RecoveryInfo> {
                 // End of committed prefix (EOF or corruption).
                 break;
             }
-            Err(e @ WalError::UnknownRequiredRecordType { .. }) => {
-                // Cannot proceed past unknown required records.
-                return Err(e);
-            }
-            Err(e) => return Err(e),
+            // Nothing past an unknown required record can be read, and a version
+            // gap is the one error that needs the segment it was found in: the
+            // reader sees one header at a time and holds no path. Every other
+            // error passes through unchanged.
+            Err(error) => return Err(error.with_segment_path(path)),
         }
     }
 
@@ -101,6 +101,7 @@ pub fn recover(path: &Path) -> Result<RecoveryInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::WalError;
     use crate::record::RecordType;
     use crate::writer::WalWriter;
 
@@ -187,5 +188,77 @@ mod tests {
         assert_eq!(info.last_lsn, 2);
         assert_eq!(info.record_count, 2);
         assert_eq!(info.next_lsn(), 3);
+    }
+
+    /// Where each of `count` records starts, and the file's bytes.
+    fn segment_with_records(path: &Path, count: u8) -> (Vec<u64>, Vec<u8>) {
+        {
+            let mut writer = WalWriter::open_without_direct_io(path).unwrap();
+            for i in 0..count {
+                writer
+                    .append(RecordType::Put as u32, 1, 0, 0, &[i; 8])
+                    .unwrap();
+            }
+            writer.sync().unwrap();
+        }
+        let mut reader = WalReader::open_raw(path).unwrap();
+        let mut starts = Vec::new();
+        loop {
+            let start = reader.committed_end();
+            if reader.next_record().unwrap().is_none() {
+                break;
+            }
+            starts.push(start);
+        }
+        (starts, std::fs::read(path).unwrap())
+    }
+
+    #[test]
+    fn a_lone_first_record_in_another_format_is_a_format_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lone.wal");
+        let (starts, mut bytes) = segment_with_records(&path, 1);
+        let at = usize::try_from(starts[0]).unwrap();
+        crate::record::foreign_version::reseal_with_version(&mut bytes, at, 1);
+        std::fs::write(&path, &bytes).unwrap();
+
+        match recover(&path) {
+            Err(WalError::SegmentFormatVersion {
+                path: named,
+                version,
+                supported,
+            }) => {
+                assert_eq!(named, path.display().to_string());
+                assert_eq!(version, 1);
+                assert_eq!(supported, crate::record::WAL_FORMAT_VERSION);
+            }
+            other => panic!("expected SegmentFormatVersion, got {other:?}"),
+        }
+    }
+
+    /// A flipped bit in the first record's version field is damage to this
+    /// build's record, not another build's format. The intact records behind
+    /// it make the damage a hole, so recovery refuses it as mid-file
+    /// corruption instead of reporting a format gap.
+    #[test]
+    fn a_flipped_first_version_bit_is_damage_not_a_format_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flipped.wal");
+        let (starts, mut bytes) = segment_with_records(&path, 3);
+        // The version field is bytes 4..6 of a record header.
+        let at = usize::try_from(starts[0]).unwrap() + 4;
+        let flipped = crate::record::WAL_FORMAT_VERSION ^ 0x0100;
+        bytes[at..at + 2].copy_from_slice(&flipped.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        match recover(&path) {
+            Err(WalError::MidFileCorruption {
+                offset, resync_lsn, ..
+            }) => {
+                assert_eq!(offset, starts[0]);
+                assert_eq!(resync_lsn, 2);
+            }
+            other => panic!("expected MidFileCorruption, got {other:?}"),
+        }
     }
 }

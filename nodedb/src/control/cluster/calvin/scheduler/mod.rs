@@ -18,7 +18,7 @@ pub mod recovery;
 pub use applied_gate::AppliedGate;
 pub use applied_ledger::{CalvinAppliedLedger, CalvinAppliedLedgers, ClaimRefusal};
 pub use barrier_log::{BarrierEvent, BarrierLog, BarrierOutcome, ReceivedReads};
-pub use caught_up::{CaughtUpHandle, CaughtUpRegistry};
+pub use caught_up::{CaughtUpHandle, CaughtUpRegistry, LaggingScheduler};
 pub use driver::{
     CalvinReadResultProposal, RaftSequencerProposer, Scheduler, SchedulerConfig, SchedulerParams,
     SequencerProposer, propose_calvin_read_result,

@@ -14,6 +14,7 @@ use super::network::{BridgeTuning, ClusterTransportTuning, NetworkTuning, WalTun
 use super::promql::PromqlTuning;
 use super::scheduler::SchedulerTuning;
 use super::shutdown::ShutdownTuning;
+use super::startup::StartupTuning;
 
 /// Top-level tuning configuration.
 ///
@@ -57,6 +58,8 @@ pub struct TuningConfig {
     pub calvin: CalvinTuning,
     #[serde(default)]
     pub promql: PromqlTuning,
+    #[serde(default)]
+    pub startup: StartupTuning,
 }
 
 impl TuningConfig {
@@ -193,5 +196,21 @@ doc_cache_entries = 8192
         assert_eq!(cfg.memory.overflow_initial_bytes, 128 * 1024 * 1024);
         assert_eq!(cfg.memory.overflow_max_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(cfg.memory.doc_cache_entries, 8192);
+    }
+
+    #[test]
+    fn startup_bounds_are_read_from_the_aggregate() {
+        let cfg: TuningConfig = toml::from_str("").expect("deserialize");
+        assert_eq!(cfg.startup.raft_ready_timeout_ms, 30_000);
+        assert_eq!(cfg.startup.data_group_recovery_timeout_ms, 60_000);
+
+        let toml_str = r#"
+[startup]
+raft_ready_timeout_ms = 1234
+data_group_recovery_timeout_ms = 5678
+"#;
+        let cfg: TuningConfig = toml::from_str(toml_str).expect("deserialize");
+        assert_eq!(cfg.startup.raft_ready_timeout_ms, 1234);
+        assert_eq!(cfg.startup.data_group_recovery_timeout_ms, 5678);
     }
 }

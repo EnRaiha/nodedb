@@ -39,7 +39,11 @@ use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::preamble::{SegmentPreamble, WAL_PREAMBLE_MAGIC, read_leading_preamble};
 use crate::reader::StopReason;
-use crate::record::{HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, RecordType, WalRecord};
+use crate::record::foreign_version::read_declared_payload;
+use crate::record::{
+    HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, RecordType, WalRecord, is_format_gap,
+    may_be_format_gap,
+};
 use crate::segment::SegmentDecryptor;
 
 fn checked_offset_add(offset: u64, len: u64) -> Result<u64> {
@@ -55,6 +59,10 @@ fn checked_offset_add(offset: u64, len: u64) -> Result<u64> {
 pub struct LazyWalReader {
     file: File,
     offset: u64,
+    /// Offset of the segment's first record, past any preamble. The format
+    /// version is judged here and nowhere else: one writer never mixes formats
+    /// inside one segment.
+    records_start: u64,
     /// Preamble read from offset 0 of this segment (present when encryption is
     /// active). The epoch is part of the AAD used to decrypt payloads.
     segment_preamble: Option<SegmentPreamble>,
@@ -94,6 +102,7 @@ impl LazyWalReader {
         Ok(Self {
             file,
             offset: start_offset,
+            records_start: start_offset,
             segment_preamble,
             double_write,
             stop_reason: None,
@@ -123,9 +132,10 @@ impl LazyWalReader {
 
     /// Read the next record header without reading the payload.
     ///
-    /// Returns `None` at EOF or first corruption. After this call, use
-    /// either `read_payload()` to get the payload or `skip_payload()` to
-    /// seek past it.
+    /// Returns `None` at EOF or first corruption. Returns `Err` for a format
+    /// version this build cannot read at the segment's first record, and the
+    /// caller must stop at that `Err`. After a header, use either
+    /// `read_payload()` to get the payload or `skip_payload()` to seek past it.
     ///
     /// Alignment padding records are consumed internally — the caller only
     /// ever sees real records.
@@ -153,6 +163,20 @@ impl LazyWalReader {
             match header.validate(record_offset) {
                 Ok(()) => {}
                 Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
+                // Another build's format travels out so the refusal can name
+                // the version. A damaged header in this build's format is a
+                // stop for `torn_tail` to classify, like any damage.
+                Err(error @ WalError::UnsupportedVersion { .. })
+                    if may_be_format_gap(&header, record_offset == self.records_start) =>
+                {
+                    let payload = read_declared_payload(&mut self.file, &header, self.offset)?;
+                    if is_format_gap(&header, payload.as_deref()) {
+                        return Err(error);
+                    }
+                    return self.stop(StopReason::Corruption {
+                        offset: record_offset,
+                    });
+                }
                 Err(_) => {
                     return self.stop(StopReason::Corruption {
                         offset: record_offset,
@@ -345,7 +369,10 @@ where
 {
     let mut reader = LazyWalReader::open(path, keys)?;
     let mut last_lsn = 0u64;
-    while let Some(header) = reader.next_header()? {
+    while let Some(header) = reader
+        .next_header()
+        .map_err(|error| error.with_segment_path(path))?
+    {
         last_lsn = header.lsn;
         handler(&mut reader, &header)?;
     }
@@ -540,5 +567,78 @@ mod tests {
 
         let mut reader = LazyWalReader::open(&path, None).unwrap();
         assert!(reader.next_header().unwrap().is_none());
+    }
+
+    /// A version this build cannot read at the segment's first record is a
+    /// typed error that names the version.
+    #[test]
+    fn an_unknown_format_version_at_the_first_record_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown.wal");
+        {
+            let mut writer = WalWriter::open_without_direct_io(&path).unwrap();
+            writer
+                .append(RecordType::Put as u32, 1, 0, 0, b"x")
+                .unwrap();
+            writer.sync().unwrap();
+        }
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        crate::record::foreign_version::reseal_with_version(&mut bytes, 0, 1);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
+        match reader.next_header() {
+            Err(WalError::UnsupportedVersion { version, supported }) => {
+                assert_eq!(version, 1);
+                assert_eq!(supported, crate::record::WAL_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    /// A version this build cannot read, found after an intact record, is
+    /// damage: the stream stops there as corruption, not as a format gap.
+    #[test]
+    fn a_version_mismatch_after_the_first_record_is_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two-records.wal");
+        {
+            let mut writer = WalWriter::open_without_direct_io(&path).unwrap();
+            writer
+                .append(RecordType::Put as u32, 1, 0, 0, b"first")
+                .unwrap();
+            writer
+                .append(RecordType::Put as u32, 1, 0, 0, b"second")
+                .unwrap();
+            writer.sync().unwrap();
+        }
+
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
+        let first = reader.next_header().unwrap().expect("the first header");
+        reader.skip_payload(&first).unwrap();
+        let second_at = reader.offset();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let version_at = usize::try_from(second_at).unwrap() + 4;
+        bytes[version_at..version_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
+        let first = reader
+            .next_header()
+            .unwrap()
+            .expect("the first record is still readable");
+        assert_eq!(first.lsn, 1);
+        reader.skip_payload(&first).unwrap();
+        assert!(
+            reader.next_header().unwrap().is_none(),
+            "the mismatch stops the stream instead of failing the read"
+        );
+        assert_eq!(
+            reader.stop_reason(),
+            Some(StopReason::Corruption { offset: second_at }),
+            "a mismatch after the first record is damage, not a format gap"
+        );
     }
 }

@@ -4,6 +4,7 @@
 pub mod aborted;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod anchor;
+pub mod foreign_version;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fts_spatial;
 pub mod header;
@@ -26,6 +27,7 @@ pub mod wal_record;
 pub use aborted::{WRITE_ABORTED_PAYLOAD_SIZE, WriteAbortedPayload};
 #[cfg(not(target_arch = "wasm32"))]
 pub use anchor::{TIME_ANCHOR_PAYLOAD_SIZE, TimeAnchorPayload};
+pub use foreign_version::{is_format_gap, may_be_format_gap};
 #[cfg(not(target_arch = "wasm32"))]
 pub use fts_spatial::{FtsDeletePayload, FtsIndexPayload, SpatialDeletePayload, SpatialPutPayload};
 pub use header::{

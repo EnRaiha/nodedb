@@ -345,9 +345,14 @@ mod tests {
 
         // The group elects, and boot recovery finishes.
         leader.store(NODE, std::sync::atomic::Ordering::Release);
-        crate::bootstrap::data_group_recovery::await_data_group_recovery(&state)
-            .await
-            .expect("recovery");
+        crate::bootstrap::data_group_recovery::await_data_group_recovery(
+            &state,
+            nodedb_types::config::tuning::DataGroupRecoveryTimeout(std::time::Duration::from_secs(
+                60,
+            )),
+        )
+        .await
+        .expect("recovery");
         assert!(
             state
                 .data_groups_replayed

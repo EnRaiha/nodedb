@@ -139,6 +139,10 @@ pub fn classify(path: &Path, corruption_offset: u64, last_lsn: u64) -> Result<Ta
 
 /// Read a full record at `offset` and return its LSN if header and CRC both
 /// check out. Anything else is a coincidental magic match, not a record.
+///
+/// A format version this build cannot read is not a record either. The scan
+/// starts past a reader's stop point, which is never before the segment's
+/// first record, and a version mismatch after the first record is damage.
 fn intact_record_lsn(file: &mut File, offset: u64, file_len: u64) -> Result<Option<u64>> {
     let header_end = match offset.checked_add(HEADER_SIZE as u64) {
         Some(end) if end <= file_len => end,
@@ -176,6 +180,31 @@ fn intact_record_lsn(file: &mut File, offset: u64, file_len: u64) -> Result<Opti
     }
 
     Ok(Some(header.lsn))
+}
+
+/// Whether a segment that holds no record holds only what a crash leaves in a
+/// segment it just created.
+///
+/// A new segment's unwritten bytes read as zeros. A crash during its first
+/// write leaves a prefix of that record, which starts with the record magic,
+/// and zeros or a partial record behind it. Any other content was never a WAL
+/// record, so it is corruption.
+pub fn holds_only_crash_residue(path: &Path) -> Result<bool> {
+    let mut file = File::open(path)?;
+    let mut window = Vec::with_capacity(SCAN_CHUNK);
+    let mut read = read_up_to(&mut file, SCAN_CHUNK, &mut window)?;
+    if window.get(..4) == Some(WAL_MAGIC.to_le_bytes().as_slice()) {
+        return Ok(true);
+    }
+    loop {
+        if window.iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
+        if read < SCAN_CHUNK {
+            return Ok(true);
+        }
+        read = read_up_to(&mut file, SCAN_CHUNK, &mut window)?;
+    }
 }
 
 /// Replace `buf` with up to `len` bytes from the file's current position,
@@ -225,6 +254,32 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&vec![0xA5u8; len]).unwrap();
         file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn crash_residue_is_zeros_or_a_torn_first_record() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let zeros = dir.path().join("zeros.wal");
+        std::fs::write(&zeros, vec![0u8; SCAN_CHUNK + 4096]).unwrap();
+        assert!(holds_only_crash_residue(&zeros).unwrap());
+
+        let torn = dir.path().join("torn.wal");
+        let mut bytes = vec![0u8; 4096];
+        bytes[..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+        bytes[4..10].copy_from_slice(&[0xA5; 6]);
+        std::fs::write(&torn, &bytes).unwrap();
+        assert!(holds_only_crash_residue(&torn).unwrap());
+
+        let junk = dir.path().join("junk.wal");
+        std::fs::write(&junk, b"NDBS-not-a-wal-record").unwrap();
+        assert!(!holds_only_crash_residue(&junk).unwrap());
+
+        let late_junk = dir.path().join("late_junk.wal");
+        let mut bytes = vec![0u8; SCAN_CHUNK + 4096];
+        bytes[SCAN_CHUNK + 7] = 1;
+        std::fs::write(&late_junk, &bytes).unwrap();
+        assert!(!holds_only_crash_residue(&late_junk).unwrap());
     }
 
     #[test]
@@ -300,6 +355,50 @@ mod tests {
                 3
             )
             .is_ok()
+        );
+    }
+
+    /// A record whose format version this build cannot read is damage, not a
+    /// resync point: the scan passes over it to the intact record behind it.
+    #[test]
+    fn a_version_mismatch_past_the_stop_is_not_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("version_mismatch.wal");
+        write_segment(&path, 4);
+
+        // Where each record starts: the reader's committed end after the one
+        // before it.
+        let mut starts = Vec::new();
+        let mut reader = crate::reader::WalReader::open_raw(&path).unwrap();
+        loop {
+            let start = reader.committed_end();
+            if reader.next_record().unwrap().is_none() {
+                break;
+            }
+            starts.push(start);
+        }
+
+        // Damage the second record, and give the third a version this build
+        // cannot read. The checksum covers the version, so it is recomputed:
+        // the third record is intact in every way except its version. The
+        // fourth stays intact.
+        smash(&path, starts[1], HEADER_SIZE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let third = usize::try_from(starts[2]).unwrap();
+        let head: &[u8; HEADER_SIZE] = bytes[third..third + HEADER_SIZE].try_into().unwrap();
+        let mut header = RecordHeader::from_bytes(head);
+        let payload_end = third + HEADER_SIZE + header.payload_len as usize;
+        header.format_version = 1;
+        header.crc32c = header.compute_checksum(&bytes[third + HEADER_SIZE..payload_end]);
+        bytes[third..third + HEADER_SIZE].copy_from_slice(&header.to_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            classify(&path, starts[1], 1).unwrap(),
+            TailVerdict::MidFileCorruption {
+                resync_offset: starts[3],
+                resync_lsn: 4,
+            }
         );
     }
 

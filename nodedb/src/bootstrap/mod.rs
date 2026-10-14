@@ -17,6 +17,7 @@ pub mod permission_tree_load;
 pub mod quota_replay;
 pub mod schema_rehydrate;
 pub mod signal;
+pub mod stall_clock;
 pub mod state_wiring;
 pub mod tls;
 pub mod tracing_init;
