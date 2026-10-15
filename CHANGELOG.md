@@ -17,13 +17,15 @@ A correctness release. Statements that returned a plausible wrong answer now ret
 
 ### ⚠️ Breaking changes
 
-- **A 0.5.0 data directory cannot be opened by 0.6.0.** The WAL format, row identity, time encoding, full-text keys and columnar footers changed. Dump and reload. Startup names the WAL format version it found instead of reporting corruption.
+- **A 0.5.0 data directory cannot be opened by 0.6.0.** The WAL format, row identity, time encoding, full-text keys and columnar footers changed. Dump and reload.
 - **Sync and native protocols changed.** Upgrade Lite and `nodedb-client` with the server.
 - **SQL refuses what it used to accept silently:**
   - an unknown or ambiguous column returns `42703` / `42702` at plan time;
   - a NULL `PRIMARY KEY` returns `23502`, and a duplicate key returns `23505`;
   - a value outside a declared `DECIMAL(p,s)`, `SMALLINT`, `INT` or `REAL` width is refused;
-  - a narrowing `ALTER COLUMN TYPE` is refused.
+  - a narrowing `ALTER COLUMN TYPE` is refused;
+  - `ORDER BY … USING <operator>` is refused;
+  - `MERGE … UPDATE SET *`, `INSERT *` and a `WHERE` or `DELETE WHERE` clause on a `MERGE` update are refused.
 - **Some queries return different results:**
   - `time_bucket` returns an ISO-8601 instant;
   - `stddev` and `variance` use sample semantics, as in PostgreSQL;
@@ -37,6 +39,7 @@ A correctness release. Statements that returned a plausible wrong answer now ret
   - `[server] single_node_calvin`, `quic_keep_alive_secs` and `quic_idle_timeout_secs` are removed;
   - `rpc_timeout_secs` has a 500 ms floor.
 - **The minimum Rust version is 1.96.**
+- **`nodedb-bridge`:** `AsyncControlHandle` has no public `inner` field. Use `try_send_request` for a non-blocking send.
 
 ### Added
 
@@ -59,6 +62,8 @@ A correctness release. Statements that returned a plausible wrong answer now ret
 - **`engine='vector'`** creates a vector-primary collection.
 - **`[tuning.startup]`** sets `raft_ready_timeout_ms` (default 30 s) and `data_group_recovery_timeout_ms` (default 60 s). A boot wait fails only when it makes no progress for that long.
 - **`[server] sync_host` / `NODEDB_SYNC_HOST`** sets the sync listener's bind address.
+- **Japanese and Korean full-text segmentation** reads a lindera dictionary from `NODEDB_FTS_IPADIC_DIR` / `NODEDB_FTS_KO_DIC_DIR`. Without one, CJK text uses character bigrams.
+- **`MERGE … WHEN MATCHED THEN DO NOTHING`.**
 
 ### Fixed
 
@@ -83,7 +88,8 @@ A correctness release. Statements that returned a plausible wrong answer now ret
 ### Security
 
 - `rustls` 0.23.46: RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349.
-- Wasmtime 49.0.1: RUSTSEC-2026-0315, RUSTSEC-2026-0316.
+- Wasmtime 49.0.3: RUSTSEC-2026-0315, RUSTSEC-2026-0316, RUSTSEC-2026-0353 to RUSTSEC-2026-0364.
+- `unsafe-libyaml` is no longer in the dependency tree: RUSTSEC-2024-0449.
 - `quinn-proto` 0.11.19 and `ruzstd` 0.9.1: RUSTSEC-2026-0338, RUSTSEC-2026-0340, RUSTSEC-2026-0343, RUSTSEC-2026-0344.
 
 ---
