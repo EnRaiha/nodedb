@@ -16,7 +16,7 @@
 //! recomputing it with this build's version restores a match. Another build's
 //! header puts its fields at other offsets, so its checksum does not match.
 
-use super::header::{MAX_WAL_PAYLOAD_SIZE, RecordHeader, WAL_FORMAT_VERSION};
+use super::header::{RecordHeader, WAL_FORMAT_VERSION};
 
 /// Whether `header`, whose version this build does not read, can be another
 /// build's format. Only a non-zero version at the segment's first record
@@ -52,6 +52,8 @@ pub(crate) fn read_declared_payload(
     payload_start: u64,
 ) -> crate::error::Result<Option<Vec<u8>>> {
     use std::io::Read;
+
+    use super::header::MAX_WAL_PAYLOAD_SIZE;
 
     let Ok(len) = usize::try_from(header.payload_len) else {
         return Ok(None);
@@ -113,7 +115,7 @@ mod tests {
     #[test]
     fn only_a_non_zero_version_at_the_first_record_may_be_a_gap() {
         let mut header = sealed(b"x");
-        header.format_version = 1;
+        header.format_version = WAL_FORMAT_VERSION + 1;
         assert!(may_be_format_gap(&header, true));
         assert!(!may_be_format_gap(&header, false));
         header.format_version = 0;
@@ -132,7 +134,7 @@ mod tests {
     fn a_record_sealed_in_another_version_is_a_gap() {
         let payload = b"payload";
         let mut header = sealed(payload);
-        header.format_version = 1;
+        header.format_version = WAL_FORMAT_VERSION + 1;
         header.crc32c = header.compute_checksum(payload);
         assert!(is_format_gap(&header, Some(payload)));
     }
@@ -140,7 +142,7 @@ mod tests {
     #[test]
     fn a_header_without_its_payload_is_a_gap() {
         let mut header = sealed(b"payload");
-        header.format_version = 1;
+        header.format_version = WAL_FORMAT_VERSION + 1;
         assert!(is_format_gap(&header, None));
     }
 }

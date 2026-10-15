@@ -260,6 +260,9 @@ mod tests {
     use crate::wal::manager::NO_APPLY_KEY;
     use nodedb_wal::record::{RecordType, WAL_FORMAT_VERSION, WAL_MAGIC, WalRecordArgs};
 
+    /// A WAL format version this build does not read.
+    const OTHER_FORMAT_VERSION: u16 = WAL_FORMAT_VERSION + 1;
+
     fn put(wal: &WalManager, payload: &[u8]) -> Lsn {
         wal.appender(NO_APPLY_KEY)
             .with_event_source(crate::event::EventSource::User)
@@ -312,10 +315,9 @@ mod tests {
     /// One record sealed in format `version`: header, then payload, with the
     /// checksum computed over the declared version.
     ///
-    /// The framing is this build's, which a version-1 writer never produced,
-    /// because its record type field was 16 bits wide and this one is 32. The
-    /// checksum matches the declared version, as it does for a record another
-    /// build wrote, so the reader judges a format gap and not damage.
+    /// The framing is this build's. The checksum matches the declared version,
+    /// as it does for a record another build wrote, so the reader judges a
+    /// format gap and not damage.
     fn record_with_format_version(lsn: u64, version: u16) -> Vec<u8> {
         let mut record = WalRecord::new(WalRecordArgs {
             record_type: RecordType::Put as u32,
@@ -464,7 +466,10 @@ mod tests {
         let mut bytes = nodedb_wal::preamble::SegmentPreamble::new_wal([9, 9, 9, 9])
             .to_bytes()
             .to_vec();
-        bytes.extend_from_slice(&record_with_format_version(newest + 1_000, 1));
+        bytes.extend_from_slice(&record_with_format_version(
+            newest + 1_000,
+            OTHER_FORMAT_VERSION,
+        ));
         std::fs::write(
             nodedb_wal::segment::segment_path(&path, newest + 1_000),
             &bytes,
@@ -479,10 +484,10 @@ mod tests {
 
         let error = wal
             .validate_for_startup()
-            .expect_err("an older format behind a preamble must be refused");
+            .expect_err("another format behind a preamble must be refused");
         let text = format!("{error}");
         assert!(
-            text.contains("version 1"),
+            text.contains(&format!("version {OTHER_FORMAT_VERSION}")),
             "the version sits behind the preamble and the message must still name it: {text}"
         );
         assert!(
@@ -524,8 +529,8 @@ mod tests {
         );
     }
 
-    /// A valid store, then a newer segment written in an older format.
-    fn store_with_an_older_newest_segment(
+    /// A valid store, then a newer segment written in another format.
+    fn store_with_a_foreign_newest_segment(
         path: &std::path::Path,
         version: u16,
     ) -> (WalManager, std::path::PathBuf) {
@@ -552,7 +557,7 @@ mod tests {
     fn the_open_refuses_a_newest_segment_in_another_format() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wal");
-        let (_wal, segment) = store_with_an_older_newest_segment(&path, 1);
+        let (_wal, segment) = store_with_a_foreign_newest_segment(&path, OTHER_FORMAT_VERSION);
 
         let error = match WalManager::open_for_testing(&path) {
             Ok(_) => panic!("a store written in another format must not open"),
@@ -565,7 +570,7 @@ mod tests {
             "the refusal must name the segment: {text}"
         );
         assert!(
-            text.contains("version 1"),
+            text.contains(&format!("version {OTHER_FORMAT_VERSION}")),
             "the refusal must name the version it found: {text}"
         );
         assert!(
@@ -585,7 +590,7 @@ mod tests {
     fn validation_names_a_gap_behind_the_newest_segment() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wal");
-        let (wal, segment) = store_with_an_older_newest_segment(&path, 1);
+        let (wal, segment) = store_with_a_foreign_newest_segment(&path, OTHER_FORMAT_VERSION);
         let newest = nodedb_wal::segment::discover_segments(&path)
             .expect("discover segments")
             .last()
@@ -607,7 +612,7 @@ mod tests {
             "the message must name the segment: {text}"
         );
         assert!(
-            text.contains("version 1"),
+            text.contains(&format!("version {OTHER_FORMAT_VERSION}")),
             "the message must name the version it found, and it named none: {text}"
         );
         assert!(

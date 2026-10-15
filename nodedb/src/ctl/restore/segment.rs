@@ -587,11 +587,21 @@ mod tests {
         let mut bytes = segment(3, None);
         let starts = record_starts(&bytes);
         for &start in &starts {
-            reseal_with_version(&mut bytes, start, 1);
+            reseal_with_version(
+                &mut bytes,
+                start,
+                nodedb_wal::record::WAL_FORMAT_VERSION + 1,
+            );
         }
 
-        assert_format_gap(scan_segment("seg", &bytes, None), 1);
-        assert_format_gap(cut_segment("seg", &bytes, 3, &[], None, ALIGN), 1);
+        assert_format_gap(
+            scan_segment("seg", &bytes, None),
+            nodedb_wal::record::WAL_FORMAT_VERSION + 1,
+        );
+        assert_format_gap(
+            cut_segment("seg", &bytes, 3, &[], None, ALIGN),
+            nodedb_wal::record::WAL_FORMAT_VERSION + 1,
+        );
     }
 
     /// A flipped bit in the first record's version field is damage to this
@@ -615,7 +625,11 @@ mod tests {
     fn a_version_mismatch_after_the_first_record_stops_the_walk() {
         let mut bytes = segment(3, None);
         let starts = record_starts(&bytes);
-        set_format_version(&mut bytes, starts[1], 1);
+        set_format_version(
+            &mut bytes,
+            starts[1],
+            nodedb_wal::record::WAL_FORMAT_VERSION + 1,
+        );
 
         let scan = scan_segment("seg", &bytes, None).unwrap();
         assert_eq!(scan.last_lsn, Some(1));

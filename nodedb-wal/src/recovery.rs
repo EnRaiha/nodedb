@@ -219,7 +219,11 @@ mod tests {
         let path = dir.path().join("lone.wal");
         let (starts, mut bytes) = segment_with_records(&path, 1);
         let at = usize::try_from(starts[0]).unwrap();
-        crate::record::foreign_version::reseal_with_version(&mut bytes, at, 1);
+        crate::record::foreign_version::reseal_with_version(
+            &mut bytes,
+            at,
+            crate::record::WAL_FORMAT_VERSION + 1,
+        );
         std::fs::write(&path, &bytes).unwrap();
 
         match recover(&path) {
@@ -229,7 +233,7 @@ mod tests {
                 supported,
             }) => {
                 assert_eq!(named, path.display().to_string());
-                assert_eq!(version, 1);
+                assert_eq!(version, crate::record::WAL_FORMAT_VERSION + 1);
                 assert_eq!(supported, crate::record::WAL_FORMAT_VERSION);
             }
             other => panic!("expected SegmentFormatVersion, got {other:?}"),

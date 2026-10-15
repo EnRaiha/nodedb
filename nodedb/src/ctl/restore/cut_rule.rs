@@ -252,7 +252,7 @@ mod tests {
         let head: &[u8; nodedb_wal::record::HEADER_SIZE] =
             bytes[..nodedb_wal::record::HEADER_SIZE].try_into().unwrap();
         let mut header = nodedb_wal::record::RecordHeader::from_bytes(head);
-        header.format_version = 1;
+        header.format_version = nodedb_wal::record::WAL_FORMAT_VERSION + 1;
         let payload_end = nodedb_wal::record::HEADER_SIZE + header.payload_len as usize;
         header.crc32c =
             header.compute_checksum(&bytes[nodedb_wal::record::HEADER_SIZE..payload_end]);
@@ -265,7 +265,7 @@ mod tests {
                 ..
             })) => {
                 assert_eq!(path, "seg");
-                assert_eq!(version, 1);
+                assert_eq!(version, nodedb_wal::record::WAL_FORMAT_VERSION + 1);
             }
             other => panic!("expected a format gap, got {other:?}"),
         }

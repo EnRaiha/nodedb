@@ -11,7 +11,7 @@ pub const WAL_MAGIC: u32 = 0x5359_4E57; // "SYNW"
 ///
 /// Every record header carries this version. The header layout is the one
 /// [`HEADER_SIZE`] describes. A record with any other version does not open.
-pub const WAL_FORMAT_VERSION: u16 = 3;
+pub const WAL_FORMAT_VERSION: u16 = 1;
 
 /// Maximum WAL record payload size (64 MiB). Distinct from cluster RPC's limit.
 pub const MAX_WAL_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;

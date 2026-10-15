@@ -388,7 +388,7 @@ mod tests {
         let head: &[u8; HEADER_SIZE] = bytes[third..third + HEADER_SIZE].try_into().unwrap();
         let mut header = RecordHeader::from_bytes(head);
         let payload_end = third + HEADER_SIZE + header.payload_len as usize;
-        header.format_version = 1;
+        header.format_version = crate::record::WAL_FORMAT_VERSION + 1;
         header.crc32c = header.compute_checksum(&bytes[third + HEADER_SIZE..payload_end]);
         bytes[third..third + HEADER_SIZE].copy_from_slice(&header.to_bytes());
         std::fs::write(&path, &bytes).unwrap();

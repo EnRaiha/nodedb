@@ -584,13 +584,17 @@ mod tests {
         }
 
         let mut bytes = std::fs::read(&path).unwrap();
-        crate::record::foreign_version::reseal_with_version(&mut bytes, 0, 1);
+        crate::record::foreign_version::reseal_with_version(
+            &mut bytes,
+            0,
+            crate::record::WAL_FORMAT_VERSION + 1,
+        );
         std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = LazyWalReader::open(&path, None).unwrap();
         match reader.next_header() {
             Err(WalError::UnsupportedVersion { version, supported }) => {
-                assert_eq!(version, 1);
+                assert_eq!(version, crate::record::WAL_FORMAT_VERSION + 1);
                 assert_eq!(supported, crate::record::WAL_FORMAT_VERSION);
             }
             other => panic!("expected UnsupportedVersion, got {other:?}"),
@@ -621,7 +625,8 @@ mod tests {
 
         let mut bytes = std::fs::read(&path).unwrap();
         let version_at = usize::try_from(second_at).unwrap() + 4;
-        bytes[version_at..version_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[version_at..version_at + 2]
+            .copy_from_slice(&(crate::record::WAL_FORMAT_VERSION + 1).to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = LazyWalReader::open(&path, None).unwrap();
