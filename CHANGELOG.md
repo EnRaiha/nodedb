@@ -16,6 +16,7 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Vector index:** search found nothing after the last vector was deleted, and compaction could hide live vectors.
+- **Percentiles:** `approx_percentile` and percentile aggregates over fewer than about 200 values returned a wrong value.
 
 ---
 
