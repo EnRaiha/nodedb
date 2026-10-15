@@ -109,7 +109,7 @@ async fn tokio_to_tpc_via_eventfd() {
     while responses.len() < MESSAGE_COUNT as usize {
         // Send a batch.
         while sent < MESSAGE_COUNT {
-            match async_ctrl.inner.try_send_request(sent + 1) {
+            match async_ctrl.try_send_request(sent + 1) {
                 Ok(()) => sent += 1,
                 Err(nodedb_bridge::BridgeError::Full { .. }) => break,
                 Err(e) => panic!("send error: {e}"),
