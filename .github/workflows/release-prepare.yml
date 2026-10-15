@@ -51,13 +51,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - name: Stamp release source and generate CycloneDX SBOM
+      - name: Generate CycloneDX SBOM
         env:
           VERSION: ${{ needs.validate-version.outputs.version }}
         run: |
           set -euo pipefail
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$GITHUB_SHA")"
-          bash scripts/ci/stamp_version.sh "$VERSION"
           cargo install cargo-cyclonedx --version 0.5.9 --locked
           cargo cyclonedx \
             --manifest-path nodedb/Cargo.toml \
@@ -111,9 +110,6 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake clang libclang-dev pkg-config protobuf-compiler perl \
             libcurl4-openssl-dev libsasl2-dev
-
-      - name: Set version from tag
-        run: bash scripts/ci/stamp_version.sh "${{ needs.validate-version.outputs.version }}"
 
       - name: Build server binary
         run: cargo build -p nodedb --release --target ${{ matrix.target }}
