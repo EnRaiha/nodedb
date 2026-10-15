@@ -11,6 +11,14 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.6.1] - 2026-10-15
+
+### Fixed
+
+- **Vector index:** search found nothing after the last vector was deleted, and compaction could hide live vectors.
+
+---
+
 ## [0.6.0] - 2026-10-15
 
 A correctness release. Statements that returned a plausible wrong answer now return the right one or a typed error, and cluster recovery, restore and Calvin transactions survive crashes and leader moves.
@@ -351,6 +359,7 @@ NodeDB 0.4.0 is a substantial distributed-correctness and durability release. It
 
 ---
 
+[0.6.1]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.6.1
 [0.6.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.6.0
 [0.5.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.4.0
