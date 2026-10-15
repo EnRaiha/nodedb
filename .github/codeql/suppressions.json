@@ -57,6 +57,12 @@
       "path": "nodedb/src/data/executor/strict_format/coerce.rs",
       "sink": "^\\s*panic!\\(\"(\\{input\\}: expected a decimal|expected an instant), got \\{got:\\?\\}\"\\);",
       "reason": "Test-only: panics inside #[cfg(test)] mod tests print a coerced fixture value when a coercion returns the wrong variant. The inputs are hard-coded literals, never user data, and the panic goes to test output, not a log."
+    },
+    {
+      "rule": "rust/cleartext-logging",
+      "path": "nodedb/src/control/server/resp/gateway_dispatch.rs",
+      "sink": "^\\s*(assert!\\(result\\.is_ok\\(\\), \"RESP KV dispatch must succeed: \\{result:\\?\\}\"\\);|\"dispatch must still succeed with metering disabled: \\{result:\\?\\}\")$",
+      "reason": "Test-only: assert messages inside #[cfg(test)] mod tests print a test dispatch result when it fails. The session id is generated for a test session on a one-node test cluster, never a real client's, and the message goes to test output, not a log."
     }
   ]
 }
