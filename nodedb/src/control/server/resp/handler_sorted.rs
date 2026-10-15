@@ -181,7 +181,10 @@ pub(super) async fn handle_zrange(
     }
 
     // Resolved once for this command, before the dispatch whose rows it covers.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let start = cmd.arg_i64(0).unwrap_or(0);
     let stop = cmd.arg_i64(1).unwrap_or(-1);
@@ -271,7 +274,10 @@ pub(super) async fn handle_zscore(
     };
 
     // Resolved once for this command, before the dispatch whose value it covers.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let plan = PhysicalPlan::Kv(KvOp::SortedIndexScore {
         index_name: session.collection.clone(),

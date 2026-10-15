@@ -148,7 +148,7 @@ pub async fn stream_events(
     // resolved once here and moved into the long-lived SSE body.
     let subscriber_tenant = identity.tenant_id();
     let subscriber_roles =
-        RequestAuthScope::for_database(&identity.0, state.shared.auth_stores(), database_id)
+        RequestAuthScope::for_database(&identity.0, state.shared.auth_stores(), database_id)?
             .auth()
             .roles
             .clone();

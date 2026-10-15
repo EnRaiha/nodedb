@@ -11,18 +11,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 
-pub(super) fn generate_key_id() -> String {
-    use argon2::password_hash::rand_core::{OsRng, RngCore};
+pub(super) fn generate_key_id() -> crate::Result<String> {
     let mut bytes = [0u8; 8];
-    OsRng.fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::fill(&mut bytes).map_err(|e| crate::Error::Internal {
+        detail: format!("OS random source failed generating an API key id: {e}"),
+    })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
-pub(super) fn generate_secret() -> String {
-    use argon2::password_hash::rand_core::{OsRng, RngCore};
+pub(super) fn generate_secret() -> crate::Result<String> {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::fill(&mut bytes).map_err(|e| crate::Error::Internal {
+        detail: format!("OS random source failed generating an API key secret: {e}"),
+    })?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// SHA-256 hash of an API key secret for storage.
@@ -117,13 +119,11 @@ mod tests {
 
     #[test]
     fn encode_decode_roundtrip_1000() {
-        use argon2::password_hash::rand_core::{OsRng, RngCore};
-
         for _ in 0..1000 {
             let mut key_bytes = [0u8; 8];
             let mut secret_bytes = [0u8; 32];
-            OsRng.fill_bytes(&mut key_bytes);
-            OsRng.fill_bytes(&mut secret_bytes);
+            getrandom::fill(&mut key_bytes).unwrap();
+            getrandom::fill(&mut secret_bytes).unwrap();
 
             let key_enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes);
             let secret_enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret_bytes);
@@ -155,8 +155,8 @@ mod tests {
             .collect();
 
         for _ in 0..10_000 {
-            let key_id = generate_key_id();
-            let secret = generate_secret();
+            let key_id = generate_key_id().unwrap();
+            let secret = generate_secret().unwrap();
 
             assert_eq!(
                 key_id.len(),

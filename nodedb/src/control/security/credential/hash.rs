@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use argon2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
-};
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, PasswordHash, Version};
 
 use crate::config::auth::Argon2Config;
 
-pub(super) fn generate_scram_salt() -> Vec<u8> {
-    use argon2::password_hash::rand_core::RngCore;
+pub(super) fn generate_scram_salt() -> crate::Result<Vec<u8>> {
     let mut salt = vec![0u8; 16];
-    OsRng.fill_bytes(&mut salt);
-    salt
+    getrandom::fill(&mut salt).map_err(|e| crate::Error::Internal {
+        detail: format!("OS random source failed generating a SCRAM salt: {e}"),
+    })?;
+    Ok(salt)
 }
 
 pub(super) fn compute_scram_salted_password(password: &str, salt: &[u8]) -> Vec<u8> {
@@ -34,10 +33,9 @@ fn build_argon2(cfg: &Argon2Config) -> crate::Result<Argon2<'static>> {
 
 /// Hash `password` using the supplied Argon2 config.
 pub(super) fn hash_password_argon2(password: &str, cfg: &Argon2Config) -> crate::Result<String> {
-    let salt = SaltString::generate(&mut OsRng);
     let argon2 = build_argon2(cfg)?;
     let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| crate::Error::Internal {
             detail: format!("argon2 hashing failed: {e}"),
         })?;
@@ -120,7 +118,7 @@ struct StoredParams {
 /// `$argon2id$v=19$m=65536,t=2,p=1$<salt>$<hash>`
 ///
 /// The `params` iterator yields `(name, decimal_value)` pairs.
-fn extract_params(hash: &PasswordHash<'_>) -> Option<StoredParams> {
+fn extract_params(hash: &PasswordHash) -> Option<StoredParams> {
     let get = |name: &str| -> Option<u32> {
         // `password-hash` exposes Argon2 PHC params (m, t, p) as decimals;
         // `get_decimal` returns `Option<u32>` directly.

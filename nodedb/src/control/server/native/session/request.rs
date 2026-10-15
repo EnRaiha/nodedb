@@ -174,11 +174,15 @@ impl NativeSession {
         // `session_id` (rather than letting the builder generate a fresh
         // one) keeps `$auth.session_id` stable across requests on this
         // connection.
-        let session_id = self
-            .auth_context
-            .as_ref()
-            .map(|ctx| ctx.session_id.clone())
-            .unwrap_or_else(crate::control::security::auth_context::generate_session_id);
+        let session_id = match self.auth_context.as_ref() {
+            Some(ctx) => ctx.session_id.clone(),
+            None => match crate::control::security::auth_context::generate_session_id() {
+                Ok(session_id) => session_id,
+                Err(e) => {
+                    return SqlOutcome::Response(Box::new(dispatch::error_to_native(seq, &e)));
+                }
+            },
+        };
         let current_database = self
             .sessions
             .get_current_database(self.peer_addr)
@@ -190,14 +194,21 @@ impl NativeSession {
         // Authority still comes from `identity` alone; `with_optional_verified_jwt`
         // never lets the token elevate it (see `AuthContext::from_verified_jwt`).
         let peer_addr = self.peer_addr.to_string();
-        let request_scope = crate::control::security::request_scope::RequestAuthScope::builder(
-            identity,
-            self.state.auth_stores(),
-        )
-        .with_session_database(Some(current_database))
-        .with_session_id(session_id)
-        .with_optional_verified_jwt(self.verified_jwt.as_ref())
-        .build_for_client(&peer_addr);
+        let request_scope =
+            match crate::control::security::request_scope::RequestAuthScope::builder(
+                identity,
+                self.state.auth_stores(),
+            )
+            .with_session_database(Some(current_database))
+            .with_session_id(session_id)
+            .with_optional_verified_jwt(self.verified_jwt.as_ref())
+            .build_for_client(&peer_addr)
+            {
+                Ok(request_scope) => request_scope,
+                Err(e) => {
+                    return SqlOutcome::Response(Box::new(dispatch::error_to_native(seq, &e)));
+                }
+            };
 
         // Request-admission gate: internal-service exemption, blacklist,
         // account status, then rate limit — run once per request, before any

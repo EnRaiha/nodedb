@@ -220,7 +220,7 @@ fn transfer_field_is_decimal(
     collection: &str,
     field: &str,
 ) -> Result<bool, DdlError> {
-    let gate = super::read_gate::CollectionReadGate::for_request(state, identity, database_id);
+    let gate = super::read_gate::CollectionReadGate::for_request(state, identity, database_id)?;
     gate.authorize(collection)?;
     gate.authorize_permission(
         collection,

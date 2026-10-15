@@ -17,6 +17,7 @@ use sqlparser::ast;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionCategory, FunctionRegistry};
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
+use crate::planner::sort::{sort_ascending, sort_nulls_first};
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
@@ -133,11 +134,8 @@ fn convert_window_spec(
                 .map(|o| {
                     Ok(SortKey {
                         expr: convert_expr(&o.expr, &ColumnScope::Relations(scope))?,
-                        ascending: o.options.asc.unwrap_or(true),
-                        nulls_first: o
-                            .options
-                            .nulls_first
-                            .unwrap_or(!o.options.asc.unwrap_or(true)),
+                        ascending: sort_ascending(&o.options)?,
+                        nulls_first: sort_nulls_first(&o.options)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;

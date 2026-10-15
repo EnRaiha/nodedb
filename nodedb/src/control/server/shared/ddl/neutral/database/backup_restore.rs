@@ -79,7 +79,8 @@ pub async fn backup_database(
 
     // A spent hard quota of any tenant refuses the backup before it reads a
     // byte, as the tenant COPY backup does.
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), db_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), db_id)
+        .map_err(|e| failed(&e))?;
     let tenants = database::database_tenants(state, db_id).map_err(|e| failed(&e))?;
     for &tenant_id in &tenants {
         admit_backup_restore_quota(state, &scope, tenant_id).map_err(|e| failed(&e))?;
@@ -155,7 +156,8 @@ pub async fn restore_database(
         db_id
             .or(identity.default_database)
             .unwrap_or(DatabaseId::DEFAULT),
-    );
+    )
+    .map_err(|e| failed(&e))?;
     for &tenant_id in backup.tenant_ids() {
         admit_backup_restore_quota(state, &scope, tenant_id).map_err(|e| failed(&e))?;
     }

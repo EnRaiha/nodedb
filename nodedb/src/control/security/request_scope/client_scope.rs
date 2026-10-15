@@ -92,7 +92,7 @@ impl<'a, 'p> ClientRequestScope<'a, 'p> {
         stores: AuthStores<'a>,
         database_id: DatabaseId,
         peer_addr: &'p str,
-    ) -> Self {
+    ) -> crate::Result<Self> {
         RequestAuthScope::builder(identity, stores)
             .with_session_database(Some(database_id))
             .build_for_client(peer_addr)
@@ -163,7 +163,8 @@ mod tests {
             stores,
             DatabaseId::new(4),
             "10.0.0.1:5432",
-        );
+        )
+        .expect("resolve client request scope");
 
         assert_eq!(request.peer_addr(), "10.0.0.1:5432");
         assert!(
@@ -192,6 +193,7 @@ mod tests {
             DatabaseId::new(9),
             "10.0.0.1:5432",
         )
+        .expect("resolve client request scope")
         .into_resolved_scope();
 
         assert_eq!(scope.database_id(), DatabaseId::new(9));

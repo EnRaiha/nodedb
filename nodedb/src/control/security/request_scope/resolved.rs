@@ -95,7 +95,7 @@ impl<'a> RequestAuthScope<'a> {
         identity: &'a AuthenticatedIdentity,
         stores: AuthStores<'a>,
         database_id: DatabaseId,
-    ) -> Self {
+    ) -> crate::Result<Self> {
         Self::builder(identity, stores)
             .with_session_database(Some(database_id))
             .build()

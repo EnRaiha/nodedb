@@ -436,7 +436,7 @@ mod tests {
     fn open_rejects_persisted_regular_user_with_empty_derived_credentials() {
         let dir = tempfile::tempdir().expect("temporary catalog directory");
         let path = dir.path().join("system.redb");
-        let salt = generate_scram_salt();
+        let salt = generate_scram_salt().expect("generate scram salt");
         let password_hash = hash_password_argon2("", &Argon2Config::default())
             .expect("hash empty password for legacy persisted user");
         let stored_hash = password_hash.clone();

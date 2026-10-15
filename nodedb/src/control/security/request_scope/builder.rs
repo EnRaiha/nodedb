@@ -126,8 +126,9 @@ impl<'a> RequestAuthScopeBuilder<'a> {
         self
     }
 
-    /// Resolve the scope. Infallible: database precedence resolution cannot
-    /// fail, and JWT verification already happened upstream of this builder
+    /// Resolve the scope. Fails only when the OS random source fails while
+    /// generating a session id. Database precedence resolution cannot fail,
+    /// and JWT verification already happened upstream of this builder
     /// (see [`Self::with_verified_jwt`]).
     ///
     /// Order of operations:
@@ -151,8 +152,8 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     /// 6. Stamp `auth.risk_score` when risk scoring is enabled, the identity
     ///    is not an internal service, and [`Self::build_for_client`] supplied
     ///    a usable client address. Enforcement of the resulting decision lives
-    ///    at the request-admission gate, not here — `build` stays infallible.
-    pub fn build(self) -> RequestAuthScope<'a> {
+    ///    at the request-admission gate, not here.
+    pub fn build(self) -> crate::Result<RequestAuthScope<'a>> {
         let resolved_db = self
             .session_database
             .or(self.identity.default_database)
@@ -161,7 +162,10 @@ impl<'a> RequestAuthScopeBuilder<'a> {
         let mut auth = match self.adopted_auth_context {
             Some(adopted) => adopted,
             None => {
-                let session_id = self.session_id.unwrap_or_else(generate_session_id);
+                let session_id = match self.session_id {
+                    Some(id) => id,
+                    None => generate_session_id()?,
+                };
                 match self.verified_jwt {
                     Some(claims) => {
                         AuthContext::from_verified_jwt(claims, self.identity, session_id)
@@ -205,7 +209,7 @@ impl<'a> RequestAuthScopeBuilder<'a> {
             auth.risk_score = Some(score);
         }
 
-        RequestAuthScope::new(self.identity, auth, resolved_db)
+        Ok(RequestAuthScope::new(self.identity, auth, resolved_db))
     }
 
     /// Resolve the scope against the transport's real peer address and keep
@@ -231,9 +235,12 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     /// A scope that is never presented to an admission door — row-level
     /// security and redaction resolution inside the SQL execution tree — uses
     /// [`Self::build`] instead.
-    pub fn build_for_client<'p>(mut self, peer_addr: &'p str) -> ClientRequestScope<'a, 'p> {
+    pub fn build_for_client<'p>(
+        mut self,
+        peer_addr: &'p str,
+    ) -> crate::Result<ClientRequestScope<'a, 'p>> {
         self.client_ip = client_ip_from_peer(peer_addr);
-        ClientRequestScope::new(self.build(), peer_addr)
+        Ok(ClientRequestScope::new(self.build()?, peer_addr))
     }
 }
 
@@ -289,7 +296,8 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .with_session_database(Some(DatabaseId::new(99)))
-            .build();
+            .build()
+            .expect("build scope");
 
         assert_eq!(scope.database_id(), DatabaseId::new(99));
     }
@@ -303,7 +311,9 @@ mod tests {
         let scorer = RiskScorer::default();
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert_eq!(scope.database_id(), DatabaseId::new(7));
     }
@@ -316,7 +326,9 @@ mod tests {
         let scorer = RiskScorer::default();
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert_eq!(scope.database_id(), DatabaseId::DEFAULT);
     }
@@ -330,7 +342,9 @@ mod tests {
         let scorer = RiskScorer::default();
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert_eq!(scope.auth().database_id, Some(scope.database_id()));
     }
@@ -345,6 +359,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build()
+            .expect("build scope")
             .rebind_database(DatabaseId::new(55));
 
         assert_eq!(scope.database_id(), DatabaseId::new(55));
@@ -371,7 +386,9 @@ mod tests {
             })
             .unwrap();
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert_eq!(
             scope.auth().metadata.get("scope_status.pro:all"),
@@ -419,7 +436,9 @@ mod tests {
         );
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert_eq!(
             scope.auth().metadata.get("quota_remaining.pro:all"),
@@ -443,7 +462,8 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .with_verified_jwt(&verified)
-            .build();
+            .build()
+            .expect("build scope");
 
         assert!(!scope.auth().is_superuser());
         assert_eq!(scope.auth().roles, vec!["readwrite"]);
@@ -465,7 +485,8 @@ mod tests {
         let scope = RequestAuthScope::builder(&identity, stores)
             .with_session_database(Some(DatabaseId::new(2)))
             .with_adopted_auth_context(pooled)
-            .build();
+            .build()
+            .expect("build scope");
 
         // The adopted identity detail survives...
         assert_eq!(scope.auth().email, Some("pooled@example.com".into()));
@@ -499,7 +520,8 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .with_adopted_auth_context(pooled)
-            .build();
+            .build()
+            .expect("build scope");
 
         assert_eq!(
             scope.auth().metadata.get("scope_status.pro:all"),
@@ -542,6 +564,7 @@ mod tests {
 
         let inside = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
+            .expect("build client scope")
             .into_resolved_scope();
         assert_eq!(
             inside.auth().metadata.get("scope_status.pro:all"),
@@ -550,6 +573,7 @@ mod tests {
 
         let outside = RequestAuthScope::builder(&identity, stores)
             .build_for_client("203.0.113.9:5432")
+            .expect("build client scope")
             .into_resolved_scope();
         assert!(
             !outside.auth().metadata.contains_key("scope_status.pro:all"),
@@ -573,7 +597,9 @@ mod tests {
         );
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert!(!scope.auth().metadata.contains_key("scope_status.pro:all"));
         assert_eq!(
@@ -595,7 +621,9 @@ mod tests {
         conditional_grant(&grants, vec![GrantCondition::RequireMfa]);
         let stores = AuthStores::new(&grants, &quotas, &scorer);
 
-        let scope = RequestAuthScope::builder(&identity, stores).build();
+        let scope = RequestAuthScope::builder(&identity, stores)
+            .build()
+            .expect("build scope");
 
         assert_eq!(
             scope.auth().metadata.get("scope_denied.pro:all"),
@@ -624,6 +652,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
+            .expect("build client scope")
             .into_resolved_scope();
 
         assert_eq!(scope.auth().risk_score, None);
@@ -639,6 +668,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
+            .expect("build client scope")
             .into_resolved_scope();
 
         let score = scope
@@ -668,6 +698,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
+            .expect("build client scope")
             .into_resolved_scope();
 
         let refusal = scorer
@@ -689,6 +720,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("http")
+            .expect("build client scope")
             .into_resolved_scope();
 
         assert_eq!(scope.auth().risk_score, None);
@@ -713,6 +745,7 @@ mod tests {
 
         let scope = RequestAuthScope::builder(&identity, stores)
             .build_for_client("10.0.0.1:5432")
+            .expect("build client scope")
             .into_resolved_scope();
 
         assert_eq!(scope.auth().risk_score, None);

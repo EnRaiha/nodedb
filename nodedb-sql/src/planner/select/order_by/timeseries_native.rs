@@ -17,6 +17,7 @@ use crate::SqlError;
 use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
+use crate::planner::sort::{sort_ascending, sort_nulls_first};
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::TableScope;
 use crate::resolver::expr::convert_expr;
@@ -71,11 +72,8 @@ pub(super) fn native_timeseries_sort_keys(
         .map(|(o, expr)| {
             Ok(SortKey {
                 expr: convert_expr(expr, &ColumnScope::Relations(&sort_scope))?,
-                ascending: o.options.asc.unwrap_or(true),
-                nulls_first: o
-                    .options
-                    .nulls_first
-                    .unwrap_or(!o.options.asc.unwrap_or(true)),
+                ascending: sort_ascending(&o.options)?,
+                nulls_first: sort_nulls_first(&o.options)?,
             })
         })
         .collect()

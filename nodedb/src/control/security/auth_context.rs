@@ -394,7 +394,7 @@ fn extract_string_array(obj: &HashMap<String, serde_json::Value>, key: &str) -> 
 ///
 /// Used as `$auth.session_id` in RLS predicates and as the audit
 /// correlation key — must be unguessable.
-pub fn generate_session_id() -> String {
+pub fn generate_session_id() -> crate::Result<String> {
     super::random::generate_tagged_random_hex("s_")
 }
 
@@ -697,8 +697,8 @@ mod tests {
 
     #[test]
     fn session_id_generation_unique() {
-        let id1 = generate_session_id();
-        let id2 = generate_session_id();
+        let id1 = generate_session_id().unwrap();
+        let id2 = generate_session_id().unwrap();
         assert_ne!(id1, id2);
         assert!(id1.starts_with("s_"));
     }
@@ -708,7 +708,7 @@ mod tests {
     /// tested on the shared helper in `super::random`.
     #[test]
     fn session_id_uses_shared_csprng_helper_with_s_prefix() {
-        let id = generate_session_id();
+        let id = generate_session_id().unwrap();
         assert!(id.starts_with("s_"));
         let rest = id.strip_prefix("s_").unwrap();
         assert_eq!(rest.len(), 32, "expected 128-bit (32 hex char) payload");

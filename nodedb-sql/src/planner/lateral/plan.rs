@@ -12,6 +12,7 @@ use super::subquery::{
 };
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
+use crate::planner::sort::{sort_ascending, sort_nulls_first};
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::{ResolvedTable, TableScope};
 use crate::resolver::expr::convert_expr;
@@ -307,11 +308,8 @@ fn plan_lateral_top_k(args: LateralTopKPlanArgs<'_>) -> Result<SqlPlan> {
                 .map(|o| {
                     Ok(SortKey {
                         expr: convert_expr(&o.expr, &ColumnScope::Relations(&inner_scope))?,
-                        ascending: o.options.asc.unwrap_or(true),
-                        nulls_first: o
-                            .options
-                            .nulls_first
-                            .unwrap_or(!o.options.asc.unwrap_or(true)),
+                        ascending: sort_ascending(&o.options)?,
+                        nulls_first: sort_nulls_first(&o.options)?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,

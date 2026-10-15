@@ -63,7 +63,7 @@ pub async fn tree_sum(
     // hold a grant for and the first denial ends the statement. Narrowing the
     // sum to the subset a caller happens to be allowed will silently return a
     // smaller total reported as the whole one.
-    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    let gate = CollectionReadGate::for_request(state, identity, database_id)?;
     let collections_to_search: Vec<String> = if let Some(ref coll) = explicit_collection {
         vec![coll.clone()]
     } else {

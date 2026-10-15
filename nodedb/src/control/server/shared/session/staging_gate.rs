@@ -343,9 +343,13 @@ where
     // metering charge after dispatch, instead of looking up the identity and
     // rebuilding the scope twice for the same statement.
     let identity = sessions.identity(session_id);
-    let scope = identity.as_ref().map(|identity| {
-        RequestAuthScope::for_database(identity, state.auth_stores(), task.database_id)
-    });
+    let scope = identity
+        .as_ref()
+        .map(|identity| {
+            RequestAuthScope::for_database(identity, state.auth_stores(), task.database_id)
+        })
+        .transpose()
+        .map_err(StagingGateError::Dispatch)?;
 
     // A spent hard quota refuses the staged write before it touches the
     // overlay. This mirrors the charge at the bottom of this function, which

@@ -188,8 +188,8 @@ pub async fn resolve_auth(
 
     let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr, transport).await?;
     let auth_ctx = match &verified_jwt {
-        Some(claims) => AuthContext::from_verified_jwt(claims, &identity, generate_session_id()),
-        None => session_auth::build_auth_context(&identity),
+        Some(claims) => AuthContext::from_verified_jwt(claims, &identity, generate_session_id()?),
+        None => session_auth::build_auth_context(&identity)?,
     };
     let auth_ctx = apply_on_deny_header(headers, auth_ctx);
     Ok((identity, auth_ctx))
@@ -281,7 +281,7 @@ pub(crate) fn build_request_scope<'a, 'p>(
     state: &'a AppState,
     database_id: crate::types::DatabaseId,
     peer_addr: &'p str,
-) -> crate::control::security::request_scope::ClientRequestScope<'a, 'p> {
+) -> crate::Result<crate::control::security::request_scope::ClientRequestScope<'a, 'p>> {
     crate::control::security::request_scope::RequestAuthScope::builder(
         identity,
         state.shared.auth_stores(),

@@ -56,7 +56,7 @@ pub async fn exchange_key(
         rate_limit_qps,
         rate_limit_burst,
         expires_days,
-    );
+    )?;
 
     let expires_in = if expires_days > 0 {
         expires_days * 86_400

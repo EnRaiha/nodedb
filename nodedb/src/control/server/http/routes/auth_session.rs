@@ -60,7 +60,7 @@ pub async fn create_session(
     )?;
 
     let fingerprint = ClientFingerprint::from_peer(identity.tenant_id, &peer);
-    let handle = state.shared.session_handles.create(auth_ctx, fingerprint);
+    let handle = state.shared.session_handles.create(auth_ctx, fingerprint)?;
 
     Ok((
         rate_limit_headers,

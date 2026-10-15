@@ -160,7 +160,8 @@ async fn native_request_scope_carries_verified_oidc_claim_enrichment() {
 
     let scope = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_verified_jwt(&claims)
-        .build();
+        .build()
+        .expect("build request scope");
     let auth = scope.auth();
 
     assert_eq!(auth.email.as_deref(), Some("alice@example.test"));
@@ -196,7 +197,8 @@ async fn native_request_scope_does_not_forge_superuser_from_verified_oidc_claims
 
     let scope = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_verified_jwt(&claims)
-        .build();
+        .build()
+        .expect("build request scope");
 
     assert!(
         !scope.auth().is_superuser(),
@@ -224,11 +226,13 @@ async fn native_request_scope_session_id_stable_across_requests_with_verified_jw
     let first = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_session_id(session_id.clone())
         .with_verified_jwt(&claims)
-        .build();
+        .build()
+        .expect("build request scope");
     let second = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_session_id(session_id.clone())
         .with_verified_jwt(&claims)
-        .build();
+        .build()
+        .expect("build request scope");
 
     assert_eq!(first.auth().session_id, session_id);
     assert_eq!(second.auth().session_id, session_id);

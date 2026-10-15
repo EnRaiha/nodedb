@@ -51,9 +51,10 @@ pub(super) async fn dispatch_kv(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
-    if let Some(info) = &plan_metering_info {
-        admit_resp_quota(state, session, database_id, info)?;
-    }
+    let metering_scope = match &plan_metering_info {
+        Some(info) => admit_resp_quota(state, session, database_id, info)?,
+        None => None,
+    };
     let checked =
         intercept_and_authorize_resp_task(state, session, plan, vshard, database_id, "kv_get")
             .await?;
@@ -63,9 +64,9 @@ pub(super) async fn dispatch_kv(
     };
     let result = execute_through_gateway(state, session, checked).await;
     if result.is_ok()
-        && let Some(info) = &plan_metering_info
+        && let (Some(info), Some(scope)) = (&plan_metering_info, &metering_scope)
     {
-        meter_resp_dispatch(state, session, database_id, info);
+        meter_resp_dispatch(state, scope, info);
     }
     result
 }
@@ -90,9 +91,10 @@ pub(super) async fn dispatch_kv_write(
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
-    if let Some(info) = &plan_metering_info {
-        admit_resp_quota(state, session, database_id, info)?;
-    }
+    let metering_scope = match &plan_metering_info {
+        Some(info) => admit_resp_quota(state, session, database_id, info)?,
+        None => None,
+    };
     // Clone CoW write-path interception, then authorization, run once per
     // task before dispatch — same protocol-neutral gate pgwire and native run.
     let checked =
@@ -104,9 +106,9 @@ pub(super) async fn dispatch_kv_write(
     };
     let result = execute_through_gateway(state, session, checked).await;
     if result.is_ok()
-        && let Some(info) = &plan_metering_info
+        && let (Some(info), Some(scope)) = (&plan_metering_info, &metering_scope)
     {
-        meter_resp_dispatch(state, session, database_id, info);
+        meter_resp_dispatch(state, scope, info);
     }
     result
 }
@@ -141,36 +143,35 @@ async fn execute_through_gateway(
 /// The sibling of [`meter_resp_dispatch`], run before dispatch rather than
 /// after it: charging happens on the success path by design and so can never
 /// be where a cap blocks anything.
-fn admit_resp_quota(
-    state: &SharedState,
-    session: &RespSession,
+///
+/// Returns the scope it admitted against, so the metering charge after
+/// dispatch reuses it and a scope error refuses the command before any work
+/// happens. Returns `None` for a session with no identity.
+fn admit_resp_quota<'a>(
+    state: &'a SharedState,
+    session: &'a RespSession,
     database_id: DatabaseId,
     info: &PlanMeteringInfo,
-) -> crate::Result<()> {
+) -> crate::Result<Option<ClientRequestScope<'a, 'a>>> {
     let Some(identity) = session.identity.as_ref() else {
-        return Ok(());
+        return Ok(None);
     };
     let scope = resp_auth_scope(
         identity,
         state.auth_stores(),
         database_id,
         &session.peer_addr,
-    );
-    admit_quota_for_dispatch(state, scope.scope(), info)
+    )?;
+    admit_quota_for_dispatch(state, scope.scope(), info)?;
+    Ok(Some(scope))
 }
 
 /// Meter one completed RESP KV dispatch, once dispatch above has already
 /// returned success.
 ///
-/// Recomputes the [`RequestAuthScope`] from `session.identity` rather than
-/// threading it out of `authorize_resp_task` — that keeps this a pure
-/// after-the-fact accounting step with no new state flowing through the
-/// dispatch path, and it is the same derivation `resp_auth_scope` already
-/// gives every caller in this file, so it cannot disagree with the scope
-/// `authorize_resp_task` used to authorize the request. `session.identity`
-/// is guaranteed `Some` here: `authorize_resp_task` already returned `Ok`
-/// on this call path, and it fails closed on a missing identity before this
-/// point is ever reached.
+/// Charges against the scope [`admit_resp_quota`] resolved before dispatch,
+/// which is the same `resp_auth_scope` derivation `authorize_resp_task` uses,
+/// so it cannot disagree with the scope that authorized the request.
 ///
 /// RESP ops are single-key, so the row count is known structurally without
 /// decoding the dispatch payload: `Some(1)` for both a hit and a miss — a
@@ -179,19 +180,9 @@ fn admit_resp_quota(
 /// relying on the `rows: None` fallback to do it implicitly.
 fn meter_resp_dispatch(
     state: &SharedState,
-    session: &RespSession,
-    database_id: DatabaseId,
+    scope: &ClientRequestScope<'_, '_>,
     info: &PlanMeteringInfo,
 ) {
-    let Some(identity) = session.identity.as_ref() else {
-        return;
-    };
-    let scope = resp_auth_scope(
-        identity,
-        state.auth_stores(),
-        database_id,
-        &session.peer_addr,
-    );
     meter_dispatch(state, scope.scope(), info, Some(1));
 }
 
@@ -216,7 +207,7 @@ fn authorize_resp_task(
         state.auth_stores(),
         database_id,
         &session.peer_addr,
-    );
+    )?;
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before RLS injection and task authorization,
@@ -319,7 +310,7 @@ fn resp_auth_scope<'a, 'p>(
     stores: crate::control::security::request_scope::AuthStores<'a>,
     database_id: DatabaseId,
     peer_addr: &'p str,
-) -> ClientRequestScope<'a, 'p> {
+) -> crate::Result<ClientRequestScope<'a, 'p>> {
     ClientRequestScope::for_database(identity, stores, database_id, peer_addr)
 }
 
@@ -368,7 +359,8 @@ mod tests {
             AuthStores::new(&grants, &quotas, &scorer),
             DatabaseId::DEFAULT,
             "127.0.0.1:6379",
-        );
+        )
+        .expect("resolve RESP scope");
 
         assert_eq!(scope.scope().database_id(), DatabaseId::DEFAULT);
         assert_eq!(scope.scope().auth().database_id, Some(DatabaseId::DEFAULT));

@@ -12,8 +12,6 @@
 //! Timestamp + counter schemes are forbidden here: they leak server state
 //! and enable enumeration.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-
 /// Size in bytes of the random payload (128 bits).
 const RANDOM_BYTES: usize = 16;
 
@@ -23,11 +21,15 @@ const RANDOM_BYTES: usize = 16;
 /// verbatim — include any trailing underscore the caller wants.
 ///
 /// Example: `generate_tagged_random_hex("nds_")` →
-/// `"nds_3f2a81c9e4d5b6a70f8e1d2c3b4a5968"`.
-pub fn generate_tagged_random_hex(prefix: &str) -> String {
+/// `Ok("nds_3f2a81c9e4d5b6a70f8e1d2c3b4a5968")`.
+///
+/// Returns an error when the OS random source fails.
+pub fn generate_tagged_random_hex(prefix: &str) -> crate::Result<String> {
     let mut bytes = [0u8; RANDOM_BYTES];
-    OsRng.fill_bytes(&mut bytes);
-    format!("{prefix}{}", hex::encode(bytes))
+    getrandom::fill(&mut bytes).map_err(|e| crate::Error::Internal {
+        detail: format!("OS random source failed generating a tagged identifier: {e}"),
+    })?;
+    Ok(format!("{prefix}{}", hex::encode(bytes)))
 }
 
 #[cfg(test)]
@@ -45,7 +47,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let id = generate_tagged_random_hex("tag_");
+        let id = generate_tagged_random_hex("tag_").expect("random id");
         for ts in (ts_now.saturating_sub(2))..=(ts_now + 2) {
             let hex = format!("{ts:x}");
             assert!(
@@ -64,7 +66,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let id = generate_tagged_random_hex("tag_");
+        let id = generate_tagged_random_hex("tag_").expect("random id");
         for ts in (ts_ms.saturating_sub(50))..=(ts_ms + 50) {
             let hex = format!("{ts:x}");
             assert!(
@@ -78,8 +80,8 @@ mod tests {
     /// Two consecutive calls must differ in nearly every byte.
     #[test]
     fn consecutive_ids_are_not_enumerable() {
-        let a = generate_tagged_random_hex("tag_");
-        let b = generate_tagged_random_hex("tag_");
+        let a = generate_tagged_random_hex("tag_").expect("random id");
+        let b = generate_tagged_random_hex("tag_").expect("random id");
         assert_ne!(a, b);
         assert_eq!(a.len(), b.len(), "identifier length should be stable");
 
@@ -96,7 +98,7 @@ mod tests {
     #[test]
     fn has_at_least_128_bits_of_entropy() {
         let prefix = "tag_";
-        let id = generate_tagged_random_hex(prefix);
+        let id = generate_tagged_random_hex(prefix).expect("random id");
         let rest = id.strip_prefix(prefix).expect("prefix preserved");
         let random_chars = rest.chars().filter(|c| *c != '_').count();
         assert!(
@@ -113,7 +115,7 @@ mod tests {
     fn batch_ids_have_no_shared_deterministic_prefix() {
         let prefix = "tag_";
         let ids: Vec<String> = (0..64)
-            .map(|_| generate_tagged_random_hex(prefix))
+            .map(|_| generate_tagged_random_hex(prefix).expect("random id"))
             .collect();
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "duplicate identifiers issued");
@@ -141,11 +143,11 @@ mod tests {
 
     #[test]
     fn preserves_caller_prefix() {
-        let id = generate_tagged_random_hex("nds_");
+        let id = generate_tagged_random_hex("nds_").expect("random id");
         assert!(id.starts_with("nds_"));
-        let id = generate_tagged_random_hex("s_");
+        let id = generate_tagged_random_hex("s_").expect("random id");
         assert!(id.starts_with("s_"));
-        let id = generate_tagged_random_hex("");
+        let id = generate_tagged_random_hex("").expect("random id");
         assert_eq!(id.chars().filter(|c| *c != '_').count(), 32);
     }
 }

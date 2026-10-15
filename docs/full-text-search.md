@@ -16,7 +16,7 @@ NodeDB's full-text search engine provides Block-Max WAND (BMW) optimized BM25 ra
 - **BM25 ranking** — Standard relevance scoring with term frequency, inverse document frequency, and SmallFloat fieldnorm-aware length normalization (4x space reduction).
 - **16 Snowball stemmers** — Arabic, Danish, Dutch, English, Finnish, French, German, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Turkish.
 - **27-language stop words** — Per-language sorted stop word lists (always compiled in, ~50KB total). Covers: English, German, French, Spanish, Italian, Portuguese, Dutch, Swedish, Norwegian, Danish, Finnish, Romanian, Russian, Turkish, Hungarian, Czech, Polish, Greek, Arabic, Hebrew, Hindi, Chinese, Japanese, Korean, Thai, Vietnamese, Indonesian.
-- **CJK tokenization** — Overlapping character bigrams for Chinese/Japanese/Korean (always available, zero dictionary dependency). Optional feature-gated dictionary segmentation: `lang-ja` (lindera/IPADIC), `lang-zh` (jieba-rs), `lang-ko` (lindera/ko-dic), `lang-th` (icu_segmenter).
+- **CJK tokenization** — Overlapping character bigrams for Chinese, Japanese and Korean, with no dictionary needed. Japanese and Korean use lindera dictionary segmentation when a built dictionary directory is configured. Thai uses ICU word segmentation.
 - **Korean Hangul decomposition** — Decomposes Hangul syllables into Jamo components for morphological matching.
 - **AND-first with OR fallback** — Tries AND semantics first; if zero results, falls back to OR with a coverage penalty (`matched_terms / total_terms`).
 - **Phrase proximity boost** — Consecutive query tokens at consecutive positions get up to 3x score boost.
@@ -116,14 +116,14 @@ Set via `ALTER COLLECTION ... SET text_analyzer = '<name>'`:
 | ----------------------------------------------------------- | ---------------------------------------- |
 | Czech, Greek, Hebrew, Hindi, Indonesian, Polish, Vietnamese | `cs`, `el`, `he`, `hi`, `id`, `pl`, `vi` |
 
-| CJK Languages (bigram default, dictionary segmentation feature-gated) | Codes | Feature gate               |
-| --------------------------------------------------------------------- | ----- | -------------------------- |
-| Chinese                                                               | `zh`  | `lang-zh` (jieba-rs)       |
-| Japanese                                                              | `ja`  | `lang-ja` (lindera/IPADIC) |
-| Korean                                                                | `ko`  | `lang-ko` (lindera/ko-dic) |
-| Thai                                                                  | `th`  | `lang-th` (icu_segmenter)  |
+| CJK and Thai languages | Codes | Segmentation                                                       |
+| ---------------------- | ----- | ------------------------------------------------------------------ |
+| Chinese                | `zh`  | Character bigrams                                                  |
+| Japanese               | `ja`  | lindera with IPADIC from `NODEDB_FTS_IPADIC_DIR`, else bigrams     |
+| Korean                 | `ko`  | lindera with ko-dic from `NODEDB_FTS_KO_DIC_DIR`, else bigrams     |
+| Thai                   | `th`  | ICU word segmentation                                              |
 
-Without the feature gate, CJK/Thai text falls back to character bigrams (high recall, zero dictionary dependency).
+`NODEDB_FTS_IPADIC_DIR` and `NODEDB_FTS_KO_DIC_DIR` name a built lindera dictionary directory. A missing or unreadable dictionary falls back to character bigrams.
 
 ## Internals
 

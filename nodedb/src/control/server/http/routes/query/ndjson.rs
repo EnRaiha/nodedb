@@ -88,14 +88,17 @@ pub async fn query_ndjson(
 
     // Passing database as the session database makes `scope.database_id()` resolve to it.
     // NDJSON does not extract a per-query `ON DENY` clause (unlike `/v1/query`).
-    let request = build_request_scope(
+    let request = match build_request_scope(
         &identity,
         verified_jwt.as_ref(),
         &headers,
         &state,
         database_id,
         peer.as_str(),
-    );
+    ) {
+        Ok(request) => request,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
 
     // Admission gate (exemption, blacklist, account status, rate limit) runs
     // before planning/dispatch, so load sheds before it's spent.

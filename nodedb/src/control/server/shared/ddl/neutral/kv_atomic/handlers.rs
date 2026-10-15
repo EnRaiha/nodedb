@@ -190,7 +190,7 @@ fn counter_shape(
     kind: KvCounterKind,
 ) -> Result<KvCounterShape, DdlError> {
     let gate =
-        super::super::read_gate::CollectionReadGate::for_request(state, identity, database_id);
+        super::super::read_gate::CollectionReadGate::for_request(state, identity, database_id)?;
     gate.authorize(collection)?;
     gate.authorize_permission(
         collection,

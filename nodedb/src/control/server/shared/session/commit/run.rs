@@ -21,7 +21,7 @@ use super::super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 use super::super::overlay_drop::drop_txn_overlay;
 use super::super::reservation_release;
 use super::super::store::SessionStore;
-use super::metering::meter_committed_buffered_writes;
+use super::metering::{meter_committed_buffered_writes, resolve_buffered_write_scopes};
 use super::read_split::SplitReads;
 use super::read_validation::stale_read_abort;
 use super::restart_identity::restart_truncated_identities;
@@ -122,6 +122,19 @@ pub async fn run_commit(
     let split_reads = SplitReads::of(state, &read_set);
     let read_vshards = match read_vshards_of(split_reads.enlisted()) {
         Ok(vshards) => vshards,
+        Err(error) => {
+            reservation_release::release_and_rollback(state, sessions, session_id).await;
+            return CommitOutcome::Aborted {
+                reason: AbortReason::Dispatch(error),
+            };
+        }
+    };
+
+    // The metering scopes for the non-stageable writes are resolved before
+    // anything durable is written: a scope error aborts the COMMIT here,
+    // where nothing needs undoing.
+    let metering_scopes = match resolve_buffered_write_scopes(state, identity, &buffered) {
+        Ok(scopes) => scopes,
         Err(error) => {
             reservation_release::release_and_rollback(state, sessions, session_id).await;
             return CommitOutcome::Aborted {
@@ -328,7 +341,7 @@ pub async fn run_commit(
     // durable replay same as a non-stageable write. `buffered` still holds
     // the peeked (not yet drained) task list, so this reads the same tasks
     // `dispatch_single_shard` / `run_commit_calvin` replayed above.
-    meter_committed_buffered_writes(state, identity, &buffered);
+    meter_committed_buffered_writes(state, &buffered, &metering_scopes);
 
     // A staged `TRUNCATE ... RESTART IDENTITY` resets its sequences only
     // here, once the truncate is durable; a ROLLBACK never reaches this.

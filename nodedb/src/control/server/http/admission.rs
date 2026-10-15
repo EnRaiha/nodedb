@@ -41,7 +41,7 @@ fn admission_scope<'a, 'p>(
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
     peer_addr: &'p str,
-) -> ClientRequestScope<'a, 'p> {
+) -> crate::Result<ClientRequestScope<'a, 'p>> {
     ClientRequestScope::for_database(identity, state.shared.auth_stores(), database_id, peer_addr)
 }
 
@@ -57,7 +57,7 @@ pub(crate) fn admit(
     peer_addr: &str,
     operation: &str,
 ) -> Result<HeaderMap, ApiError> {
-    let request = admission_scope(state, identity, database_id, peer_addr);
+    let request = admission_scope(state, identity, database_id, peer_addr)?;
     let result = session_auth::check_request_admission(&state.shared, &request, operation)?;
     Ok(rate_limit_headers(&result))
 }
@@ -73,7 +73,7 @@ pub(crate) fn admit_without_rate_limit(
     database_id: DatabaseId,
     peer_addr: &str,
 ) -> Result<(), ApiError> {
-    let request = admission_scope(state, identity, database_id, peer_addr);
+    let request = admission_scope(state, identity, database_id, peer_addr)?;
     session_auth::check_blacklist_and_status(&state.shared, &request)?;
     Ok(())
 }

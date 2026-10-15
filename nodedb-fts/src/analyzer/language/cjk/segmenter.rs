@@ -6,6 +6,18 @@
 //! Thai (icu_segmenter), and CJK bigrams for Chinese (permanent fallback —
 //! the previous jieba-rs dictionary chain depended on yanked crates).
 //! All paths are compiled in unconditionally; selection is at runtime.
+//!
+//! lindera reads a built dictionary directory. `NODEDB_FTS_IPADIC_DIR` names
+//! the Japanese one and `NODEDB_FTS_KO_DIC_DIR` the Korean one. Without it, a
+//! language falls back to CJK bigrams.
+
+use std::borrow::Cow;
+use std::sync::OnceLock;
+
+use icu_segmenter::WordSegmenter;
+use icu_segmenter::options::WordBreakInvariantOptions;
+use lindera::mode::Mode;
+use lindera::segmenter::Segmenter;
 
 use super::bigram::tokenize_cjk;
 
@@ -22,9 +34,9 @@ pub fn segment(text: &str, lang: &str) -> Vec<String> {
     }
 }
 
-/// Japanese segmentation: lindera/IPADIC with bigram fallback on tokenizer error.
+/// Japanese segmentation: lindera with IPADIC, or bigrams without it.
 fn segment_japanese(text: &str) -> Vec<String> {
-    lindera_segment(text, "ipadic")
+    lindera_segment(text, &IPADIC)
 }
 
 /// Chinese segmentation: CJK bigrams (dictionary segmentation temporarily disabled).
@@ -32,9 +44,9 @@ fn segment_chinese(text: &str) -> Vec<String> {
     tokenize_cjk(text)
 }
 
-/// Korean segmentation: lindera/ko-dic with bigram fallback on tokenizer error.
+/// Korean segmentation: lindera with ko-dic, or bigrams without it.
 fn segment_korean(text: &str) -> Vec<String> {
-    lindera_segment(text, "ko-dic")
+    lindera_segment(text, &KO_DIC)
 }
 
 /// Thai segmentation: icu_segmenter.
@@ -44,12 +56,44 @@ fn segment_thai(text: &str) -> Vec<String> {
 
 // ── Implementations ──────────────────────────────────────────────────────────
 
-fn lindera_segment(text: &str, _dict: &str) -> Vec<String> {
-    use lindera::tokenizer::TokenizerBuilder;
-    let Ok(tokenizer) = TokenizerBuilder::new().and_then(|b| b.build()) else {
+/// A lindera dictionary, loaded once from the directory its env var names.
+struct LinderaDictionary {
+    env_var: &'static str,
+    segmenter: OnceLock<Option<Segmenter>>,
+}
+
+impl LinderaDictionary {
+    const fn new(env_var: &'static str) -> Self {
+        Self {
+            env_var,
+            segmenter: OnceLock::new(),
+        }
+    }
+
+    /// The segmenter over this dictionary, or `None` when the env var is unset
+    /// or the dictionary does not load.
+    fn segmenter(&self) -> Option<&Segmenter> {
+        self.segmenter
+            .get_or_init(|| {
+                let path = std::env::var(self.env_var).ok()?;
+                let dictionary = lindera::dictionary::load_dictionary(&path).ok()?;
+                Some(Segmenter::new(Mode::Normal, dictionary, None))
+            })
+            .as_ref()
+    }
+}
+
+/// Built IPADIC dictionary directory for Japanese.
+static IPADIC: LinderaDictionary = LinderaDictionary::new("NODEDB_FTS_IPADIC_DIR");
+
+/// Built ko-dic dictionary directory for Korean.
+static KO_DIC: LinderaDictionary = LinderaDictionary::new("NODEDB_FTS_KO_DIC_DIR");
+
+fn lindera_segment(text: &str, dictionary: &LinderaDictionary) -> Vec<String> {
+    let Some(segmenter) = dictionary.segmenter() else {
         return tokenize_cjk(text);
     };
-    let Ok(tokens) = tokenizer.tokenize(text) else {
+    let Ok(tokens) = segmenter.segment(Cow::Borrowed(text)) else {
         return tokenize_cjk(text);
     };
     tokens
@@ -60,8 +104,7 @@ fn lindera_segment(text: &str, _dict: &str) -> Vec<String> {
 }
 
 fn icu_segment_thai(text: &str) -> Vec<String> {
-    use icu_segmenter::WordSegmenter;
-    let segmenter = WordSegmenter::new_auto();
+    let segmenter = WordSegmenter::new_auto(WordBreakInvariantOptions::default());
     let breakpoints: Vec<usize> = segmenter.segment_str(text).collect();
     let mut words = Vec::new();
     for window in breakpoints.windows(2) {

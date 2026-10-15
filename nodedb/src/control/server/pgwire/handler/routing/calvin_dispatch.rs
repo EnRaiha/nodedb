@@ -37,18 +37,33 @@ use super::super::core::NodeDbPgHandler;
 /// for `None`, correct for the write that committed.
 fn meter_calvin_task(
     state: &crate::control::state::SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
+    scope: Option<&RequestAuthScope<'_>>,
     task: &PhysicalTask,
 ) {
-    if !state.metering_config.enabled {
-        return;
+    if let Some(scope) = scope {
+        let info = PlanMeteringInfo::extract(&task.plan);
+        meter_dispatch(state, scope, &info, None);
     }
-    let info = PlanMeteringInfo::extract(&task.plan);
-    let scope = RequestAuthScope::builder(identity, state.auth_stores())
+}
+
+/// Resolve the scope the batch's tasks are metered against.
+///
+/// Resolved before the batch is submitted, so a scope error refuses the
+/// statement instead of surfacing after the batch has committed. `None` when
+/// metering is disabled.
+fn resolve_calvin_metering_scope<'a>(
+    state: &'a crate::control::state::SharedState,
+    identity: &'a AuthenticatedIdentity,
+    database_id: DatabaseId,
+) -> PgWireResult<Option<RequestAuthScope<'a>>> {
+    if !state.metering_config.enabled {
+        return Ok(None);
+    }
+    RequestAuthScope::builder(identity, state.auth_stores())
         .with_session_database(Some(database_id))
-        .build();
-    meter_dispatch(state, &scope, &info, None);
+        .build()
+        .map(Some)
+        .map_err(|e| error_to_pg(&e))
 }
 
 /// Who issued the statement and how its rows must be encoded back.
@@ -134,6 +149,7 @@ impl NodeDbPgHandler {
             } else {
                 TxnDispatchPosition::Autocommit
             };
+            let metering_scope = resolve_calvin_metering_scope(&self.state, identity, database_id)?;
             let authorized = self.authorize_tasks(identity, &tasks)?;
             let apply_resp = dispatch_authorized_tasks_to_calvin(
                 &self.state,
@@ -158,7 +174,7 @@ impl NodeDbPgHandler {
                 &tasks,
                 apply_resp.as_ref(),
                 CalvinBatchShaping {
-                    identity,
+                    metering_scope,
                     result_formats,
                     auth,
                     projection,
@@ -193,6 +209,7 @@ impl NodeDbPgHandler {
         // write (if any). `tasks` is cloned into the recon call so the original
         // list survives to shape the per-task responses afterwards: a RETURNING
         // task emits its rows, every other task its command tag.
+        let metering_scope = resolve_calvin_metering_scope(&self.state, identity, database_id)?;
         let authorized = self.authorize_tasks(identity, &tasks)?;
         let outcome = dispatch_authorized_dependent_edge_recon(
             &self.state,
@@ -215,7 +232,7 @@ impl NodeDbPgHandler {
             &tasks,
             outcome.apply_result.as_ref(),
             CalvinBatchShaping {
-                identity,
+                metering_scope,
                 result_formats,
                 auth,
                 projection,
@@ -236,7 +253,7 @@ impl NodeDbPgHandler {
         shaping: CalvinBatchShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
         let CalvinBatchShaping {
-            identity,
+            metering_scope,
             result_formats,
             auth,
             projection,
@@ -261,7 +278,7 @@ impl NodeDbPgHandler {
             CalvinFoldError::Shape(e) => error_to_pg(&e),
         })?;
         for task in tasks {
-            meter_calvin_task(&self.state, identity, database_id, task);
+            meter_calvin_task(&self.state, metering_scope.as_ref(), task);
         }
         let mut responses: Vec<Response> = Vec::with_capacity(2);
         if let Some(shaped) = fold.rows {
@@ -276,7 +293,9 @@ impl NodeDbPgHandler {
 
 /// How a completed Calvin batch is shaped back to the client.
 struct CalvinBatchShaping<'a> {
-    identity: &'a AuthenticatedIdentity,
+    /// The scope the batch's tasks are metered against, resolved before the
+    /// batch was submitted. `None` when metering is disabled.
+    metering_scope: Option<RequestAuthScope<'a>>,
     result_formats: &'a pgwire::api::portal::Format,
     auth: &'a crate::control::security::auth_context::AuthContext,
     projection: Option<&'a crate::control::server::response_shape::schema::OutputSchema>,

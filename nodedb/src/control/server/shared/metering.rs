@@ -403,6 +403,7 @@ mod tests {
         state: &'a SharedState,
     ) -> RequestAuthScope<'a> {
         RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT)
+            .expect("resolve request scope")
     }
 
     #[test]

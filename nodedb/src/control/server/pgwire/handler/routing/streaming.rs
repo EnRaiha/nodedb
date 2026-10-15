@@ -226,7 +226,8 @@ impl NodeDbPgHandler {
                 state.auth_stores(),
             )
             .with_session_database(Some(task.database_id))
-            .build();
+            .build()
+            .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
             let info =
                 crate::control::server::shared::metering::PlanMeteringInfo::extract(&task.plan);
             crate::control::server::shared::metering::DetachedMeterGuard::new(&state, &scope, &info)

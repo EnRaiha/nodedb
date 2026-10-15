@@ -30,9 +30,9 @@ use crate::types::{HomedRecord, RecordHomes};
 ///
 /// `what` names the table for the error message; a purge that fails partway
 /// should say which table it was draining.
-fn drain_range<'a, K, V>(
+fn drain_range<K, V>(
     table: &mut redb::Table<'_, K, V>,
-    range: impl KeyRange<'a, K>,
+    range: impl KeyRange<K>,
     what: &'static str,
 ) -> crate::Result<usize>
 where

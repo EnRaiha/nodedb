@@ -86,7 +86,7 @@ impl KvPushDispatcher for SharedStateKvDispatcher<'_> {
             self.shared.auth_stores(),
             database_id,
             self.peer_addr,
-        );
+        )?;
         crate::control::server::session_auth::check_blacklist_and_status(self.shared, &request)?;
         self.shared.check_tenant_quota(tenant_id)?;
 

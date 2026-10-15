@@ -182,7 +182,8 @@ impl NodeDbQueryParser {
             identity,
             self.state.auth_stores(),
             database_id,
-        );
+        )
+        .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
         // Parse plans against the same authorization state as every other
         // planning path. A refusal is an error, not "not plannable".
         crate::control::security::auth_fence::admit_permission_view(

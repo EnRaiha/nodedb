@@ -56,7 +56,7 @@ pub async fn tree_children(
     // The RLS half asks the same tenant-wide question: the reply is node ids,
     // which carry no row filter, so a read policy anywhere on this identity
     // cannot be honored through this shape.
-    let gate = RefusingReadGate::for_request(state, identity, database_id);
+    let gate = RefusingReadGate::for_request(state, identity, database_id)?;
     gate.authorize_every_collection()?;
     gate.refuse_if_any_read_policy(CHILDREN_WHAT)?;
 

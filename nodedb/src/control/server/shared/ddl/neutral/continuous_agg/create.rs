@@ -199,7 +199,7 @@ fn authorize_source(
     database_id: DatabaseId,
     source: &str,
 ) -> Result<(), DdlError> {
-    CollectionReadGate::for_request(state, identity, database_id).authorize(source)?;
+    CollectionReadGate::for_request(state, identity, database_id)?.authorize(source)?;
     let qualified = nodedb_types::QualifiedCollection::new(database_id, source);
     if state
         .rls

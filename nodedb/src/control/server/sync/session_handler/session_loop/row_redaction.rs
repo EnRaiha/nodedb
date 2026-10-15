@@ -34,18 +34,25 @@ pub(super) struct RowPushRedaction {
 impl RowPushRedaction {
     /// Resolve the subscriber's roles for this session.
     ///
-    /// Returns `None` when the session has no established identity: there is
-    /// then no principal to evaluate a policy against, and the caller must
-    /// deliver nothing rather than deliver unredacted.
-    pub(super) fn for_session(shared: &SharedState, session: &SyncSession) -> Option<Self> {
-        let identity = session.identity.as_ref()?;
+    /// Returns `Ok(None)` when the session has no established identity: there
+    /// is then no principal to evaluate a policy against, and the caller must
+    /// deliver nothing rather than deliver unredacted. An error means the
+    /// subscriber's request scope could not be resolved, which the caller
+    /// treats the same way.
+    pub(super) fn for_session(
+        shared: &SharedState,
+        session: &SyncSession,
+    ) -> crate::Result<Option<Self>> {
+        let Some(identity) = session.identity.as_ref() else {
+            return Ok(None);
+        };
         let scope =
-            RequestAuthScope::for_database(identity, shared.auth_stores(), session.database_id());
-        Some(Self {
+            RequestAuthScope::for_database(identity, shared.auth_stores(), session.database_id())?;
+        Ok(Some(Self {
             tenant_id: identity.tenant_id,
             roles: scope.auth().roles.clone(),
             resolved: None,
-        })
+        }))
     }
 
     /// Redact one row post-image in place, reporting whether it may be sent.

@@ -13,7 +13,9 @@
 //! is evaluated on the Data Plane against the source row and carries no
 //! value at plan time.
 
-use sqlparser::ast::{self, MergeAction, MergeClauseKind as AstMergeClauseKind, MergeInsertKind};
+use sqlparser::ast::{
+    self, MergeAction, MergeClauseKind as AstMergeClauseKind, MergeInsertKind, MergeUpdateKind,
+};
 
 use super::super::ast_helpers::strip_and_convert_filters;
 use super::super::declared_type_coerce::coerce_assignments_to_declared_types;
@@ -85,8 +87,17 @@ pub(super) fn convert_merge_action(
 ) -> Result<MergePlanAction> {
     match action {
         MergeAction::Update(update_expr) => {
-            let mut assignments = update_expr
-                .assignments
+            if update_expr.update_predicate.is_some() || update_expr.delete_predicate.is_some() {
+                return Err(SqlError::Unsupported {
+                    detail: "WHERE and DELETE WHERE on MERGE UPDATE are not supported".into(),
+                });
+            }
+            let MergeUpdateKind::Set(set) = &update_expr.kind else {
+                return Err(SqlError::Unsupported {
+                    detail: "UPDATE SET * in MERGE is not supported".into(),
+                });
+            };
+            let mut assignments = set
                 .iter()
                 .map(|a| {
                     let col = match &a.target {
@@ -116,6 +127,7 @@ pub(super) fn convert_merge_action(
             Ok(MergePlanAction::Update { assignments })
         }
         MergeAction::Delete { .. } => Ok(MergePlanAction::Delete),
+        MergeAction::DoNothing { .. } => Ok(MergePlanAction::DoNothing),
         MergeAction::Insert(insert_expr) => {
             let columns: Vec<String> = insert_expr
                 .columns
@@ -145,6 +157,11 @@ pub(super) fn convert_merge_action(
                 MergeInsertKind::Row => {
                     return Err(SqlError::Unsupported {
                         detail: "MERGE INSERT ROW is not supported; use explicit VALUES".into(),
+                    });
+                }
+                MergeInsertKind::Wildcard => {
+                    return Err(SqlError::Unsupported {
+                        detail: "MERGE INSERT * is not supported; use explicit VALUES".into(),
                     });
                 }
             };
@@ -397,5 +414,28 @@ mod tests {
             matches!(err, SqlError::InsertColumnArityMismatch { .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn do_nothing_plans_as_a_no_op_arm() {
+        let planned = action("WHEN MATCHED THEN DO NOTHING").expect("plans");
+        assert!(matches!(planned, MergePlanAction::DoNothing), "{planned:?}");
+    }
+
+    /// Forms the planner cannot honour are refused, never planned with a
+    /// clause dropped.
+    #[test]
+    fn unsupported_arm_forms_are_refused() {
+        for when in [
+            "WHEN MATCHED THEN UPDATE SET n = 1 WHERE s.n > 0",
+            "WHEN MATCHED THEN UPDATE SET n = 1 DELETE WHERE s.n > 0",
+            "WHEN MATCHED THEN UPDATE SET *",
+            "WHEN NOT MATCHED THEN INSERT *",
+        ] {
+            let Err(err) = action(when) else {
+                panic!("{when} must be refused");
+            };
+            assert!(matches!(err, SqlError::Unsupported { .. }), "{when}: {err}");
+        }
     }
 }

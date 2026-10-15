@@ -214,13 +214,15 @@ pub async fn poll_stream(
 
     // Events carry the written row, so the poller's column redaction rules
     // apply to them exactly as they do to a SELECT of the source collection.
-    let mut subscriber = CdcSubscriberScope::new(
-        identity.tenant_id(),
-        RequestAuthScope::for_database(&identity.0, state.shared.auth_stores(), database_id)
-            .auth()
-            .roles
-            .clone(),
-    );
+    let subscriber_roles = match RequestAuthScope::for_database(
+        &identity.0,
+        state.shared.auth_stores(),
+        database_id,
+    ) {
+        Ok(scope) => scope.auth().roles.clone(),
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let mut subscriber = CdcSubscriberScope::new(identity.tenant_id(), subscriber_roles);
     subscriber.retain_deliverable(&state.shared.redaction, &mut result.events);
 
     let events: Vec<serde_json::Value> = result

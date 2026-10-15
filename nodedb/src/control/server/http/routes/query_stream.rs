@@ -390,7 +390,8 @@ mod tests {
             &identity,
             state.auth_stores(),
             crate::types::DatabaseId::DEFAULT,
-        );
+        )
+        .expect("resolve request scope");
         // Collection/engine only matter for attribution, not for this test's
         // assertion — any plan with an extractable collection works.
         let plan = crate::bridge::envelope::PhysicalPlan::Kv(KvOp::Get {

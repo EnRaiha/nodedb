@@ -77,7 +77,8 @@ impl NodeDbPgHandler {
             identity,
             self.state.auth_stores(),
             database_id,
-        );
+        )
+        .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
         crate::control::security::auth_fence::admit_permission_view(&self.state, tenant_id)
             .await
             .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;

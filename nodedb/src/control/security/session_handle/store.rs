@@ -122,7 +122,7 @@ impl SessionHandleStore {
         &self,
         auth_context: AuthContext,
         captured_fingerprint: ClientFingerprint,
-    ) -> String {
+    ) -> crate::Result<String> {
         let now = now_secs();
         let cached = CachedSession {
             auth_context,
@@ -132,7 +132,7 @@ impl SessionHandleStore {
 
         let mut sessions = self.sessions.write();
         let handle = loop {
-            let candidate = generate_handle();
+            let candidate = generate_handle()?;
             if !sessions.contains_key(&candidate) {
                 break candidate;
             }
@@ -150,7 +150,7 @@ impl SessionHandleStore {
             sessions.remove(&key);
         }
 
-        handle
+        Ok(handle)
     }
 
     /// Resolve a handle with full hygiene: per-connection rate limiting,
@@ -263,7 +263,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn generate_handle() -> String {
+fn generate_handle() -> crate::Result<String> {
     crate::control::security::random::generate_tagged_random_hex("nds_")
 }
 
@@ -287,7 +287,7 @@ mod tests {
                 nodedb_types::id::DatabaseId::DEFAULT,
             ]),
         );
-        AuthContext::from_identity(&identity, generate_session_id())
+        AuthContext::from_identity(&identity, generate_session_id().unwrap())
     }
 
     fn fp(tenant: u64, a: u8, b: u8, c: u8, d: u8) -> ClientFingerprint {
@@ -298,7 +298,7 @@ mod tests {
     fn resolve_and_invalidate_survive_panic_while_session_cache_is_write_locked() {
         let store = SessionHandleStore::new(3600);
         let origin = fp(1, 10, 0, 0, 5);
-        let handle = store.create(ctx(1, "alice"), origin);
+        let handle = store.create(ctx(1, "alice"), origin).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _sessions = store.sessions.write();
             panic!("simulated interrupted session-handle cache update");
@@ -319,7 +319,7 @@ mod tests {
     fn create_then_resolve_with_matching_fingerprint() {
         let store = SessionHandleStore::new(3600);
         let origin = fp(1, 10, 0, 0, 5);
-        let handle = store.create(ctx(1, "alice"), origin);
+        let handle = store.create(ctx(1, "alice"), origin).unwrap();
         match store.resolve(&handle, "c1", &origin) {
             ResolveOutcome::Resolved(ctx) => assert_eq!(ctx.username, "alice"),
             other => panic!("expected Resolved, got {other:?}"),
@@ -339,7 +339,7 @@ mod tests {
     fn expired_handle_is_miss() {
         let store = SessionHandleStore::new(0);
         let origin = fp(1, 10, 0, 0, 5);
-        let handle = store.create(ctx(1, "alice"), origin);
+        let handle = store.create(ctx(1, "alice"), origin).unwrap();
         matches!(store.resolve(&handle, "c1", &origin), ResolveOutcome::Miss);
     }
 
@@ -347,7 +347,7 @@ mod tests {
     fn invalidate_removes_handle() {
         let store = SessionHandleStore::new(3600);
         let origin = fp(1, 10, 0, 0, 5);
-        let handle = store.create(ctx(1, "alice"), origin);
+        let handle = store.create(ctx(1, "alice"), origin).unwrap();
         assert!(store.invalidate(&handle));
         matches!(store.resolve(&handle, "c1", &origin), ResolveOutcome::Miss);
     }
@@ -359,7 +359,7 @@ mod tests {
         let sink = Arc::clone(&events);
         store.set_audit_hook(move |e| sink.lock().unwrap().push(e));
 
-        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5));
+        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5)).unwrap();
         matches!(
             store.resolve(&handle, "c1", &fp(1, 10, 0, 0, 6)),
             ResolveOutcome::Miss
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn subnet_mode_tolerates_ipv4_24() {
         let store = SessionHandleStore::new(3600).with_fingerprint_mode(FingerprintMode::Subnet);
-        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5));
+        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5)).unwrap();
         matches!(
             store.resolve(&handle, "c1", &fp(1, 10, 0, 0, 99)),
             ResolveOutcome::Resolved(_)
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn disabled_mode_skips_ip_check() {
         let store = SessionHandleStore::new(3600).with_fingerprint_mode(FingerprintMode::Disabled);
-        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5));
+        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5)).unwrap();
         matches!(
             store.resolve(&handle, "c1", &fp(1, 192, 168, 1, 1)),
             ResolveOutcome::Resolved(_)
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn hit_does_not_increment_miss_counter() {
         let store = SessionHandleStore::new(3600).with_fingerprint_mode(FingerprintMode::Disabled);
-        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5));
+        let handle = store.create(ctx(1, "alice"), fp(1, 10, 0, 0, 5)).unwrap();
         for _ in 0..5 {
             let _ = store.resolve(&handle, "c1", &fp(1, 10, 0, 0, 5));
         }
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn generated_handle_has_nds_prefix_and_128_bit_payload() {
-        let h = generate_handle();
+        let h = generate_handle().unwrap();
         assert!(h.starts_with("nds_"));
         let rest = h.strip_prefix("nds_").unwrap();
         assert_eq!(rest.len(), 32);

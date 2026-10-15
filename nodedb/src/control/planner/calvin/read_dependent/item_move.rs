@@ -235,7 +235,7 @@ fn admit_destination_image(
     identity: &AuthenticatedIdentity,
     mut put: PhysicalTask,
 ) -> crate::Result<PhysicalTask> {
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), put.database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), put.database_id)?;
     inject_rls_for_single_plan(
         put.tenant_id.as_u64(),
         put.database_id,

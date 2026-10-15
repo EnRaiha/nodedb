@@ -196,7 +196,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_request_admission(&state, &request, "point_get")
             .expect("internal-service identity must never be blocked");
@@ -220,7 +221,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_request_admission(&state, &request, "point_get");
         assert!(
@@ -254,7 +256,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_request_admission(&state, &request, "point_get");
         assert!(
@@ -279,7 +282,8 @@ mod tests {
         let request = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(DatabaseId::DEFAULT))
             .with_adopted_auth_context(ctx)
-            .build_for_client("127.0.0.1");
+            .build_for_client("127.0.0.1")
+            .expect("resolve client request scope");
 
         let result = check_request_admission(&state, &request, "point_get");
         assert!(result.is_err(), "suspended account must be rejected");
@@ -294,7 +298,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_request_admission(&state, &request, "point_get")
             .expect("non-blacklisted, active, unthrottled request must be admitted");
@@ -329,6 +334,7 @@ mod tests {
             DatabaseId::DEFAULT,
             peer_addr,
         )
+        .expect("resolve client request scope")
     }
 
     fn rejection_reason(error: &crate::Error) -> String {
@@ -479,7 +485,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1:5432",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_blacklist_and_status(&state, &request);
         assert!(
@@ -505,7 +512,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "203.0.113.5:5432",
-        );
+        )
+        .expect("resolve client request scope");
         let allowed = check_blacklist_and_status(&state, &outside);
         assert!(
             allowed.is_ok(),
@@ -517,7 +525,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "10.1.2.3:5432",
-        );
+        )
+        .expect("resolve client request scope");
         let denied = check_blacklist_and_status(&state, &inside);
         assert!(
             denied.is_err(),
@@ -538,7 +547,8 @@ mod tests {
         let request = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(DatabaseId::DEFAULT))
             .with_adopted_auth_context(ctx)
-            .build_for_client("127.0.0.1:5432");
+            .build_for_client("127.0.0.1:5432")
+            .expect("resolve client request scope");
 
         let result = check_blacklist_and_status(&state, &request);
         assert!(
@@ -561,7 +571,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1:5432",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_blacklist_and_status(&state, &request);
         assert!(
@@ -579,7 +590,8 @@ mod tests {
             state.auth_stores(),
             DatabaseId::DEFAULT,
             "127.0.0.1:5432",
-        );
+        )
+        .expect("resolve client request scope");
 
         let result = check_blacklist_and_status(&state, &request);
         assert!(

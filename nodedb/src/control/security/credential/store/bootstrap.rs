@@ -37,7 +37,7 @@ impl CredentialStore {
         };
         validate_password_assignment(password, principal)?;
 
-        let salt = generate_scram_salt();
+        let salt = generate_scram_salt()?;
         let scram_salted_password = compute_scram_salted_password(password, &salt);
         let password_hash = hash_password_argon2(password, &self.argon2_config)?;
 
@@ -167,7 +167,7 @@ impl CredentialStore {
         }
 
         let secret = generate_internal_trust_secret();
-        let salt = generate_scram_salt();
+        let salt = generate_scram_salt()?;
         let scram_salted_password = compute_scram_salted_password(&secret, &salt);
         let password_hash = hash_password_argon2(&secret, &self.argon2_config)?;
 

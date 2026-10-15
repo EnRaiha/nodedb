@@ -291,7 +291,10 @@ async fn handle_persist(
 
 async fn handle_scan(cmd: &RespCommand, session: &RespSession, state: &SharedState) -> RespValue {
     // Resolved once for this command, before the dispatch whose rows it covers.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
     let cursor_str = cmd.arg_str(0).unwrap_or("0");
     let cursor = if cursor_str == "0" {
         Vec::new()
@@ -373,7 +376,10 @@ async fn handle_scan(cmd: &RespCommand, session: &RespSession, state: &SharedSta
 
 async fn handle_keys(cmd: &RespCommand, session: &RespSession, state: &SharedState) -> RespValue {
     // Resolved once for this command, before the dispatch whose rows it covers.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
     let pattern = cmd.arg_str(0).unwrap_or("*");
 
     let plan = PhysicalPlan::Kv(KvOp::Scan {

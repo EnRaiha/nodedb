@@ -109,7 +109,7 @@ getrandom = { version = "0.4", features = ["std"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 aes-gcm = "0.10"
-argon2 = "0.5"
+argon2 = "0.6"
 rsa = "0.9"
 zeroize = { version = "1", features = ["derive"] }
 aws-sdk-kms = { version = "1", default-features = false, features = [
@@ -144,7 +144,7 @@ wasmtime = { version = "49", default-features = false, features = [
 memmap2 = "0.9"
 
 # Cold storage
-parquet = "59"
+parquet = "60"
 object_store = { version = "0.14", features = ["aws"] }
 bytes = "1"
 
@@ -152,7 +152,7 @@ bytes = "1"
 io-uring = "0.7"
 
 # CRDTs
-loro = "=1.13.9"
+loro = "=1.16.2"
 
 # Kafka bridge
 rdkafka = { version = "0.39", features = ["cmake-build"] }
@@ -174,7 +174,7 @@ flate2 = "1"
 tonic = "0.14"
 
 # Arrow (columnar format)
-arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow = { version = "60", default-features = false, features = ["ipc"] }
 
 # Config & serialization
 toml = "1"
@@ -206,17 +206,16 @@ half = { version = "2", features = ["bytemuck"] }
 tokio-tungstenite = "0.30"
 
 # Storage
-# `experimental_cursor` (which pulls in `experimental-api-5`) exposes the cursor
-# API we contributed upstream, and api-5 reshapes `range`/`get`/`extract_from_if`
-# across the whole workspace.
+# `experimental-api-5` reshapes `range`/`get`/`extract_from_if` across the whole
+# workspace. The cursor API is stable since 4.4.
 #
-# The requirement is `~4.2`, not `4`, precisely BECAUSE these surfaces are
-# labelled experimental: redb is free to change them in any minor release, and a
-# floating `4` would pull that in on the next `cargo update` and break the build
-# — or worse, change iteration semantics under a published release. `~4.2` still
+# The requirement is `~4.4`, not `4`, precisely BECAUSE api-5 is labelled
+# experimental: redb is free to change it in any minor release, and a floating
+# `4` would pull that in on the next `cargo update` and break the build — or
+# worse, change iteration semantics under a published release. `~4.4` still
 # takes patch fixes. Widen it deliberately, after re-reading redb's changelog for
 # api-5 changes, never as a routine bump.
-redb = { version = "~4.2", features = ["experimental_cursor"] }
+redb = { version = "~4.4", features = ["experimental-api-5"] }
 
 # Temp files (external sort spill)
 tempfile = "3"
@@ -232,7 +231,7 @@ rustc-hash = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Fast parsing (CSV bulk import)
-memchr = "2.7"
+memchr = "2.8"
 lexical-core = "1"
 
 # Random
@@ -262,7 +261,7 @@ h3o = "0.11"
 nalgebra = "0.35"
 
 # Compression
-zstd = "0.13"
+zstd = "0.14"
 # `alloc`, not `std`: the codec crate must stay usable from the wasm builds.
 lz4_flex = { version = "0.14", default-features = false, features = [
   "safe-encode",
@@ -295,7 +294,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 rustls-pemfile = "2"
 
 # SQL parser
-sqlparser = { version = "0.62", features = ["visitor"] }
+sqlparser = { version = "0.63", features = ["visitor"] }
 
 # X.509 / PEM handling (TLS peer identity, certificate pinning)
 x509-parser = "0.18"
@@ -309,8 +308,8 @@ sd-notify = "0.5"
 ruzstd = "0.9"
 
 # CJK / language segmentation (FTS analyzers)
-lindera = "2.3"
-icu_segmenter = "1"
+lindera = "6.2"
+icu_segmenter = "2"
 whatlang = "0.18"
 
 # Hex encoding
@@ -323,7 +322,7 @@ proptest = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Benchmarking
-fluxbench = "0.1"
+fluxbench = "0.2"
 
 [profile.dev]
 debug = "line-tables-only"

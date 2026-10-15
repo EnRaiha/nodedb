@@ -16,12 +16,12 @@ pub use crate::control::security::scope::enrichment::enrich_auth_context_with_sc
 /// This is the centralized factory used by password, API-key, certificate,
 /// and trust flows. JWT flows use the opaque verified-claims constructor so
 /// unverified token fields cannot enrich authorization context.
-pub fn build_auth_context(identity: &AuthenticatedIdentity) -> AuthContext {
-    let mut ctx = AuthContext::from_identity(identity, generate_session_id());
+pub fn build_auth_context(identity: &AuthenticatedIdentity) -> crate::Result<AuthContext> {
+    let mut ctx = AuthContext::from_identity(identity, generate_session_id()?);
     // Stamp the per-user default database so `$auth.database_id` is available
     // for RLS predicates even before a `USE DATABASE` command.
     ctx.database_id = identity.default_database;
-    ctx
+    Ok(ctx)
 }
 
 /// Read the `SET LOCAL nodedb.on_deny = '...'` session parameter, parsed into

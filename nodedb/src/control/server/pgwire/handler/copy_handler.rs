@@ -86,7 +86,8 @@ impl NodeDbPgHandler {
             self.state.auth_stores(),
             database_id,
             &peer_addr,
-        );
+        )
+        .map_err(typed)?;
         crate::control::server::session_auth::check_blacklist_and_status(&self.state, &request)
             .map_err(|e| {
                 let (severity, code, message) =
@@ -239,7 +240,8 @@ impl CopyHandler for NodeDbCopyHandler {
             &pending.identity,
             self.state.auth_stores(),
             database_id,
-        );
+        )
+        .map_err(typed)?;
         admit_backup_restore_quota(&self.state, &scope, pending.tenant_id).map_err(typed)?;
 
         let stats = backup::restore_tenant(
@@ -437,7 +439,8 @@ mod tests {
             &user,
             handler.state.auth_stores(),
             crate::types::DatabaseId::DEFAULT,
-        );
+        )
+        .expect("resolve request scope");
 
         meter_backup_restore(&handler.state, &scope, 7, Some(42));
 
@@ -463,7 +466,8 @@ mod tests {
             &user,
             handler.state.auth_stores(),
             crate::types::DatabaseId::DEFAULT,
-        );
+        )
+        .expect("resolve request scope");
 
         meter_backup_restore(&handler.state, &scope, 7, Some(42));
 

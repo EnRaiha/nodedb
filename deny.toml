@@ -44,12 +44,6 @@ ignore = [
     "RUSTSEC-2026-0247", # bitmaps; review-by: 2027-05-01
     "RUSTSEC-2026-0248", # im; review-by: 2027-05-01
     "RUSTSEC-2026-0251", # sized-chunks; review-by: 2027-05-01
-    # lindera reads its tokenizer config through serde_yaml_ng, which pulls
-    # unsafe-libyaml. The crate was archived upstream with no fixed version
-    # and no known security impact. lindera parses YAML only from the config
-    # file the operator names in LINDERA_CONFIG_PATH, never client input.
-    # Revisit on each lindera upgrade.
-    "RUSTSEC-2024-0449", # unsafe-libyaml; review-by: 2027-05-01
 ]
 
 [licenses]

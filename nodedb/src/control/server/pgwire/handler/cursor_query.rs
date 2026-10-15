@@ -43,7 +43,8 @@ impl NodeDbPgHandler {
             identity,
             self.state.auth_stores(),
             database_id,
-        );
+        )
+        .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
 
         // Borrowed so each retry attempt re-reads permission state without
         // moving the planning context out of the retried closure.

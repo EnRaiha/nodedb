@@ -61,7 +61,7 @@ pub async fn refresh_continuous_aggregate(
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let target = authorized_target(state, identity, database_id, name)?;
-    CollectionReadGate::for_request(state, identity, database_id).authorize(&target.root)?;
+    CollectionReadGate::for_request(state, identity, database_id)?.authorize(&target.root)?;
     let refresh_id = state.hlc_clock.now().wall_ns;
     let cut = RefreshCut {
         aggregate: name.to_string(),

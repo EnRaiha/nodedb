@@ -167,7 +167,7 @@ async fn execute_and_collect(
     // (`RequestAuthScope::for_database` over the same identity and database),
     // so the roles a row is redacted for cannot disagree with the roles it was
     // authorized for.
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?;
     let redaction = QueryRedaction::for_plans(
         identity.tenant_id,
         scope.auth(),

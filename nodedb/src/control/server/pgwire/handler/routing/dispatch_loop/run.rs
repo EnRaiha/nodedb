@@ -274,13 +274,20 @@ impl NodeDbPgHandler {
             // charging call at the bottom of this loop is on the success
             // path by design, so it can never be the place a cap blocks
             // anything — by the time it runs the work is already done.
-            if let Some(info) = &plan_metering_info {
-                let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
-                    .with_session_database(Some(task_database_id))
-                    .build();
-                admit_quota_for_dispatch(&self.state, &scope, info)
-                    .map_err(|e| sqlstate_error("53400", &e.to_string()))?;
-            }
+            // The scope is kept for the charge below, so a scope error
+            // refuses the task here instead of after its work has happened.
+            let metering_scope = match &plan_metering_info {
+                Some(info) => {
+                    let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
+                        .with_session_database(Some(task_database_id))
+                        .build()
+                        .map_err(|e| error_to_pg(&e))?;
+                    admit_quota_for_dispatch(&self.state, &scope, info)
+                        .map_err(|e| sqlstate_error("53400", &e.to_string()))?;
+                    Some(scope)
+                }
+                None => None,
+            };
 
             // Single-node pgwire streaming fast path (autocommit SELECT only).
             // In-transaction reads skip streaming so the transaction id rides on
@@ -445,11 +452,8 @@ impl NodeDbPgHandler {
             // Metered here, once per successfully dispatched task — every
             // path reaching this point already passed the
             // `response_status_to_sqlstate` error check above.
-            if let Some(info) = &plan_metering_info {
-                let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
-                    .with_session_database(Some(task_database_id))
-                    .build();
-                meter_dispatch(&self.state, &scope, info, task_rows);
+            if let (Some(info), Some(scope)) = (&plan_metering_info, &metering_scope) {
+                meter_dispatch(&self.state, scope, info, task_rows);
             }
         }
 

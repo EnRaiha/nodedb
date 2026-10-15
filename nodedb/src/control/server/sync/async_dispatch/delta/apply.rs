@@ -118,12 +118,26 @@ pub(crate) async fn apply_delta_and_finalize(
     // The scope is resolved against that same address, so `$auth.risk_score`
     // is stamped and an IP-conditional grant is evaluated for this device
     // rather than being withheld.
-    let request = crate::control::security::request_scope::ClientRequestScope::for_database(
+    let request = match crate::control::security::request_scope::ClientRequestScope::for_database(
         identity,
         shared.auth_stores(),
         database_id,
         peer_addr,
-    );
+    ) {
+        Ok(request) => request,
+        Err(e) => {
+            warn!(error = %e, "sync: delta request scope could not be resolved");
+            let detail = e.to_string();
+            return terminal_reject(
+                delta_msg,
+                detail.clone(),
+                CompensationHint::Custom {
+                    constraint: "request_scope".into(),
+                    detail,
+                },
+            );
+        }
+    };
     if let Err(e) =
         crate::control::server::session_auth::check_blacklist_and_status(shared, &request)
     {

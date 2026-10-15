@@ -56,7 +56,7 @@ pub async fn query(
         &state,
         database_id,
         peer.as_str(),
-    );
+    )?;
 
     // Admission gate runs once, before either DDL dispatch or DML planning, so both
     // are covered. `Some(result)` carries the outcome as `X-RateLimit-*` headers below.

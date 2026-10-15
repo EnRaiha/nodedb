@@ -35,7 +35,7 @@ pub(super) fn resolve_edge_write_rls(
     op: GraphOp,
 ) -> Result<GraphOp, DdlError> {
     let mut plan = PhysicalPlan::Graph(op);
-    CollectionReadGate::for_request(state, identity, database_id).inject_rls(&mut plan)?;
+    CollectionReadGate::for_request(state, identity, database_id)?.inject_rls(&mut plan)?;
     match plan {
         PhysicalPlan::Graph(op) => Ok(op),
         other => Err(DdlError::internal(format!(

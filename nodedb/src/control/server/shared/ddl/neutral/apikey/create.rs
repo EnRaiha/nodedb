@@ -120,7 +120,7 @@ pub async fn create_api_key(
                 expires_secs,
                 scope: key_scopes,
                 accessible_databases,
-            });
+            })?;
     let entry = crate::control::catalog_entry::CatalogEntry::PutApiKey(Box::new(stored.clone()));
     crate::control::metadata_proposer::propose_catalog_entry_async(state, &entry)
         .await

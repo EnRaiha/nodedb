@@ -68,7 +68,7 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     // and an IP-conditional grant is evaluated for this sender rather than
     // being withheld.
     let request =
-        ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr);
+        ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr)?;
     crate::control::server::session_auth::check_blacklist_and_status(state, &request)?;
 
     let audit = ArcAuditEmitter(Arc::clone(&state.audit));
@@ -196,7 +196,7 @@ async fn flush_ilp_batch_inner(
     // here — an RLS policy or metering rule keyed on such a grant must not
     // read differently on this transport than it does on a planned `INSERT`.
     let scope =
-        ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr)
+        ClientRequestScope::for_database(identity, state.auth_stores(), database_id, peer_addr)?
             .into_resolved_scope();
     crate::control::planner::rls_injection::inject_rls(
         &mut tasks,

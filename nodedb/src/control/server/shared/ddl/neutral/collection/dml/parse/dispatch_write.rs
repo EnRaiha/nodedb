@@ -228,7 +228,7 @@ impl ReturningShape<'_> {
             self.identity,
             self.state.auth_stores(),
             self.database_id,
-        );
+        )?;
         let redaction = QueryRedaction::for_plan(tenant_id, self.database_id, scope.auth(), plan);
         // A RETURNING expression is evaluated here, per returned row, and a
         // sequence accessor in it resolves against this session's `currval`

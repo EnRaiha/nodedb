@@ -44,7 +44,7 @@ pub async fn rewrite_partitions(
     require_timeseries(state, database_id, tenant_id, &name)?;
 
     // A rewrite changes the collection's storage layout: an ALTER of it.
-    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    let gate = CollectionReadGate::for_request(state, identity, database_id)?;
     gate.authorize_permission(&name, Permission::Alter)?;
     let mut plan = PhysicalPlan::Timeseries(TimeseriesOp::Partitions {
         collection: nodedb_types::QualifiedCollection::new(database_id, &name),

@@ -25,7 +25,11 @@ use super::surrogate::resp_kv_surrogate;
 /// aggregate over a redacted column. The refusal happens BEFORE dispatch, so
 /// the increment the caller cannot observe is never performed either.
 fn refuse_if_counter_is_redacted(state: &SharedState, session: &RespSession) -> Option<RespValue> {
-    let redaction = resp_redaction(state, session)?;
+    let redaction = match resp_redaction(state, session) {
+        Ok(Some(redaction)) => redaction,
+        Ok(None) => return None,
+        Err(e) => return Some(RespValue::from_error(&e)),
+    };
     redaction
         .field_has_rule(&state.redaction, "value")
         .then(|| RespValue::err("ERR the counter value is redacted for this role"))

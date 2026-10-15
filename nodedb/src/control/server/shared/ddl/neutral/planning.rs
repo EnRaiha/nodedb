@@ -35,7 +35,7 @@ pub async fn plan_authorized_sql(
     database_id: DatabaseId,
 ) -> Result<(Vec<PhysicalTask>, OutputSchema, QueryLeaseScope), DdlError> {
     // Internal DDL scans still plan in the caller-selected database context.
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?;
     crate::control::security::auth_fence::admit_permission_view(state, identity.tenant_id)
         .await
         .map_err(|error| DdlError::from_error(&error))?;

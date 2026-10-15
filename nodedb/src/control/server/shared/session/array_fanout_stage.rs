@@ -81,9 +81,13 @@ where
     // Quota admission once for the whole statement, on the original plan,
     // before any shard touches its overlay. Mirrors `stage_write`.
     let identity = sessions.identity(session_id);
-    let scope = identity.as_ref().map(|identity| {
-        RequestAuthScope::for_database(identity, state.auth_stores(), task.database_id)
-    });
+    let scope = identity
+        .as_ref()
+        .map(|identity| {
+            RequestAuthScope::for_database(identity, state.auth_stores(), task.database_id)
+        })
+        .transpose()
+        .map_err(StagingGateError::Dispatch)?;
     if state.metering_config.enabled
         && let Some(scope) = &scope
     {

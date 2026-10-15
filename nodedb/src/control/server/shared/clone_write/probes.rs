@@ -220,7 +220,7 @@ fn with_caller_rls(
         identity,
         state.auth_stores(),
         database_id,
-    );
+    )?;
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
         database_id,

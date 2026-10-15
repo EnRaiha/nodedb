@@ -153,7 +153,18 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
     // Resolved once for the whole snapshot, before `plan` is moved into the
     // dispatch, and from the subscriber's own identity — every row of this
     // payload is delivered under it.
-    let redaction = snapshot_redaction(req.shared, req.identity, req.database_id, &plan);
+    let redaction = match snapshot_redaction(req.shared, req.identity, req.database_id, &plan) {
+        Ok(redaction) => redaction,
+        Err(error) => {
+            tracing::error!(
+                shape_id = %req.shape_id,
+                collection = %req.collection,
+                error = %error,
+                "shape snapshot refused: the subscriber's request scope could not be resolved"
+            );
+            return None;
+        }
+    };
 
     // A predicate that probes a redacted column discloses it through row
     // presence no matter how the delivered cell is masked, so the subscription

@@ -45,7 +45,17 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
     // `check_blacklist_and_status` runs that half of
     // `check_request_admission`'s gate (plus the internal-service exemption
     // every other transport gets) using the session's real remote address.
-    let request = subscription_admission_scope(shared, identity, database_id, session);
+    let request = match subscription_admission_scope(shared, identity, database_id, session) {
+        Ok(request) => request,
+        Err(e) => {
+            warn!(
+                tenant_id = tenant_id.as_u64(),
+                error = %e,
+                "sync: shape subscribe refused, request scope could not be resolved"
+            );
+            return None;
+        }
+    };
     if let Err(e) =
         crate::control::server::session_auth::check_blacklist_and_status(shared, &request)
     {
@@ -172,7 +182,17 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
     // See `handle_shape_subscribe_async` above: blacklist + account status,
     // no rate limit, with the same internal-service exemption, resolved
     // against the same real remote address.
-    let request = subscription_admission_scope(shared, identity, database_id, session);
+    let request = match subscription_admission_scope(shared, identity, database_id, session) {
+        Ok(request) => request,
+        Err(e) => {
+            warn!(
+                tenant_id = tenant_id.as_u64(),
+                error = %e,
+                "sync: resync request refused, request scope could not be resolved"
+            );
+            return None;
+        }
+    };
     if let Err(e) =
         crate::control::server::session_auth::check_blacklist_and_status(shared, &request)
     {
@@ -237,7 +257,7 @@ fn subscription_admission_scope<'a>(
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
     session: &'a SyncSession,
-) -> ClientRequestScope<'a, 'a> {
+) -> crate::Result<ClientRequestScope<'a, 'a>> {
     ClientRequestScope::for_database(
         identity,
         shared.auth_stores(),
@@ -322,7 +342,8 @@ mod tests {
         let session = session_from("10.0.0.7:44321");
 
         let request =
-            subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &session);
+            subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &session)
+                .expect("resolve admission scope");
 
         assert_eq!(request.peer_addr(), "10.0.0.7:44321");
         assert!(
@@ -365,7 +386,8 @@ mod tests {
             .expect("grant the IP-conditional scope");
 
         let inside = session_from("10.0.0.7:44321");
-        let granted = subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &inside);
+        let granted = subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &inside)
+            .expect("resolve admission scope");
         assert_eq!(
             granted
                 .scope()
@@ -378,7 +400,8 @@ mod tests {
 
         let outside = session_from("203.0.113.9:44321");
         let withheld =
-            subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &outside);
+            subscription_admission_scope(&state, &identity, DatabaseId::DEFAULT, &outside)
+                .expect("resolve admission scope");
         assert!(
             !withheld
                 .scope()

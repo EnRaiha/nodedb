@@ -62,12 +62,12 @@ impl<'a> RefusingReadGate<'a> {
         state: &'a SharedState,
         identity: &'a AuthenticatedIdentity,
         database_id: DatabaseId,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DdlError> {
+        Ok(Self {
             state,
             database_id,
-            inner: CollectionReadGate::for_request(state, identity, database_id),
-        }
+            inner: CollectionReadGate::for_request(state, identity, database_id)?,
+        })
     }
 
     /// Authorize `collection` for reading and refuse while a policy applies —
@@ -79,7 +79,7 @@ impl<'a> RefusingReadGate<'a> {
         collection: &str,
         what: &str,
     ) -> Result<Self, DdlError> {
-        let gate = Self::for_request(state, identity, database_id);
+        let gate = Self::for_request(state, identity, database_id)?;
         gate.gate_collection(collection, what)?;
         Ok(gate)
     }

@@ -29,7 +29,10 @@ pub(super) async fn handle_hget(
     let field = cmd.arg_str(1).unwrap_or("").to_string();
 
     // Resolved once for this command, before the dispatch whose field it covers.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let plan = PhysicalPlan::Kv(KvOp::FieldGet {
         collection: QualifiedCollection::new(
@@ -74,7 +77,10 @@ pub(super) async fn handle_hmget(
         .collect();
 
     // Resolved once for the whole command, not once per requested field.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let plan = PhysicalPlan::Kv(KvOp::FieldGet {
         collection: QualifiedCollection::new(

@@ -66,7 +66,7 @@ pub async fn match_query(
     // only the caller who will otherwise walk a collection it cannot read.
     // The RLS half mirrors it: the narrow question when the pattern names a
     // collection, the tenant-wide one when it names none.
-    let gate = RefusingReadGate::for_request(state, identity, database_id);
+    let gate = RefusingReadGate::for_request(state, identity, database_id)?;
     match query.collection.as_deref() {
         Some(collection) => gate.gate_collection(collection, MATCH_WHAT)?,
         None => {

@@ -79,7 +79,7 @@ pub(crate) async fn dispatch_and_respond(
     // replaced or computed, so it is a read as much as a write and needs both
     // grants — and a cross-collection move needs them on each side, hence the
     // slice.
-    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    let gate = CollectionReadGate::for_request(state, identity, database_id)?;
     for collection in collections {
         gate.authorize(collection)?;
         gate.authorize_permission(collection, Permission::Write)?;

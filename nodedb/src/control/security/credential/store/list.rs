@@ -98,7 +98,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary catalog directory");
         let catalog = SystemCatalog::open(&dir.path().join("system.redb"))
             .expect("open persistent system catalog");
-        let valid_salt = generate_scram_salt();
+        let valid_salt = generate_scram_salt().expect("generate valid scram salt");
         catalog
             .put_user(&StoredUser {
                 user_id: 1,
@@ -130,7 +130,7 @@ mod tests {
                 accessible_databases: vec![],
             })
             .expect("seed valid persisted regular user");
-        let salt = generate_scram_salt();
+        let salt = generate_scram_salt().expect("generate scram salt");
         let password_hash = hash_password_argon2("", &Argon2Config::default())
             .expect("hash empty password for invalid persisted user");
         catalog

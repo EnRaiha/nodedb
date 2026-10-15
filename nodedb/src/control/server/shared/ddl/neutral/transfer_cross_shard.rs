@@ -47,7 +47,7 @@ pub(super) async fn transfer_item_across_shards(
     if txn_ctx.sessions.transaction_state(txn_ctx.session_id) != TransactionState::Idle {
         return Err(error_to_ddl(&crate::Error::CrossShardInExplicitTransaction));
     }
-    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    let gate = CollectionReadGate::for_request(state, identity, database_id)?;
     for collection in collections {
         gate.authorize(collection)?;
         gate.authorize_permission(collection, Permission::Write)?;

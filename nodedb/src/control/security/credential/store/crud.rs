@@ -36,7 +36,7 @@ impl CredentialStore {
         }
         validate_password_assignment(password, PasswordPrincipal::New)?;
 
-        let salt = generate_scram_salt();
+        let salt = generate_scram_salt()?;
         let scram_salted_password = compute_scram_salted_password(password, &salt);
         let password_hash = hash_password_argon2(password, &self.argon2_config)?;
 
@@ -166,7 +166,7 @@ impl CredentialStore {
         };
         validate_password_assignment(password, PasswordPrincipal::Existing { is_service_account })?;
 
-        let salt = generate_scram_salt();
+        let salt = generate_scram_salt()?;
         let scram_salted_password = compute_scram_salted_password(password, &salt);
         let password_hash = hash_password_argon2(password, &self.argon2_config)?;
 

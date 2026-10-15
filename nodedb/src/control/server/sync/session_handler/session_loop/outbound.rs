@@ -148,13 +148,25 @@ async fn pump_crdt_deltas(
     // A row push carries a stored row post-image, so the subscriber's column
     // redaction applies to it exactly as it would to the same row read over
     // SQL. Resolved once for the whole drain — see `row_redaction`.
-    let Some(mut redaction) = RowPushRedaction::for_session(state, session) else {
-        warn!(
-            session = %session.session_id,
-            "sync: row push suppressed; the session has no established identity to \
-             evaluate column redaction against"
-        );
-        return Flow::Break;
+    let mut redaction = match RowPushRedaction::for_session(state, session) {
+        Ok(Some(redaction)) => redaction,
+        Ok(None) => {
+            warn!(
+                session = %session.session_id,
+                "sync: row push suppressed; the session has no established identity to \
+                 evaluate column redaction against"
+            );
+            return Flow::Break;
+        }
+        Err(error) => {
+            warn!(
+                session = %session.session_id,
+                %error,
+                "sync: row push suppressed; the subscriber's request scope could not be \
+                 resolved to evaluate column redaction against"
+            );
+            return Flow::Break;
+        }
     };
 
     while let Ok(delta) = rx.try_recv() {

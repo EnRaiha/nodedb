@@ -85,7 +85,7 @@ pub fn create_auth_key(
         rate_limit,
         0, // burst = use default
         expires_days,
-    );
+    )?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::PrivilegeChange,
@@ -127,7 +127,7 @@ pub fn rotate_auth_key(
 
     let new_token = state
         .auth_api_keys
-        .rotate(key_id, overlap_hours)
+        .rotate(key_id, overlap_hours)?
         .ok_or_else(|| err("42704", format!("auth key '{key_id}' not found")))?;
 
     state.audit_record(

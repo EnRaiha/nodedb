@@ -136,7 +136,7 @@ pub async fn create_change_stream(
     // across the Data→Event bus, so the scope their column redaction is keyed
     // on has to be resolved here and carried by the definition itself.
     let subscriber_roles =
-        RequestAuthScope::for_database(identity, state.auth_stores(), database_id)
+        RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?
             .auth()
             .roles
             .clone();

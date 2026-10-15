@@ -47,7 +47,8 @@ impl NodeDbPgHandler {
         let peer_addr = peer_addr.to_string();
         let request = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
-            .build_for_client(&peer_addr);
+            .build_for_client(&peer_addr)
+            .map_err(|e| crate::control::server::pgwire::types::error_map::error_to_pg(&e))?;
         crate::control::server::session_auth::check_request_admission(&self.state, &request, "sql")
             .map_err(|e| {
                 let (severity, code, message) =
@@ -152,6 +153,7 @@ impl NodeDbPgHandler {
         // else `$auth.risk_score` is unset and an IP-conditional grant withheld.
         let scope = scope_builder
             .build_for_client(&peer_addr.to_string())
+            .map_err(StatementSetupError::from)?
             .into_resolved_scope();
 
         // Request-admission already ran once in `execute_single_sql` — must not admit again.

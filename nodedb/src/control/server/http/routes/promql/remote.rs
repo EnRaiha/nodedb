@@ -85,13 +85,17 @@ pub async fn remote_write(
     // collection an `INSERT` refuses. The scope is resolved against the
     // sender's address, as the line-protocol listener resolves it, so an
     // IP-conditional grant reads the same on both transports.
-    let scope = ClientRequestScope::for_database(
+    let scope = match ClientRequestScope::for_database(
         &identity.0,
         state.shared.auth_stores(),
         database_id,
         peer.as_str(),
-    )
-    .into_resolved_scope();
+    ) {
+        Ok(request) => request.into_resolved_scope(),
+        Err(error) => {
+            return crate::control::server::http::auth::ApiError::from(error).into_response();
+        }
+    };
     let mut registered: HashSet<String> = HashSet::new();
     // The stored lines of each metric, for the catalog field projection.
     let mut stored_lines: BTreeMap<String, Vec<String>> = BTreeMap::new();

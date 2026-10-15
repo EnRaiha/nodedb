@@ -30,14 +30,19 @@ use super::session::RespSession;
 /// `DatabaseId::DEFAULT` matches the database RESP pins every dispatch to (the
 /// protocol carries no database selector), so the policy snapshot is resolved
 /// in the same database the rows are read from.
-pub(super) fn resp_redaction(state: &SharedState, session: &RespSession) -> Option<QueryRedaction> {
-    let identity = session.identity.as_ref()?;
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT);
-    Some(QueryRedaction::for_collections(
+pub(super) fn resp_redaction(
+    state: &SharedState,
+    session: &RespSession,
+) -> crate::Result<Option<QueryRedaction>> {
+    let Some(identity) = session.identity.as_ref() else {
+        return Ok(None);
+    };
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT)?;
+    Ok(Some(QueryRedaction::for_collections(
         session.tenant_id,
         scope.auth(),
         vec![(String::new(), session.collection.clone())],
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -99,7 +104,11 @@ mod tests {
         let (dispatcher, _sides) = Dispatcher::new(1, 64);
         let state = SharedState::new(dispatcher, wal).expect("construct shared state");
 
-        assert!(resp_redaction(&state, &RespSession::default()).is_none());
+        assert!(
+            resp_redaction(&state, &RespSession::default())
+                .expect("resolve redaction")
+                .is_none()
+        );
     }
 
     /// An authenticated session resolves a context keyed on the SELECTed
@@ -121,7 +130,9 @@ mod tests {
             identity: Some(resp_identity()),
             ..RespSession::default()
         };
-        let redaction = resp_redaction(&state, &session).expect("authenticated session");
+        let redaction = resp_redaction(&state, &session)
+            .expect("resolve redaction")
+            .expect("authenticated session");
 
         let store = store_with_mask("users", RESP_ROLE, "email");
         assert!(redaction.field_has_rule(&store, "email"));

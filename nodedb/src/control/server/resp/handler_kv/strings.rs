@@ -27,7 +27,10 @@ pub(in crate::control::server::resp) async fn handle_get(
     };
 
     // Resolved once for this command, before the dispatch whose value it covers.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let plan = PhysicalPlan::Kv(KvOp::Get {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),
@@ -231,7 +234,10 @@ pub(in crate::control::server::resp) async fn handle_getset(
 
     // Resolved once for this command: GETSET returns the row's PREVIOUS stored
     // value, which carries exactly the disclosure a GET of it does.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let surrogate = match resp_kv_surrogate(state, session, &key).await {
         Ok(s) => s,

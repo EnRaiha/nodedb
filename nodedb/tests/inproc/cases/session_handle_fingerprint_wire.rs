@@ -32,7 +32,7 @@ fn nodedb_auth_ctx() -> AuthContext {
     // Matches the harness-provisioned `nodedb` superuser (tenant 1) so the
     // resolver can hand back a context the query path will accept.
     let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
-    AuthContext::from_identity(&identity, generate_session_id())
+    AuthContext::from_identity(&identity, generate_session_id().unwrap())
 }
 
 async fn connect_from(
@@ -77,7 +77,8 @@ async fn set_local_auth_session_rejects_mismatched_fingerprint_origin() {
     let handle = server
         .shared
         .session_handles
-        .create(nodedb_auth_ctx(), captured_fp);
+        .create(nodedb_auth_ctx(), captured_fp)
+        .unwrap();
 
     let tenant = TenantId::new(1);
     let baseline_miss = server.shared.session_handles.miss_total_for_tenant(tenant);

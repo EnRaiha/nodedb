@@ -66,7 +66,7 @@ pub fn explain_permission(
         identity.clone()
     };
 
-    let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build();
+    let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build()?;
     let explanation = crate::control::security::explain::explain_permission(
         perm,
         collection,
@@ -198,7 +198,7 @@ pub fn assert_visible(
         None,
         crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![database_id]),
     );
-    let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build();
+    let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build()?;
 
     // RLS policies are keyed by the database-qualified collection name.
     let qualified =

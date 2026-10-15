@@ -93,8 +93,8 @@ impl ApiKeyStore {
             scope,
             accessible_databases,
         } = params;
-        let key_id = generate_key_id();
-        let secret = generate_secret();
+        let key_id = generate_key_id()?;
+        let secret = generate_secret()?;
         let secret_hash = hash_secret(&secret);
 
         let expires_at = if expires_secs > 0 {
@@ -177,7 +177,10 @@ impl ApiKeyStore {
     ///
     /// `accessible_databases`: subset of the owner's database set (validated by caller).
     /// Empty vec means "inherit from owner at bind time".
-    pub fn prepare_key(&self, params: CreateKeyParams<'_>) -> (StoredApiKey, String) {
+    pub fn prepare_key(
+        &self,
+        params: CreateKeyParams<'_>,
+    ) -> crate::Result<(StoredApiKey, String)> {
         let CreateKeyParams {
             username,
             user_id,
@@ -186,8 +189,8 @@ impl ApiKeyStore {
             scope,
             accessible_databases,
         } = params;
-        let key_id = generate_key_id();
-        let secret = generate_secret();
+        let key_id = generate_key_id()?;
+        let secret = generate_secret()?;
         let secret_hash = hash_secret(&secret);
         let expires_at = if expires_secs > 0 {
             now_unix_secs() + expires_secs
@@ -210,7 +213,7 @@ impl ApiKeyStore {
             accessible_databases: accessible_databases.iter().map(|id| id.as_u64()).collect(),
         };
         let token = format!("ndb_{key_id}.{secret}");
-        (stored, token)
+        Ok((stored, token))
     }
 
     /// Install a replicated `StoredApiKey` into the in-memory cache.
@@ -354,8 +357,8 @@ mod tests {
     #[test]
     fn expired_key_rejected() {
         let store = ApiKeyStore::new();
-        let key_id = generate_key_id();
-        let secret = generate_secret();
+        let key_id = generate_key_id().expect("key id");
+        let secret = generate_secret().expect("secret");
         let secret_hash = hash_secret(&secret);
 
         let record = ApiKeyRecord {

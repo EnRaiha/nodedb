@@ -112,16 +112,17 @@ impl AuthApiKeyStore {
         rate_limit_qps: u64,
         rate_limit_burst: u64,
         expires_days: u64,
-    ) -> String {
-        self.create_key_inner(
-            auth_user_id,
-            tenant_id,
-            scopes,
-            rate_limit_qps,
-            rate_limit_burst,
-            expires_days,
-        )
-        .1
+    ) -> crate::Result<String> {
+        Ok(self
+            .create_key_inner(
+                auth_user_id,
+                tenant_id,
+                scopes,
+                rate_limit_qps,
+                rate_limit_burst,
+                expires_days,
+            )?
+            .1)
     }
 
     /// Build an unpublished key record and token. Callers publish the record
@@ -133,9 +134,9 @@ impl AuthApiKeyStore {
         rate_limit_qps: u64,
         rate_limit_burst: u64,
         expires_days: u64,
-    ) -> (AuthApiKey, String, String) {
+    ) -> crate::Result<(AuthApiKey, String, String)> {
         let key_id = generate_key_id();
-        let secret = generate_secret();
+        let secret = generate_secret()?;
         let token = format!("nda_{key_id}_{secret}");
         let secret_hash = hash_secret(&secret);
         let now = now_secs();
@@ -162,7 +163,7 @@ impl AuthApiKeyStore {
             superseded_at: 0,
             superseded_by: None,
         };
-        (record, hash_hex, token)
+        Ok((record, hash_hex, token))
     }
 
     fn insert_key(state: &mut AuthApiKeyState, record: AuthApiKey, hash_hex: String) {
@@ -179,7 +180,7 @@ impl AuthApiKeyStore {
         rate_limit_qps: u64,
         rate_limit_burst: u64,
         expires_days: u64,
-    ) -> (String, String) {
+    ) -> crate::Result<(String, String)> {
         let (record, hash_hex, token) = Self::build_key_record(
             auth_user_id,
             tenant_id,
@@ -187,10 +188,10 @@ impl AuthApiKeyStore {
             rate_limit_qps,
             rate_limit_burst,
             expires_days,
-        );
+        )?;
         let key_id = record.key_id.clone();
         Self::insert_key(&mut self.state.write(), record, hash_hex);
-        (key_id, token)
+        Ok((key_id, token))
     }
 
     /// Verify an `nda_` token. Returns the key record if valid.
@@ -243,15 +244,19 @@ impl AuthApiKeyStore {
 
     /// Rotate a key: create a new key that replaces the old one.
     /// Both are valid during the overlap period.
-    pub fn rotate(&self, old_key_id: &str, overlap_hours: u64) -> Option<String> {
+    ///
+    /// Returns `Ok(None)` when the old key is missing, invalid, or already superseded.
+    pub fn rotate(&self, old_key_id: &str, overlap_hours: u64) -> crate::Result<Option<String>> {
         // Generate the replacement before acquiring the write lock, but do not
         // publish it. The source is re-read and validated under that one lock
         // before either index is mutated.
         let source = {
             let state = self.state.read();
-            let source = state.keys.get(old_key_id)?;
+            let Some(source) = state.keys.get(old_key_id) else {
+                return Ok(None);
+            };
             if !source.is_valid(now_secs()) || source.superseded_by.is_some() {
-                return None;
+                return Ok(None);
             }
             source.clone()
         };
@@ -262,15 +267,17 @@ impl AuthApiKeyStore {
             source.rate_limit_qps,
             source.rate_limit_burst,
             0,
-        );
+        )?;
         let replacement_id = replacement.key_id.clone();
         replacement.replaces_key_id = Some(old_key_id.to_owned());
 
         let mut state = self.state.write();
         let now = now_secs();
-        let old = state.keys.get_mut(old_key_id)?;
+        let Some(old) = state.keys.get_mut(old_key_id) else {
+            return Ok(None);
+        };
         if !old.is_valid(now) || old.superseded_by.is_some() {
-            return None;
+            return Ok(None);
         }
         old.superseded_by = Some(replacement_id.clone());
         if overlap_hours == 0 {
@@ -286,7 +293,7 @@ impl AuthApiKeyStore {
             overlap_hours,
             "auth API key rotated"
         );
-        Some(token)
+        Ok(Some(token))
     }
 
     /// List all keys for an auth user.
@@ -328,16 +335,17 @@ fn generate_key_id() -> String {
     format!("{ts:x}{seq:04x}")
 }
 
-fn generate_secret() -> String {
+fn generate_secret() -> crate::Result<String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     // 32 bytes of OS randomness + sequential suffix for uniqueness. The
     // secret never falls back to a guessable value.
-    use argon2::password_hash::rand_core::{OsRng, RngCore};
     let mut random_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut random_bytes);
-    format!("{}{seq:08x}", hex::encode(random_bytes))
+    getrandom::fill(&mut random_bytes).map_err(|e| crate::Error::Internal {
+        detail: format!("OS random source failed generating an API key secret: {e}"),
+    })?;
+    Ok(format!("{}{seq:08x}", hex::encode(random_bytes)))
 }
 
 fn hash_secret(secret: &str) -> Vec<u8> {
@@ -356,7 +364,7 @@ mod tests {
     #[test]
     fn key_and_hash_indexes_remain_usable_after_panic_while_state_write_locked() {
         let store = AuthApiKeyStore::new();
-        let token = store.create_key("panic-safe", 1, vec![], 0, 0, 0);
+        let token = store.create_key("panic-safe", 1, vec![], 0, 0, 0).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _state = store.state.write();
             panic!("simulated interrupted auth-key cache update");
@@ -377,7 +385,7 @@ mod tests {
         use std::sync::{Arc, Barrier};
 
         let store = Arc::new(AuthApiKeyStore::new());
-        let token = store.create_key("existing", 1, vec![], 0, 0, 0);
+        let token = store.create_key("existing", 1, vec![], 0, 0, 0).unwrap();
         let start = Arc::new(Barrier::new(3));
 
         let verify_store = Arc::clone(&store);
@@ -393,7 +401,9 @@ mod tests {
         let creator = std::thread::spawn(move || {
             create_start.wait();
             for _ in 0..1_000 {
-                create_store.create_key("created", 1, vec![], 0, 0, 0);
+                create_store
+                    .create_key("created", 1, vec![], 0, 0, 0)
+                    .unwrap();
             }
         });
 
@@ -405,7 +415,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let store = AuthApiKeyStore::new();
-        let token = store.create_key("user_42", 1, vec![], 0, 0, 0);
+        let token = store.create_key("user_42", 1, vec![], 0, 0, 0).unwrap();
 
         assert!(token.starts_with("nda_"));
         let key = store.verify(&token).unwrap();
@@ -423,7 +433,7 @@ mod tests {
     #[test]
     fn revoked_key_rejected() {
         let store = AuthApiKeyStore::new();
-        let token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let key = store.verify(&token).unwrap();
         store.revoke(&key.key_id);
         assert!(store.verify(&token).is_none());
@@ -432,14 +442,16 @@ mod tests {
     #[test]
     fn scoped_key() {
         let store = AuthApiKeyStore::new();
-        let token = store.create_key(
-            "u1",
-            1,
-            vec!["profile:read".into(), "orders:write".into()],
-            100,
-            200,
-            30,
-        );
+        let token = store
+            .create_key(
+                "u1",
+                1,
+                vec!["profile:read".into(), "orders:write".into()],
+                100,
+                200,
+                30,
+            )
+            .unwrap();
         let key = store.verify(&token).unwrap();
         assert_eq!(key.scopes, vec!["profile:read", "orders:write"]);
         assert_eq!(key.rate_limit_qps, 100);
@@ -449,7 +461,7 @@ mod tests {
     #[test]
     fn last_used_tracking() {
         let store = AuthApiKeyStore::new();
-        let token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let key = store.verify(&token).unwrap();
         assert_eq!(key.last_used_at, 0);
 
@@ -462,10 +474,12 @@ mod tests {
     #[test]
     fn key_rotation() {
         let store = AuthApiKeyStore::new();
-        let old_token = store.create_key("u1", 1, vec!["scope_a".into()], 0, 0, 0);
+        let old_token = store
+            .create_key("u1", 1, vec!["scope_a".into()], 0, 0, 0)
+            .unwrap();
         let old_key = store.verify(&old_token).unwrap();
 
-        let new_token = store.rotate(&old_key.key_id, 24).unwrap();
+        let new_token = store.rotate(&old_key.key_id, 24).unwrap().unwrap();
         assert!(new_token.starts_with("nda_"));
 
         // Both old and new must be valid during overlap.
@@ -484,11 +498,11 @@ mod tests {
         // the old token must be rejected by verify(). Operators rotate
         // precisely so that the old (possibly-leaked) key stops working.
         let store = AuthApiKeyStore::new();
-        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let old_key_id = store.verify(&old_token).unwrap().key_id;
 
         // Zero-hour overlap: cutover as soon as wall clock advances past now.
-        let _new_token = store.rotate(&old_key_id, 0).unwrap();
+        let _new_token = store.rotate(&old_key_id, 0).unwrap().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         assert!(
@@ -503,13 +517,13 @@ mod tests {
         // Spec: rotation chains invalidate every superseded key, not only the
         // first. After A→B→C with zero overlap, both A and B must be rejected.
         let store = AuthApiKeyStore::new();
-        let token_a = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token_a = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let id_a = store.verify(&token_a).unwrap().key_id;
 
-        let token_b = store.rotate(&id_a, 0).unwrap();
+        let token_b = store.rotate(&id_a, 0).unwrap().unwrap();
         let id_b = store.verify(&token_b).unwrap().key_id;
 
-        let _token_c = store.rotate(&id_b, 0).unwrap();
+        let _token_c = store.rotate(&id_b, 0).unwrap().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         assert!(
@@ -528,10 +542,10 @@ mod tests {
         // is_revoked bit. An operator auditing active credentials never
         // sees a rotated-out key as still active after its overlap elapsed.
         let store = AuthApiKeyStore::new();
-        let token_old = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token_old = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let old_id = store.verify(&token_old).unwrap().key_id;
 
-        let _token_new = store.rotate(&old_id, 0).unwrap();
+        let _token_new = store.rotate(&old_id, 0).unwrap().unwrap();
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         let active = store.list_for_user("u1");
@@ -554,10 +568,10 @@ mod tests {
         // itself, not only decorate the NEW key. verify() then rejects by
         // inspecting the old record alone, with no cross-record lookup.
         let store = AuthApiKeyStore::new();
-        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let old_id = store.verify(&old_token).unwrap().key_id;
 
-        let _new_token = store.rotate(&old_id, 24).unwrap();
+        let _new_token = store.rotate(&old_id, 24).unwrap().unwrap();
 
         let state = store.state.read();
         let old = state
@@ -583,10 +597,10 @@ mod tests {
         // a real auth window during which a leaked key still verifies.
         // No sleep in this test: the cutover must be synchronous.
         let store = AuthApiKeyStore::new();
-        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let old_id = store.verify(&old_token).unwrap().key_id;
 
-        let _new_token = store.rotate(&old_id, 0).unwrap();
+        let _new_token = store.rotate(&old_id, 0).unwrap().unwrap();
 
         assert!(
             store.verify(&old_token).is_none(),
@@ -601,10 +615,10 @@ mod tests {
         // that is no longer valid. Otherwise audit trails silently record
         // post-rotation use of a dead key as if it were live.
         let store = AuthApiKeyStore::new();
-        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let old_token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let old_id = store.verify(&old_token).unwrap().key_id;
 
-        let _new_token = store.rotate(&old_id, 0).unwrap();
+        let _new_token = store.rotate(&old_id, 0).unwrap().unwrap();
         // Old key is now invalid (zero-overlap → immediate revoke).
         store.touch(&old_id, "10.0.0.99");
 
@@ -626,10 +640,10 @@ mod tests {
         // Spec: list_all() is the admin view. Like list_for_user(), it must
         // reflect supersession, not only the is_revoked bit.
         let store = AuthApiKeyStore::new();
-        let token_old = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token_old = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let old_id = store.verify(&token_old).unwrap().key_id;
 
-        let _token_new = store.rotate(&old_id, 0).unwrap();
+        let _token_new = store.rotate(&old_id, 0).unwrap().unwrap();
 
         let all = store.list_all();
         assert_eq!(
@@ -650,12 +664,12 @@ mod tests {
         // is nothing to overlap with. rotate() must return None rather than
         // silently minting a replacement for a dead key.
         let store = AuthApiKeyStore::new();
-        let token = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let key_id = store.verify(&token).unwrap().key_id;
         assert!(store.revoke(&key_id));
 
         assert!(
-            store.rotate(&key_id, 24).is_none(),
+            store.rotate(&key_id, 24).unwrap().is_none(),
             "rotate() on a revoked key must fail, not silently create a replacement"
         );
         let state = store.state.read();
@@ -669,16 +683,16 @@ mod tests {
         // attempting A→C) is the same nonsense as rotating a revoked key —
         // the source key is no longer authoritative. rotate() must fail.
         let store = AuthApiKeyStore::new();
-        let token_a = store.create_key("u1", 1, vec![], 0, 0, 0);
+        let token_a = store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
         let id_a = store.verify(&token_a).unwrap().key_id;
 
-        let token_b = store.rotate(&id_a, 24).unwrap();
+        let token_b = store.rotate(&id_a, 24).unwrap().unwrap();
         // A remains credential-valid during the overlap, but is no longer an
         // authoritative rotation source. A second rotation must not mint C.
         assert!(store.verify(&token_a).is_some());
         assert!(store.verify(&token_b).is_some());
         assert!(
-            store.rotate(&id_a, 24).is_none(),
+            store.rotate(&id_a, 24).unwrap().is_none(),
             "rotate() on an already-superseded key must fail; chain rotations \
              must go through the current-active key, not an overlapping source"
         );
@@ -690,9 +704,9 @@ mod tests {
     #[test]
     fn list_for_user() {
         let store = AuthApiKeyStore::new();
-        store.create_key("u1", 1, vec![], 0, 0, 0);
-        store.create_key("u1", 1, vec![], 0, 0, 0);
-        store.create_key("u2", 1, vec![], 0, 0, 0);
+        store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
+        store.create_key("u1", 1, vec![], 0, 0, 0).unwrap();
+        store.create_key("u2", 1, vec![], 0, 0, 0).unwrap();
 
         assert_eq!(store.list_for_user("u1").len(), 2);
         assert_eq!(store.list_for_user("u2").len(), 1);

@@ -72,7 +72,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // `tasks` after this point, and injecting later will hand them
     // un-injected copies.
     let (mut tasks, output_schema, versions) = {
-        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?;
         crate::control::security::auth_fence::admit_permission_view(state, tenant_id)
             .await
             .map_err(|error| DdlError::from_error(&error))?;
@@ -241,7 +241,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             .record_read_entries(txn_ctx.session_id, sum_target_reads);
     }
 
-    let auth_scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    let auth_scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?;
     let route_ctx = in_txn_block.then(|| TxnTaskContext {
         state,
         identity,

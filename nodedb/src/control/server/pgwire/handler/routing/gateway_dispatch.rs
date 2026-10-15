@@ -35,18 +35,32 @@ use super::gateway_fold::{GatewayFold, GatewayShaping, plan_produces_rows};
 /// unit for `None`, correct for a write or a zero-row read.
 fn meter_gateway_task(
     state: &crate::control::state::SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: nodedb_types::id::DatabaseId,
+    scope: Option<&RequestAuthScope<'_>>,
     info: &PlanMeteringInfo,
     rows: Option<u64>,
 ) {
-    if !state.metering_config.enabled {
-        return;
+    if let Some(scope) = scope {
+        meter_dispatch(state, scope, info, rows);
     }
-    let scope = RequestAuthScope::builder(identity, state.auth_stores())
+}
+
+/// Resolve the scope the gateway tasks of one request are metered against.
+///
+/// Resolved before any task dispatches, so a scope error refuses the request
+/// instead of surfacing after its work has happened. `None` when metering is
+/// disabled.
+fn resolve_gateway_metering_scope<'a>(
+    state: &'a crate::control::state::SharedState,
+    identity: &'a AuthenticatedIdentity,
+    database_id: nodedb_types::id::DatabaseId,
+) -> crate::Result<Option<RequestAuthScope<'a>>> {
+    if !state.metering_config.enabled {
+        return Ok(None);
+    }
+    RequestAuthScope::builder(identity, state.auth_stores())
         .with_session_database(Some(database_id))
-        .build();
-    meter_dispatch(state, &scope, info, rows);
+        .build()
+        .map(Some)
 }
 
 /// Everything a gateway dispatch needs besides the tasks themselves.
@@ -132,6 +146,15 @@ impl NodeDbPgHandler {
         // A derived write beside the user's own never answers the statement,
         // exactly as Calvin's deposit rule has it.
         let mut fold = GatewayFold::for_tasks(&tasks);
+        let metering_scope = resolve_gateway_metering_scope(&self.state, identity, database_id)
+            .map_err(|e| {
+                let (severity, code, message) = super::super::super::types::error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
         for task in tasks {
             let plan_kind = describe_plan(&task.plan);
             // The task moves into authorization below; a row-producing task
@@ -196,8 +219,7 @@ impl NodeDbPgHandler {
                         )?;
                         meter_gateway_task(
                             &self.state,
-                            identity,
-                            database_id,
+                            metering_scope.as_ref(),
                             &metering_info,
                             rows,
                         );
@@ -247,8 +269,7 @@ impl NodeDbPgHandler {
             }
             meter_gateway_task(
                 &self.state,
-                identity,
-                database_id,
+                metering_scope.as_ref(),
                 &metering_info,
                 task_rows,
             );

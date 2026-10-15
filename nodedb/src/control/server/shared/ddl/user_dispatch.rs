@@ -105,6 +105,14 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         .metering_config
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
+    // The metering scope is resolved before dispatch, so a scope error refuses
+    // the request instead of surfacing after its work has already happened.
+    let metering = plan_metering_info
+        .map(|info| {
+            resolve_dispatch_scope(state, identity, database_id, admission)
+                .map(|scope| (info, scope))
+        })
+        .transpose()?;
     let result =
         match authorize_for_identity(state, identity, database_id, collection, plan, admission)
             .await?
@@ -122,7 +130,7 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         // Metered only on the success path above — a denied/errored/timed-out
         // request performed no billable work, while a clone hook that served
         // the request did the work this dispatch was charged for and is metered
-        // like any other success. Rebuilt from `state`/`identity`/`database_id`
+        // like any other success. Resolved from `state`/`identity`/`database_id`
         // rather than threaded out of `authorize_for_identity`, since that
         // function's scope is local to its own clone-check-and-authorize step;
         // this is the same derivation `resolve_dispatch_scope` already gives
@@ -134,9 +142,8 @@ pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Re
         // handlers that go through this door. `meter_dispatch` charges one
         // unit for `None`, which is correct for the lookup/mutation that
         // happened.
-        if let Some(info) = &plan_metering_info {
-            let metering_scope = resolve_dispatch_scope(state, identity, database_id, admission);
-            meter_dispatch(state, &metering_scope, info, None);
+        if let Some((info, metering_scope)) = &metering {
+            meter_dispatch(state, metering_scope, info, None);
         }
     }
     result
@@ -180,12 +187,12 @@ async fn authorize_for_identity(
     // [`RequestAdmission`] for why both cases exist.
     let scope = match admission {
         RequestAdmission::AlreadyAdmitted => {
-            resolve_dispatch_scope(state, identity, database_id, admission)
+            resolve_dispatch_scope(state, identity, database_id, admission)?
         }
         RequestAdmission::NotYetAdmitted { peer_addr } => {
             let request = RequestAuthScope::builder(identity, state.auth_stores())
                 .with_session_database(Some(database_id))
-                .build_for_client(peer_addr);
+                .build_for_client(peer_addr)?;
             crate::control::server::session_auth::check_request_admission(
                 state,
                 &request,
@@ -251,13 +258,13 @@ fn resolve_dispatch_scope<'a>(
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
     admission: RequestAdmission<'_>,
-) -> RequestAuthScope<'a> {
+) -> crate::Result<RequestAuthScope<'a>> {
     let builder = RequestAuthScope::builder(identity, state.auth_stores())
         .with_session_database(Some(database_id));
     match admission {
         RequestAdmission::AlreadyAdmitted => builder.build(),
         RequestAdmission::NotYetAdmitted { peer_addr } => {
-            builder.build_for_client(peer_addr).into_resolved_scope()
+            Ok(builder.build_for_client(peer_addr)?.into_resolved_scope())
         }
     }
 }
@@ -326,7 +333,8 @@ mod tests {
             RequestAdmission::NotYetAdmitted {
                 peer_addr: "127.0.0.1:5432",
             },
-        );
+        )
+        .expect("resolve dispatch scope");
 
         assert_eq!(scope.database_id(), dispatch_target);
         assert_eq!(scope.auth().database_id, Some(dispatch_target));

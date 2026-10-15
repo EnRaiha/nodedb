@@ -71,7 +71,7 @@ pub async fn show_graph_stats(
     // tenant-wide form names no collection to ask the narrow question about, so
     // it asks the tenant-wide one — and narrows its rows to the collections the
     // caller can actually read, below.
-    let gate = RefusingReadGate::for_request(state, identity, database_id);
+    let gate = RefusingReadGate::for_request(state, identity, database_id)?;
     match collection.as_deref() {
         Some(name) => gate.gate_collection(name, STATS_WHAT)?,
         None => gate.refuse_if_any_read_policy(STATS_TENANT_WIDE_WHAT)?,

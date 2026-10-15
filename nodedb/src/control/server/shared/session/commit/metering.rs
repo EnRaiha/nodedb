@@ -10,8 +10,38 @@ use crate::control::server::shared::metering::meter_buffered_write;
 use crate::control::server::shared::sql::staging_predicates::is_stageable_write;
 use crate::control::state::SharedState;
 
+/// A non-stageable write's position in the buffered batch, with the scope its
+/// metering charge is billed against.
+pub(super) type BufferedWriteScope<'a> = (usize, RequestAuthScope<'a>);
+
+/// Resolve the metering scope of every non-stageable ("Buffered") write in
+/// `buffered`. Runs before any durable write so a scope error aborts the
+/// COMMIT instead of surfacing after the writes are durable. Returns no
+/// scopes when metering is disabled.
+pub(super) fn resolve_buffered_write_scopes<'a>(
+    state: &'a SharedState,
+    identity: &'a AuthenticatedIdentity,
+    buffered: &[PhysicalTask],
+) -> crate::Result<Vec<BufferedWriteScope<'a>>> {
+    let mut scopes = Vec::new();
+    if !state.metering_config.enabled {
+        return Ok(scopes);
+    }
+    for (index, task) in buffered.iter().enumerate() {
+        if is_stageable_write(&task.plan) {
+            continue;
+        }
+        let scope = RequestAuthScope::builder(identity, state.auth_stores())
+            .with_session_database(Some(task.database_id))
+            .build()?;
+        scopes.push((index, scope));
+    }
+    Ok(scopes)
+}
+
 /// Meter every non-stageable ("Buffered") write in `buffered`, once its
-/// COMMIT-time durable replay has already succeeded.
+/// COMMIT-time durable replay has already succeeded. `scopes` comes from
+/// [`resolve_buffered_write_scopes`].
 ///
 /// Skips any task `is_stageable_write` still classifies as stageable: that
 /// task was already metered at STATEMENT time when it staged into the
@@ -27,20 +57,13 @@ use crate::control::state::SharedState;
 /// dispatch whose response carries no row payload to count).
 pub(super) fn meter_committed_buffered_writes(
     state: &SharedState,
-    identity: &AuthenticatedIdentity,
     buffered: &[PhysicalTask],
+    scopes: &[BufferedWriteScope<'_>],
 ) {
-    if !state.metering_config.enabled {
-        return;
-    }
-    for task in buffered {
-        if is_stageable_write(&task.plan) {
-            continue;
+    for (index, scope) in scopes {
+        if let Some(task) = buffered.get(*index) {
+            meter_buffered_write(state, scope, &task.plan);
         }
-        let scope = RequestAuthScope::builder(identity, state.auth_stores())
-            .with_session_database(Some(task.database_id))
-            .build();
-        meter_buffered_write(state, &scope, &task.plan);
     }
 }
 
@@ -138,7 +161,9 @@ mod tests {
         let identity = identity();
         let buffered = vec![stageable_task(), non_stageable_task()];
 
-        meter_committed_buffered_writes(&state, &identity, &buffered);
+        let scopes = resolve_buffered_write_scopes(&state, &identity, &buffered)
+            .expect("resolve buffered write scopes");
+        meter_committed_buffered_writes(&state, &buffered, &scopes);
 
         let events = state.usage_counter.drain();
         assert_eq!(
@@ -157,7 +182,9 @@ mod tests {
         let identity = identity();
         let buffered = vec![non_stageable_task()];
 
-        meter_committed_buffered_writes(&state, &identity, &buffered);
+        let scopes = resolve_buffered_write_scopes(&state, &identity, &buffered)
+            .expect("resolve buffered write scopes");
+        meter_committed_buffered_writes(&state, &buffered, &scopes);
 
         assert_eq!(state.usage_counter.total_tokens(), 0);
     }
@@ -168,7 +195,9 @@ mod tests {
         enable_metering(&mut state);
         let identity = identity();
 
-        meter_committed_buffered_writes(&state, &identity, &[]);
+        let scopes = resolve_buffered_write_scopes(&state, &identity, &[])
+            .expect("resolve buffered write scopes");
+        meter_committed_buffered_writes(&state, &[], &scopes);
 
         assert_eq!(state.usage_counter.total_tokens(), 0);
     }

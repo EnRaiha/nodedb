@@ -26,7 +26,10 @@ pub(in crate::control::server::resp) async fn handle_mget(
     }
 
     // Resolved once for the whole command, not once per returned value.
-    let redaction = resp_redaction(state, session);
+    let redaction = match resp_redaction(state, session) {
+        Ok(redaction) => redaction,
+        Err(e) => return RespValue::from_error(&e),
+    };
 
     let plan = PhysicalPlan::Kv(KvOp::BatchGet {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, &session.collection),

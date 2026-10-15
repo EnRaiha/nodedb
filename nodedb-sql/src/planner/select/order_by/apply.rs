@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
 use crate::planner::select::post_process::post_process;
+use crate::planner::sort::{sort_ascending, sort_nulls_first};
 use crate::resolver::ColumnScope;
 use crate::resolver::columns::{ColumnNaming, TableScope};
 use crate::resolver::expr::convert_expr;
@@ -75,20 +76,14 @@ pub(in crate::planner::select) fn apply_order_by(
                     table: None,
                     name: alias,
                 },
-                ascending: first.options.asc.unwrap_or(true),
-                nulls_first: first
-                    .options
-                    .nulls_first
-                    .unwrap_or(!first.options.asc.unwrap_or(true)),
+                ascending: sort_ascending(&first.options)?,
+                nulls_first: sort_nulls_first(&first.options)?,
             }];
             for o in &exprs[1..] {
                 keys.push(SortKey {
                     expr: convert_expr(&o.expr, &ColumnScope::Relations(&sort_scope))?,
-                    ascending: o.options.asc.unwrap_or(true),
-                    nulls_first: o
-                        .options
-                        .nulls_first
-                        .unwrap_or(!o.options.asc.unwrap_or(true)),
+                    ascending: sort_ascending(&o.options)?,
+                    nulls_first: sort_nulls_first(&o.options)?,
                 });
             }
             return post_process(scored, keys, None, 0);
@@ -139,11 +134,8 @@ pub(in crate::planner::select) fn apply_order_by(
             .map(|(o, expr)| {
                 Ok(SortKey {
                     expr: convert_expr(expr, &ColumnScope::Relations(&sort_scope))?,
-                    ascending: o.options.asc.unwrap_or(true),
-                    nulls_first: o
-                        .options
-                        .nulls_first
-                        .unwrap_or(!o.options.asc.unwrap_or(true)),
+                    ascending: sort_ascending(&o.options)?,
+                    nulls_first: sort_nulls_first(&o.options)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -170,11 +162,8 @@ pub(in crate::planner::select) fn apply_order_by(
             .map(|o| {
                 Ok(SortKey {
                     expr: convert_expr(&o.expr, &ColumnScope::Relations(&sort_scope))?,
-                    ascending: o.options.asc.unwrap_or(true),
-                    nulls_first: o
-                        .options
-                        .nulls_first
-                        .unwrap_or(!o.options.asc.unwrap_or(true)),
+                    ascending: sort_ascending(&o.options)?,
+                    nulls_first: sort_nulls_first(&o.options)?,
                 })
             })
             .collect::<Result<_>>()?

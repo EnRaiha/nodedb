@@ -166,7 +166,7 @@ pub async fn select_from_stream(
     // scope is its own resolved roles rather than the subscription's.
     let mut subscriber = CdcSubscriberScope::new(
         identity.tenant_id,
-        RequestAuthScope::for_database(identity, state.auth_stores(), database_id)
+        RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?
             .auth()
             .roles
             .clone(),

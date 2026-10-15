@@ -51,7 +51,7 @@ pub async fn execute_sql(
     // database so `scope.database_id()` resolves to `database_id`.
     let request = RequestAuthScope::builder(identity, shared.auth_stores())
         .with_session_database(Some(database_id))
-        .build_for_client(peer_addr);
+        .build_for_client(peer_addr)?;
 
     // Admission gate runs before planning/dispatch. WebSocket has no headers for
     // `X-RateLimit-*`, so the outcome is discarded on success; a denial still fails closed.
@@ -603,6 +603,7 @@ mod tests {
         state: &'a SharedState,
     ) -> RequestAuthScope<'a> {
         RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT)
+            .expect("resolve request scope")
     }
 
     /// `meter_task` runs unconditionally after every dispatch branch in

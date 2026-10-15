@@ -74,7 +74,7 @@ impl<'a> CollectionReadGate<'a> {
         database_id: DatabaseId,
         collection: &str,
     ) -> Result<Self, DdlError> {
-        let gate = Self::for_request(state, identity, database_id);
+        let gate = Self::for_request(state, identity, database_id)?;
         gate.authorize(collection)?;
         Ok(gate)
     }
@@ -89,11 +89,11 @@ impl<'a> CollectionReadGate<'a> {
         state: &'a SharedState,
         identity: &'a AuthenticatedIdentity,
         database_id: DatabaseId,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DdlError> {
+        Ok(Self {
             state,
-            scope: RequestAuthScope::for_database(identity, state.auth_stores(), database_id),
-        }
+            scope: RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?,
+        })
     }
 
     /// The tenant this gate is scoped to.
