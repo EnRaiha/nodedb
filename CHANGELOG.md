@@ -31,84 +31,91 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.6.0] - 2026-10-15
 
-A correctness release. Statements that returned a plausible wrong answer now return the right one or a typed error, and cluster recovery, restore and Calvin transactions survive crashes and leader moves.
+A feature and correctness release. It adds per-database backup with point-in-time restore, lease reads, redaction policies and wider SQL. Queries that returned a wrong answer return the right one or a typed error.
 
 ### ⚠️ Breaking changes
 
-- **A 0.5.0 data directory cannot be opened by 0.6.0.** The WAL format, row identity, time encoding, full-text keys and columnar footers changed. Dump and reload.
-- **Sync and native protocols changed.** Upgrade Lite and `nodedb-client` with the server.
-- **SQL refuses what it used to accept silently:**
-  - an unknown or ambiguous column returns `42703` / `42702` at plan time;
-  - a NULL `PRIMARY KEY` returns `23502`, and a duplicate key returns `23505`;
-  - a value outside a declared `DECIMAL(p,s)`, `SMALLINT`, `INT` or `REAL` width is refused;
-  - a narrowing `ALTER COLUMN TYPE` is refused;
-  - `ORDER BY … USING <operator>` is refused;
-  - `MERGE … UPDATE SET *`, `INSERT *` and a `WHERE` or `DELETE WHERE` clause on a `MERGE` update are refused.
+- **0.6.0 cannot read a 0.5.0 data directory.** The WAL, row identity, time encoding, full-text keys and columnar footers changed, but the format version numbers did not. 0.6.0 cannot detect 0.5.0 files, so start it on an empty directory.
+- **Sync and native protocols changed.** Upgrade Lite and `nodedb-client` with the server. The handshake does not refuse an old client: a mismatch surfaces as a decode error. pgwire clients are unaffected.
+- **`nodedb-client`:** `graph_traverse` takes a `Direction`, and `text_search` has no default body.
+- **Error codes:**
+  - native numeric codes are renumbered: 1111 means `UNDEFINED_OBJECT`, and `CANNOT_DROP_DEFAULT_DATABASE` is 1710;
+  - planner errors that returned `42601` return a specific SQLSTATE (`42703`, `42702`, `22003`, `22012` and others);
+  - more remote errors keep their SQLSTATE instead of `XX000`;
+  - a full dispatch queue returns `57P03`, and HTTP returns `503` with `Retry-After`.
+- **SQL refuses what it accepted:**
+  - an unknown or ambiguous column returns `42703` / `42702` at plan time, except on schemaless collections;
+  - a NULL or omitted declared `PRIMARY KEY` returns `23502`. 0.5.0 generated an id;
+  - a duplicate key returns `23505` on columnar, timeseries, spatial and vector-primary collections, and on every row of a multi-row document `INSERT`;
+  - a value outside a declared `DECIMAL(p,s)` returns `22003`;
+  - `ALTER COLUMN TYPE` refuses narrowing within a type family, such as `BIGINT` to `SMALLINT`;
+  - `MERGE` refuses a `WHERE` or `DELETE WHERE` on its update clause. 0.5.0 ignored it.
 - **Some queries return different results:**
-  - `time_bucket` returns an ISO-8601 instant;
+  - `time_bucket` over a timestamp returns a timestamp. 0.5.0 returned epoch milliseconds. Integer input still returns an integer;
   - `stddev` and `variance` use sample semantics, as in PostgreSQL;
-  - KV sorted indexes order numbers by value;
+  - KV sorted indexes compare integers and floats as one numeric order, and strings lexically. Rebuild existing sorted indexes;
   - aggregates inside a transaction count its own writes.
-- **Typed errors keep their SQLSTATE across nodes** instead of collapsing to `XX000`. A full dispatch queue returns `57P03`, and HTTP returns `503` with `Retry-After`.
+- **`engine='vector'`** creates a vector-primary collection and requires `vector_field` and `dim`. 0.5.0 created a schemaless document collection.
 - **Multi-row `INSERT` and `UPSERT` are atomic** on KV, document and vector-primary collections. A row that fails writes nothing.
 - **Config:**
-  - an invalid `NODEDB_*` value aborts startup;
-  - `${VAR}` in the TOML file expands;
-  - `[server] single_node_calvin`, `quic_keep_alive_secs` and `quic_idle_timeout_secs` are removed;
-  - `rpc_timeout_secs` has a 500 ms floor.
+  - an invalid `NODEDB_*` value or an out-of-range TOML value aborts startup;
+  - `${VAR}` in the TOML file expands, and an unset variable aborts startup. Write `$${` for a literal `${`;
+  - `[server] single_node_calvin` is removed, and setting it aborts startup;
+  - `[tuning.cluster_transport] quic_keep_alive_secs` and `quic_idle_timeout_secs` and `[tuning.query] aggregate_scan_cap` are removed and ignored;
+  - the QUIC idle timeout follows `rpc_timeout_secs` (default 5 s, 0.5.0 used 30 s), and `rpc_timeout_secs = 0` is refused.
 - **The minimum Rust version is 1.96.**
 - **`nodedb-bridge`:** `AsyncControlHandle` has no public `inner` field. Use `try_send_request` for a non-blocking send.
 
 ### Added
 
 - **Backup and restore:**
-  - per-database consistent-cut backups, scheduled and verified, to local or remote storage;
-  - selective restore by database;
-  - point-in-time restore with `nodedb restore`.
-- **Leader-lease linearizable reads.**
-- **Sequences:** `nextval`, `currval`, `setval` and `SERIAL`, evaluated per row.
+  - `BACKUP DATABASE` / `RESTORE DATABASE` to `file://` or `s3://`, with `[[backup.schedule]]` cron schedules. 0.5.0 returned `0A000`;
+  - restore checks row counts against the backup;
+  - point-in-time restore with `nodedb restore --target-lsn | --target-time | --restore-point`.
+- **Reads:** leader-lease linearizable reads and bounded-staleness follower reads.
+- **Redaction policies:** `CREATE REDACTION POLICY` masks columns in query results, CDC, streaming views and CRDT pushes.
 - **SQL:**
-  - `EXISTS` / `NOT EXISTS`;
-  - expressions over derived tables, CTEs and derived tables as join sides;
-  - `CROSS JOIN`;
-  - `FILTER (WHERE …)`, `HAVING` and grouping sets on timeseries aggregates.
-- **SQL write forms:**
-  - `RETURNING` on KV `UPDATE` / `DELETE`;
-  - `CREATE [UNIQUE] INDEX IF NOT EXISTS`;
-  - one real command tag per DML statement on every engine and protocol.
-- **Continuous aggregates are queryable relations.** `REFRESH CONTINUOUS AGGREGATE` runs on any node.
-- **`engine='vector'`** creates a vector-primary collection.
-- **`[tuning.startup]`** sets `raft_ready_timeout_ms` (default 30 s) and `data_group_recovery_timeout_ms` (default 60 s). A boot wait fails only when it makes no progress for that long.
-- **`[server] sync_host` / `NODEDB_SYNC_HOST`** sets the sync listener's bind address.
-- **Japanese and Korean full-text segmentation** reads a lindera dictionary from `NODEDB_FTS_IPADIC_DIR` / `NODEDB_FTS_KO_DIC_DIR`. Without one, CJK text uses character bigrams.
-- **`MERGE … WHEN MATCHED THEN DO NOTHING`.**
+  - `EXISTS` / `NOT EXISTS`, `CROSS JOIN`, and derived tables and CTEs as join sides;
+  - aggregates, window functions and computed columns over derived tables, CTEs and `UNION ALL`;
+  - aggregate `FILTER (WHERE …)` on every engine, and `HAVING` and grouping sets on timeseries;
+  - `nextval`, `currval` and `setval` callable from SQL, with `SERIAL` evaluated per row;
+  - `INSERT … SELECT` with any projection. 0.5.0 took only `SELECT *`;
+  - `RETURNING` on `INSERT`, `UPSERT` and `MERGE`, and on KV `UPDATE` / `DELETE`;
+  - column `DEFAULT` on KV, columnar, timeseries and vector-primary collections;
+  - `CREATE [UNIQUE] INDEX IF NOT EXISTS`, `MERGE … WHEN MATCHED THEN DO NOTHING`, and `REMOVE EVENT`;
+  - `statement_timeout` is enforced.
+- **Continuous aggregates** are relations you can `SELECT` from, refreshed with `REFRESH CONTINUOUS AGGREGATE` on any node.
+- **Graph:** `LABEL` lists and `EDGE WHERE` filters on `GRAPH TRAVERSE` / `GRAPH PATH`.
+- **Full-text:**
+  - `text_match` / `bm25_score` take a column and `mode` / `fuzzy` options;
+  - Japanese and Korean segmentation read a lindera dictionary from `NODEDB_FTS_IPADIC_DIR` / `NODEDB_FTS_KO_DIC_DIR`. Without one, CJK text uses character bigrams.
+- **Indexes:** IVF-PQ takes inserts and deletes, and graph and full-text `REINDEX` no longer block writes.
+- **Config:** `[tuning.startup]` boot timeouts, and `[server] sync_host` / `NODEDB_SYNC_HOST` for the loopback sync listener.
 
 ### Fixed
 
-- **Restore and recovery:** restore dropped committed rows, graph edges and arrays. A crash during snapshot install left a half-installed group.
-- **Cross-shard Calvin transactions** lost state on a leader move or restart.
+- **Restore:** backups omitted arrays, and restore dropped committed rows and graph edges. A crash during snapshot install left a half-installed group.
+- **Calvin:** cross-shard transactions were lost on a leader move or restart.
 - **Cluster writes:**
   - a write inside a transaction on a non-owning coordinator survived `ROLLBACK`;
-  - `MERGE`, `UPDATE … FROM` and `INSERT … SELECT` wrote to non-owning nodes.
-- **`INSERT … SELECT`, `MERGE` and `UPDATE … FROM`** stopped silently at 10,000 rows.
-- **Typeguards** were skipped on some write paths.
-- **Query results:**
-  - joins and aggregates bypassed row-level security;
-  - `TRUNCATE` left KV, columnar, timeseries, spatial and vector-primary rows in place;
-  - unknown identifiers returned NULL rows.
-- **Time keys** used mixed units, so cross-node joins dropped every row.
-- **Server crashes:**
-  - `CREATE VECTOR INDEX` and `CREATE SORTED INDEX` crashed the server with a stack overflow;
-  - JWT bearer authentication over HTTP panicked the handler.
+  - `MERGE`, `UPDATE … FROM` and `INSERT … SELECT` applied only on the coordinating node and were not replicated.
+- **`INSERT … SELECT` without `LIMIT`** stopped silently at 10,000 rows.
+- **Typeguards** ran only on `{ }` writes. SQL `INSERT`, `INSERT … SELECT`, `UPDATE` and transaction writes skipped them.
+- **Row-level security** did not apply to columnar or timeseries scans, or to the remote side of a cross-node join.
+- **`TRUNCATE`** left KV, columnar, timeseries, spatial and vector-primary rows in place.
+- **Unknown columns** returned NULL rows.
+- **Command tags:** a multi-row or multi-shard statement returned several tags, or none.
+- **JWT bearer authentication over HTTP** panicked the handler when a JWKS provider was configured.
 - **The published container image** could not start.
 - **Write cost:** a multi-row write paid one fsync per row.
 
 ### Security
 
-- `rustls` 0.23.46: RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348, RUSTSEC-2026-0349.
-- Wasmtime 49.0.3: RUSTSEC-2026-0315, RUSTSEC-2026-0316, RUSTSEC-2026-0353 to RUSTSEC-2026-0364.
-- `unsafe-libyaml` is no longer in the dependency tree: RUSTSEC-2024-0449.
-- `quinn-proto` 0.11.19 and `ruzstd` 0.9.1: RUSTSEC-2026-0338, RUSTSEC-2026-0340, RUSTSEC-2026-0343, RUSTSEC-2026-0344.
+- `rustls` 0.23.46: RUSTSEC-2026-0285, RUSTSEC-2026-0346, RUSTSEC-2026-0348, RUSTSEC-2026-0349.
+- Wasmtime 49.0.3: RUSTSEC-2026-0315, RUSTSEC-2026-0316, RUSTSEC-2026-0353 to RUSTSEC-2026-0359, RUSTSEC-2026-0361 to RUSTSEC-2026-0364.
+- `quinn-proto` 0.11.19: RUSTSEC-2026-0338, RUSTSEC-2026-0340.
+- `ruzstd` 0.9.1, WASM builds of `nodedb-codec` only: RUSTSEC-2026-0344.
+- `unsafe-libyaml` (unmaintained) is no longer in the dependency tree: RUSTSEC-2024-0449.
 
 ---
 
