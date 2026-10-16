@@ -5,6 +5,7 @@
 
 pub mod dispatch;
 pub mod hit_key;
+pub mod rag_fusion;
 pub mod text_hybrid;
 pub mod vector;
 

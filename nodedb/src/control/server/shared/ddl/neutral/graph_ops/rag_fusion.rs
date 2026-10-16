@@ -15,6 +15,7 @@ use nodedb_sql::ddl_ast::GraphDirection;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::response_translate::rag_fusion::translate_rag_fusion_payload;
 use crate::control::server::shared::ddl::user_dispatch;
 use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
@@ -101,8 +102,9 @@ pub async fn rag_fusion(
         None => GraphTraversalOptions::default(),
     };
 
+    let qualified = nodedb_types::QualifiedCollection::new(database_id, &collection);
     let plan = PhysicalPlan::Graph(GraphOp::RagFusion {
-        collection: nodedb_types::QualifiedCollection::new(database_id, &collection),
+        collection: qualified.clone(),
         query_vector,
         vector_top_k,
         edge_label: params.edge_label,
@@ -135,6 +137,16 @@ pub async fn rag_fusion(
     .await
     .map_err(|e| DdlError::from_error(&e))?;
 
+    // This handler renders its own rows, so the response never reaches
+    // `translate_search_response`. A hit bound to no graph node names itself by
+    // surrogate until the catalog turns it into the row's user PK.
+    let payload = translate_rag_fusion_payload(
+        &payload,
+        state,
+        database_id,
+        identity.tenant_id,
+        qualified.as_str(),
+    );
     let json_text = response_codec::decode_payload_to_json(&payload);
     let mut row = Map::new();
     row.insert("result".to_string(), JsonValue::String(json_text));

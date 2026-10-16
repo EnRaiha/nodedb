@@ -8,14 +8,16 @@ use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::{TextOp, VectorOp};
+use nodedb_physical::physical_plan::{GraphOp, RagStage, TextOp, VectorOp};
 
+use super::rag_fusion::translate_rag_fusion_payload;
 use super::text_hybrid::{translate_hybrid_search_payload, translate_text_search_payload};
 use super::vector::translate_vector_search_payload;
 
 /// Inspect the executed plan and apply the surrogate→PK translation that
-/// matches its shape: vector search hits, full-text search hits, or hybrid
-/// (RRF) fusion hits. Every other plan kind returns the payload untouched.
+/// matches its shape: vector search hits, full-text search hits, hybrid
+/// (RRF) fusion hits, or `GRAPH RAG FUSION` results. Every other plan kind
+/// returns the payload untouched.
 pub fn translate_search_response(
     payload: &[u8],
     plan: &PhysicalPlan,
@@ -86,6 +88,19 @@ pub fn translate_search_response(
                 collection.as_str(),
             )
         }
+        // Only the stage that answers the client carries a `GraphRagResponse`.
+        // `ExportLegs` and `Bindings` payloads are the coordinator's input.
+        PhysicalPlan::Graph(GraphOp::RagFusion {
+            collection,
+            stage: RagStage::Local,
+            ..
+        }) => translate_rag_fusion_payload(
+            payload,
+            state,
+            database_id,
+            tenant_id,
+            collection.as_str(),
+        ),
         _ => payload.to_vec(),
     }
 }
