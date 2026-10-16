@@ -286,6 +286,108 @@ async fn vector_only_hit_ranks_without_an_index_local_sentinel() {
         !blob.contains("__local_"),
         "an index-local id must never surface as a node_id; got: {blob}"
     );
+
+    // The row is a document, not a graph node, so it names itself by the user
+    // PK every other search response uses, never by its surrogate.
+    let results = fusion_results(&blob);
+    assert_eq!(
+        results.len(),
+        1,
+        "exactly the vector-only hit must rank; got: {blob}"
+    );
+    assert_eq!(
+        results[0]["node_id"], "lonely",
+        "a vector hit bound to no graph node must report its user PK, not a surrogate; got: {blob}"
+    );
+}
+
+/// The `results` array of a `GRAPH RAG FUSION` response body.
+fn fusion_results(blob: &str) -> Vec<serde_json::Value> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(blob).unwrap_or_else(|e| panic!("response is not JSON: {e}: {blob}"));
+    parsed
+        .get("results")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("response carries no results array: {blob}"))
+        .clone()
+}
+
+/// Documents and graph nodes in one ranking each keep their own name: a
+/// document that is in no edge reports its user PK, a graph node reports its
+/// node name and hop distance. A declared `PRIMARY KEY` changes neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn documents_and_graph_nodes_each_report_their_own_name() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION ragf_names (id TEXT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+    server
+        .exec("CREATE VECTOR INDEX idx_ragf_names ON ragf_names (embedding) METRIC cosine DIM 2")
+        .await
+        .unwrap();
+    // `lonely` is nearest the query and is in no edge. `a` is the second hit and
+    // an edge source. `b` is far from the query and only the walk reaches it.
+    for (id, vector) in [
+        ("lonely", "ARRAY[1.0, 0.0]"),
+        ("a", "ARRAY[0.0, 1.0]"),
+        ("b", "ARRAY[-1.0, 0.0]"),
+    ] {
+        server
+            .exec(&format!(
+                "INSERT INTO ragf_names (id, embedding) VALUES ('{id}', {vector})"
+            ))
+            .await
+            .unwrap();
+    }
+    server
+        .exec("GRAPH INSERT EDGE IN 'ragf_names' FROM 'a' TO 'b' TYPE 'hop'")
+        .await
+        .unwrap();
+
+    let blob = server
+        .query_text(
+            "GRAPH RAG FUSION ON ragf_names \
+             QUERY ARRAY[1.0, 0.0] \
+             VECTOR_FIELD 'embedding' \
+             VECTOR_TOP_K 2 \
+             EXPANSION_DEPTH 1 \
+             EDGE_LABEL 'hop' \
+             FINAL_TOP_K 10",
+        )
+        .await
+        .expect("fusion must succeed")
+        .join("");
+
+    let results = fusion_results(&blob);
+    let hop = |node: &str| {
+        results
+            .iter()
+            .find(|r| r["node_id"] == node)
+            .unwrap_or_else(|| panic!("no result named {node}; got: {blob}"))
+            .get("hop_distance")
+            .and_then(serde_json::Value::as_u64)
+    };
+    assert_eq!(
+        results.len(),
+        3,
+        "lonely, a and b must all rank; got: {blob}"
+    );
+    assert_eq!(
+        hop("lonely"),
+        None,
+        "a document in no edge has no hop; got: {blob}"
+    );
+    assert_eq!(
+        hop("a"),
+        Some(0),
+        "a seed graph node is at hop 0; got: {blob}"
+    );
+    assert_eq!(
+        hop("b"),
+        Some(1),
+        "a reached graph node is at hop 1; got: {blob}"
+    );
 }
 
 /// Graph expansion is seeded by the vector hits' identity, so a node reachable
