@@ -88,13 +88,36 @@ impl From<nodedb_types::LsnTimeError> for Error {
     }
 }
 
-/// An array-engine error. The array store is engine storage, so it renders
-/// as a storage error of the `array` engine.
+/// An array-engine error. A value outside its attr type's range or an
+/// integer overflow renders as SQLSTATE `22003`. A cell of another type than
+/// its attr declares renders as `42804`. Every other error is engine
+/// storage, so it renders as a storage error of the `array` engine.
 impl From<crate::engine::array::engine::ArrayEngineError> for Error {
     fn from(e: crate::engine::array::engine::ArrayEngineError) -> Self {
-        Error::Storage {
-            engine: "array".to_string(),
-            detail: e.to_string(),
+        use crate::engine::array::engine::ArrayEngineError;
+        use nodedb_array::ArrayError;
+        match &e {
+            ArrayEngineError::Array(ArrayError::NumericOverflow { .. }) => {
+                Error::NumericValueOutOfRange {
+                    detail: e.to_string(),
+                }
+            }
+            ArrayEngineError::Array(ArrayError::Narrow { source, .. })
+                if source.is_out_of_range() =>
+            {
+                Error::NumericValueOutOfRange {
+                    detail: e.to_string(),
+                }
+            }
+            ArrayEngineError::Array(
+                ArrayError::Narrow { .. } | ArrayError::CellTypeMismatch { .. },
+            ) => Error::DatatypeMismatch {
+                detail: e.to_string(),
+            },
+            _ => Error::Storage {
+                engine: "array".to_string(),
+                detail: e.to_string(),
+            },
         }
     }
 }

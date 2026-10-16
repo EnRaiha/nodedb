@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::error::{ArrayError, ArrayResult};
+use crate::schema::ArraySchema;
 use crate::sync::hlc::Hlc;
 use crate::sync::op::{ArrayOp, ArrayOpKind};
 use crate::types::coord::value::CoordValue;
@@ -57,6 +58,13 @@ pub enum ApplyRejection {
         /// Human-readable description of the violation.
         detail: String,
     },
+    /// A `Put` op's attrs do not match the local schema: wrong arity, a
+    /// value of another type than the attr declares, or `Null` on a
+    /// NOT NULL attr.
+    SchemaViolation {
+        /// Human-readable description of the violation.
+        detail: String,
+    },
     /// The engine rejected the op (e.g. a transient storage error).
     ///
     /// The rejection is wrapped here so callers can record it without
@@ -80,6 +88,10 @@ pub trait ApplyEngine {
     /// Return the current schema HLC for `array`, or `None` if the array is
     /// not known to this replica.
     fn schema_hlc(&self, array: &str) -> ArrayResult<Option<Hlc>>;
+
+    /// Return the current schema of `array`, or `None` if the array is not
+    /// known to this replica.
+    fn array_schema(&self, array: &str) -> ArrayResult<Option<ArraySchema>>;
 
     /// Return `true` if `hlc` has already been applied to `array`.
     ///
@@ -112,11 +124,13 @@ pub trait ApplyEngine {
 ///    `op.header.schema_hlc` strictly later on the clock than `local`
 ///    → `Rejected(SchemaTooNew)`. Same-instant schemas are admitted.
 /// 3. Idempotency — already seen → `Idempotent`.
-/// 4. Dispatch to `apply_put`/`apply_delete`/`apply_erase`. Engine errors
+/// 4. Schema check — a `Put` op's attrs are checked against the local schema
+///    with [`ArraySchema::check_cell`] — on error: `Rejected(SchemaViolation)`.
+/// 5. Dispatch to `apply_put`/`apply_delete`/`apply_erase`. Engine errors
 ///    that indicate corruption (`SegmentCorruption`, `HlcLockPoisoned`) are
 ///    propagated; all others become `Rejected(EngineRejected)`.
-/// 5. Tile-cache invalidation.
-/// 6. Return `Applied`.
+/// 6. Tile-cache invalidation.
+/// 7. Return `Applied`.
 pub fn apply_op<E: ApplyEngine>(engine: &mut E, op: &ArrayOp) -> ArrayResult<ApplyOutcome> {
     // 1. Shape validation.
     if let Err(e) = op.validate_shape() {
@@ -150,7 +164,21 @@ pub fn apply_op<E: ApplyEngine>(engine: &mut E, op: &ArrayOp) -> ArrayResult<App
         return Ok(ApplyOutcome::Idempotent);
     }
 
-    // 4. Dispatch.
+    // 4. Schema check of a Put's attrs.
+    if let (ArrayOpKind::Put, Some(attrs)) = (op.kind, op.attrs.as_deref()) {
+        let Some(schema) = engine.array_schema(&op.header.array)? else {
+            return Ok(ApplyOutcome::Rejected(ApplyRejection::ArrayUnknown {
+                name: op.header.array.clone(),
+            }));
+        };
+        if let Err(e) = schema.check_cell(attrs) {
+            return Ok(ApplyOutcome::Rejected(ApplyRejection::SchemaViolation {
+                detail: e.to_string(),
+            }));
+        }
+    }
+
+    // 5. Dispatch.
     let dispatch_result = match op.kind {
         ArrayOpKind::Put => engine.apply_put(op),
         ArrayOpKind::Delete => engine.apply_delete(op),
@@ -169,10 +197,10 @@ pub fn apply_op<E: ApplyEngine>(engine: &mut E, op: &ArrayOp) -> ArrayResult<App
         }
     }
 
-    // 5. Tile invalidation.
+    // 6. Tile invalidation.
     engine.invalidate_tile(&op.header.array, &op.coord)?;
 
-    // 6. Success.
+    // 7. Success.
     Ok(ApplyOutcome::Applied)
 }
 
@@ -188,7 +216,7 @@ pub fn apply_op<E: ApplyEngine>(engine: &mut E, op: &ArrayOp) -> ArrayResult<App
 /// - a log of invalidated tile coords
 #[cfg(test)]
 pub struct MockEngine {
-    schemas: HashMap<String, Hlc>,
+    schemas: HashMap<String, (Hlc, ArraySchema)>,
     seen: HashSet<(String, [u8; 18])>,
     pub applied: Vec<ArrayOp>,
     pub invalidated: Vec<(String, Vec<CoordValue>)>,
@@ -208,9 +236,28 @@ impl MockEngine {
         }
     }
 
-    /// Register an array so that ops targeting it can be applied.
+    /// Register an array so that ops targeting it can be applied. Its schema
+    /// has one `Int64` dim `k` and one nullable `Float64` attr `v`.
     pub fn register_array(&mut self, array: &str, schema_hlc: Hlc) {
-        self.schemas.insert(array.to_string(), schema_hlc);
+        use crate::schema::{ArraySchemaBuilder, AttrSpec, AttrType, DimSpec, DimType};
+        use crate::types::domain::{Domain, DomainBound};
+        let schema = ArraySchemaBuilder::new(array)
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("v", AttrType::Float64, true))
+            .tile_extents(vec![16])
+            .build()
+            .expect("invariant: the mock schema is well formed");
+        self.register_array_with_schema(schema_hlc, schema);
+    }
+
+    /// Register an array under its own schema.
+    pub fn register_array_with_schema(&mut self, schema_hlc: Hlc, schema: ArraySchema) {
+        self.schemas
+            .insert(schema.name.clone(), (schema_hlc, schema));
     }
 
     /// Inject an error that will be returned by the next `apply_*` call.
@@ -239,7 +286,11 @@ impl Default for MockEngine {
 #[cfg(test)]
 impl ApplyEngine for MockEngine {
     fn schema_hlc(&self, array: &str) -> ArrayResult<Option<Hlc>> {
-        Ok(self.schemas.get(array).copied())
+        Ok(self.schemas.get(array).map(|(hlc, _)| *hlc))
+    }
+
+    fn array_schema(&self, array: &str) -> ArrayResult<Option<ArraySchema>> {
+        Ok(self.schemas.get(array).map(|(_, schema)| schema.clone()))
     }
 
     fn already_seen(&self, array: &str, hlc: Hlc) -> ArrayResult<bool> {
@@ -421,6 +472,50 @@ mod tests {
             outcome,
             ApplyOutcome::Rejected(ApplyRejection::ShapeInvalid { .. })
         ));
+    }
+
+    /// A Put whose attr value is of another type than the local schema
+    /// declares is refused before the engine sees it.
+    #[test]
+    fn apply_rejects_a_put_that_breaks_the_schema() {
+        use crate::schema::{ArraySchemaBuilder, AttrSpec, AttrType, DimSpec, DimType};
+        use crate::types::domain::{Domain, DomainBound};
+        let mut engine = MockEngine::new();
+        let schema = ArraySchemaBuilder::new("scene")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("b1", AttrType::UInt16, false))
+            .tile_extents(vec![16])
+            .build()
+            .unwrap();
+        engine.register_array_with_schema(hlc(100), schema);
+
+        let mut wide = put_op("scene", 50, 100);
+        wide.attrs = Some(vec![CellValue::Int64(70_000)]);
+        let outcome = apply_op(&mut engine, &wide).unwrap();
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(ApplyRejection::SchemaViolation { .. })
+        ));
+
+        let mut null = put_op("scene", 51, 100);
+        null.attrs = Some(vec![CellValue::Null]);
+        let outcome = apply_op(&mut engine, &null).unwrap();
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(ApplyRejection::SchemaViolation { .. })
+        ));
+        assert!(engine.applied.is_empty());
+
+        let mut typed = put_op("scene", 52, 100);
+        typed.attrs = Some(vec![CellValue::UInt16(65_535)]);
+        assert_eq!(
+            apply_op(&mut engine, &typed).unwrap(),
+            ApplyOutcome::Applied
+        );
     }
 
     #[test]

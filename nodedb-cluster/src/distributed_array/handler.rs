@@ -653,7 +653,7 @@ mod tests {
         assert_eq!(resp.shard_id, 3);
         assert_eq!(resp.partials.len(), 1);
         assert_eq!(resp.partials[0].count, 1);
-        assert!((resp.partials[0].sum - 42.0).abs() < f64::EPSILON);
+        assert!((resp.partials[0].sum.as_f64() - 42.0).abs() < f64::EPSILON);
     }
 
     fn make_put_req_bytes(prefix_bits: u8) -> Vec<u8> {

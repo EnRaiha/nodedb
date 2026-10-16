@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 /// Attribute type tag. One-to-one with
 /// [`crate::types::cell_value::value::CellValue`] (excluding `Null`,
 /// which is per-cell, not per-attribute).
+///
+/// The narrow integer and `Float32` types store a cell at its declared
+/// width. A value outside the width is refused at write time, never
+/// wrapped or saturated.
 #[derive(
     Debug,
     Clone,
@@ -25,6 +29,62 @@ pub enum AttrType {
     Float64,
     String,
     Bytes,
+    #[serde(rename = "uint8")]
+    UInt8,
+    Int16,
+    #[serde(rename = "uint16")]
+    UInt16,
+    Int32,
+    #[serde(rename = "uint32")]
+    UInt32,
+    Float32,
+}
+
+impl AttrType {
+    /// The canonical DDL name of the type.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            AttrType::Int64 => "INT64",
+            AttrType::Float64 => "FLOAT64",
+            AttrType::String => "STRING",
+            AttrType::Bytes => "BYTES",
+            AttrType::UInt8 => "UINT8",
+            AttrType::Int16 => "INT16",
+            AttrType::UInt16 => "UINT16",
+            AttrType::Int32 => "INT32",
+            AttrType::UInt32 => "UINT32",
+            AttrType::Float32 => "FLOAT32",
+        }
+    }
+
+    /// The inclusive range an integer type holds, or `None` for a
+    /// non-integer type.
+    pub fn int_range(self) -> Option<(i64, i64)> {
+        match self {
+            AttrType::Int64 => Some((i64::MIN, i64::MAX)),
+            AttrType::UInt8 => Some((0, i64::from(u8::MAX))),
+            AttrType::Int16 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+            AttrType::UInt16 => Some((0, i64::from(u16::MAX))),
+            AttrType::Int32 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+            AttrType::UInt32 => Some((0, i64::from(u32::MAX))),
+            AttrType::Float64 | AttrType::Float32 | AttrType::String | AttrType::Bytes => None,
+        }
+    }
+
+    /// Whether the type is `Float32` or `Float64`.
+    pub fn is_float(self) -> bool {
+        match self {
+            AttrType::Float64 | AttrType::Float32 => true,
+            AttrType::Int64
+            | AttrType::UInt8
+            | AttrType::Int16
+            | AttrType::UInt16
+            | AttrType::Int32
+            | AttrType::UInt32
+            | AttrType::String
+            | AttrType::Bytes => false,
+        }
+    }
 }
 
 /// One attribute column on an [`super::ArraySchema`].
@@ -64,5 +124,16 @@ mod tests {
         let a = AttrSpec::new("qual", AttrType::Float64, true);
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn integer_ranges_match_their_widths() {
+        assert_eq!(AttrType::UInt8.int_range(), Some((0, 255)));
+        assert_eq!(AttrType::Int16.int_range(), Some((-32768, 32767)));
+        assert_eq!(AttrType::UInt16.int_range(), Some((0, 65535)));
+        assert_eq!(AttrType::UInt32.int_range(), Some((0, 4_294_967_295)));
+        assert_eq!(AttrType::Float32.int_range(), None);
+        assert!(AttrType::Float32.is_float());
+        assert!(!AttrType::Int32.is_float());
     }
 }

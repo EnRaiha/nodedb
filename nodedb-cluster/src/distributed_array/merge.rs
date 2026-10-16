@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::agg_number::ArrayAggNumber;
 use super::group_key::ArrayAggGroupKey;
 use super::wire::{ArrayShardAggResp, ArrayShardSliceResp};
 use crate::error::{ClusterError, Result};
@@ -35,24 +36,47 @@ pub struct ArrayAggPartial {
     /// Group-by dimension value, or `Scalar` when group_by_dim < 0.
     pub group_key: ArrayAggGroupKey,
     pub count: u64,
-    pub sum: f64,
-    pub min: f64,
-    pub max: f64,
+    /// Exact for an integer attr.
+    pub sum: ArrayAggNumber,
+    pub min: ArrayAggNumber,
+    pub max: ArrayAggNumber,
     /// Welford mean — enables MEAN without a second pass.
     pub welford_mean: f64,
     pub welford_m2: f64,
 }
 
 impl ArrayAggPartial {
-    /// Create from a single cell value.
+    /// Create from a single float cell value.
     pub fn from_single(group_key: ArrayAggGroupKey, val: f64) -> Self {
+        Self::from_number(group_key, ArrayAggNumber::Float(val))
+    }
+
+    /// Create from a single integer cell value.
+    pub fn from_single_int(group_key: ArrayAggGroupKey, val: i64) -> Self {
+        Self::from_number(group_key, ArrayAggNumber::int(i128::from(val)))
+    }
+
+    fn from_number(group_key: ArrayAggGroupKey, val: ArrayAggNumber) -> Self {
         Self {
             group_key,
             count: 1,
             sum: val,
             min: val,
             max: val,
-            welford_mean: val,
+            welford_mean: val.as_f64(),
+            welford_m2: 0.0,
+        }
+    }
+
+    /// The partial of a group no cell contributed to. Merging it is a no-op.
+    pub fn empty(group_key: ArrayAggGroupKey) -> Self {
+        Self {
+            group_key,
+            count: 0,
+            sum: ArrayAggNumber::Float(0.0),
+            min: ArrayAggNumber::Float(f64::INFINITY),
+            max: ArrayAggNumber::Float(f64::NEG_INFINITY),
+            welford_mean: 0.0,
             welford_m2: 0.0,
         }
     }
@@ -66,13 +90,9 @@ impl ArrayAggPartial {
             *self = other.clone();
             return;
         }
-        self.sum += other.sum;
-        if other.min < self.min {
-            self.min = other.min;
-        }
-        if other.max > self.max {
-            self.max = other.max;
-        }
+        self.sum = self.sum.sum_with(other.sum);
+        self.min = self.min.min_with(other.min);
+        self.max = self.max.max_with(other.max);
         let new_count = self.count + other.count;
         let delta = other.welford_mean - self.welford_mean;
         let combined_mean = (self.welford_mean * self.count as f64
@@ -265,7 +285,22 @@ mod tests {
         let merged = reduce_agg_partials(&[resp_a, resp_b]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].count, 2);
-        assert!((merged[0].sum - 30.0).abs() < f64::EPSILON);
+        assert!((merged[0].sum.as_f64() - 30.0).abs() < f64::EPSILON);
+    }
+
+    /// An integer SUM across shards keeps every unit past 2^53.
+    #[test]
+    fn reduce_integer_sum_is_exact_across_shards() {
+        let shard = |shard_id, v| ArrayShardAggResp {
+            shard_id,
+            partials: vec![ArrayAggPartial::from_single_int(g(0), v)],
+            truncated_before_horizon: false,
+            read_versions: Vec::new(),
+        };
+        let merged = reduce_agg_partials(&[shard(0, 1 << 53), shard(1, 1)]);
+        assert_eq!(merged[0].sum.as_i128(), Some((1 << 53) + 1));
+        assert_eq!(merged[0].max.as_i128(), Some(1 << 53));
+        assert_eq!(merged[0].min.as_i128(), Some(1));
     }
 
     #[test]
@@ -292,7 +327,7 @@ mod tests {
         };
         a.merge(&empty);
         assert_eq!(a.count, 1);
-        assert!((a.sum - 42.0).abs() < f64::EPSILON);
+        assert!((a.sum.as_f64() - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -346,7 +381,7 @@ mod tests {
         };
         let merged = reduce_agg_partials(&[resp_a, resp_b]);
         assert_eq!(merged.len(), 1);
-        assert!((merged[0].min - 3.0).abs() < f64::EPSILON);
+        assert!((merged[0].min.as_f64() - 3.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -365,7 +400,7 @@ mod tests {
         };
         let merged = reduce_agg_partials(&[resp_a, resp_b]);
         assert_eq!(merged.len(), 1);
-        assert!((merged[0].max - 99.0).abs() < f64::EPSILON);
+        assert!((merged[0].max.as_f64() - 99.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -378,7 +413,7 @@ mod tests {
         // welford_mean after merge = 15.0
         assert!((a.welford_mean - 15.0).abs() < 1e-9);
         assert_eq!(a.count, 2);
-        assert!((a.sum - 30.0).abs() < f64::EPSILON);
+        assert!((a.sum.as_f64() - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -407,9 +442,9 @@ mod tests {
         let g0 = merged.iter().find(|p| p.group_key == g(0)).unwrap();
         let g1 = merged.iter().find(|p| p.group_key == g(1)).unwrap();
         let g2 = merged.iter().find(|p| p.group_key == g(2)).unwrap();
-        assert!((g0.sum - 5.0).abs() < f64::EPSILON);
-        assert!((g1.sum - 30.0).abs() < f64::EPSILON);
-        assert!((g2.sum - 30.0).abs() < f64::EPSILON);
+        assert!((g0.sum.as_f64() - 5.0).abs() < f64::EPSILON);
+        assert!((g1.sum.as_f64() - 30.0).abs() < f64::EPSILON);
+        assert!((g2.sum.as_f64() - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -510,7 +545,7 @@ mod tests {
             merged
                 .iter()
                 .find(|p| p.group_key == key)
-                .map(|p| p.sum)
+                .map(|p| p.sum.as_f64())
                 .expect("group present")
         };
         assert!((sum_of(f(101.5)) - 3.0).abs() < f64::EPSILON);

@@ -23,7 +23,8 @@ use crate::types::domain::DomainBound;
     zerompk::FromMessagePack,
 )]
 pub enum AttrStats {
-    /// Numeric (`Int64` / `Float64`) min + max + null count.
+    /// Numeric min + max + null count. Every integer and float attr type
+    /// folds here, widened to `f64`.
     Numeric { min: f64, max: f64, null_count: u32 },
     /// String / bytes — only cardinality + null count, no min/max.
     Categorical { distinct: u32, null_count: u32 },
@@ -130,10 +131,18 @@ impl MbrBuilder {
         self.attr_total[i] += 1;
         match a {
             CellValue::Null => self.attr_nulls[i] += 1,
-            CellValue::Int64(v) => {
-                fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], *v as f64)
+            CellValue::Int64(_)
+            | CellValue::Float64(_)
+            | CellValue::UInt8(_)
+            | CellValue::Int16(_)
+            | CellValue::UInt16(_)
+            | CellValue::Int32(_)
+            | CellValue::UInt32(_)
+            | CellValue::Float32(_) => {
+                if let Some(v) = a.as_f64() {
+                    fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], v);
+                }
             }
-            CellValue::Float64(v) => fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], *v),
             CellValue::String(s) => {
                 self.attr_is_categorical[i] = true;
                 self.attr_distinct[i].insert(s.as_bytes().to_vec());

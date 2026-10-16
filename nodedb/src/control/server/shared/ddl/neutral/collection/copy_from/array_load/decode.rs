@@ -9,12 +9,15 @@
 
 use std::borrow::Cow;
 
+use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_sql::catalog::ArrayCatalogView;
 use nodedb_sql::types_array::{
-    ArrayAttrLiteral, ArrayAttrType, ArrayCoordLiteral, ArrayDimType, ArrayDomainBound,
-    ArrayInsertRow,
+    ArrayAttrAst, ArrayAttrLiteral, ArrayAttrType, ArrayCoordLiteral, ArrayDimType,
+    ArrayDomainBound, ArrayInsertRow,
 };
 use nodedb_types::Value;
+
+use crate::control::planner::sql_plan_convert::array_convert::engine_attr_type;
 
 /// A row a load refuses: its 1-based number, SQLSTATE and message.
 #[derive(Debug)]
@@ -108,8 +111,12 @@ pub(super) fn decode_text_row(
         let value = match field.as_deref() {
             None if attr.nullable => ArrayAttrLiteral::Null,
             None => return Err(not_null(&attr.name, row)),
-            Some(text) => parse_attr(text, attr.dtype)
-                .ok_or_else(|| invalid(&attr.name, attr_type_name(attr.dtype), text, row))?,
+            Some(text) => {
+                let literal = parse_attr(text, attr.dtype)
+                    .ok_or_else(|| invalid(&attr.name, attr.dtype.sql_name(), text, row))?;
+                check_width(&literal, attr, row)?;
+                literal
+            }
         };
         attrs.push(value);
     }
@@ -148,15 +155,16 @@ pub(super) fn decode_value_row(
         let literal = match (value, attr.dtype) {
             (Value::Null, _) if attr.nullable => ArrayAttrLiteral::Null,
             (Value::Null, _) => return Err(not_null(&attr.name, row)),
-            (Value::Integer(n), ArrayAttrType::Int64) => ArrayAttrLiteral::Int64(*n),
-            (Value::Integer(n), ArrayAttrType::Float64) => ArrayAttrLiteral::Float64(*n as f64),
-            (Value::Float(f), ArrayAttrType::Float64) => ArrayAttrLiteral::Float64(*f),
+            (Value::Integer(n), dtype) if dtype.is_integer() => ArrayAttrLiteral::Int64(*n),
+            (Value::Integer(n), dtype) if dtype.is_float() => ArrayAttrLiteral::Float64(*n as f64),
+            (Value::Float(f), dtype) if dtype.is_float() => ArrayAttrLiteral::Float64(*f),
             (Value::String(s), ArrayAttrType::String) => ArrayAttrLiteral::String(s.clone()),
             (Value::Bytes(b), ArrayAttrType::Bytes) => ArrayAttrLiteral::Bytes(b.clone()),
             (other, dtype) => {
-                return Err(mismatch(&attr.name, attr_type_name(dtype), other, row));
+                return Err(mismatch(&attr.name, dtype.sql_name(), other, row));
             }
         };
+        check_width(&literal, attr, row)?;
         out.push(literal);
     }
     Ok(ArrayInsertRow { coords, attrs: out })
@@ -221,10 +229,47 @@ fn parse_coord(text: &str, dtype: ArrayDimType) -> Option<ArrayCoordLiteral> {
 
 fn parse_attr(text: &str, dtype: ArrayAttrType) -> Option<ArrayAttrLiteral> {
     match dtype {
-        ArrayAttrType::Int64 => text.trim().parse().ok().map(ArrayAttrLiteral::Int64),
-        ArrayAttrType::Float64 => text.trim().parse().ok().map(ArrayAttrLiteral::Float64),
+        ArrayAttrType::Int64
+        | ArrayAttrType::UInt8
+        | ArrayAttrType::Int16
+        | ArrayAttrType::UInt16
+        | ArrayAttrType::Int32
+        | ArrayAttrType::UInt32 => text.trim().parse().ok().map(ArrayAttrLiteral::Int64),
+        ArrayAttrType::Float64 | ArrayAttrType::Float32 => {
+            text.trim().parse().ok().map(ArrayAttrLiteral::Float64)
+        }
         ArrayAttrType::String => Some(ArrayAttrLiteral::String(text.to_string())),
         ArrayAttrType::Bytes => parse_bytea_hex(text).map(ArrayAttrLiteral::Bytes),
+    }
+}
+
+/// A number outside its attr's declared width is `22003`, checked here so
+/// the refusal names its row.
+fn check_width(
+    literal: &ArrayAttrLiteral,
+    attr: &ArrayAttrAst,
+    row: usize,
+) -> Result<(), RowError> {
+    let dtype = engine_attr_type(attr.dtype);
+    let narrowed = match literal {
+        ArrayAttrLiteral::Int64(n) => CellValue::from_int_literal(*n, dtype),
+        ArrayAttrLiteral::Float64(f) => CellValue::from_float_literal(*f, dtype),
+        ArrayAttrLiteral::String(_) | ArrayAttrLiteral::Bytes(_) | ArrayAttrLiteral::Null => {
+            return Ok(());
+        }
+    };
+    match narrowed {
+        Ok(_) => Ok(()),
+        Err(e) if e.is_out_of_range() => Err(RowError::new(
+            row,
+            "22003",
+            format!("attr '{}': {e}", attr.name),
+        )),
+        Err(e) => Err(RowError::new(
+            row,
+            "42804",
+            format!("attr '{}': {e}", attr.name),
+        )),
     }
 }
 
@@ -312,15 +357,6 @@ fn dim_type_name(dtype: ArrayDimType) -> &'static str {
         ArrayDimType::Float64 => "FLOAT64",
         ArrayDimType::TimestampMs => "TIMESTAMP",
         ArrayDimType::String => "STRING",
-    }
-}
-
-fn attr_type_name(dtype: ArrayAttrType) -> &'static str {
-    match dtype {
-        ArrayAttrType::Int64 => "INT64",
-        ArrayAttrType::Float64 => "FLOAT64",
-        ArrayAttrType::String => "STRING",
-        ArrayAttrType::Bytes => "BYTES",
     }
 }
 
@@ -421,6 +457,78 @@ mod tests {
         let err = decode_value_row(&dims, &attrs, 1, &view()).expect_err("string in float");
         assert_eq!(err.sqlstate, "22P02");
         assert_eq!(err.row, 2);
+    }
+
+    fn narrow_view() -> ArrayCatalogView {
+        let attr = |name: &str, dtype| ArrayAttrAst {
+            name: name.into(),
+            dtype,
+            nullable: true,
+        };
+        ArrayCatalogView {
+            name: "scene".into(),
+            dims: vec![ArrayDimAst {
+                name: "y".into(),
+                dtype: ArrayDimType::Int64,
+                lo: ArrayDomainBound::Int64(0),
+                hi: ArrayDomainBound::Int64(255),
+            }],
+            attrs: vec![
+                attr("q", ArrayAttrType::UInt8),
+                attr("b1", ArrayAttrType::UInt16),
+                attr("t", ArrayAttrType::Int16),
+                attr("ndvi", ArrayAttrType::Float32),
+            ],
+            tile_extents: vec![64],
+        }
+    }
+
+    /// Text and native rows narrow by declared width: an in-range value
+    /// loads, and one past the width is `22003` with its row number.
+    #[test]
+    fn narrow_attrs_load_in_range_and_refuse_past_it() {
+        let ok = decode_text_row(
+            &fields(&[
+                Some("1"),
+                Some("255"),
+                Some("65535"),
+                Some("-32768"),
+                Some("0.1"),
+            ]),
+            &narrow_view(),
+            1,
+        )
+        .expect("in range");
+        assert_eq!(ok.attrs[1], ArrayAttrLiteral::Int64(65535));
+        let cases: [&[Option<&'static str>]; 5] = [
+            &[Some("1"), Some("256"), None, None, None],
+            &[Some("1"), Some("-1"), None, None, None],
+            &[Some("1"), None, Some("65536"), None, None],
+            &[Some("1"), None, None, Some("32768"), None],
+            &[Some("1"), None, None, None, Some("1e39")],
+        ];
+        for input in cases {
+            let err = decode_text_row(&fields(input), &narrow_view(), 4).expect_err("out of range");
+            assert_eq!(err.sqlstate, "22003", "{input:?}");
+            assert_eq!(err.row, 4);
+        }
+        let float_into_int = decode_text_row(
+            &fields(&[Some("1"), Some("1.5"), None, None, None]),
+            &narrow_view(),
+            2,
+        )
+        .expect_err("float text into UINT8");
+        assert_eq!(float_into_int.sqlstate, "22P02");
+
+        let dims = vec![vec![Value::Integer(3)]];
+        let attrs = vec![
+            vec![Value::Integer(300)],
+            vec![Value::Null],
+            vec![Value::Null],
+            vec![Value::Float(0.5)],
+        ];
+        let err = decode_value_row(&dims, &attrs, 0, &narrow_view()).expect_err("300 > UINT8");
+        assert_eq!(err.sqlstate, "22003");
     }
 
     #[test]

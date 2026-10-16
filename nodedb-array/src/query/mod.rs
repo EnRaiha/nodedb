@@ -9,6 +9,7 @@
 //! (re-bucket cells into a new tile-extent layout). No engine state, no plane crossings — the executor wires these
 //! into the physical plan.
 
+pub mod agg_number;
 pub mod aggregate;
 pub mod ceiling;
 pub mod elementwise;
@@ -18,6 +19,7 @@ pub mod region;
 pub mod retention;
 pub mod slice;
 
+pub use agg_number::{AggNumber, AggScalar};
 pub use aggregate::{AggregateResult, GroupAggregate, Reducer, aggregate_attr, group_by_dim};
 pub use ceiling::{CeilingParams, CeilingResult, ceiling_resolve_cell};
 pub use elementwise::{BinaryOp, elementwise};

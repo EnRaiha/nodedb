@@ -15,7 +15,8 @@ use crate::types::{
     ArrayCatalogView, ArraySlicePlan, CollectionInfo, ColumnInfo, EngineType, SqlCatalog,
     SqlDataType,
 };
-use crate::types_array::{ArrayAttrType, ArrayDimType};
+use crate::types_array::{ArrayAttrType, ArrayDimType, ArrayReducerAst};
+use nodedb_types::columnar::{FloatWidth, IntWidth};
 
 /// The column an audit-log slice (`AS OF SYSTEM TIME NULL`) stamps on each
 /// row: the version's system time in milliseconds.
@@ -103,12 +104,12 @@ pub fn array_relation_columns(view: &ArrayCatalogView, attrs: &[String]) -> Vec<
     }
     if attrs.is_empty() {
         for a in &view.attrs {
-            cols.push(column(&a.name, attr_type_to_sql(a.dtype), a.nullable));
+            cols.push(attr_column(&a.name, a.dtype, a.nullable));
         }
     } else {
         for name in attrs {
             if let Some(a) = view.attrs.iter().find(|a| &a.name == name) {
-                cols.push(column(&a.name, attr_type_to_sql(a.dtype), a.nullable));
+                cols.push(attr_column(&a.name, a.dtype, a.nullable));
             }
         }
     }
@@ -149,7 +150,8 @@ pub fn array_table_fn_columns(
             {
                 cols.push(column("group", dim_type_to_sql(d.dtype), false));
             }
-            cols.push(column("result", SqlDataType::Float64, true));
+            let attr = view.attrs.iter().find(|a| a.name == agg.attr);
+            cols.push(agg_result_column(agg.reducer, attr.map(|a| a.dtype)));
             Ok(cols)
         }
         ArrayTableFn::Elementwise(_) => Ok(vec![
@@ -189,12 +191,53 @@ fn dim_type_to_sql(t: ArrayDimType) -> SqlDataType {
     }
 }
 
-fn attr_type_to_sql(t: ArrayAttrType) -> SqlDataType {
+/// The column of attr `name`, typed to its wire type: `UINT8` and `INT16`
+/// are `int2`, `UINT16` and `INT32` are `int4`, `UINT32` and `INT64` are
+/// `int8`, `FLOAT32` is `float4`, and `FLOAT64` is `float8`. An unsigned
+/// type takes the next signed width, so every stored value fits. A width of
+/// `None` keeps the base `int8` / `float8`.
+fn attr_column(name: &str, t: ArrayAttrType, nullable: bool) -> ColumnInfo {
+    let (data_type, int_width, float_width) = attr_wire_type(t);
+    ColumnInfo {
+        int_width,
+        float_width,
+        ..column(name, data_type, nullable)
+    }
+}
+
+fn attr_wire_type(t: ArrayAttrType) -> (SqlDataType, Option<IntWidth>, Option<FloatWidth>) {
     match t {
-        ArrayAttrType::Int64 => SqlDataType::Int64,
-        ArrayAttrType::Float64 => SqlDataType::Float64,
-        ArrayAttrType::String => SqlDataType::String,
-        ArrayAttrType::Bytes => SqlDataType::Bytes,
+        ArrayAttrType::Int64 | ArrayAttrType::UInt32 => (SqlDataType::Int64, None, None),
+        ArrayAttrType::Int32 | ArrayAttrType::UInt16 => {
+            (SqlDataType::Int64, Some(IntWidth::I32), None)
+        }
+        ArrayAttrType::Int16 | ArrayAttrType::UInt8 => {
+            (SqlDataType::Int64, Some(IntWidth::I16), None)
+        }
+        ArrayAttrType::Float64 => (SqlDataType::Float64, None, None),
+        ArrayAttrType::Float32 => (SqlDataType::Float64, None, Some(FloatWidth::F32)),
+        ArrayAttrType::String => (SqlDataType::String, None, None),
+        ArrayAttrType::Bytes => (SqlDataType::Bytes, None, None),
+    }
+}
+
+/// The `result` column of an aggregate. `COUNT` and the `SUM` of an integer
+/// attr are `int8`. `MIN` / `MAX` take the attr's own wire type. `MEAN`
+/// and the `SUM` of a float attr are `float8`.
+fn agg_result_column(reducer: ArrayReducerAst, attr: Option<ArrayAttrType>) -> ColumnInfo {
+    let float8 = || column("result", SqlDataType::Float64, true);
+    let int8 = || column("result", SqlDataType::Int64, true);
+    match (reducer, attr) {
+        (ArrayReducerAst::Count, _) => int8(),
+        (ArrayReducerAst::Mean, _) => float8(),
+        (ArrayReducerAst::Sum, Some(t)) if t.is_integer() => int8(),
+        (ArrayReducerAst::Sum, _) => float8(),
+        (ArrayReducerAst::Min | ArrayReducerAst::Max, Some(t))
+            if t.is_integer() || t.is_float() =>
+        {
+            attr_column("result", t, true)
+        }
+        (ArrayReducerAst::Min | ArrayReducerAst::Max, _) => float8(),
     }
 }
 
@@ -214,5 +257,46 @@ fn extract_string_literal_arg(arg: &sqlparser::ast::FunctionArg) -> Option<Strin
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_attrs_announce_their_wire_widths() {
+        let cases = [
+            (ArrayAttrType::UInt8, Some(IntWidth::I16), None),
+            (ArrayAttrType::Int16, Some(IntWidth::I16), None),
+            (ArrayAttrType::UInt16, Some(IntWidth::I32), None),
+            (ArrayAttrType::Int32, Some(IntWidth::I32), None),
+            (ArrayAttrType::UInt32, None, None),
+            (ArrayAttrType::Int64, None, None),
+            (ArrayAttrType::Float32, None, Some(FloatWidth::F32)),
+            (ArrayAttrType::Float64, None, None),
+        ];
+        for (t, int_width, float_width) in cases {
+            let c = attr_column("v", t, true);
+            assert_eq!(
+                (c.int_width, c.float_width),
+                (int_width, float_width),
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregate_results_take_the_reducer_type() {
+        let sum = agg_result_column(ArrayReducerAst::Sum, Some(ArrayAttrType::UInt16));
+        assert_eq!(sum.data_type, SqlDataType::Int64);
+        let count = agg_result_column(ArrayReducerAst::Count, Some(ArrayAttrType::String));
+        assert_eq!(count.data_type, SqlDataType::Int64);
+        let mean = agg_result_column(ArrayReducerAst::Mean, Some(ArrayAttrType::Int16));
+        assert_eq!(mean.data_type, SqlDataType::Float64);
+        let max = agg_result_column(ArrayReducerAst::Max, Some(ArrayAttrType::Float32));
+        assert_eq!(max.float_width, Some(FloatWidth::F32));
+        let min = agg_result_column(ArrayReducerAst::Min, Some(ArrayAttrType::Int16));
+        assert_eq!(min.int_width, Some(IntWidth::I16));
     }
 }

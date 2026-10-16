@@ -380,6 +380,41 @@ impl OriginArrayInbound {
             Some(_) => {}
         }
 
+        // 2a. A put's attrs must match the schema before the op is proposed:
+        //     a refusal after commit would refuse again on every replay.
+        if let Some(attrs) = op.attrs.as_deref()
+            && op.kind == nodedb_array::sync::op::ArrayOpKind::Put
+        {
+            let checked = self
+                .engine
+                .schemas
+                .to_array_schema_in_database(
+                    self.database_id,
+                    self.tenant_id.as_u64(),
+                    &op.header.array,
+                )
+                .map(|schema| schema.check_cell(attrs));
+            match checked {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    return Err(build_reject(
+                        &op.header.array,
+                        op.header.hlc,
+                        ArrayRejectReason::EngineRefused,
+                        format!("schema check: {e}"),
+                    ));
+                }
+                None => {
+                    return Err(build_reject(
+                        &op.header.array,
+                        op.header.hlc,
+                        ArrayRejectReason::ArrayUnknown,
+                        format!("array '{}' has no decodable schema", op.header.array),
+                    ));
+                }
+            }
+        }
+
         // 3. Fast-path idempotency check (before proposing).
         if self.engine.already_seen_in_database(
             self.database_id,

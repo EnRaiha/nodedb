@@ -7,9 +7,8 @@
 // NOT handled here; the segment reader peeks the tag and dispatches to
 // zerompk for those.
 
-use crate::codec::column_codec::{
-    decode_attr_col, decode_row_kinds, decode_surrogates, decode_timestamps_col,
-};
+use crate::codec::attr_col::decode_attr_col;
+use crate::codec::column_codec::{decode_row_kinds, decode_surrogates, decode_timestamps_col};
 use crate::codec::coord_rle::decode_coord_axis_rle;
 use crate::codec::limits::{
     MAX_ATTRS_PER_TILE, MAX_AXES_PER_TILE, MAX_CELLS_PER_TILE, check_decoded_size, checked_capacity,

@@ -149,6 +149,14 @@ impl CoreLoop {
         let bin = map_op(op);
         let combined = match elementwise(&schema, &left_union, &right_union, bin, attr_idx) {
             Ok(t) => t,
+            Err(e @ nodedb_array::ArrayError::NumericOverflow { .. }) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::NumericValueOutOfRange {
+                        detail: format!("array elementwise: {e}"),
+                    },
+                );
+            }
             Err(e) => {
                 return self.response_error(
                     task,

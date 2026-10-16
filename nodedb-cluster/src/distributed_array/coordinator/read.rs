@@ -514,7 +514,7 @@ mod tests {
 
         assert_eq!(merged.partials.len(), 1);
         assert_eq!(merged.partials[0].count, 3);
-        assert!((merged.partials[0].sum - 30.0).abs() < f64::EPSILON);
+        assert!((merged.partials[0].sum.as_f64() - 30.0).abs() < f64::EPSILON);
         assert!(!merged.truncated_before_horizon);
     }
 
@@ -587,9 +587,9 @@ mod tests {
             .iter()
             .find(|p| p.group_key == g(1))
             .expect("group 1");
-        assert!((g0.sum - 20.0).abs() < f64::EPSILON);
+        assert!((g0.sum.as_f64() - 20.0).abs() < f64::EPSILON);
         assert_eq!(g0.count, 2);
-        assert!((g1.sum - 20.0).abs() < f64::EPSILON);
+        assert!((g1.sum.as_f64() - 20.0).abs() < f64::EPSILON);
         assert_eq!(g1.count, 1);
     }
 

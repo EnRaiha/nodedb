@@ -21,7 +21,7 @@ use nodedb_sql::types::{
 };
 
 use crate::control::server::response_shape::schema::{
-    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type,
+    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type_with_width,
 };
 use crate::control::server::response_shape::types::DdlColType;
 
@@ -333,7 +333,8 @@ fn array_view<C: SqlCatalog + ?Sized>(
 }
 
 /// One output column per relation column, in order, under its own name and
-/// its wire type.
+/// its wire type. A narrow attr announces its own width: `int2`, `int4`, or
+/// `float4`.
 fn array_columns_schema(columns: &[nodedb_sql::types::ColumnInfo]) -> OutputSchema {
     OutputSchema {
         columns: columns
@@ -341,7 +342,11 @@ fn array_columns_schema(columns: &[nodedb_sql::types::ColumnInfo]) -> OutputSche
             .map(|column| OutputColumn {
                 display_name: column.name.clone(),
                 lookup_key: column.name.clone(),
-                ty: sql_data_type_to_ddl_col_type(&column.data_type),
+                ty: sql_data_type_to_ddl_col_type_with_width(
+                    &column.data_type,
+                    column.int_width,
+                    column.float_width,
+                ),
             })
             .collect(),
         is_star: false,

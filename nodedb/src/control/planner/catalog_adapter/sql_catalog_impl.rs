@@ -269,11 +269,9 @@ impl SqlCatalog for OriginCatalog {
     }
 
     fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
-        use nodedb_array::schema::{ArraySchema, AttrType as EAT, DimType as EDT};
+        use nodedb_array::schema::{ArraySchema, DimType as EDT};
         use nodedb_array::types::domain::DomainBound;
-        use nodedb_sql::types_array::{
-            ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound,
-        };
+        use nodedb_sql::types_array::{ArrayAttrAst, ArrayDimAst, ArrayDimType, ArrayDomainBound};
 
         let entry = {
             // A poisoned lock still holds a consistent mirror: every writer
@@ -311,12 +309,9 @@ impl SqlCatalog for OriginCatalog {
             .iter()
             .map(|a| ArrayAttrAst {
                 name: a.name.clone(),
-                dtype: match a.dtype {
-                    EAT::Int64 => ArrayAttrType::Int64,
-                    EAT::Float64 => ArrayAttrType::Float64,
-                    EAT::String => ArrayAttrType::String,
-                    EAT::Bytes => ArrayAttrType::Bytes,
-                },
+                dtype: crate::control::planner::sql_plan_convert::array_convert::sql_attr_type(
+                    a.dtype,
+                ),
                 nullable: a.nullable,
             })
             .collect();

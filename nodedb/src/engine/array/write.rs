@@ -105,6 +105,9 @@ pub(crate) fn stamp_put_cells(
         .into());
     }
     let schema = store.schema().clone();
+    // Every attr value has its attr's declared type, so a stored column
+    // holds one type plus NULL. One refused cell refuses the whole batch.
+    schema.check_cells(cells.iter().map(|c| c.attrs.as_slice()))?;
     for c in cells {
         store.memtable.put_cell(
             &schema,
@@ -213,6 +216,38 @@ mod tests {
             e.put_cells(&aid(), vec![cell(1, 7), cell(2, 0)], 1)
                 .is_err()
         );
+        assert_eq!(e.store(&aid()).unwrap().memtable.stats().cell_count, 0);
+    }
+
+    /// A cell whose attr value has another type than the schema declares
+    /// refuses the whole batch with SQLSTATE 42804, and nothing is buffered.
+    #[test]
+    fn a_batch_with_a_mistyped_cell_is_refused_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(aid(), schema(), 0xCAFE).unwrap();
+        let cell = |x: i64, attr: CellValue| ArrayPutCell {
+            coord: vec![CoordValue::Int64(x), CoordValue::Int64(x)],
+            attrs: vec![attr],
+            surrogate: nodedb_types::Surrogate::new(1 + x as u32),
+            system_from_ms: 0,
+            valid_from_ms: 0,
+            valid_until_ms: i64::MAX,
+        };
+        let err = e
+            .put_cells(
+                &aid(),
+                vec![
+                    cell(1, CellValue::Int64(1)),
+                    cell(2, CellValue::Float64(2.0)),
+                ],
+                1,
+            )
+            .expect_err("mistyped cell");
+        assert!(matches!(
+            crate::Error::from(err),
+            crate::Error::DatatypeMismatch { .. }
+        ));
         assert_eq!(e.store(&aid()).unwrap().memtable.stats().cell_count, 0);
     }
 }

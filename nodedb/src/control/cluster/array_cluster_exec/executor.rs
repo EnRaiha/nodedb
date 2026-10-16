@@ -348,7 +348,7 @@ impl ClusterArrayExecutor {
             group_by_dim,
             agg.truncated_before_horizon,
             emit_horizon,
-        );
+        )?;
         zerompk::to_msgpack_vec(&rows).map_err(encode_err)
     }
 

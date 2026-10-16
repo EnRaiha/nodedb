@@ -3,7 +3,7 @@
 //! Shared helpers for array fn → PhysicalTask lowering.
 
 use nodedb_array::query::slice::{DimRange, Slice};
-use nodedb_array::schema::{ArraySchema, AttrType as EngineAttrType, DimType as EngineDimType};
+use nodedb_array::schema::{ArraySchema, DimType as EngineDimType};
 use nodedb_array::types::domain::DomainBound;
 use nodedb_sql::temporal::{TemporalScope, ValidTime};
 use nodedb_sql::types_array::{
@@ -215,5 +215,3 @@ pub(super) fn resolve_array_temporal_scope(
     };
     Ok((system_time, valid_at_ms))
 }
-
-const _UNUSED_ATTR_TYPE: Option<EngineAttrType> = None;

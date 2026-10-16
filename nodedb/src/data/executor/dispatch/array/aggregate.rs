@@ -29,7 +29,7 @@ use nodedb_physical::physical_plan::ArrayReducer;
 
 use super::aggregate_helpers::{
     AggCell, agg_result_to_partial, apply_surrogate_filter, coord_to_agg_cell, coord_to_group_key,
-    encode_agg_rows, encode_bitemporal_agg_partial, float_or_null, map_reducer, unwrap_sparse,
+    encode_agg_rows, encode_bitemporal_agg_partial, map_reducer, result_cell, unwrap_sparse,
 };
 
 /// Aggregate query parameters bundled to avoid exceeding the 7-argument limit.
@@ -293,15 +293,7 @@ impl CoreLoop {
             if return_partial {
                 let partial = acc
                     .map(|a| agg_result_to_partial(ArrayAggGroupKey::Scalar, a))
-                    .unwrap_or_else(|| ArrayAggPartial {
-                        group_key: ArrayAggGroupKey::Scalar,
-                        count: 0,
-                        sum: 0.0,
-                        min: f64::INFINITY,
-                        max: f64::NEG_INFINITY,
-                        welford_mean: 0.0,
-                        welford_m2: 0.0,
-                    });
+                    .unwrap_or_else(|| ArrayAggPartial::empty(ArrayAggGroupKey::Scalar));
                 return encode_bitemporal_agg_partial(
                     self,
                     task,
@@ -309,10 +301,13 @@ impl CoreLoop {
                     truncated_before_horizon,
                 );
             }
-            let final_val = acc.and_then(|a| a.finalize());
+            let result = match result_cell(acc) {
+                Ok(cell) => cell,
+                Err(code) => return self.response_error(task, code),
+            };
             let mut rows: Vec<BTreeMap<&'static str, AggCell>> = Vec::new();
             let mut row: BTreeMap<&'static str, AggCell> = BTreeMap::new();
-            row.insert("result", float_or_null(final_val));
+            row.insert("result", result);
             rows.push(row);
             push_horizon_summary(&mut rows, emit_horizon, truncated_before_horizon);
             return encode_agg_rows(self, task, &rows);
@@ -357,10 +352,13 @@ impl CoreLoop {
 
         let mut rows: Vec<BTreeMap<&'static str, AggCell>> = Vec::with_capacity(order.len() + 1);
         for key in order {
-            let result_val = by_key.remove(&key).and_then(|r| r.finalize());
+            let result = match result_cell(by_key.remove(&key)) {
+                Ok(cell) => cell,
+                Err(code) => return self.response_error(task, code),
+            };
             let mut row: BTreeMap<&'static str, AggCell> = BTreeMap::new();
             row.insert("group", coord_to_agg_cell(&key));
-            row.insert("result", float_or_null(result_val));
+            row.insert("result", result);
             rows.push(row);
         }
         push_horizon_summary(&mut rows, emit_horizon, truncated_before_horizon);
@@ -633,8 +631,8 @@ mod tests {
             .expect("return_partial payload must be a (Vec<ArrayAggPartial>, bool) tuple");
         assert_eq!(partials.len(), 1);
         assert!(
-            (partials[0].sum - 3.0).abs() < 1e-9,
-            "sum got {}",
+            (partials[0].sum.as_f64() - 3.0).abs() < 1e-9,
+            "sum got {:?}",
             partials[0].sum
         );
         assert!(
@@ -1112,7 +1110,7 @@ mod tests {
         partials.sort_by(|a, b| a.group_key.cmp(&b.group_key));
         let got: Vec<(ArrayAggGroupKey, f64)> = partials
             .iter()
-            .map(|p| (p.group_key.clone(), p.sum))
+            .map(|p| (p.group_key.clone(), p.sum.as_f64()))
             .collect();
         assert_eq!(
             got,

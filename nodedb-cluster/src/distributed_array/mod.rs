@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod agg_number;
 pub mod coordinator;
 pub mod group_key;
 pub mod handler;
@@ -12,6 +13,7 @@ pub mod rpc;
 pub mod scatter;
 pub mod wire;
 
+pub use agg_number::ArrayAggNumber;
 pub use coordinator::{
     ArrayCoordinator, ArrayWriteCoordParams, CoordAggResult, CoordElementwiseResult,
     CoordSliceResult, coord_delete, coord_put, coord_put_partitioned,

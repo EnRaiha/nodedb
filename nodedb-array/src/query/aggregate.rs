@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 
+use crate::error::{ArrayError, ArrayResult};
+use crate::query::agg_number::{AggNumber, AggScalar};
 use crate::tile::sparse_tile::{RowKind, SparseTile};
 use crate::types::cell_value::value::CellValue;
 use crate::types::coord::value::CoordValue;
@@ -29,26 +31,27 @@ pub enum Reducer {
 }
 
 /// Partial result for one reducer over one (group of) cell(s).
-/// `Mean` retains `(sum, count)` so partials merge exactly.
+/// `Mean` retains `(sum, count)` so partials merge exactly. An integer attr
+/// accumulates exactly; see [`AggNumber`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AggregateResult {
     Sum {
-        value: f64,
+        value: AggNumber,
         count: u64,
     },
     Count {
         count: u64,
     },
     Min {
-        value: f64,
+        value: AggNumber,
         count: u64,
     },
     Max {
-        value: f64,
+        value: AggNumber,
         count: u64,
     },
     Mean {
-        sum: f64,
+        sum: AggNumber,
         count: u64,
     },
     /// No non-null cells observed yet for this reducer.
@@ -73,7 +76,7 @@ impl AggregateResult {
                     count: cb,
                 },
             ) => Sum {
-                value: a + b,
+                value: a.sum_with(b),
                 count: ca + cb,
             },
             (Count { count: a }, Count { count: b }) => Count { count: a + b },
@@ -87,7 +90,7 @@ impl AggregateResult {
                     count: cb,
                 },
             ) => Min {
-                value: if a <= b { a } else { b },
+                value: a.min_with(b),
                 count: ca + cb,
             },
             (
@@ -100,25 +103,35 @@ impl AggregateResult {
                     count: cb,
                 },
             ) => Max {
-                value: if a >= b { a } else { b },
+                value: a.max_with(b),
                 count: ca + cb,
             },
             (Mean { sum: a, count: ca }, Mean { sum: b, count: cb }) => Mean {
-                sum: a + b,
+                sum: a.sum_with(b),
                 count: ca + cb,
             },
             (lhs, _) => lhs,
         }
     }
 
-    /// Final scalar — useful for tests and the planner's last fold.
-    pub fn finalize(self) -> Option<f64> {
+    /// Final value, or `None` when no cell contributed. `SUM` of an integer
+    /// attr is an exact integer and refuses past `i64` (SQLSTATE `22003`).
+    /// `MIN` / `MAX` keep the attr's kind. `COUNT` is an integer. `MEAN` is
+    /// always a float.
+    pub fn finalize(self) -> ArrayResult<Option<AggScalar>> {
         match self {
-            AggregateResult::Sum { value, .. } => Some(value),
-            AggregateResult::Count { count } => Some(count as f64),
-            AggregateResult::Min { value, .. } | AggregateResult::Max { value, .. } => Some(value),
-            AggregateResult::Mean { sum, count } if count > 0 => Some(sum / count as f64),
-            _ => None,
+            AggregateResult::Sum { value, .. }
+            | AggregateResult::Min { value, .. }
+            | AggregateResult::Max { value, .. } => value.finish().map(Some),
+            AggregateResult::Count { count } => Ok(Some(AggScalar::Int(
+                i64::try_from(count).map_err(|_| ArrayError::NumericOverflow {
+                    detail: format!("count {count} is out of range for bigint"),
+                })?,
+            ))),
+            AggregateResult::Mean { sum, count } if count > 0 => {
+                Ok(Some(AggScalar::Float(sum.to_f64() / count as f64)))
+            }
+            AggregateResult::Mean { .. } | AggregateResult::Empty(_) => Ok(None),
         }
     }
 }
@@ -145,11 +158,7 @@ pub fn aggregate_attr(tile: &SparseTile, attr_idx: usize, reducer: Reducer) -> A
 
 fn single_cell(v: &CellValue, reducer: Reducer) -> AggregateResult {
     use AggregateResult::*;
-    let n = match v {
-        CellValue::Int64(x) => Some(*x as f64),
-        CellValue::Float64(x) => Some(*x),
-        CellValue::String(_) | CellValue::Bytes(_) | CellValue::Null => None,
-    };
+    let n = AggNumber::of_cell(v);
     match (reducer, n) {
         (Reducer::Count, _) if !v.is_null() => Count { count: 1 },
         (Reducer::Count, _) => Empty(Reducer::Count),
@@ -254,44 +263,134 @@ mod tests {
         b.build()
     }
 
+    fn fin(r: AggregateResult) -> Option<AggScalar> {
+        r.finalize().expect("finalize")
+    }
+
+    fn float(v: f64) -> Option<AggScalar> {
+        Some(AggScalar::Float(v))
+    }
+
+    fn int_tile(dtype: AttrType, values: &[CellValue]) -> SparseTile {
+        let s = ArraySchemaBuilder::new("n")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("v", dtype, true))
+            .tile_extents(vec![16])
+            .build()
+            .unwrap();
+        let mut b = SparseTileBuilder::new(&s);
+        for (k, v) in values.iter().enumerate() {
+            b.push(&[CoordValue::Int64(k as i64)], std::slice::from_ref(v))
+                .unwrap();
+        }
+        b.build()
+    }
+
     #[test]
     fn sum_skips_nulls() {
         let t = tile(&[(0, Some(1.0)), (1, None), (2, Some(3.0))]);
         let r = aggregate_attr(&t, 0, Reducer::Sum);
-        assert_eq!(r.finalize(), Some(4.0));
+        assert_eq!(fin(r), float(4.0));
     }
 
     #[test]
     fn count_includes_nonnull_only() {
         let t = tile(&[(0, Some(1.0)), (1, None), (2, Some(3.0))]);
         let r = aggregate_attr(&t, 0, Reducer::Count);
-        assert_eq!(r.finalize(), Some(2.0));
+        assert_eq!(fin(r), Some(AggScalar::Int(2)));
     }
 
     #[test]
     fn min_max_mean() {
         let t = tile(&[(0, Some(1.0)), (1, Some(5.0)), (2, Some(3.0))]);
-        assert_eq!(aggregate_attr(&t, 0, Reducer::Min).finalize(), Some(1.0));
-        assert_eq!(aggregate_attr(&t, 0, Reducer::Max).finalize(), Some(5.0));
-        assert_eq!(aggregate_attr(&t, 0, Reducer::Mean).finalize(), Some(3.0));
+        assert_eq!(fin(aggregate_attr(&t, 0, Reducer::Min)), float(1.0));
+        assert_eq!(fin(aggregate_attr(&t, 0, Reducer::Max)), float(5.0));
+        assert_eq!(fin(aggregate_attr(&t, 0, Reducer::Mean)), float(3.0));
     }
 
     #[test]
     fn merge_combines_partials_exactly() {
         let a = AggregateResult::Mean {
-            sum: 10.0,
+            sum: AggNumber::Float(10.0),
             count: 4,
         };
-        let b = AggregateResult::Mean { sum: 6.0, count: 2 };
+        let b = AggregateResult::Mean {
+            sum: AggNumber::Float(6.0),
+            count: 2,
+        };
         // (10 + 6) / (4 + 2) = 16/6
-        assert_eq!(a.merge(b).finalize(), Some(16.0 / 6.0));
+        assert_eq!(fin(a.merge(b)), float(16.0 / 6.0));
     }
 
     #[test]
     fn empty_reducer_finalizes_to_none() {
         let t = tile(&[(0, None)]);
         let r = aggregate_attr(&t, 0, Reducer::Sum);
-        assert_eq!(r.finalize(), None);
+        assert_eq!(fin(r), None);
+    }
+
+    /// An `INT64` SUM keeps every unit past 2^53, and MIN / MAX stay exact
+    /// integers. MEAN is a float.
+    #[test]
+    fn integer_reducers_are_exact() {
+        let big = (1i64 << 53) + 1;
+        let t = int_tile(
+            AttrType::Int64,
+            &[CellValue::Int64(big), CellValue::Null, CellValue::Int64(0)],
+        );
+        assert_eq!(
+            fin(aggregate_attr(&t, 0, Reducer::Sum)),
+            Some(AggScalar::Int(big))
+        );
+        assert_eq!(
+            fin(aggregate_attr(&t, 0, Reducer::Max)),
+            Some(AggScalar::Int(big))
+        );
+        assert_eq!(
+            fin(aggregate_attr(&t, 0, Reducer::Min)),
+            Some(AggScalar::Int(0))
+        );
+        assert!(matches!(
+            fin(aggregate_attr(&t, 0, Reducer::Mean)),
+            Some(AggScalar::Float(_))
+        ));
+    }
+
+    #[test]
+    fn integer_sum_past_bigint_is_refused() {
+        let t = int_tile(
+            AttrType::Int64,
+            &[CellValue::Int64(i64::MAX), CellValue::Int64(1)],
+        );
+        assert!(matches!(
+            aggregate_attr(&t, 0, Reducer::Sum).finalize(),
+            Err(ArrayError::NumericOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn narrow_attrs_reduce() {
+        let t = int_tile(
+            AttrType::UInt16,
+            &[CellValue::UInt16(65535), CellValue::UInt16(65535)],
+        );
+        assert_eq!(
+            fin(aggregate_attr(&t, 0, Reducer::Sum)),
+            Some(AggScalar::Int(131_070))
+        );
+        let f = int_tile(
+            AttrType::Float32,
+            &[CellValue::Float32(0.5), CellValue::Float32(f32::NAN)],
+        );
+        assert!(matches!(
+            fin(aggregate_attr(&f, 0, Reducer::Max)),
+            Some(AggScalar::Float(v)) if v.is_nan()
+        ));
+        assert_eq!(fin(aggregate_attr(&f, 0, Reducer::Min)), float(0.5));
     }
 
     #[test]
@@ -306,8 +405,8 @@ mod tests {
         assert_eq!(g.len(), 2);
         // first-seen order: 0, then 1
         assert_eq!(g[0].key, CoordValue::Int64(0));
-        assert_eq!(g[0].result.finalize(), Some(4.0));
+        assert_eq!(fin(g[0].result), float(4.0));
         assert_eq!(g[1].key, CoordValue::Int64(1));
-        assert_eq!(g[1].result.finalize(), Some(6.0));
+        assert_eq!(fin(g[1].result), float(6.0));
     }
 }

@@ -238,12 +238,20 @@ fn parse_dim_type(s: &str) -> Option<ArrayDimType> {
     }
 }
 
+/// An attr type name. `INT` is the 4-byte `INT32`, as in PostgreSQL. A
+/// bare `FLOAT` is the 8-byte `FLOAT64`.
 fn parse_attr_type(s: &str) -> Option<ArrayAttrType> {
     match s.to_ascii_uppercase().as_str() {
-        "INT64" | "INT" | "BIGINT" => Some(ArrayAttrType::Int64),
+        "INT64" | "BIGINT" => Some(ArrayAttrType::Int64),
         "FLOAT64" | "DOUBLE" | "FLOAT" => Some(ArrayAttrType::Float64),
         "STRING" | "TEXT" | "VARCHAR" => Some(ArrayAttrType::String),
         "BYTES" | "BLOB" | "BYTEA" => Some(ArrayAttrType::Bytes),
+        "UINT8" => Some(ArrayAttrType::UInt8),
+        "INT16" | "SMALLINT" | "INT2" => Some(ArrayAttrType::Int16),
+        "UINT16" => Some(ArrayAttrType::UInt16),
+        "INT32" | "INTEGER" | "INT" | "INT4" => Some(ArrayAttrType::Int32),
+        "UINT32" => Some(ArrayAttrType::UInt32),
+        "FLOAT32" | "REAL" | "FLOAT4" => Some(ArrayAttrType::Float32),
         _ => None,
     }
 }

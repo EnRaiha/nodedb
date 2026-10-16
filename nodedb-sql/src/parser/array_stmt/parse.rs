@@ -155,6 +155,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_create_array_narrow_attr_types() {
+        use crate::types_array::ArrayAttrType as T;
+        let sql = "CREATE ARRAY scene DIMS (x INT64 [0..255]) \
+                   ATTRS (a UINT8, b INT16, c SMALLINT, d INT2, e UINT16, f INT32, \
+                   g INTEGER, h INT, i INT4, j UINT32, k FLOAT32, l REAL, m FLOAT4, \
+                   n FLOAT, o BIGINT) \
+                   TILE_EXTENTS (64)";
+        let stmt = try_parse_array_statement(sql).unwrap().unwrap();
+        let ArrayStatement::Create(c) = stmt else {
+            panic!("wrong variant");
+        };
+        let types: Vec<T> = c.attrs.iter().map(|a| a.dtype).collect();
+        assert_eq!(
+            types,
+            vec![
+                T::UInt8,
+                T::Int16,
+                T::Int16,
+                T::Int16,
+                T::UInt16,
+                T::Int32,
+                T::Int32,
+                T::Int32,
+                T::Int32,
+                T::UInt32,
+                T::Float32,
+                T::Float32,
+                T::Float32,
+                T::Float64,
+                T::Int64,
+            ]
+        );
+    }
+
+    #[test]
+    fn create_rejects_unknown_attr_type() {
+        let sql = "CREATE ARRAY g DIMS (x INT64 [0..10]) ATTRS (v UINT64) TILE_EXTENTS (1)";
+        assert!(try_parse_array_statement(sql).is_err());
+    }
+
+    #[test]
     fn create_rejects_unknown_dim_type() {
         let sql = "CREATE ARRAY g DIMS (x BOGUS [0..10]) ATTRS (v INT64) TILE_EXTENTS (1)";
         assert!(try_parse_array_statement(sql).is_err());

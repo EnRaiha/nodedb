@@ -9,6 +9,7 @@ mod aggregate_over_join;
 mod aggregate_routing_multicore;
 mod array_copy_from;
 mod array_dml_in_bodies;
+mod array_narrow_attrs;
 mod backup_support;
 mod bitemporal_array_sql;
 mod bitemporal_asof_scan_parity;

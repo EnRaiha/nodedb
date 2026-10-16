@@ -4,9 +4,9 @@
 //! and response-opcode → `VShardMessageType` lookup for the local-dispatch
 //! fast path.
 
-use nodedb_cluster::distributed_array::ArrayAggGroupKey;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_cluster::distributed_array::scatter::{ArrayCoordError, ShardFailure};
+use nodedb_cluster::distributed_array::{ArrayAggGroupKey, ArrayAggNumber};
 use nodedb_cluster::error::ClusterError;
 use nodedb_cluster::wire::VShardMessageType;
 
@@ -51,9 +51,11 @@ fn group_cell(key: &ArrayAggGroupKey) -> AggValue {
 /// Finalize merged `ArrayAggPartial`s into the same msgpack-map structure
 /// the local `ArrayOp::Aggregate` path produces via `encode_agg_rows`.
 ///
-/// For scalar (no group-by), returns a single `[{"result": f64}]`.
-/// For group-by, returns one `{"group": <dim value>, "result": f64}` per
-/// partial, the dim value typed as its dim.
+/// For scalar (no group-by), returns a single `[{"result": <value>}]`.
+/// For group-by, returns one `{"group": <dim value>, "result": <value>}` per
+/// partial, the dim value typed as its dim. `COUNT` and an integer attr's
+/// `SUM` / `MIN` / `MAX` are integers, and a `SUM` past `i64` refuses with
+/// SQLSTATE `22003`, as on a single node. `MEAN` is a float.
 /// When `emit_horizon` is set (temporal queries only), a trailing
 /// `{"truncated_before_horizon": bool}` summary row is appended. This mirrors
 /// the single-node path (`dispatch::array::aggregate`) exactly — including the
@@ -65,21 +67,21 @@ pub(super) fn finalize_agg_partials(
     group_by_dim: i32,
     truncated_before_horizon: bool,
     emit_horizon: bool,
-) -> Vec<std::collections::BTreeMap<String, AggValue>> {
+) -> Result<Vec<std::collections::BTreeMap<String, AggValue>>, Error> {
     use nodedb_physical::physical_plan::ArrayReducer;
 
-    let finalize = |p: &ArrayAggPartial| -> AggValue {
+    let finalize = |p: &ArrayAggPartial| -> Result<AggValue, Error> {
         if p.count == 0 {
-            return AggValue::Null;
+            return Ok(AggValue::Null);
         }
-        let v = match reducer {
+        let n = match reducer {
             ArrayReducer::Sum => p.sum,
-            ArrayReducer::Count => p.count as f64,
+            ArrayReducer::Count => return count_value(p.count),
             ArrayReducer::Min => p.min,
             ArrayReducer::Max => p.max,
-            ArrayReducer::Mean => p.welford_mean,
+            ArrayReducer::Mean => return Ok(AggValue::Float(p.welford_mean)),
         };
-        AggValue::Float(v)
+        number_value(n)
     };
 
     let is_grouped = group_by_dim >= 0;
@@ -91,10 +93,10 @@ pub(super) fn finalize_agg_partials(
             if is_grouped {
                 row.insert("group".to_string(), group_cell(&p.group_key));
             }
-            row.insert("result".to_string(), finalize(p));
-            row
+            row.insert("result".to_string(), finalize(p)?);
+            Ok(row)
         })
-        .collect();
+        .collect::<Result<_, Error>>()?;
 
     // Trailing summary row carrying the below-horizon signal — only for
     // temporal queries, matching the single-node path so both topologies emit
@@ -108,7 +110,30 @@ pub(super) fn finalize_agg_partials(
         rows.push(summary);
     }
 
-    rows
+    Ok(rows)
+}
+
+fn out_of_range(detail: String) -> Error {
+    Error::NumericValueOutOfRange {
+        detail: format!("array aggregate: {detail}"),
+    }
+}
+
+/// The final value of a partial's number: an exact integer, refused past
+/// `i64`, or a float.
+fn number_value(n: ArrayAggNumber) -> Result<AggValue, Error> {
+    match n.as_i128() {
+        Some(v) => i64::try_from(v)
+            .map(AggValue::Int)
+            .map_err(|_| out_of_range(format!("value {v} is out of range for bigint"))),
+        None => Ok(AggValue::Float(n.as_f64())),
+    }
+}
+
+fn count_value(count: u64) -> Result<AggValue, Error> {
+    i64::try_from(count)
+        .map(AggValue::Int)
+        .map_err(|_| out_of_range(format!("count {count} is out of range for bigint")))
 }
 
 /// One msgpack array holding the already-encoded `rows`, the shape a local
@@ -271,7 +296,8 @@ mod tests {
             ArrayAggPartial::from_single(ArrayAggGroupKey::String("chrX".into()), 3.0),
             ArrayAggPartial::from_single(ArrayAggGroupKey::Int64(7), 4.0),
         ];
-        let rows = finalize_agg_partials(&partials, &ArrayReducer::Sum, 0, false, false);
+        let rows = finalize_agg_partials(&partials, &ArrayReducer::Sum, 0, false, false)
+            .expect("finalize");
         let bytes = zerompk::to_msgpack_vec(&rows).expect("encode rows");
         let json = nodedb_types::msgpack_to_json_string(&bytes).expect("rows to json");
         let rows: serde_json::Value = serde_json::from_str(&json).expect("parse json");
@@ -279,6 +305,32 @@ mod tests {
         assert_eq!(rows[1]["group"].as_str(), Some("chrX"));
         assert_eq!(rows[2]["group"].as_i64(), Some(7));
         assert_eq!(rows[2]["result"].as_f64(), Some(4.0));
+    }
+
+    /// An integer SUM finalizes as an exact integer, and one past `i64`
+    /// refuses with SQLSTATE 22003 as on a single node.
+    #[test]
+    fn an_integer_sum_is_exact_and_refuses_past_bigint() {
+        use nodedb_physical::physical_plan::ArrayReducer;
+        let big = (1i64 << 53) + 1;
+        let mut exact = ArrayAggPartial::from_single_int(ArrayAggGroupKey::Scalar, big);
+        exact.merge(&ArrayAggPartial::from_single_int(
+            ArrayAggGroupKey::Scalar,
+            0,
+        ));
+        let rows = finalize_agg_partials(&[exact], &ArrayReducer::Sum, -1, false, false)
+            .expect("finalize");
+        assert!(matches!(rows[0].get("result"), Some(AggValue::Int(v)) if *v == big));
+
+        let mut over = ArrayAggPartial::from_single_int(ArrayAggGroupKey::Scalar, i64::MAX);
+        over.merge(&ArrayAggPartial::from_single_int(
+            ArrayAggGroupKey::Scalar,
+            1,
+        ));
+        assert!(matches!(
+            finalize_agg_partials(&[over], &ArrayReducer::Sum, -1, false, false),
+            Err(Error::NumericValueOutOfRange { .. })
+        ));
     }
 
     /// A shard request that never went out answers `NoLeader` for that

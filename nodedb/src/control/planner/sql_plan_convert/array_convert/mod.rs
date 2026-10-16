@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+mod attr_type;
 mod ddl;
 mod dml;
 mod helpers;
 mod tile_route;
+
+pub(crate) use attr_type::{engine_attr_type, sql_attr_type};
 
 pub(super) use ddl::{CreateArrayArgs, convert_create_array, convert_drop_array};
 pub(super) use dml::{

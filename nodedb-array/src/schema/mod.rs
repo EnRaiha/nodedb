@@ -3,6 +3,7 @@
 pub mod array_schema;
 pub mod attr_spec;
 pub mod builder;
+pub mod cell_check;
 pub mod cell_order;
 pub mod dim_spec;
 pub mod validation;
