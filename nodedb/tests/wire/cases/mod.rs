@@ -175,6 +175,7 @@ mod pgwire_returning_dml;
 mod pgwire_returning_dml_kv;
 mod pgwire_returning_dml_strict;
 mod pgwire_show_dispatch;
+mod pgwire_startup_database;
 mod pgwire_tenant_scoping;
 mod pgwire_txn_control_spellings;
 mod pgwire_txn_overlay_teardown_reclaim;

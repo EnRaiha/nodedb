@@ -22,7 +22,7 @@ use crate::control::server::session_auth::identity::stored_user_identity;
 use crate::control::state::SharedState;
 
 use super::super::handler::NodeDbPgHandler;
-use super::super::types::{error_to_pg_in_context, sqlstate_error};
+use super::super::types::error_to_sqlstate;
 use super::provider::NodeDbParameterProvider;
 
 /// Enum dispatch for startup handler — avoids dyn trait object issues.
@@ -53,6 +53,10 @@ pub(crate) enum AuthStartup {
 ///
 /// A catalog read failure is refused for the same reason — it says nothing
 /// about whether the database exists, so it cannot become a fallback.
+///
+/// Every refusal is `FATAL`. A non-fatal error leaves the connection open, and
+/// on the SCRAM path, where ReadyForQuery is already sent, the client reads the
+/// error as the reply to its first statement.
 fn bind_startup_database<C: pgwire::api::ClientInfo>(
     client: &C,
     session_id: crate::control::server::shared::session::SessionId,
@@ -68,8 +72,11 @@ fn bind_startup_database<C: pgwire::api::ClientInfo>(
         .credentials
         .catalog()
         .get_database_id_by_name(&db_name)
-        .map_err(|e| error_to_pg_in_context("catalog lookup failed", &e))?
-        .ok_or_else(|| sqlstate_error("3D000", &format!("database '{db_name}' does not exist")))?;
+        .map_err(|e| {
+            let (_, code, message) = error_to_sqlstate(&e);
+            startup_refusal(code, format!("catalog lookup failed: {message}"))
+        })?
+        .ok_or_else(|| startup_refusal("3D000", format!("database '{db_name}' does not exist")))?;
 
     handler.sessions.set_current_database(session_id, db_id);
     Ok(())
@@ -108,9 +115,9 @@ fn admit_connection(
         .sessions
         .set_admission_permit(handler.session_id, permit)
     {
-        return Err(sqlstate_error(
+        return Err(startup_refusal(
             nodedb_types::error::sqlstate::INTERNAL_ERROR,
-            "internal error: connection session is not registered",
+            "internal error: connection session is not registered".to_owned(),
         ));
     }
     Ok(())
@@ -122,10 +129,18 @@ fn admit_connection(
 /// native protocol reports for the same condition, so a cap refusal reads the
 /// same on both protocols.
 fn admission_refusal(error: &AdmissionError) -> PgWireError {
+    startup_refusal(
+        nodedb_types::error::sqlstate::QUOTA_EXCEEDED,
+        error.to_string(),
+    )
+}
+
+/// A `FATAL` startup refusal. pgwire closes the connection after sending it.
+fn startup_refusal(code: &str, message: String) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "FATAL".to_owned(),
-        nodedb_types::error::sqlstate::QUOTA_EXCEEDED.to_owned(),
-        error.to_string(),
+        code.to_owned(),
+        message,
     )))
 }
 
