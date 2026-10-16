@@ -171,7 +171,8 @@ impl<'a> Parser<'a> {
         let dtype = parse_attr_type(&type_name)
             .ok_or_else(|| self.err(format!("unknown attr type `{type_name}`")))?;
         let nullable = if self.match_kw("NOT") {
-            self.expect_kw("NULL")?;
+            // The lexer reads `NULL` as its own token, never as an identifier.
+            self.expect(&Tok::Null)?;
             false
         } else {
             // Default: nullable.

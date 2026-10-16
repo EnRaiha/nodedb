@@ -190,6 +190,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_create_array_not_null_attr() {
+        let sql = "CREATE ARRAY g DIMS (x INT64 [0..10]) \
+                   ATTRS (a UINT16 NOT NULL, b FLOAT32, c INT64 not null) TILE_EXTENTS (1)";
+        let stmt = try_parse_array_statement(sql).unwrap().unwrap();
+        let ArrayStatement::Create(c) = stmt else {
+            panic!("wrong variant");
+        };
+        let nullable: Vec<bool> = c.attrs.iter().map(|a| a.nullable).collect();
+        assert_eq!(nullable, vec![false, true, false]);
+    }
+
+    #[test]
+    fn create_rejects_not_without_null() {
+        let sql = "CREATE ARRAY g DIMS (x INT64 [0..10]) ATTRS (a INT64 NOT) TILE_EXTENTS (1)";
+        assert!(try_parse_array_statement(sql).is_err());
+    }
+
+    #[test]
     fn create_rejects_unknown_attr_type() {
         let sql = "CREATE ARRAY g DIMS (x INT64 [0..10]) ATTRS (v UINT64) TILE_EXTENTS (1)";
         assert!(try_parse_array_statement(sql).is_err());
