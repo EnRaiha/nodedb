@@ -734,8 +734,10 @@ You get a full TUI with syntax highlighting, tab completion, and history search.
 ### With psql
 
 ```bash
-psql -h localhost -p 6432
+psql -h localhost -p 6432 -U nodedb
 ```
+
+The server starts in password mode with the superuser `nodedb`. Set `NODEDB_SUPERUSER_PASSWORD` before the first start, or read the generated password from `<data_dir>/.superuser_password`.
 
 NodeDB speaks PostgreSQL's wire protocol, so standard tools like `psql`, ORMs, and BI tools work out of the box.
 

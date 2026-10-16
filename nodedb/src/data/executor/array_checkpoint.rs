@@ -10,7 +10,7 @@
 //! calls `note_write` with the Control Plane's `wal_lsn`). The periodic
 //! checkpoint reports those writes as durable, and the manager then removes
 //! the `ArrayPut` / `ArrayDelete` records below that LSN. The checkpoint must
-//! therefore flush every memtable first. An explicit `NDARRAY_FLUSH` and the
+//! therefore flush every memtable first. An explicit `ARRAY_FLUSH` and the
 //! `flush_cell_threshold` flush in `dispatch::array::mutate` are not ordered
 //! against that removal, so they cannot stand in for it.
 //!

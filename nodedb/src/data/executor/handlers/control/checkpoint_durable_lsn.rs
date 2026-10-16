@@ -193,7 +193,7 @@ impl CoreLoop {
     /// Unlike the engines above this writes no checkpoint file of its own: the
     /// array engine's durable form IS its on-disk segments, and
     /// `checkpoint_array_engines` calls the same `ArrayEngine::flush` an
-    /// `NDARRAY_FLUSH` does. The bug it closes is that the flush was reachable
+    /// `ARRAY_FLUSH` does. The bug it closes is that the flush was reachable
     /// ONLY by that explicit command, so every cell written since the last one a
     /// user happened to run sat in a memory-only memtable while its `ArrayPut`
     /// records were truncated out from under it.

@@ -119,7 +119,7 @@ Requires Linux kernel >= 5.1 (io_uring). Connect:
 
 ```bash
 ndb                              # native CLI (connects to localhost:6433)
-psql -h localhost -p 6432        # or any PostgreSQL client
+psql -h localhost -p 6432 -U nodedb   # password: <data_dir>/.superuser_password, or set NODEDB_SUPERUSER_PASSWORD
 ```
 
 ```sql
@@ -164,7 +164,7 @@ See [NodeDB-Lite](https://github.com/NodeDB-Lab/nodedb-lite) for platform detail
 
 **Write-time validation** -- Typeguards enforce types, required fields, CHECK constraints, and DEFAULT/VALUE expressions on schemaless collections. Graduate to strict schema with `CONVERT COLLECTION x TO document_strict`.
 
-**Bitemporal queries** -- System time (audit trail) and valid time (temporal semantics) across all engines. Query data as it existed in the past, or as it was valid on a past date. GDPR-compliant tile purge on array engine.
+**Bitemporal queries** -- System time (audit trail) and valid time (temporal semantics) on Document, Columnar, Timeseries, Graph and Array. Vector, Full-Text, Spatial and KV indexes reach time through the collection they index. Query data as it existed in the past, or as it was valid on a past date. GDPR-compliant tile purge on array engine.
 
 **Multi-dimensional arrays** -- Scientific computing with Z-order indexed tiles, tile-level compression, and bitemporal support. Combine with vector/graph/text in fused queries via cross-engine identity.
 
@@ -214,11 +214,9 @@ cargo nextest run --all-features
 
 ## Release Status
 
-NodeDB Origin is in **public beta**; the current release is **v0.5.0 (2026-08-04)**. All eight engines are feature-complete and covered by tests. The query-facing wire protocols (pgwire, HTTP, native MessagePack, RESP) are stable — clients written against 0.1.0 will keep working through 1.0. The CRDT sync protocol and ILP ingest are still moving: 0.5.0 changes the sync frame and requires authentication on ILP connections, so upgrade NodeDB Lite and ingest clients together with the server.
+NodeDB Origin is in **public beta**; the current release is **v0.6.2 (2026-10-16)**. All eight engines are feature-complete and covered by tests. Server binaries, Docker images and the crates.io crates ship at the same version. The CRDT sync protocol and the native protocol still change between minor releases, so upgrade NodeDB Lite and `nodedb-client` together with the server.
 
-v0.5.0 ships as server binaries and Docker images; the crates.io publication follows separately, so `cargo add` still resolves 0.4.0 for now. Library users who need the 0.5.0 fixes today can depend on the `v0.5.0` tag by git.
-
-**v0.5.0 — Beta (today).** Build new products on it. The public surface (SQL dialect, query wire protocols, configuration) is stable; expect internal changes (storage layout, on-disk format, replication internals) between minor releases — a 0.4.0 data directory needs a dump/reload to move to 0.5.0. Patch and minor bumps land as needed — 0.2 through 0.5 shipped as the work demanded. The beta period is deliberately for real workloads to surface edge cases we can't manufacture in-house.
+**v0.6 — Beta (today).** Build new products on it. Expect internal changes (storage layout, on-disk format, replication internals) between minor releases: a 0.5.0 data directory cannot be opened by 0.6, so start 0.6 on an empty directory. Patch and minor bumps land as needed. The beta period is deliberately for real workloads to surface edge cases we can't manufacture in-house.
 
 **v1.0.0 — Production-ready (target: after the beta hardening period).** What 1.0 guarantees:
 

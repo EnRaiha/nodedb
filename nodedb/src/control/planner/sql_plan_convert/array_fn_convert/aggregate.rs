@@ -216,7 +216,7 @@ mod tests {
         // live read. This is why `ArrayOp::Aggregate` / `ClusterArrayOp::Agg`
         // carry `Option<i64>` (Current | AsOf) and not `SystemTimeScope`: the
         // AllVersions state is made unrepresentable by rejecting it here.
-        // Audit-log reads go through NDARRAY_SLICE instead.
+        // Audit-log reads go through ARRAY_SLICE instead.
         let ctx = make_ctx(false);
         let temporal = TemporalScope {
             system_time: nodedb_types::SystemTimeScope::AllVersions,

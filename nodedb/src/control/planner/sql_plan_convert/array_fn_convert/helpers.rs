@@ -129,7 +129,7 @@ pub(super) fn map_binary_op(o: ArrayBinaryOpAst) -> ArrayBinaryOp {
 ///
 /// `AS OF SYSTEM TIME NULL` (AllVersions) is rejected for aggregates because
 /// summing across all historical versions is not meaningful. Use
-/// `NDARRAY_SLICE` for audit-log reads instead.
+/// `ARRAY_SLICE` for audit-log reads instead.
 pub(super) fn resolve_array_temporal(
     temporal: TemporalScope,
     context: &str,
@@ -140,8 +140,8 @@ pub(super) fn resolve_array_temporal(
         nodedb_types::SystemTimeScope::AllVersions => {
             return Err(crate::Error::PlanError {
                 detail: format!(
-                    "{context}: AS OF SYSTEM TIME NULL is not meaningful for NDARRAY_AGG; \
-                     use a point-in-time AS OF SYSTEM TIME <ms>, or NDARRAY_SLICE for the audit log"
+                    "{context}: AS OF SYSTEM TIME NULL is not meaningful for ARRAY_AGG; \
+                     use a point-in-time AS OF SYSTEM TIME <ms>, or ARRAY_SLICE for the audit log"
                 ),
             });
         }
