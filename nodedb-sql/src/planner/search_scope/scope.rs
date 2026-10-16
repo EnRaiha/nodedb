@@ -252,7 +252,6 @@ impl Scope<'_> {
             | SqlPlan::InsertArray { .. }
             | SqlPlan::DeleteArray { .. }
             | SqlPlan::ArraySlice { .. }
-            | SqlPlan::ArrayProject { .. }
             | SqlPlan::ArrayAgg { .. }
             | SqlPlan::ArrayElementwise { .. }
             | SqlPlan::ArrayFlush { .. }

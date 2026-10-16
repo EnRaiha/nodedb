@@ -12,12 +12,14 @@ use nodedb_cluster::distributed_array::coordinator::{
     ArrayCoordinator, ArrayWriteCoordParams, coord_delete, coord_put,
 };
 use nodedb_cluster::distributed_array::rpc::ShardRpcDispatch;
-use nodedb_cluster::distributed_array::wire::{ArrayShardAggReq, ArrayShardSliceReq};
+use nodedb_cluster::distributed_array::wire::{
+    ArrayShardAggReq, ArrayShardMaintOp, ArrayShardSliceReq,
+};
 use nodedb_cluster::routing::VSHARD_COUNT;
 use nodedb_cluster::{NexarTransport, RoutingTable};
 
 use crate::control::cluster::array_cluster_helpers::{
-    cluster_err, coord_err, encode_err, finalize_agg_partials,
+    cluster_err, coord_err, encode_err, encode_row_array, finalize_agg_partials,
 };
 use crate::control::server::shared::session::pending_shard_reads::{ShardObservation, ShardReads};
 use crate::control::server::shared::session::read_set::EngineTag;
@@ -30,17 +32,17 @@ use zerompk;
 use super::dispatch::NexarArrayDispatch;
 
 /// Default RPC timeout for array cluster operations in milliseconds.
-const ARRAY_RPC_TIMEOUT_MS: u64 = 30_000;
+pub(super) const ARRAY_RPC_TIMEOUT_MS: u64 = 30_000;
 
 /// Control-Plane executor for distributed array operations.
 ///
 /// Constructed per-request from `SharedState` by the routing interceptor.
 /// Holds references to the transport and routing table; is not cached.
 pub struct ClusterArrayExecutor {
-    dispatch: Arc<dyn ShardRpcDispatch>,
-    circuit_breaker: Arc<CircuitBreaker>,
-    source_node: u64,
-    total_shards: u32,
+    pub(super) dispatch: Arc<dyn ShardRpcDispatch>,
+    pub(super) circuit_breaker: Arc<CircuitBreaker>,
+    pub(super) source_node: u64,
+    pub(super) total_shards: u32,
 }
 
 struct SliceArgs<'a> {
@@ -64,6 +66,7 @@ struct AggArgs<'a> {
     prefix_bits: u8,
     system_as_of: Option<i64>,
     valid_at_ms: Option<i64>,
+    region_msgpack: &'a [u8],
     txn_id: Option<TxnId>,
 }
 
@@ -142,6 +145,7 @@ impl ClusterArrayExecutor {
                 prefix_bits,
                 system_as_of,
                 valid_at_ms,
+                region_msgpack,
             } => {
                 self.execute_agg(AggArgs {
                     array_id,
@@ -149,6 +153,29 @@ impl ClusterArrayExecutor {
                     reducer_msgpack,
                     group_by_dim: *group_by_dim,
                     slice_tile_keys,
+                    prefix_bits: *prefix_bits,
+                    system_as_of: *system_as_of,
+                    valid_at_ms: *valid_at_ms,
+                    region_msgpack,
+                    txn_id,
+                })
+                .await
+            }
+
+            ClusterArrayOp::Elementwise {
+                left,
+                right,
+                op,
+                attr_idx,
+                prefix_bits,
+                system_as_of,
+                valid_at_ms,
+            } => {
+                self.execute_elementwise(super::elementwise::ElementwiseArgs {
+                    left,
+                    right,
+                    op: *op,
+                    attr_idx: *attr_idx,
                     prefix_bits: *prefix_bits,
                     system_as_of: *system_as_of,
                     valid_at_ms: *valid_at_ms,
@@ -177,6 +204,25 @@ impl ClusterArrayExecutor {
             } => {
                 self.execute_delete(array_id_msgpack, coords, *wal_lsn, *prefix_bits)
                     .await
+            }
+
+            ClusterArrayOp::Flush {
+                array_id,
+                prefix_bits,
+            } => {
+                self.execute_maint(array_id, ArrayShardMaintOp::Flush, *prefix_bits)
+                    .await
+            }
+
+            ClusterArrayOp::Compact {
+                array_id,
+                audit_retain_ms,
+                prefix_bits,
+            } => {
+                let op = ArrayShardMaintOp::Compact {
+                    audit_retain_ms: *audit_retain_ms,
+                };
+                self.execute_maint(array_id, op, *prefix_bits).await
             }
         }
     }
@@ -233,23 +279,8 @@ impl ClusterArrayExecutor {
         // `truncated_before_horizon` flag is OR-reduced across shards by the
         // coordinator so the upstream NOTICE is emitted whenever any shard
         // dropped data below its system-time horizon.
-        let mut rows_msgpack =
-            Vec::with_capacity(5 + result.rows.iter().map(|r| r.len()).sum::<usize>());
-        let n = result.rows.len();
-        if n <= 15 {
-            rows_msgpack.push(0x90 | (n as u8));
-        } else if n <= u16::MAX as usize {
-            rows_msgpack.push(0xdc);
-            rows_msgpack.extend_from_slice(&(n as u16).to_be_bytes());
-        } else {
-            rows_msgpack.push(0xdd);
-            rows_msgpack.extend_from_slice(&(n as u32).to_be_bytes());
-        }
-        for r in &result.rows {
-            rows_msgpack.extend_from_slice(r);
-        }
         let resp = crate::data::executor::response_codec::ArraySliceResponse {
-            rows_msgpack,
+            rows_msgpack: encode_row_array(&result.rows),
             truncated_before_horizon: result.truncated_before_horizon,
         };
         zerompk::to_msgpack_vec(&resp).map_err(|e| crate::Error::Codec {
@@ -267,6 +298,7 @@ impl ClusterArrayExecutor {
             prefix_bits,
             system_as_of,
             valid_at_ms,
+            region_msgpack,
             txn_id,
         } = args;
         let coordinator = ArrayCoordinator::for_slice(
@@ -291,6 +323,7 @@ impl ClusterArrayExecutor {
             system_as_of,
             valid_at_ms,
             txn_id: txn_id.map(TxnId::as_u64),
+            region_msgpack: region_msgpack.to_vec(),
         };
         let agg = coordinator.coord_agg(req).await.map_err(coord_err)?;
         note_array_reads(array_id, &agg.read_versions);
@@ -398,7 +431,7 @@ impl ClusterArrayExecutor {
 /// note when the request ends (`session::pending_shard_reads::record_pending`), so
 /// commit validation checks the read on each covered vShard: inside the
 /// Calvin barrier, or against each vShard's leader on a local commit.
-fn note_array_reads(
+pub(super) fn note_array_reads(
     array_id: &nodedb_array::types::ArrayId,
     read_versions: &[nodedb_types::ShardVersion],
 ) {

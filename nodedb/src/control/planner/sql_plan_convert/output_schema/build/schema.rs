@@ -14,11 +14,10 @@ use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::query::Projection;
 use nodedb_sql::types::{
-    ArrayProjectPlan, CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan,
-    InsertPlan, KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan,
-    RecursiveScanPlan, RecursiveValuePlan, SqlPlan, TextSearchPlan, TimeseriesIngestPlan,
-    TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan,
-    VectorPrimaryUpdatePlan,
+    CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, InsertPlan,
+    KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan, RecursiveScanPlan,
+    RecursiveValuePlan, SqlPlan, TextSearchPlan, TimeseriesIngestPlan, TimeseriesScanPlan,
+    UpsertPlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan, VectorPrimaryUpdatePlan,
 };
 
 use crate::control::server::response_shape::schema::{
@@ -271,16 +270,6 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
             let view = array_view(catalog, &slice.name)?;
             array_columns_schema(&nodedb_sql::resolver::array_tvf::array_slice_columns(
                 &view, slice,
-            ))
-        }
-        SqlPlan::ArrayProject(ArrayProjectPlan {
-            name,
-            attr_projection,
-        }) => {
-            let view = array_view(catalog, name)?;
-            array_columns_schema(&nodedb_sql::resolver::array_tvf::array_relation_columns(
-                &view,
-                attr_projection,
             ))
         }
         // A write announces exactly what its `RETURNING` clause projects, from

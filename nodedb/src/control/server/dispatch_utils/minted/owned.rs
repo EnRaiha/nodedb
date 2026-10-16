@@ -61,6 +61,13 @@ pub(crate) enum OwnedResponse {
     /// The merged response outgrew its byte budget. The task closes the
     /// records once the final response arrives.
     OverBudget { bytes: usize },
+    /// The final response arrived, but its streamed chunks do not merge into
+    /// one payload. `closed` is the result of closing the records from that
+    /// final response.
+    Unmergeable {
+        error: crate::Error,
+        closed: crate::Result<()>,
+    },
     /// The channel closed without a final response. The records are held.
     ChannelClosed,
 }
@@ -148,6 +155,12 @@ async fn wait_and_close(
         Ok(Err(DispatchCollectError::ChannelClosed)) => {
             minted.hold();
             let _ = report.send(OwnedResponse::ChannelClosed);
+        }
+        Ok(Err(DispatchCollectError::Unmergeable { response, error })) => {
+            let closed =
+                resolve_on_response(&wal, owner, final_refusal_key, &response, minted).await;
+            let _ = report.send(OwnedResponse::Unmergeable { error, closed });
+            forward(Some(*response));
         }
         Err(_) => {
             let _ = report.send(OwnedResponse::DeadlineExceeded);

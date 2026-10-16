@@ -132,6 +132,17 @@ pub fn slice_sparse(
     tile: &SparseTile,
     slice: &Slice,
 ) -> ArrayResult<SparseTile> {
+    filter_sparse(schema, tile, |coord| cell_in_slice(coord, slice))
+}
+
+/// Keep the live cells of `tile` whose coordinate passes `keep`. Result is a
+/// freshly-built [`SparseTile`] — dictionaries shrink to surviving values,
+/// MBR/attr_stats are recomputed. Sentinel rows never survive.
+pub fn filter_sparse(
+    schema: &ArraySchema,
+    tile: &SparseTile,
+    keep: impl Fn(&[CoordValue]) -> bool,
+) -> ArrayResult<SparseTile> {
     use crate::tile::sparse_tile::RowKind;
     let mut b = SparseTileBuilder::new(schema);
     let n = tile.row_count();
@@ -146,7 +157,7 @@ pub fn slice_sparse(
             .iter()
             .map(|d| d.values[d.indices[row] as usize].clone())
             .collect();
-        if !cell_in_slice(&coord, slice) {
+        if !keep(&coord) {
             live_idx += 1;
             continue;
         }
@@ -177,7 +188,8 @@ pub fn slice_sparse(
     Ok(b.build())
 }
 
-fn cell_in_slice(coord: &[CoordValue], slice: &Slice) -> bool {
+/// True if `coord` passes every constrained dim range of `slice`.
+pub(crate) fn cell_in_slice(coord: &[CoordValue], slice: &Slice) -> bool {
     for (i, range) in slice.dim_ranges.iter().enumerate() {
         let Some(r) = range else { continue };
         let Some(c) = coord.get(i) else {

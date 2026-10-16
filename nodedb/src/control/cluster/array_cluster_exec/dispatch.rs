@@ -96,14 +96,17 @@ impl ShardRpcDispatch for NexarArrayDispatch {
 }
 
 /// Whether a second run of the request leaves the same state and answer. A
-/// slice, an aggregate and a surrogate bitmap only read the shard. A put or
-/// a delete can have applied when its answer was lost.
+/// slice, an aggregate, an elementwise op and a surrogate bitmap only read
+/// the shard. A second flush or compaction finds nothing left to do. A put
+/// or a delete can have applied when its answer was lost.
 fn is_resend_safe(msg_type: VShardMessageType) -> bool {
     matches!(
         msg_type,
         VShardMessageType::ArrayShardSliceReq
             | VShardMessageType::ArrayShardAggReq
+            | VShardMessageType::ArrayShardElementwiseReq
             | VShardMessageType::ArrayShardSurrogateBitmapReq
+            | VShardMessageType::ArrayShardMaintReq
     )
 }
 
@@ -215,11 +218,14 @@ mod tests {
         }
     }
 
-    /// A slice, an aggregate and a surrogate bitmap only read the shard.
+    /// A slice, an aggregate, an elementwise op and a surrogate bitmap only
+    /// read the shard. A repeated flush or compaction finds nothing to do.
     #[test]
-    fn only_array_reads_are_resend_safe() {
+    fn only_array_reads_and_maintenance_are_resend_safe() {
+        assert!(is_resend_safe(VShardMessageType::ArrayShardMaintReq));
         assert!(is_resend_safe(VShardMessageType::ArrayShardSliceReq));
         assert!(is_resend_safe(VShardMessageType::ArrayShardAggReq));
+        assert!(is_resend_safe(VShardMessageType::ArrayShardElementwiseReq));
         assert!(is_resend_safe(
             VShardMessageType::ArrayShardSurrogateBitmapReq
         ));

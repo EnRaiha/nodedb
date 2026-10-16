@@ -11,9 +11,10 @@ use super::kind::PlanKind;
 pub(super) fn describe_cluster_array(op: &ClusterArrayOp) -> PlanKind {
     match op {
         ClusterArrayOp::Slice { .. } => PlanKind::ArraySlice,
-        ClusterArrayOp::Agg { .. } => PlanKind::MultiRow,
+        ClusterArrayOp::Agg { .. } | ClusterArrayOp::Elementwise { .. } => PlanKind::MultiRow,
         ClusterArrayOp::Put { .. } => PlanKind::DmlResult("INSERT"),
         ClusterArrayOp::Delete { .. } => PlanKind::DmlResult("DELETE"),
+        ClusterArrayOp::Flush { .. } | ClusterArrayOp::Compact { .. } => PlanKind::SingleDocument,
     }
 }
 
@@ -22,7 +23,7 @@ pub(super) fn describe_array(op: &ArrayOp) -> PlanKind {
         ArrayOp::Slice { .. } => PlanKind::ArraySlice,
 
         // JSON-array payloads: each row streams as its own pgwire field.
-        ArrayOp::Project { .. } | ArrayOp::Aggregate { .. } | ArrayOp::Elementwise { .. } => {
+        ArrayOp::Aggregate { .. } | ArrayOp::Elementwise { .. } => {
             PlanKind::MultiRow
         }
 

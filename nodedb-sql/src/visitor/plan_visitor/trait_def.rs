@@ -6,7 +6,7 @@
 //! bundled params struct from [`super::args`] instead of raw positional arguments.
 
 use super::args::{
-    AggregateVisitArgs, CreateArrayVisitArgs, DocumentIndexLookupVisitArgs,
+    AggregateVisitArgs, ArrayAggVisitArgs, CreateArrayVisitArgs, DocumentIndexLookupVisitArgs,
     HybridSearchTripleVisitArgs, HybridSearchVisitArgs, InsertVisitArgs, JoinVisitArgs,
     LateralLoopVisitArgs, LateralTopKVisitArgs, MergeVisitArgs, RecursiveScanVisitArgs,
     RecursiveValueVisitArgs, ScanVisitArgs, SpatialScanVisitArgs, SubqueryVisitArgs,
@@ -19,9 +19,7 @@ use crate::types::SqlPlan;
 use crate::types::filter::Filter;
 use crate::types::plan::KvInsertIntent;
 use crate::types::query::EngineType;
-use crate::types_array::{
-    ArrayBinaryOpAst, ArrayCoordLiteral, ArrayInsertRow, ArrayReducerAst, ArraySliceAst,
-};
+use crate::types_array::{ArrayBinaryOpAst, ArrayCoordLiteral, ArrayInsertRow, ArraySliceAst};
 use crate::types_expr::{SqlExpr, SqlValue};
 
 /// Executor parity contract: every [`SqlPlan`] variant must be handled.
@@ -270,22 +268,8 @@ pub trait PlanVisitor {
         temporal: &TemporalScope,
     ) -> Result<Self::Output, Self::Error>;
 
-    /// Handle [`SqlPlan::ArrayProject`].
-    fn array_project(
-        &mut self,
-        name: &str,
-        attr_projection: &[String],
-    ) -> Result<Self::Output, Self::Error>;
-
     /// Handle [`SqlPlan::ArrayAgg`].
-    fn array_agg(
-        &mut self,
-        name: &str,
-        attr: &str,
-        reducer: &ArrayReducerAst,
-        group_by_dim: Option<&str>,
-        temporal: &TemporalScope,
-    ) -> Result<Self::Output, Self::Error>;
+    fn array_agg(&mut self, args: ArrayAggVisitArgs<'_>) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::ArrayElementwise`].
     fn array_elementwise(
@@ -294,6 +278,7 @@ pub trait PlanVisitor {
         right: &str,
         op: ArrayBinaryOpAst,
         attr: &str,
+        temporal: &TemporalScope,
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::ArrayFlush`].

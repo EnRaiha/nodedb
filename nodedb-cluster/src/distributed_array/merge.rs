@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::group_key::ArrayAggGroupKey;
 use super::wire::{ArrayShardAggResp, ArrayShardSliceResp};
 use crate::error::{ClusterError, Result};
 
@@ -31,8 +32,8 @@ use crate::error::{ClusterError, Result};
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
 pub struct ArrayAggPartial {
-    /// Group-by dimension value, or 0 when group_by_dim < 0 (scalar aggregate).
-    pub group_key: i64,
+    /// Group-by dimension value, or `Scalar` when group_by_dim < 0.
+    pub group_key: ArrayAggGroupKey,
     pub count: u64,
     pub sum: f64,
     pub min: f64,
@@ -44,7 +45,7 @@ pub struct ArrayAggPartial {
 
 impl ArrayAggPartial {
     /// Create from a single cell value.
-    pub fn from_single(group_key: i64, val: f64) -> Self {
+    pub fn from_single(group_key: ArrayAggGroupKey, val: f64) -> Self {
         Self {
             group_key,
             count: 1,
@@ -227,11 +228,11 @@ fn decode_system_time(bytes: &[u8]) -> Result<i64> {
 /// Groups by `group_key`; uses `ArrayAggPartial::merge` for each group.
 pub fn reduce_agg_partials(shard_resps: &[ArrayShardAggResp]) -> Vec<ArrayAggPartial> {
     use std::collections::BTreeMap;
-    let mut buckets: BTreeMap<i64, ArrayAggPartial> = BTreeMap::new();
+    let mut buckets: BTreeMap<ArrayAggGroupKey, ArrayAggPartial> = BTreeMap::new();
     for resp in shard_resps {
         for partial in &resp.partials {
             buckets
-                .entry(partial.group_key)
+                .entry(partial.group_key.clone())
                 .and_modify(|existing| existing.merge(partial))
                 .or_insert_with(|| partial.clone());
         }
@@ -243,17 +244,21 @@ pub fn reduce_agg_partials(shard_resps: &[ArrayShardAggResp]) -> Vec<ArrayAggPar
 mod tests {
     use super::*;
 
+    fn g(k: i64) -> ArrayAggGroupKey {
+        ArrayAggGroupKey::Int64(k)
+    }
+
     #[test]
     fn reduce_sum_across_shards() {
         let resp_a = ArrayShardAggResp {
             shard_id: 0,
-            partials: vec![ArrayAggPartial::from_single(0, 10.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 10.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
         let resp_b = ArrayShardAggResp {
             shard_id: 1,
-            partials: vec![ArrayAggPartial::from_single(0, 20.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 20.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
@@ -268,8 +273,8 @@ mod tests {
         let resp = ArrayShardAggResp {
             shard_id: 0,
             partials: vec![
-                ArrayAggPartial::from_single(0, 5.0),
-                ArrayAggPartial::from_single(1, 15.0),
+                ArrayAggPartial::from_single(g(0), 5.0),
+                ArrayAggPartial::from_single(g(1), 15.0),
             ],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
@@ -280,10 +285,10 @@ mod tests {
 
     #[test]
     fn merge_empty_partial_is_noop() {
-        let mut a = ArrayAggPartial::from_single(0, 42.0);
+        let mut a = ArrayAggPartial::from_single(g(0), 42.0);
         let empty = ArrayAggPartial {
             count: 0,
-            ..ArrayAggPartial::from_single(0, 0.0)
+            ..ArrayAggPartial::from_single(g(0), 0.0)
         };
         a.merge(&empty);
         assert_eq!(a.count, 1);
@@ -329,13 +334,13 @@ mod tests {
     fn reduce_min_across_shards() {
         let resp_a = ArrayShardAggResp {
             shard_id: 0,
-            partials: vec![ArrayAggPartial::from_single(0, 5.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 5.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
         let resp_b = ArrayShardAggResp {
             shard_id: 1,
-            partials: vec![ArrayAggPartial::from_single(0, 3.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 3.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
@@ -348,13 +353,13 @@ mod tests {
     fn reduce_max_across_shards() {
         let resp_a = ArrayShardAggResp {
             shard_id: 0,
-            partials: vec![ArrayAggPartial::from_single(0, 5.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 5.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
         let resp_b = ArrayShardAggResp {
             shard_id: 1,
-            partials: vec![ArrayAggPartial::from_single(0, 99.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 99.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
@@ -367,8 +372,8 @@ mod tests {
     fn reduce_avg_welford_merge_exact() {
         // Two shards: shard A has one value of 10, shard B has one value of 20.
         // Combined mean should be exactly 15.
-        let mut a = ArrayAggPartial::from_single(0, 10.0);
-        let b = ArrayAggPartial::from_single(0, 20.0);
+        let mut a = ArrayAggPartial::from_single(g(0), 10.0);
+        let b = ArrayAggPartial::from_single(g(0), 20.0);
         a.merge(&b);
         // welford_mean after merge = 15.0
         assert!((a.welford_mean - 15.0).abs() < 1e-9);
@@ -382,8 +387,8 @@ mod tests {
         let resp_a = ArrayShardAggResp {
             shard_id: 0,
             partials: vec![
-                ArrayAggPartial::from_single(0, 5.0),
-                ArrayAggPartial::from_single(1, 10.0),
+                ArrayAggPartial::from_single(g(0), 5.0),
+                ArrayAggPartial::from_single(g(1), 10.0),
             ],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
@@ -391,17 +396,17 @@ mod tests {
         let resp_b = ArrayShardAggResp {
             shard_id: 1,
             partials: vec![
-                ArrayAggPartial::from_single(1, 20.0),
-                ArrayAggPartial::from_single(2, 30.0),
+                ArrayAggPartial::from_single(g(1), 20.0),
+                ArrayAggPartial::from_single(g(2), 30.0),
             ],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
         let merged = reduce_agg_partials(&[resp_a, resp_b]);
         assert_eq!(merged.len(), 3);
-        let g0 = merged.iter().find(|p| p.group_key == 0).unwrap();
-        let g1 = merged.iter().find(|p| p.group_key == 1).unwrap();
-        let g2 = merged.iter().find(|p| p.group_key == 2).unwrap();
+        let g0 = merged.iter().find(|p| p.group_key == g(0)).unwrap();
+        let g1 = merged.iter().find(|p| p.group_key == g(1)).unwrap();
+        let g2 = merged.iter().find(|p| p.group_key == g(2)).unwrap();
         assert!((g0.sum - 5.0).abs() < f64::EPSILON);
         assert!((g1.sum - 30.0).abs() < f64::EPSILON);
         assert!((g2.sum - 30.0).abs() < f64::EPSILON);
@@ -453,22 +458,64 @@ mod tests {
         // Shard A has only group 0; shard B has only group 1 — no overlap.
         let resp_a = ArrayShardAggResp {
             shard_id: 0,
-            partials: vec![ArrayAggPartial::from_single(0, 7.0)],
+            partials: vec![ArrayAggPartial::from_single(g(0), 7.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
         let resp_b = ArrayShardAggResp {
             shard_id: 1,
-            partials: vec![ArrayAggPartial::from_single(1, 13.0)],
+            partials: vec![ArrayAggPartial::from_single(g(1), 13.0)],
             truncated_before_horizon: false,
             read_versions: Vec::new(),
         };
         let merged = reduce_agg_partials(&[resp_a, resp_b]);
         assert_eq!(merged.len(), 2);
-        let g0 = merged.iter().find(|p| p.group_key == 0).unwrap();
-        let g1 = merged.iter().find(|p| p.group_key == 1).unwrap();
+        let g0 = merged.iter().find(|p| p.group_key == g(0)).unwrap();
+        let g1 = merged.iter().find(|p| p.group_key == g(1)).unwrap();
         assert_eq!(g0.count, 1);
         assert_eq!(g1.count, 1);
+    }
+
+    /// Float64 and String group keys merge by value across shards, and
+    /// distinct values stay distinct groups.
+    #[test]
+    fn reduce_merges_typed_keys_by_value() {
+        let shard = |shard_id, partials| ArrayShardAggResp {
+            shard_id,
+            partials,
+            truncated_before_horizon: false,
+            read_versions: Vec::new(),
+        };
+        let f = ArrayAggGroupKey::Float64;
+        let s = |v: &str| ArrayAggGroupKey::String(v.into());
+        let merged = reduce_agg_partials(&[
+            shard(
+                0,
+                vec![
+                    ArrayAggPartial::from_single(f(101.5), 1.0),
+                    ArrayAggPartial::from_single(s("chrX"), 4.0),
+                ],
+            ),
+            shard(
+                1,
+                vec![
+                    ArrayAggPartial::from_single(f(101.5), 2.0),
+                    ArrayAggPartial::from_single(f(101.25), 8.0),
+                    ArrayAggPartial::from_single(s("chrX"), 16.0),
+                ],
+            ),
+        ]);
+        assert_eq!(merged.len(), 3);
+        let sum_of = |key: ArrayAggGroupKey| {
+            merged
+                .iter()
+                .find(|p| p.group_key == key)
+                .map(|p| p.sum)
+                .expect("group present")
+        };
+        assert!((sum_of(f(101.5)) - 3.0).abs() < f64::EPSILON);
+        assert!((sum_of(f(101.25)) - 8.0).abs() < f64::EPSILON);
+        assert!((sum_of(s("chrX")) - 20.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -579,8 +626,8 @@ mod tests {
         // also drops the below-horizon signal. This pins the contract so the
         // producer and consumer can't drift apart again.
         let partials = vec![
-            ArrayAggPartial::from_single(0, 10.0),
-            ArrayAggPartial::from_single(1, 20.0),
+            ArrayAggPartial::from_single(g(0), 10.0),
+            ArrayAggPartial::from_single(g(1), 20.0),
         ];
         let bytes = zerompk::to_msgpack_vec(&(&partials, true)).expect("encode tuple");
 

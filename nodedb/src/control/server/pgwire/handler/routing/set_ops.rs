@@ -17,7 +17,7 @@ use crate::control::server::set_op_merge::{
     SetMergeMode, dedup_union_payloads, merge_set_op_payloads,
 };
 
-use super::super::super::types::shape_error_to_pg;
+use super::super::super::types::{error_to_pg, shape_error_to_pg};
 use super::super::plan::{PlanKind, multirow_payload_to_response};
 use super::super::shape_encode;
 
@@ -42,7 +42,8 @@ pub(super) fn apply_set_ops(
             merge_set_op_payloads(dedup_payloads, SetMergeMode::Except)
         }
         _ => dedup_union_payloads(dedup_payloads),
-    };
+    }
+    .map_err(|e| error_to_pg(&e))?;
     Ok(
         match compose::shape_payload_no_plan(
             &merged,

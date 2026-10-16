@@ -18,6 +18,7 @@ mod helpers;
 mod maint_fn;
 mod pushdown;
 mod table_fn;
+mod zone;
 
 pub use maint_fn::try_plan_array_maint_fn;
 pub use pushdown::push_down_into_slice;

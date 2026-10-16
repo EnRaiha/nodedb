@@ -325,7 +325,7 @@ pub async fn resolve_shuffle_aggregate(
     //    ORDER BY). Reuse the shared extract/encode helpers — no hand-rolled framing.
     let mut elements: Vec<Vec<u8>> = Vec::new();
     for rows in &per_part_rows {
-        elements.extend(extract_msgpack_elements(rows));
+        elements.extend(extract_msgpack_elements(rows)?);
     }
     if elements.len() > limit {
         elements.truncate(limit);

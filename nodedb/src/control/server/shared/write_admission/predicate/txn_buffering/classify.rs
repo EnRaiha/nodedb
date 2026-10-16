@@ -387,7 +387,6 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Array(
             ArrayOp::OpenArray { .. }
             | ArrayOp::Slice { .. }
-            | ArrayOp::Project { .. }
             | ArrayOp::Aggregate { .. }
             | ArrayOp::Elementwise { .. }
             | ArrayOp::Flush { .. }
@@ -404,9 +403,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. }) => true,
 
         // ---- ClusterArray: coordinator-only, never touched by `to_replicated_entry`.
-        PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. }) => {
-            false
-        }
+        PhysicalPlan::ClusterArray(
+            ClusterArrayOp::Slice { .. }
+            | ClusterArrayOp::Agg { .. }
+            | ClusterArrayOp::Elementwise { .. }
+            | ClusterArrayOp::Flush { .. }
+            | ClusterArrayOp::Compact { .. },
+        ) => false,
         // Buffered but unencoded: `session::txn_expand` reshapes the routing
         // wrapper into per-shard `ArrayOp::Put`/`Delete` before it enters the
         // buffer, so COMMIT replays those and never the wrapper itself.
@@ -2081,10 +2084,6 @@ mod tests {
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
             }),
-            PhysicalPlan::Array(ArrayOp::Project {
-                array_id: array_id.clone(),
-                attr_indices: Vec::new(),
-            }),
             PhysicalPlan::Array(ArrayOp::Aggregate {
                 array_id: array_id.clone(),
                 attr_idx: 0,
@@ -2095,6 +2094,7 @@ mod tests {
                 shard_bucket: None,
                 system_as_of: None,
                 valid_at_ms: None,
+                region_msgpack: Vec::new(),
             }),
             PhysicalPlan::Array(ArrayOp::Elementwise {
                 left: array_id.clone(),
@@ -2102,6 +2102,9 @@ mod tests {
                 op: ArrayBinaryOp::Add,
                 attr_idx: 0,
                 cell_filter: None,
+                shard_bucket: None,
+                system_as_of: None,
+                valid_at_ms: None,
             }),
             PhysicalPlan::Array(ArrayOp::Flush {
                 array_id: array_id.clone(),
@@ -2153,6 +2156,25 @@ mod tests {
                 prefix_bits: 0,
                 system_as_of: None,
                 valid_at_ms: None,
+                region_msgpack: Vec::new(),
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Elementwise {
+                left: array_id.clone(),
+                right: array_id.clone(),
+                op: ArrayBinaryOp::Add,
+                attr_idx: 0,
+                prefix_bits: 0,
+                system_as_of: None,
+                valid_at_ms: None,
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Flush {
+                array_id: array_id.clone(),
+                prefix_bits: 0,
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Compact {
+                array_id: array_id.clone(),
+                audit_retain_ms: None,
+                prefix_bits: 0,
             }),
             // `ClusterArrayOp::Put`/`Delete` are flipped (buffered, unencoded)
             // and pinned by `flipped_variants_are_buffered_and_unencoded`.

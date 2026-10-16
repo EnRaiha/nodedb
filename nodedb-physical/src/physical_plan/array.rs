@@ -3,7 +3,7 @@
 //! Array engine operations dispatched to the Data Plane.
 //!
 //! `ArrayOp` is the wire type for array query operators (slice,
-//! project, aggregate, elementwise) plus the write-side ops (put,
+//! aggregate, elementwise) plus the write-side ops (put,
 //! delete) and engine maintenance (flush, compact). Complex nested
 //! payloads — schemas, slice predicates, cell batches — ride as
 //! opaque msgpack bytes (`*_msgpack`) decoded on the Data Plane via
@@ -169,12 +169,6 @@ pub enum ArrayOp {
         valid_at_ms: Option<i64>,
     },
 
-    /// Attribute projection (no coord filter).
-    Project {
-        array_id: ArrayId,
-        attr_indices: Vec<u32>,
-    },
-
     /// Reduce one attribute column. `group_by_dim < 0` means no
     /// group-by (one scalar partial per tile, merged across tiles by
     /// the executor).
@@ -204,6 +198,9 @@ pub enum ArrayOp {
         /// `valid_from_ms <= vt < valid_until_ms` contribute. `None` = no
         /// valid-time filter.
         valid_at_ms: Option<i64>,
+        /// zerompk-encoded `nodedb_array::query::ArrayRegion`. Only cells
+        /// inside it contribute. Empty = the whole array.
+        region_msgpack: Vec<u8>,
     },
 
     /// Pairwise op between two coord-aligned arrays. Both must share
@@ -218,6 +215,16 @@ pub enum ArrayOp {
         /// fallthroughs from either side are also excluded.
         /// `None` = all cells.
         cell_filter: Option<SurrogateBitmap>,
+        /// Optional shard bucket. When set, only cells whose tile key routes
+        /// to this bucket take part on either side, so vShards that share
+        /// one Data Plane emit no row twice. `None` includes every cell.
+        shard_bucket: Option<ShardBucket>,
+        /// Bitemporal system-time cutoff for both operands. `None` = live
+        /// read.
+        system_as_of: Option<i64>,
+        /// Bitemporal valid-time point for both operands. `None` = no
+        /// valid-time filter.
+        valid_at_ms: Option<i64>,
     },
 
     /// Force a memtable flush. Returns the new segment ref's id +
@@ -266,9 +273,9 @@ pub enum ArrayOp {
 }
 
 impl ArrayOp {
-    /// The array this op targets. For `Elementwise`, returns the
-    /// left operand — vshard routing pins to the left array's
-    /// shard and the right is fetched cross-shard.
+    /// The array this op targets. For `Elementwise`, returns the left
+    /// operand. Both operands share one tile layout and routing, so a
+    /// shard holds the matching cells of both.
     pub fn primary_array(&self) -> &ArrayId {
         match self {
             ArrayOp::OpenArray { array_id, .. }
@@ -276,7 +283,6 @@ impl ArrayOp {
             | ArrayOp::Delete { array_id, .. }
             | ArrayOp::Slice { array_id, .. }
             | ArrayOp::SurrogateBitmapScan { array_id, .. }
-            | ArrayOp::Project { array_id, .. }
             | ArrayOp::Aggregate { array_id, .. }
             | ArrayOp::Flush { array_id, .. }
             | ArrayOp::Compact { array_id, .. }
@@ -309,6 +315,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: vec![1, 2, 3],
         };
         let bytes = zerompk::to_msgpack_vec(&op).unwrap();
         let back: ArrayOp = zerompk::from_msgpack(&bytes).unwrap();
@@ -369,6 +376,9 @@ mod tests {
             op: ArrayBinaryOp::Add,
             attr_idx: 0,
             cell_filter: None,
+            shard_bucket: None,
+            system_as_of: None,
+            valid_at_ms: None,
         };
         assert_eq!(op.primary_array().name, "L");
     }

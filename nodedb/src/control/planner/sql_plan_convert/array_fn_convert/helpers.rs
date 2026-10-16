@@ -2,10 +2,13 @@
 
 //! Shared helpers for array fn → PhysicalTask lowering.
 
+use nodedb_array::query::slice::{DimRange, Slice};
 use nodedb_array::schema::{ArraySchema, AttrType as EngineAttrType, DimType as EngineDimType};
 use nodedb_array::types::domain::DomainBound;
 use nodedb_sql::temporal::{TemporalScope, ValidTime};
-use nodedb_sql::types_array::{ArrayBinaryOpAst, ArrayCoordLiteral, ArrayReducerAst};
+use nodedb_sql::types_array::{
+    ArrayBinaryOpAst, ArrayCoordLiteral, ArrayReducerAst, ArraySliceAst,
+};
 
 use crate::control::array_catalog::ArrayCatalogEntry;
 use nodedb_physical::physical_plan::{ArrayBinaryOp, ArrayReducer};
@@ -36,12 +39,8 @@ pub(super) fn load_entry(
         })
 }
 
-pub(super) fn load_schema(
-    name: &str,
-    tenant_id: nodedb_types::TenantId,
-    ctx: &ConvertContext,
-) -> crate::Result<ArraySchema> {
-    let entry = load_entry(name, tenant_id, ctx)?;
+/// The schema a catalog entry holds.
+pub(super) fn decode_schema(entry: &ArrayCatalogEntry) -> crate::Result<ArraySchema> {
     zerompk::from_msgpack(&entry.schema_msgpack).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
         detail: format!("array schema decode: {e}"),
@@ -65,6 +64,32 @@ pub(super) fn resolve_attr_indices(
         out.push(idx as u32);
     }
     Ok(out)
+}
+
+/// The engine [`Slice`] for a named-dim slice predicate over array `name`.
+/// Each range is coerced to its dim's type. A dim no range names stays
+/// unconstrained. `context` prefixes every error.
+pub(crate) fn resolve_slice(
+    context: &str,
+    name: &str,
+    ast: &ArraySliceAst,
+    schema: &ArraySchema,
+) -> crate::Result<Slice> {
+    let mut dim_ranges: Vec<Option<DimRange>> = vec![None; schema.dims.len()];
+    for r in &ast.dim_ranges {
+        let idx = schema
+            .dims
+            .iter()
+            .position(|d| d.name == r.dim)
+            .ok_or_else(|| crate::Error::PlanError {
+                detail: format!("{context}: array '{name}' has no dim '{}'", r.dim),
+            })?;
+        let dtype = schema.dims[idx].dtype;
+        let lo = coerce_bound(&r.lo, dtype, &r.dim)?;
+        let hi = coerce_bound(&r.hi, dtype, &r.dim)?;
+        dim_ranges[idx] = Some(DimRange::new(lo, hi));
+    }
+    Ok(Slice::new(dim_ranges))
 }
 
 pub(crate) fn coerce_bound(
@@ -140,7 +165,7 @@ pub(super) fn resolve_array_temporal(
         nodedb_types::SystemTimeScope::AllVersions => {
             return Err(crate::Error::PlanError {
                 detail: format!(
-                    "{context}: AS OF SYSTEM TIME NULL is not meaningful for ARRAY_AGG; \
+                    "{context}: AS OF SYSTEM TIME NULL is not meaningful for {context}; \
                      use a point-in-time AS OF SYSTEM TIME <ms>, or ARRAY_SLICE for the audit log"
                 ),
             });

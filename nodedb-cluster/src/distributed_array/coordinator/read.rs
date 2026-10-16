@@ -73,7 +73,10 @@ pub struct CoordAggResult {
 
 /// The bucket filter for a read sent to vShard `shard_id`. `None` when
 /// `prefix_bits` is 0, which reads every tile.
-fn shard_bucket(shard_id: u32, prefix_bits: u8) -> Result<Option<nodedb_types::ShardBucket>> {
+pub(super) fn shard_bucket(
+    shard_id: u32,
+    prefix_bits: u8,
+) -> Result<Option<nodedb_types::ShardBucket>> {
     if prefix_bits == 0 {
         return Ok(None);
     }
@@ -323,7 +326,12 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::circuit_breaker::CircuitBreakerConfig;
+    use crate::distributed_array::group_key::ArrayAggGroupKey;
     use crate::wire::{VShardEnvelope, VShardMessageType};
+
+    fn g(k: i64) -> ArrayAggGroupKey {
+        ArrayAggGroupKey::Int64(k)
+    }
 
     use super::*;
 
@@ -488,13 +496,14 @@ mod tests {
             system_as_of: None,
             valid_at_ms: None,
             txn_id: None,
+            region_msgpack: vec![],
         }
     }
 
     #[tokio::test]
     async fn coord_agg_merges_scalar_partials_from_shards() {
         let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(AggEchoDispatch {
-            partials: vec![ArrayAggPartial::from_single(0, 10.0)],
+            partials: vec![ArrayAggPartial::from_single(ArrayAggGroupKey::Scalar, 10.0)],
         });
         // 3 shards each returning a partial with sum=10 → merged sum=30.
         let coord = make_coordinator(vec![0, 1, 2], dispatch);
@@ -554,10 +563,10 @@ mod tests {
         }
 
         let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(GroupedDispatch {
-            shard0_partials: vec![ArrayAggPartial::from_single(0, 5.0)],
+            shard0_partials: vec![ArrayAggPartial::from_single(g(0), 5.0)],
             shard1_partials: vec![
-                ArrayAggPartial::from_single(0, 15.0),
-                ArrayAggPartial::from_single(1, 20.0),
+                ArrayAggPartial::from_single(g(0), 15.0),
+                ArrayAggPartial::from_single(g(1), 20.0),
             ],
         });
         let coord = make_coordinator(vec![0, 1], dispatch);
@@ -571,12 +580,12 @@ mod tests {
         let g0 = merged
             .partials
             .iter()
-            .find(|p| p.group_key == 0)
+            .find(|p| p.group_key == g(0))
             .expect("group 0");
         let g1 = merged
             .partials
             .iter()
-            .find(|p| p.group_key == 1)
+            .find(|p| p.group_key == g(1))
             .expect("group 1");
         assert!((g0.sum - 20.0).abs() < f64::EPSILON);
         assert_eq!(g0.count, 2);
@@ -596,7 +605,10 @@ mod tests {
             async fn call(&self, req: VShardEnvelope, _timeout_ms: u64) -> Result<VShardEnvelope> {
                 // Shard 1 is below horizon (zero partials); shard 0 has data.
                 let (partials, below) = if req.vshard_id == 0 {
-                    (vec![ArrayAggPartial::from_single(0, 10.0)], false)
+                    (
+                        vec![ArrayAggPartial::from_single(ArrayAggGroupKey::Scalar, 10.0)],
+                        false,
+                    )
                 } else {
                     (vec![], true)
                 };

@@ -21,10 +21,10 @@ pub use merge_types::{MergeClauseKind, MergePlanAction, MergePlanClause};
 pub use row_types::{KvInsertIntent, VectorPrimaryInsertIntent, VectorPrimaryRow, WriteRoute};
 /// Per-family payloads of the larger `SqlPlan` variants.
 pub use variants::{
-    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArrayProjectPlan, ArraySlicePlan,
-    CreateArrayPlan, CreateIndexPlan, CtePlan, DeleteArrayPlan, DocumentIndexLookupPlan,
-    DropIndexPlan, HybridSearchPlan, HybridSearchTriplePlan, InsertArrayPlan, InsertPlan,
-    KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan, RecursiveScanPlan,
+    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan, CreateArrayPlan,
+    CreateIndexPlan, CtePlan, DeleteArrayPlan, DocumentIndexLookupPlan, DropIndexPlan,
+    HybridSearchPlan, HybridSearchTriplePlan, InsertArrayPlan, InsertPlan, KvInsertPlan,
+    LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan, RecursiveScanPlan,
     RecursiveValuePlan, TextScoreColumn, TextSearchPlan, TextSearchShape, TimeseriesIngestPlan,
     TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan,
     VectorPrimaryTruncatePlan, VectorPrimaryUpdatePlan,

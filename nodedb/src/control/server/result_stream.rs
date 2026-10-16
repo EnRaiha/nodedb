@@ -129,7 +129,7 @@ pub(crate) async fn materialize(mut stream: ResultStream) -> crate::Result<(Vec<
         }
         payloads.push(batch.payload);
     }
-    Ok((merge_msgpack_arrays(&payloads), max_lsn))
+    Ok((merge_msgpack_arrays(&payloads)?, max_lsn))
 }
 
 #[cfg(test)]
@@ -221,7 +221,7 @@ mod tests {
         );
         let (merged, _lsn) = materialize(stream).await.unwrap();
         assert_eq!(
-            extract_msgpack_elements(&merged).len(),
+            extract_msgpack_elements(&merged).unwrap().len(),
             2500,
             "three array batches must materialize into one array of all rows"
         );
@@ -240,6 +240,28 @@ mod tests {
         );
         let err = materialize(stream).await.unwrap_err();
         assert!(matches!(err, crate::Error::ExecutionLimitExceeded { .. }));
+    }
+
+    /// A batch that is not a msgpack array fails the materialize instead of
+    /// reading as one row.
+    #[tokio::test]
+    async fn a_non_array_batch_is_refused() {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(partial(2)).await.unwrap();
+        let mut last = final_frame(0);
+        // fixmap of 1: "k" => 1.
+        last.payload = Payload::from_vec(vec![0x81, 0xa1, b'k', 1]);
+        tx.send(last).await.unwrap();
+        drop(tx);
+        let stream = stream_response_channel(
+            crate::control::ResponseReceiver::from_channel(rx),
+            1 << 20,
+            false,
+        );
+        match materialize(stream).await {
+            Err(crate::Error::Codec { .. }) => {}
+            other => panic!("expected a codec error, got {other:?}"),
+        }
     }
 
     /// A terminal error frame ends the stream with the typed error its code
@@ -318,7 +340,7 @@ mod tests {
         );
         let (merged, _lsn) = materialize(stream).await.unwrap();
         assert_eq!(
-            extract_msgpack_elements(&merged).len(),
+            extract_msgpack_elements(&merged).unwrap().len(),
             0,
             "tolerated NotFound yields an empty result, not an error"
         );

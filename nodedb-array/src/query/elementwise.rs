@@ -7,10 +7,10 @@
 //! in only one operand contribute a Null on the other side, which
 //! propagates as Null through the op (SQL-style null semantics).
 //!
-//! Numeric attrs (Int64, Float64) participate in the op; non-numeric
-//! attrs (String, Bytes) are passed through from the left operand
-//! unchanged — the op is undefined for them. Division by zero yields
-//! Null rather than infinity so downstream aggregates stay finite.
+//! The op reads one named attr. Every other attr passes through from the
+//! left operand. A non-numeric value (String, Bytes) in the named attr also
+//! passes through, since the op is undefined for it. Division by zero yields
+//! Null rather than infinity, so downstream aggregates stay finite.
 
 use std::collections::BTreeMap;
 
@@ -28,15 +28,25 @@ pub enum BinaryOp {
     Div,
 }
 
-/// Apply `op` to every aligned pair of cells. The result tile carries
-/// the union of both coord sets.
+/// Apply `op` to attr `attr_idx` of every aligned pair of cells. The result
+/// tile carries the union of both coord sets. Every other attr passes
+/// through, from the left operand when it has the cell.
 pub fn elementwise(
     schema: &ArraySchema,
     a: &SparseTile,
     b: &SparseTile,
     op: BinaryOp,
+    attr_idx: usize,
 ) -> ArrayResult<SparseTile> {
     let n_attrs = schema.attrs.len();
+    if attr_idx >= n_attrs {
+        return Err(ArrayError::InvalidOp {
+            detail: format!(
+                "elementwise: attr index {attr_idx} is out of range for {n_attrs} attrs of '{}'",
+                schema.name
+            ),
+        });
+    }
     let by_coord_a = index_rows(a)?;
     let by_coord_b = index_rows(b)?;
     let mut keys: BTreeMap<Vec<CoordKey>, ()> = BTreeMap::new();
@@ -53,7 +63,11 @@ pub fn elementwise(
         for i in 0..n_attrs {
             let l = lhs.map(|v| v[i].clone()).unwrap_or(CellValue::Null);
             let r = rhs.map(|v| v[i].clone()).unwrap_or(CellValue::Null);
-            out.push(apply(&l, &r, op));
+            out.push(if i == attr_idx {
+                apply(&l, &r, op)
+            } else {
+                passthrough(&l, &r)
+            });
         }
         builder.push(&coord, &out)?;
     }
@@ -206,7 +220,7 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 1), (1, 2)]);
         let b = tile(&[(0, 10), (1, 20)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
         assert_eq!(out.nnz(), 2);
         assert_eq!(out.attr_cols[0][0], CellValue::Int64(11));
         assert_eq!(out.attr_cols[0][1], CellValue::Int64(22));
@@ -217,7 +231,7 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 1)]);
         let b = tile(&[(1, 2)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
         assert_eq!(out.nnz(), 2);
         // Both rows are missing one operand → both become Null+something
         // → passthrough gives the present operand.
@@ -232,7 +246,7 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 5)]);
         let b = tile(&[(0, 0)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Div).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Div, 0).unwrap();
         assert_eq!(out.attr_cols[0][0], CellValue::Null);
     }
 
@@ -267,7 +281,7 @@ mod tests {
             .unwrap();
         let a = builder.build();
         let b = tile(&[(1, 6)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
         assert_eq!(out.nnz(), 1);
         assert_eq!(out.attr_cols[0][0], CellValue::Int64(10));
     }
@@ -277,9 +291,56 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 10)]);
         let b = tile(&[(0, 3)]);
-        let s1 = elementwise(&s, &a, &b, BinaryOp::Sub).unwrap();
-        let s2 = elementwise(&s, &a, &b, BinaryOp::Mul).unwrap();
+        let s1 = elementwise(&s, &a, &b, BinaryOp::Sub, 0).unwrap();
+        let s2 = elementwise(&s, &a, &b, BinaryOp::Mul, 0).unwrap();
         assert_eq!(s1.attr_cols[0][0], CellValue::Int64(7));
         assert_eq!(s2.attr_cols[0][0], CellValue::Int64(30));
+    }
+
+    fn two_attr_schema() -> ArraySchema {
+        ArraySchemaBuilder::new("g2")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("a", AttrType::Int64, true))
+            .attr(AttrSpec::new("b", AttrType::Int64, true))
+            .tile_extents(vec![16])
+            .build()
+            .unwrap()
+    }
+
+    fn two_attr_tile(s: &ArraySchema, k: i64, a: i64, b: i64) -> SparseTile {
+        let mut builder = SparseTileBuilder::new(s);
+        builder
+            .push(
+                &[CoordValue::Int64(k)],
+                &[CellValue::Int64(a), CellValue::Int64(b)],
+            )
+            .unwrap();
+        builder.build()
+    }
+
+    /// Only the named attr takes the op. The other attr keeps the left
+    /// operand's value.
+    #[test]
+    fn the_op_reads_the_named_attr_only() {
+        let s = two_attr_schema();
+        let left = two_attr_tile(&s, 0, 1, 2);
+        let right = two_attr_tile(&s, 0, 10, 20);
+        let on_b = elementwise(&s, &left, &right, BinaryOp::Add, 1).unwrap();
+        assert_eq!(on_b.attr_cols[1][0], CellValue::Int64(22));
+        assert_eq!(on_b.attr_cols[0][0], CellValue::Int64(1));
+        let on_a = elementwise(&s, &left, &right, BinaryOp::Add, 0).unwrap();
+        assert_eq!(on_a.attr_cols[0][0], CellValue::Int64(11));
+        assert_eq!(on_a.attr_cols[1][0], CellValue::Int64(2));
+    }
+
+    #[test]
+    fn an_attr_index_out_of_range_is_refused() {
+        let s = two_attr_schema();
+        let t = two_attr_tile(&s, 0, 1, 2);
+        assert!(elementwise(&s, &t, &t, BinaryOp::Add, 2).is_err());
     }
 }

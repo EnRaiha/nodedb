@@ -354,7 +354,7 @@ pub async fn resolve_shuffle_join(
 
     // 9. Merge every part-owner's msgpack-array rows into one array (reuse the
     //    shared gather merge helper — never hand-roll msgpack framing).
-    let merged = merge_msgpack_arrays(&per_part_rows);
+    let merged = merge_msgpack_arrays(&per_part_rows)?;
 
     // The per-node consumer registries self-clean their inboxes once the part's
     // staged sides are consumed; there is no coordinator-side cleanup hook to

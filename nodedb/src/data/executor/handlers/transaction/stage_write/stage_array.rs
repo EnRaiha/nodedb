@@ -135,7 +135,6 @@ impl CoreLoop {
 
             ArrayOp::OpenArray { .. }
             | ArrayOp::Slice { .. }
-            | ArrayOp::Project { .. }
             | ArrayOp::Aggregate { .. }
             | ArrayOp::Elementwise { .. }
             | ArrayOp::Flush { .. }

@@ -122,6 +122,7 @@ impl DataPlaneArrayExecutor {
             shard_bucket: req.shard_bucket,
             system_as_of: req.system_as_of,
             valid_at_ms: req.valid_at_ms,
+            region_msgpack: req.region_msgpack.clone(),
         });
 
         let resp = self
@@ -196,7 +197,7 @@ impl DataPlaneArrayExecutor {
 ///
 /// Returns one `Vec<u8>` per row. Returns an empty `Vec` if the payload is
 /// empty or contains an empty array.
-fn split_msgpack_array_rows(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub(super) fn split_msgpack_array_rows(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
     if payload.is_empty() {
         return Ok(Vec::new());
     }

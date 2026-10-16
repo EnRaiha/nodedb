@@ -62,14 +62,6 @@ pub struct ArraySlicePlan {
     pub temporal: TemporalScope,
 }
 
-/// Payload of [`SqlPlan::ArrayProject`](crate::types::SqlPlan::ArrayProject).
-#[derive(Debug, Clone)]
-pub struct ArrayProjectPlan {
-    pub name: String,
-    /// Attribute names. Must be non-empty.
-    pub attr_projection: Vec<String>,
-}
-
 /// Payload of [`SqlPlan::ArrayAgg`](crate::types::SqlPlan::ArrayAgg).
 #[derive(Debug, Clone)]
 pub struct ArrayAggPlan {
@@ -78,6 +70,10 @@ pub struct ArrayAggPlan {
     pub reducer: types_array::ArrayReducerAst,
     /// `None` = scalar fold; `Some(name)` = group by that dim.
     pub group_by_dim: Option<String>,
+    /// Coordinate box the aggregate reads. No dim range = the whole array.
+    pub slice: types_array::ArraySliceAst,
+    /// Polygon zone inside the box. `None` = the whole box.
+    pub zone: Option<types_array::ArrayZoneAst>,
     /// Bitemporal qualifier. When both axes are `None` / `Any`, the Data
     /// Plane aggregates against the live (current) state — the default
     /// fast path. Populated from `AS OF SYSTEM TIME` / `AS OF VALID TIME`.
@@ -91,4 +87,7 @@ pub struct ArrayElementwisePlan {
     pub right: String,
     pub op: types_array::ArrayBinaryOpAst,
     pub attr: String,
+    /// Bitemporal qualifier, applied to both operands. Populated from
+    /// `AS OF SYSTEM TIME` / `AS OF VALID TIME`.
+    pub temporal: TemporalScope,
 }

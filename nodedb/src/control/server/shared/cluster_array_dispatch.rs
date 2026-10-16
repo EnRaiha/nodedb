@@ -101,8 +101,11 @@ pub(crate) async fn run_trusted_cluster_array(
     let op = match &cluster_op {
         ClusterArrayOp::Slice { .. } => "slice",
         ClusterArrayOp::Agg { .. } => "agg",
+        ClusterArrayOp::Elementwise { .. } => "elementwise",
         ClusterArrayOp::Put { .. } => "put",
         ClusterArrayOp::Delete { .. } => "delete",
+        ClusterArrayOp::Flush { .. } => "flush",
+        ClusterArrayOp::Compact { .. } => "compact",
     };
     tracing::debug!(
         op,

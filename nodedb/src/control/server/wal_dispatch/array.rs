@@ -62,7 +62,6 @@ pub(super) fn wal_append_array_op(
         ArrayOp::OpenArray { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::SurrogateBitmapScan { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::DropArray { .. }

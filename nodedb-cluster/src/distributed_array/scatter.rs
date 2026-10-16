@@ -314,7 +314,7 @@ pub async fn fan_out_partitioned(
 
 /// Map an opcode constant to a `VShardMessageType`.
 ///
-/// All array opcodes are in the range 80–89. Any other value is a
+/// All array opcodes are in the range 80–93. Any other value is a
 /// programming error in the coordinator, not a runtime condition.
 fn msg_type_from_opcode(opcode: u32) -> Result<VShardMessageType> {
     match opcode {
@@ -328,6 +328,10 @@ fn msg_type_from_opcode(opcode: u32) -> Result<VShardMessageType> {
         87 => Ok(VShardMessageType::ArrayShardDeleteResp),
         88 => Ok(VShardMessageType::ArrayShardSurrogateBitmapReq),
         89 => Ok(VShardMessageType::ArrayShardSurrogateBitmapResp),
+        90 => Ok(VShardMessageType::ArrayShardElementwiseReq),
+        91 => Ok(VShardMessageType::ArrayShardElementwiseResp),
+        92 => Ok(VShardMessageType::ArrayShardMaintReq),
+        93 => Ok(VShardMessageType::ArrayShardMaintResp),
         other => Err(ClusterError::Codec {
             detail: format!("msg_type_from_opcode: unknown array opcode {other}"),
         }),

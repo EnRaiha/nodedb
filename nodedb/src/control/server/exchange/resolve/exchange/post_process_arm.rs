@@ -8,12 +8,11 @@ use nodedb_physical::physical_plan::{
     plan_contains_cluster_partitioned_leaf,
 };
 
-use super::super::array_read_rows::ArrayReadShape;
+use super::super::array_read_rows::is_cluster_array_read;
 
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
-use crate::control::server::exchange::gather::{
-    GatherOutcome, finalize_aggregate, gather_all_vshards,
-};
+use crate::control::server::exchange::gather::gather_all_vshards;
+use crate::control::server::exchange::gather_outcome::GatherOutcome;
 use crate::control::server::exchange::owning_core::gather_single_owning_core;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::server::response_translate::hit_key::parse_surrogate_hex;
@@ -54,9 +53,9 @@ enum HitShape {
     /// Hybrid (RRF) fusion hits: `{doc_id: <surrogate hex>, <score alias>,
     /// ...}` with no body. Resolve `doc_id` to the user PK as `id`.
     Hybrid,
-    /// An array read, whose rows are already relational (see
-    /// [`ArrayReadShape`]).
-    Array(ArrayReadShape),
+    /// A cluster array read, whose rows are already relational (see
+    /// [`is_cluster_array_read`]).
+    ArrayRows,
     /// Flat storage rows (`{id, data}` document / text, columnar, spatial) or
     /// computed rows — already fully columned after the storage flatten.
     None,
@@ -64,8 +63,8 @@ enum HitShape {
 
 /// Classify a resolved `PostProcess` child by the row shape its engine emits.
 fn classify_hit_shape(plan: &PhysicalPlan) -> HitShape {
-    if let Some(shape) = ArrayReadShape::of(plan) {
-        return HitShape::Array(shape);
+    if is_cluster_array_read(plan) {
+        return HitShape::ArrayRows;
     }
     match plan {
         PhysicalPlan::Vector(
@@ -249,32 +248,33 @@ pub(super) async fn materialize_child_rows(
         });
     }
 
-    let merged = if as_aggregate {
-        finalize_aggregate(&outcome.merged_array)
-    } else {
-        outcome.merged_array
-    };
-
     // Flatten to the bare relational row shape the `ProviderScan` tail
     // consumes, resolving surrogate→PK for hit-shaped bodies via the
-    // catalog so `SELECT id` returns the user PK, not the surrogate.
+    // catalog so `SELECT id` returns the user PK, not the surrogate. A
+    // cluster array read's rows pass through unflattened.
     let coll = hit_collection.unwrap_or_default();
     let rows = match hit_kind {
-        HitShape::Vector => flatten_vector_hits_to_relational_rows(&merged, |surrogate| {
-            resolve_surrogate_pk(
-                state,
-                database_id,
-                tenant_id,
-                &coll,
-                nodedb_types::Surrogate::new(surrogate),
-            )
-        }),
-        HitShape::Hybrid => flatten_hybrid_hits_to_relational_rows(&merged, |key| {
-            let surrogate = parse_surrogate_hex(key)?;
-            resolve_surrogate_pk(state, database_id, tenant_id, &coll, surrogate)
-        }),
-        HitShape::Array(shape) => shape.rows(merged)?,
-        HitShape::None => flatten_to_relational_rows(&merged),
+        HitShape::Vector => {
+            let merged = outcome.merged_rows(as_aggregate)?;
+            flatten_vector_hits_to_relational_rows(&merged, |surrogate| {
+                resolve_surrogate_pk(
+                    state,
+                    database_id,
+                    tenant_id,
+                    &coll,
+                    nodedb_types::Surrogate::new(surrogate),
+                )
+            })
+        }
+        HitShape::Hybrid => {
+            let merged = outcome.merged_rows(as_aggregate)?;
+            flatten_hybrid_hits_to_relational_rows(&merged, |key| {
+                let surrogate = parse_surrogate_hex(key)?;
+                resolve_surrogate_pk(state, database_id, tenant_id, &coll, surrogate)
+            })
+        }
+        HitShape::ArrayRows => outcome.merged_array()?,
+        HitShape::None => flatten_to_relational_rows(&outcome.merged_rows(as_aggregate)?),
     };
     Ok(ChildRows::Rows { rows, sources })
 }

@@ -7,10 +7,12 @@ use sqlparser::ast;
 
 use nodedb_types::Value;
 
+use crate::catalog::ArrayCatalogView;
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
+use crate::parser::object_literal::parse_object_literal_complete;
 use crate::types::SqlCatalog;
-use crate::types_array::ArrayCoordLiteral;
+use crate::types_array::{ArrayCoordLiteral, ArraySliceAst, NamedDimRange};
 
 pub(super) fn collect_args(args: &[ast::FunctionArg]) -> Vec<ast::Expr> {
     args.iter()
@@ -118,6 +120,49 @@ pub(super) fn is_null_literal(expr: &ast::Expr) -> bool {
         expr,
         ast::Expr::Value(v) if matches!(v.value, ast::Value::Null)
     )
+}
+
+/// Parse a slice-predicate argument of `fn_name` over array `name`.
+///
+/// The argument is a quoted string holding the brace-form object literal
+/// `'{dim: [lo, hi], ...}'`: the PostgreSQL dialect does not accept a bare
+/// `{...}` in expression position. Each named dim must exist on the array.
+pub(super) fn parse_slice_arg(
+    expr: &ast::Expr,
+    fn_name: &str,
+    name: &str,
+    view: &ArrayCatalogView,
+) -> Result<ArraySliceAst> {
+    let slice_str = expect_string_literal(expr, &format!("{fn_name} slice predicate"))?;
+    let parsed =
+        parse_object_literal_complete(&slice_str).ok_or_else(|| SqlError::Unsupported {
+            detail: format!("{fn_name}: slice predicate must be an object literal: {slice_str}"),
+        })?;
+    let map = parsed.map_err(|detail| SqlError::Unsupported {
+        detail: format!("{fn_name}: slice parse: {detail}"),
+    })?;
+    let mut dim_ranges: Vec<NamedDimRange> = Vec::with_capacity(map.len());
+    for (dim, val) in map {
+        if !view.dims.iter().any(|d| d.name == dim) {
+            return Err(SqlError::Unsupported {
+                detail: format!("{fn_name}: array '{name}' has no dim '{dim}'"),
+            });
+        }
+        let arr = match val {
+            Value::Array(a) if a.len() == 2 => a,
+            _ => {
+                return Err(SqlError::Unsupported {
+                    detail: format!(
+                        "{fn_name}: dim '{dim}' range must be a 2-element array [lo, hi]"
+                    ),
+                });
+            }
+        };
+        let lo = value_to_coord_literal(&arr[0], &dim)?;
+        let hi = value_to_coord_literal(&arr[1], &dim)?;
+        dim_ranges.push(NamedDimRange { dim, lo, hi });
+    }
+    Ok(ArraySliceAst { dim_ranges })
 }
 
 pub(super) fn value_to_coord_literal(v: &Value, dim: &str) -> Result<ArrayCoordLiteral> {

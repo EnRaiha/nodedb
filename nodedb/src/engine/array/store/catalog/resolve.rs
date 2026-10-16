@@ -16,6 +16,7 @@
 use std::cmp::Reverse;
 
 use nodedb_array::query::ceiling::CeilingParams;
+use nodedb_array::query::region::ArrayRegion;
 use nodedb_array::segment::TilePayload;
 use nodedb_array::tile::cell_payload::{CellPayload, is_cell_sentinel};
 use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTileBuilder};
@@ -40,6 +41,42 @@ struct PrefixVersion<'a> {
 }
 
 impl ArrayStore {
+    /// Whether `prefix` can resolve to a live cell inside `region` at
+    /// `system_as_of`. Read from the segment footers' MBRs, so no tile is
+    /// decoded.
+    ///
+    /// Every version of a cell sits under the cell's prefix, and a footer
+    /// MBR bounds the live rows of its tile. A tombstone only hides a cell.
+    /// So when no qualifying version holds a live row the region can contain,
+    /// the prefix resolves to no cell in the region. A version is never
+    /// skipped on its own: its tombstones can hide an older cell in the
+    /// region. The memtable keeps no MBR, so a prefix with a qualifying
+    /// memtable version is always read.
+    pub(super) fn prefix_may_hold(
+        &self,
+        prefix: u64,
+        system_as_of: i64,
+        region: &ArrayRegion,
+    ) -> bool {
+        if self
+            .memtable
+            .iter_tile_versions(prefix, system_as_of)
+            .next()
+            .is_some()
+        {
+            return true;
+        }
+        self.segments.values().any(|h| {
+            let reader = h.reader();
+            let tiles = reader.tiles();
+            let first = tiles.partition_point(|e| e.tile_id.hilbert_prefix < prefix);
+            let end = tiles.partition_point(|e| e.tile_id.hilbert_prefix <= prefix);
+            tiles[first..end].iter().any(|e| {
+                e.tile_id.system_from_ms <= system_as_of && region.tile_may_contain(&e.mbr)
+            })
+        })
+    }
+
     /// Every tile version of `prefix`, in reading order. Each segment tile is
     /// decoded once.
     fn prefix_versions(&self, prefix: u64) -> ArrayResult<Vec<PrefixVersion<'_>>> {

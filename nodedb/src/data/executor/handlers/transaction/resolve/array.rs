@@ -86,7 +86,6 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
         // re-derived on replay, so neither carries a redo sub-record.
         ArrayOp::Slice { .. }
         | ArrayOp::SurrogateBitmapScan { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::Flush { .. }

@@ -138,13 +138,9 @@ pub fn array_table_fn_columns(
     call: &ArrayTableFn,
 ) -> Result<Vec<ColumnInfo>> {
     match call {
-        ArrayTableFn::Slice(slice) => {
+        ArrayTableFn::Slice(slice) | ArrayTableFn::Project(slice) => {
             Ok(array_slice_columns(&view_of(catalog, &slice.name)?, slice))
         }
-        ArrayTableFn::Project(project) => Ok(array_relation_columns(
-            &view_of(catalog, &project.name)?,
-            &project.attr_projection,
-        )),
         ArrayTableFn::Agg(agg) => {
             let view = view_of(catalog, &agg.name)?;
             let mut cols = Vec::with_capacity(2);

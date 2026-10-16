@@ -13,6 +13,7 @@ mod cluster_leaf;
 pub mod core_outcome;
 pub mod full_scan;
 pub mod gather;
+pub mod gather_outcome;
 pub mod owner_dispatch;
 pub mod owning_core;
 pub mod read_scope;
@@ -25,8 +26,9 @@ pub use all_cores::NodeLevelResult;
 pub(crate) use all_cores::{
     capture_base_on_local_cores, execute_plan_all_local_cores, snapshot_tenant_on_local_cores,
 };
+pub use gather::finalize_aggregate;
 pub(crate) use gather::gather_all_cores;
-pub use gather::{GatherOutcome, finalize_aggregate};
+pub use gather_outcome::GatherOutcome;
 pub use read_scope::ReadScope;
 pub(crate) use received::execute_received_plan;
 pub use resolve::{

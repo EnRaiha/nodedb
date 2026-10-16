@@ -61,7 +61,6 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut ArrayOp) -> crate::Resu
         ArrayOp::Delete { .. }
         | ArrayOp::OpenArray { .. }
         | ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::Flush { .. }

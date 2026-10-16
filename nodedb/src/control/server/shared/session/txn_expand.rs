@@ -70,7 +70,13 @@ pub fn expand_for_buffering(task: PhysicalTask) -> crate::Result<Vec<PhysicalTas
 
         // Every other plan buffers verbatim. Enumerated rather than wildcarded
         // so a new fan-out variant forces an explicit decision here.
-        PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. })
+        PhysicalPlan::ClusterArray(
+            ClusterArrayOp::Slice { .. }
+            | ClusterArrayOp::Agg { .. }
+            | ClusterArrayOp::Elementwise { .. }
+            | ClusterArrayOp::Flush { .. }
+            | ClusterArrayOp::Compact { .. },
+        )
         | PhysicalPlan::Vector(_)
         | PhysicalPlan::Graph(_)
         | PhysicalPlan::Document(_)

@@ -13,6 +13,7 @@ use nodedb_physical::physical_plan::ArrayOp;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::dispatch::array::aggregate::AggParams;
+use crate::data::executor::dispatch::array::elementwise::ElementwiseParams;
 use crate::data::executor::dispatch::array::read::SliceParams;
 use crate::data::executor::task::ExecutionTask;
 
@@ -108,10 +109,6 @@ impl CoreLoop {
                 array_id,
                 slice_msgpack,
             } => self.dispatch_array_surrogate_bitmap_scan(task, array_id, slice_msgpack),
-            ArrayOp::Project {
-                array_id,
-                attr_indices,
-            } => self.dispatch_array_project(task, array_id, attr_indices),
             ArrayOp::Aggregate {
                 array_id,
                 attr_idx,
@@ -122,6 +119,7 @@ impl CoreLoop {
                 shard_bucket,
                 system_as_of,
                 valid_at_ms,
+                region_msgpack,
             } => self.dispatch_array_aggregate(
                 task,
                 AggParams {
@@ -134,6 +132,7 @@ impl CoreLoop {
                     shard_bucket: *shard_bucket,
                     system_as_of: *system_as_of,
                     valid_at_ms: *valid_at_ms,
+                    region_msgpack,
                 },
             ),
             ArrayOp::Elementwise {
@@ -142,13 +141,21 @@ impl CoreLoop {
                 op,
                 attr_idx,
                 cell_filter,
+                shard_bucket,
+                system_as_of,
+                valid_at_ms,
             } => self.dispatch_array_elementwise(
                 task,
-                left,
-                right,
-                *op,
-                *attr_idx,
-                cell_filter.as_ref(),
+                ElementwiseParams {
+                    left,
+                    right,
+                    op: *op,
+                    attr_idx: *attr_idx,
+                    cell_filter: cell_filter.as_ref(),
+                    shard_bucket: *shard_bucket,
+                    system_as_of: *system_as_of,
+                    valid_at_ms: *valid_at_ms,
+                },
             ),
         }
     }

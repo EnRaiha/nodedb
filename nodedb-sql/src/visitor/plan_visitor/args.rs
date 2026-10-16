@@ -16,7 +16,10 @@ use crate::types::plan::{
 use crate::types::query::{
     AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate, WindowSpec,
 };
-use crate::types_array::{ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayTileOrderAst};
+use crate::types_array::{
+    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayReducerAst, ArraySliceAst,
+    ArrayTileOrderAst, ArrayZoneAst,
+};
 use crate::types_expr::{SqlExpr, SqlPayloadAtom, SqlValue};
 use nodedb_types::vector_distance::DistanceMetric;
 
@@ -254,6 +257,19 @@ pub struct CreateArrayVisitArgs<'a> {
     pub prefix_bits: u8,
     pub audit_retain_ms: Option<u64>,
     pub minimum_audit_retain_ms: Option<u64>,
+}
+
+/// Parameters for [`super::trait_def::PlanVisitor::array_agg`].
+pub struct ArrayAggVisitArgs<'a> {
+    pub name: &'a str,
+    pub attr: &'a str,
+    pub reducer: ArrayReducerAst,
+    pub group_by_dim: Option<&'a str>,
+    /// Coordinate box the aggregate reads. No dim range = the whole array.
+    pub slice: &'a ArraySliceAst,
+    /// Polygon zone inside the box. `None` = the whole box.
+    pub zone: Option<&'a ArrayZoneAst>,
+    pub temporal: &'a TemporalScope,
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::merge`].

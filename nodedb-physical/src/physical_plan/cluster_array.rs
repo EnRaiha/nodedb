@@ -16,6 +16,8 @@
 use nodedb_array::types::ArrayId;
 use nodedb_types::SystemTimeScope;
 
+use super::array::ArrayBinaryOp;
+
 /// Cluster-mode array operations executed by the coordinator on the
 /// Control Plane.
 #[derive(
@@ -76,6 +78,32 @@ pub enum ClusterArrayOp {
         system_as_of: Option<i64>,
         /// Bitemporal valid-time point. `None` = no valid-time filter.
         valid_at_ms: Option<i64>,
+        /// zerompk-encoded `nodedb_array::query::ArrayRegion`, forwarded to
+        /// every shard. Empty = the whole array.
+        region_msgpack: Vec<u8>,
+    },
+
+    /// Fan-out an elementwise op to every primary vShard and concatenate the
+    /// rows.
+    ///
+    /// The planner admits only two arrays with one schema hash and one
+    /// `prefix_bits`. Their tile keys then match per coordinate, so each
+    /// shard holds both sides of every pair it owns and pairs them on its
+    /// Data Plane.
+    Elementwise {
+        left: ArrayId,
+        right: ArrayId,
+        op: ArrayBinaryOp,
+        /// Index of the attribute the op reads.
+        attr_idx: u32,
+        /// Routing granularity, shared by both arrays.
+        prefix_bits: u8,
+        /// Bitemporal system-time cutoff for both operands. `None` = live
+        /// read.
+        system_as_of: Option<i64>,
+        /// Bitemporal valid-time point for both operands. `None` = no
+        /// valid-time filter.
+        valid_at_ms: Option<i64>,
     },
 
     /// Fan-out a cell write batch, partitioned by routing bucket.
@@ -109,18 +137,40 @@ pub enum ClusterArrayOp {
         /// Routing granularity.
         prefix_bits: u8,
     },
+
+    /// Fan-out a memtable flush to every primary vShard. Each shard's core
+    /// stamps the flush with its own WAL frontier.
+    Flush {
+        array_id: ArrayId,
+        /// Routing granularity.
+        prefix_bits: u8,
+    },
+
+    /// Fan-out a compaction to every primary vShard.
+    ///
+    /// `audit_retain_ms` is the array's retention window from the catalog.
+    /// `None` keeps every version.
+    Compact {
+        array_id: ArrayId,
+        audit_retain_ms: Option<i64>,
+        /// Routing granularity.
+        prefix_bits: u8,
+    },
 }
 
 impl ClusterArrayOp {
     /// The array this op targets. Total over every variant, so read-set
     /// tracking and the commit validator key on the same name a shard-local
-    /// `ArrayOp` reports.
+    /// `ArrayOp` reports. For `Elementwise`, the left operand.
     pub fn array_id(&self) -> &ArrayId {
         match self {
             ClusterArrayOp::Slice { array_id, .. }
             | ClusterArrayOp::Agg { array_id, .. }
             | ClusterArrayOp::Put { array_id, .. }
-            | ClusterArrayOp::Delete { array_id, .. } => array_id,
+            | ClusterArrayOp::Delete { array_id, .. }
+            | ClusterArrayOp::Flush { array_id, .. }
+            | ClusterArrayOp::Compact { array_id, .. } => array_id,
+            ClusterArrayOp::Elementwise { left, .. } => left,
         }
     }
 }

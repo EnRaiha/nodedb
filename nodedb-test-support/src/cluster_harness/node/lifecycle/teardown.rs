@@ -16,6 +16,33 @@ impl TestClusterNode {
         }
     }
 
+    /// Run a simple query and return every row keyed by column name. A NULL
+    /// column reads as the empty string. Returns an error message on SQL
+    /// error.
+    pub async fn query_named_rows(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<std::collections::HashMap<String, String>>, String> {
+        let msgs = self
+            .client
+            .simple_query(sql)
+            .await
+            .map_err(|e| pg_error_detail(&e))?;
+        Ok(msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(row) => Some(
+                    row.columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (c.name().to_string(), row.get(i).unwrap_or("").to_string()))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Cooperatively shut down every background task this node owns.
     pub async fn shutdown(self) {
         self.pg_shutdown_bus.initiate();

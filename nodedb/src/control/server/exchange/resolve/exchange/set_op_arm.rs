@@ -6,7 +6,7 @@
 use nodedb_physical::physical_plan::{PhysicalPlan, SetOpKind};
 
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
-use crate::control::server::payload_merge::merge_msgpack_arrays;
+use crate::control::server::payload_merge::merge_payload_rows;
 use crate::control::server::set_op_merge::{
     SetMergeMode, dedup_union_payloads, merge_set_op_payloads,
 };
@@ -60,7 +60,7 @@ pub(super) async fn resolve_set_op(
     }
 
     // The merged rows carry the requirements of every branch.
-    let merged = merge_set_op_rows(&payloads, op);
+    let merged = merge_set_op_rows(&payloads, op)?;
     Ok(Resolved::Plan(Box::new(provider_scan_of_rows(
         merged, sources,
     ))))
@@ -70,10 +70,10 @@ pub(super) async fn resolve_set_op(
 /// array of flat row maps. The mapping from kind to merge mirrors the pgwire
 /// per-task set-op path: `INTERSECT [ALL]` and `EXCEPT [ALL]` share one
 /// value-keyed merge each, `UNION` dedups on raw bytes, and `UNION ALL`
-/// concatenates.
-fn merge_set_op_rows(payloads: &[Vec<u8>], op: SetOpKind) -> Vec<u8> {
+/// concatenates. A payload in no row shape fails the merge.
+fn merge_set_op_rows(payloads: &[Vec<u8>], op: SetOpKind) -> crate::Result<Vec<u8>> {
     match op {
-        SetOpKind::UnionAll => merge_msgpack_arrays(payloads),
+        SetOpKind::UnionAll => merge_payload_rows(payloads),
         SetOpKind::UnionDistinct => dedup_union_payloads(payloads),
         SetOpKind::Intersect | SetOpKind::IntersectAll => {
             merge_set_op_payloads(payloads, SetMergeMode::Intersect)
@@ -101,7 +101,7 @@ mod tests {
     fn union_all_keeps_every_row_in_branch_order() {
         let left = encode_array(&[serde_json::json!({"x": 1}), serde_json::json!({"x": 2})]);
         let right = encode_array(&[serde_json::json!({"x": 2})]);
-        let merged = merge_set_op_rows(&[left, right], SetOpKind::UnionAll);
+        let merged = merge_set_op_rows(&[left, right], SetOpKind::UnionAll).unwrap();
         assert_eq!(decode(&merged), r#"[{"x":1},{"x":2},{"x":2}]"#);
     }
 
@@ -109,7 +109,7 @@ mod tests {
     fn union_distinct_drops_duplicates() {
         let left = encode_array(&[serde_json::json!({"x": 1}), serde_json::json!({"x": 2})]);
         let right = encode_array(&[serde_json::json!({"x": 2})]);
-        let merged = merge_set_op_rows(&[left, right], SetOpKind::UnionDistinct);
+        let merged = merge_set_op_rows(&[left, right], SetOpKind::UnionDistinct).unwrap();
         assert_eq!(decode(&merged), r#"[{"x":1},{"x":2}]"#);
     }
 
@@ -117,7 +117,7 @@ mod tests {
     fn intersect_keeps_rows_present_in_every_branch() {
         let left = encode_array(&[serde_json::json!({"x": 1}), serde_json::json!({"x": 2})]);
         let right = encode_array(&[serde_json::json!({"x": 2}), serde_json::json!({"x": 3})]);
-        let merged = merge_set_op_rows(&[left, right], SetOpKind::Intersect);
+        let merged = merge_set_op_rows(&[left, right], SetOpKind::Intersect).unwrap();
         assert_eq!(decode(&merged), r#"[{"x":2}]"#);
     }
 
@@ -125,7 +125,24 @@ mod tests {
     fn except_drops_rows_present_in_later_branches() {
         let left = encode_array(&[serde_json::json!({"x": 1}), serde_json::json!({"x": 2})]);
         let right = encode_array(&[serde_json::json!({"x": 2})]);
-        let merged = merge_set_op_rows(&[left, right], SetOpKind::Except);
+        let merged = merge_set_op_rows(&[left, right], SetOpKind::Except).unwrap();
         assert_eq!(decode(&merged), r#"[{"x":1}]"#);
+    }
+
+    /// A branch payload in no row shape fails the merge in every mode.
+    #[test]
+    fn a_scalar_branch_fails_every_merge() {
+        let left = encode_array(&[serde_json::json!({"x": 1})]);
+        for op in [
+            SetOpKind::UnionAll,
+            SetOpKind::UnionDistinct,
+            SetOpKind::Intersect,
+            SetOpKind::Except,
+        ] {
+            assert!(matches!(
+                merge_set_op_rows(&[left.clone(), vec![0x2a]], op),
+                Err(crate::Error::Codec { .. })
+            ));
+        }
     }
 }

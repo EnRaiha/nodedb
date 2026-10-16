@@ -384,7 +384,6 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         PhysicalPlan::Array(
             ArrayOp::Slice { .. }
             | ArrayOp::SurrogateBitmapScan { .. }
-            | ArrayOp::Project { .. }
             | ArrayOp::Aggregate { .. }
             | ArrayOp::Elementwise { .. },
         ) => Permission::Read,
@@ -401,12 +400,17 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         // ClusterArray mirrors the local ArrayOp permission model.
         PhysicalPlan::ClusterArray(
             nodedb_physical::physical_plan::ClusterArrayOp::Slice { .. }
-            | nodedb_physical::physical_plan::ClusterArrayOp::Agg { .. },
+            | nodedb_physical::physical_plan::ClusterArrayOp::Agg { .. }
+            | nodedb_physical::physical_plan::ClusterArrayOp::Elementwise { .. },
         ) => Permission::Read,
         PhysicalPlan::ClusterArray(
             nodedb_physical::physical_plan::ClusterArrayOp::Put { .. }
             | nodedb_physical::physical_plan::ClusterArrayOp::Delete { .. },
         ) => Permission::Write,
+        PhysicalPlan::ClusterArray(
+            nodedb_physical::physical_plan::ClusterArrayOp::Flush { .. }
+            | nodedb_physical::physical_plan::ClusterArrayOp::Compact { .. },
+        ) => Permission::Admin,
         PhysicalPlan::ClusterEvent(_) => Permission::Read,
 
         // Calvin cross-shard execution batches: dispatched internally, treated as Write.

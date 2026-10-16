@@ -597,6 +597,7 @@ mod tests {
             prefix_bits: 8,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert!(extract_write_metadata(&agg, TenantId::new(1)).is_empty());
     }

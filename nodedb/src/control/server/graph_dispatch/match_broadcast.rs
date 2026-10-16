@@ -132,7 +132,7 @@ fn decode_match_envelope(payload: &[u8]) -> crate::Result<DecodedMatchEnvelope> 
             detail: "match envelope: missing or malformed 'frontier' field".into(),
         })?;
 
-    let row_elements = extract_msgpack_elements(rows_bytes);
+    let row_elements = extract_msgpack_elements(rows_bytes)?;
     let frontier: Vec<UnresolvedExpansion> =
         zerompk::from_msgpack(frontier_bytes).map_err(|e| crate::Error::Codec {
             detail: format!("match envelope: invalid frontier: {e}"),

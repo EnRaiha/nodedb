@@ -7,6 +7,7 @@ use nodedb_array::schema::ArraySchema;
 use nodedb_array::segment::TilePayload;
 use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTileBuilder};
 use nodedb_array::types::coord::value::CoordValue;
+use nodedb_cluster::distributed_array::ArrayAggGroupKey;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_types::SurrogateBitmap;
 
@@ -124,7 +125,10 @@ pub(super) fn apply_surrogate_filter(
     Ok(b.build())
 }
 
-pub(super) fn agg_result_to_partial(group_key: i64, result: AggregateResult) -> ArrayAggPartial {
+pub(super) fn agg_result_to_partial(
+    group_key: ArrayAggGroupKey,
+    result: AggregateResult,
+) -> ArrayAggPartial {
     match result {
         AggregateResult::Sum { value, count } => ArrayAggPartial {
             group_key,
@@ -186,17 +190,13 @@ pub(super) fn agg_result_to_partial(group_key: i64, result: AggregateResult) -> 
     }
 }
 
-pub(super) fn coord_to_group_key(c: &CoordValue) -> i64 {
+/// The typed group key a distributed partial carries for dim value `c`.
+pub(super) fn coord_to_group_key(c: &CoordValue) -> ArrayAggGroupKey {
     match c {
-        CoordValue::Int64(v) | CoordValue::TimestampMs(v) => *v,
-        CoordValue::Float64(v) => v.to_bits() as i64,
-        CoordValue::String(s) => {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            s.hash(&mut h);
-            h.finish() as i64
-        }
+        CoordValue::Int64(v) => ArrayAggGroupKey::Int64(*v),
+        CoordValue::TimestampMs(v) => ArrayAggGroupKey::TimestampMs(*v),
+        CoordValue::Float64(v) => ArrayAggGroupKey::Float64(*v),
+        CoordValue::String(s) => ArrayAggGroupKey::String(s.clone()),
     }
 }
 

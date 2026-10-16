@@ -165,7 +165,6 @@ fn collect_sides(
         | SqlPlan::InsertArray { .. }
         | SqlPlan::DeleteArray { .. }
         | SqlPlan::ArraySlice { .. }
-        | SqlPlan::ArrayProject { .. }
         | SqlPlan::ArrayAgg { .. }
         | SqlPlan::ArrayElementwise { .. }
         | SqlPlan::ArrayFlush { .. }

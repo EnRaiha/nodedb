@@ -119,6 +119,18 @@ pub struct ArraySliceAst {
     pub dim_ranges: Vec<NamedDimRange>,
 }
 
+/// `ARRAY_AGG(...)` polygon zone over two numeric dims.
+///
+/// `polygons` holds one entry per member polygon: its exterior ring, then
+/// its holes. Each ring is closed and lists `[x, y]` positions, `x` on
+/// `x_dim` and `y` on `y_dim`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayZoneAst {
+    pub polygons: Vec<Vec<Vec<[f64; 2]>>>,
+    pub x_dim: String,
+    pub y_dim: String,
+}
+
 /// Reducer carried on `SqlPlan::ArrayAgg`. Mirrors
 /// `crate::bridge::physical_plan::ArrayReducer` without the bridge dep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

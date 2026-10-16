@@ -46,6 +46,12 @@ impl Answer {
                         OwnedResponse::OverBudget { bytes }
                     }
                     Ok(Err(DispatchCollectError::ChannelClosed)) => OwnedResponse::ChannelClosed,
+                    Ok(Err(DispatchCollectError::Unmergeable { error, .. })) => {
+                        OwnedResponse::Unmergeable {
+                            error,
+                            closed: Ok(()),
+                        }
+                    }
                     Err(_) => OwnedResponse::DeadlineExceeded,
                 })
             }

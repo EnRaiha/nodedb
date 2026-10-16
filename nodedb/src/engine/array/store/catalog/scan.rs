@@ -3,6 +3,7 @@
 //! Tile/cell scanning and bitemporal ceiling resolution for [`ArrayStore`].
 
 use nodedb_array::query::ceiling::{CeilingParams, CeilingResult, ceiling_resolve_cell};
+use nodedb_array::query::region::ArrayRegion;
 use nodedb_array::segment::{MbrQueryPredicate, TilePayload};
 use nodedb_array::tile::sparse_tile::SparseTile;
 use nodedb_array::types::coord::value::CoordValue;
@@ -70,17 +71,20 @@ impl ArrayStore {
         system_as_of: i64,
         valid_at_ms: Option<i64>,
     ) -> Result<(Vec<(u64, SparseTile)>, bool), nodedb_array::ArrayError> {
-        self.scan_shard_tiles_at(system_as_of, valid_at_ms, None)
+        self.scan_shard_tiles_at(system_as_of, valid_at_ms, None, None)
     }
 
     /// [`scan_tiles_at`](Self::scan_tiles_at) over the prefixes that
-    /// `shard_bucket` admits. A prefix the bucket rejects is never decoded.
+    /// `shard_bucket` admits and that can hold a cell of `region`. A prefix
+    /// either test rejects is never decoded. The tiles returned can still
+    /// hold cells outside `region`: the caller filters cells exactly.
     /// `truncated_before_horizon` is computed over the whole store.
     pub fn scan_shard_tiles_at(
         &self,
         system_as_of: i64,
         valid_at_ms: Option<i64>,
         shard_bucket: Option<ShardBucket>,
+        region: Option<&ArrayRegion>,
     ) -> Result<(Vec<(u64, SparseTile)>, bool), nodedb_array::ArrayError> {
         let params = CeilingParams {
             system_as_of,
@@ -93,6 +97,11 @@ impl ArrayStore {
         let mut out: Vec<(u64, SparseTile)> = Vec::new();
         for prefix in all_prefixes {
             if !shard_bucket_admits(shard_bucket, prefix) {
+                continue;
+            }
+            if let Some(region) = region
+                && !self.prefix_may_hold(prefix, system_as_of, region)
+            {
                 continue;
             }
             if let Some(tile) = self.resolve_prefix_at(prefix, &params)?
@@ -362,6 +371,58 @@ mod tests {
                 .unwrap()
                 .contains_cell(&coord(1, 1))
                 .unwrap()
+        );
+    }
+
+    /// A region scan skips every prefix whose footer MBRs miss the region.
+    /// A prefix whose newer version tombstones a cell inside the region is
+    /// still read, so the tombstone hides the older cell.
+    #[test]
+    fn a_region_scan_reads_only_prefixes_that_can_hold_its_cells() {
+        use crate::engine::array::engine::{ArrayEngine, ArrayEngineConfig};
+        use crate::engine::array::test_support::{aid, put_one, schema as engine_schema};
+        use crate::engine::array::wal::ArrayDeleteCell;
+        use crate::types::replay_stamp::ReplayStamp;
+        use nodedb_array::query::slice::{DimRange, Slice};
+
+        let dir = TempDir::new().unwrap();
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(aid(), engine_schema(), 0xD1CE).unwrap();
+        // One cell in tile (0, 0), one in tile (2, 2).
+        put_one(&mut e, 1, 1, 7, 1);
+        put_one(&mut e, 9, 9, 8, 2);
+        e.flush(&aid(), ReplayStamp::through(2)).unwrap();
+
+        let low = || Some(DimRange::new(DomainBound::Int64(0), DomainBound::Int64(3)));
+        let region = ArrayRegion::new(Slice::new(vec![low(), low()]), None);
+        let (tiles, _) = e
+            .store(&aid())
+            .unwrap()
+            .scan_shard_tiles_at(i64::MAX, None, None, Some(&region))
+            .unwrap();
+        assert_eq!(tiles.len(), 1, "the far tile's prefix is pruned");
+        assert_eq!(tiles[0].1.nnz(), 1);
+
+        e.delete_cells(
+            &aid(),
+            vec![ArrayDeleteCell {
+                coord: vec![CoordValue::Int64(1), CoordValue::Int64(1)],
+                system_from_ms: 10,
+                erasure: false,
+            }],
+            3,
+        )
+        .unwrap();
+        e.flush(&aid(), ReplayStamp::through(3)).unwrap();
+        let (tiles, _) = e
+            .store(&aid())
+            .unwrap()
+            .scan_shard_tiles_at(i64::MAX, None, None, Some(&region))
+            .unwrap();
+        assert!(
+            tiles.iter().all(|(_, t)| t.nnz() == 0),
+            "the tombstone hides the cell: {} tiles",
+            tiles.len()
         );
     }
 

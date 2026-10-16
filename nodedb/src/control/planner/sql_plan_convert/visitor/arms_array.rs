@@ -104,36 +104,11 @@ macro_rules! impl_array_arms_for_convert_visitor {
             )
         }
 
-        fn array_project(
-            &mut self,
-            name: &str,
-            attr_projection: &[String],
-        ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::array_fn_convert::convert_project(
-                name,
-                attr_projection,
-                self.tenant_id,
-                self.ctx,
-            )
-        }
-
         fn array_agg(
             &mut self,
-            name: &str,
-            attr: &str,
-            reducer: &nodedb_sql::types_array::ArrayReducerAst,
-            group_by_dim: Option<&str>,
-            temporal: &nodedb_sql::temporal::TemporalScope,
+            args: nodedb_sql::ArrayAggVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::array_fn_convert::convert_agg(
-                name,
-                attr,
-                *reducer,
-                group_by_dim,
-                *temporal,
-                self.tenant_id,
-                self.ctx,
-            )
+            super::super::array_fn_convert::convert_agg(args, self.tenant_id, self.ctx)
         }
 
         fn array_elementwise(
@@ -142,12 +117,16 @@ macro_rules! impl_array_arms_for_convert_visitor {
             right: &str,
             op: nodedb_sql::types_array::ArrayBinaryOpAst,
             attr: &str,
+            temporal: &nodedb_sql::temporal::TemporalScope,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::array_fn_convert::convert_elementwise(
-                left,
-                right,
-                op,
-                attr,
+                super::super::array_fn_convert::elementwise::ElementwiseCall {
+                    left_name: left,
+                    right_name: right,
+                    op,
+                    attr,
+                    temporal: *temporal,
+                },
                 self.tenant_id,
                 self.ctx,
             )

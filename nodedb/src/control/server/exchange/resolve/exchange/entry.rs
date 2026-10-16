@@ -10,6 +10,7 @@ use crate::control::server::exchange::read_scope::ReadScope;
 use crate::control::state::SharedState;
 use crate::types::{Lsn, VShardId};
 
+use crate::control::server::exchange::resolve::array_prefilter::resolve_array_prefilters;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::server::exchange::resolve::materialize::materialize_providers;
 use crate::control::server::result_stream::ResultStream;
@@ -64,7 +65,8 @@ pub async fn resolve_and_materialize(
     scope: ReadScope,
 ) -> crate::Result<Resolved> {
     // Pass 1: fill empty ProviderScan rows (identity-scoped, per-request).
-    let plan = materialize_providers(state, identity, scope.database_id, plan).await?;
+    let mut plan = materialize_providers(state, identity, scope.database_id, plan).await?;
+    resolve_array_prefilters(state, &mut plan).await?;
 
     // Pass 2: resolve Exchange nodes. The captures accumulator is filled at every
     // base-collection gather point beneath the plan root and consumed (taken)
@@ -85,9 +87,10 @@ pub async fn resolve_and_materialize(
 /// See `resolve_and_materialize` for the `scope` semantics.
 pub async fn resolve_exchange_in_plan(
     state: &SharedState,
-    plan: PhysicalPlan,
+    mut plan: PhysicalPlan,
     scope: ReadScope,
 ) -> crate::Result<Resolved> {
+    resolve_array_prefilters(state, &mut plan).await?;
     let mut captures = Vec::new();
     resolve_exchange(state, scope, plan, &mut captures).await
 }

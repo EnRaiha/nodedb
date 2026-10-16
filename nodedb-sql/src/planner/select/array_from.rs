@@ -23,9 +23,7 @@ use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::array_fn::{ArrayTableFn, push_down_into_slice, try_plan_array_table_fn};
 use crate::planner::ast_helpers::{single_table_qualifiers, strip_single_table_qualifiers};
-use crate::resolver::array_tvf::{
-    ARRAY_SYSTEM_TIME_COLUMN, array_relation_columns, array_slice_columns,
-};
+use crate::resolver::array_tvf::{ARRAY_SYSTEM_TIME_COLUMN, array_slice_columns};
 use crate::resolver::columns::TableScope;
 use crate::temporal::TemporalScope;
 use crate::types::*;
@@ -51,26 +49,28 @@ pub(in crate::planner::select) fn try_plan_array_from(
         statement_output,
     };
     let planned = match call {
-        ArrayTableFn::Slice(mut slice) => {
-            let view = array_view(catalog, &slice.name)?;
-            let read = RelationRead::new(&ctx, "ARRAY_SLICE", &view.name)?;
-            let columns = array_slice_columns(&view, &slice);
-            let outer = read.plan_outer(&ctx, columns)?;
-            push_down_into_slice(&mut slice, &view, &outer.plan, &read.name);
-            read.into_cte(SqlPlan::ArraySlice(slice), outer)
-        }
-        ArrayTableFn::Project(project) => {
-            let view = array_view(catalog, &project.name)?;
-            let read = RelationRead::new(&ctx, "ARRAY_PROJECT", &view.name)?;
-            let columns = array_relation_columns(&view, &project.attr_projection);
-            let outer = read.plan_outer(&ctx, columns)?;
-            read.into_cte(SqlPlan::ArrayProject(project), outer)
-        }
+        ArrayTableFn::Slice(slice) => plan_cell_read(&ctx, "ARRAY_SLICE", slice)?,
+        ArrayTableFn::Project(slice) => plan_cell_read(&ctx, "ARRAY_PROJECT", slice)?,
         call @ (ArrayTableFn::Agg(_) | ArrayTableFn::Elementwise(_)) => {
             plan_non_relational(&ctx, temporal, call)?
         }
     };
     Ok(Some(planned))
+}
+
+/// Plan the SELECT over the cells `slice` reads, as the relation `fn_name`
+/// names.
+fn plan_cell_read(
+    ctx: &OuterContext<'_>,
+    fn_name: &str,
+    mut slice: ArraySlicePlan,
+) -> Result<PlannedSelect> {
+    let view = array_view(ctx.catalog, &slice.name)?;
+    let read = RelationRead::new(ctx, fn_name, &view.name)?;
+    let columns = array_slice_columns(&view, &slice);
+    let outer = read.plan_outer(ctx, columns)?;
+    push_down_into_slice(&mut slice, &view, &outer.plan, &read.name);
+    Ok(read.into_cte(SqlPlan::ArraySlice(slice), outer))
 }
 
 /// The parts of the enclosing SELECT every arm reads.

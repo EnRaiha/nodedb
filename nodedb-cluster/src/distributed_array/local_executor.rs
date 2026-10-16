@@ -14,7 +14,8 @@
 
 use crate::distributed_array::merge::ArrayAggPartial;
 use crate::distributed_array::wire::{
-    ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardPutReq, ArrayShardSliceReq,
+    ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardElementwiseReq, ArrayShardMaintReq,
+    ArrayShardPutReq, ArrayShardSliceReq,
 };
 use crate::error::Result;
 
@@ -38,6 +39,15 @@ pub struct ArraySliceExec {
 /// plus the bitemporal below-horizon signal (see [`ArraySliceExec`]).
 pub struct ArrayAggExec {
     pub partials: Vec<ArrayAggPartial>,
+    pub truncated_before_horizon: bool,
+    /// The write versions the shard read observed (see [`ArraySliceExec`]).
+    pub read_versions: Vec<nodedb_types::ShardVersion>,
+}
+
+/// Result of a local shard elementwise op: one row per output cell, plus the
+/// bitemporal below-horizon signal (see [`ArraySliceExec`]).
+pub struct ArrayElementwiseExec {
+    pub rows: Vec<Vec<u8>>,
     pub truncated_before_horizon: bool,
     /// The write versions the shard read observed (see [`ArraySliceExec`]).
     pub read_versions: Vec<nodedb_types::ShardVersion>,
@@ -110,6 +120,24 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// request so the partial folds in that transaction's staged cells on
     /// this shard.
     async fn exec_agg(&self, local_vshard_id: u32, req: &ArrayShardAggReq) -> Result<ArrayAggExec>;
+
+    /// Pair the cells of two co-located arrays on this shard and apply the
+    /// request's binary op on the Data Plane. Only cells in
+    /// `req.shard_bucket` take part. `req.txn_id` folds in that transaction's
+    /// staged cells on this shard.
+    ///
+    /// Returns one native-msgpack row per output cell.
+    async fn exec_elementwise(
+        &self,
+        local_vshard_id: u32,
+        req: &ArrayShardElementwiseReq,
+    ) -> Result<ArrayElementwiseExec>;
+
+    /// Flush or compact the array on the core that owns `local_vshard_id`.
+    ///
+    /// Returns the count the Data Plane handler answered with: `1` for a
+    /// flush, the number of segments merged for a compaction.
+    async fn exec_maint(&self, local_vshard_id: u32, req: &ArrayShardMaintReq) -> Result<u64>;
 
     /// Apply a cell-batch write to the local array engine.
     ///

@@ -26,3 +26,11 @@ pub const ARRAY_SHARD_DELETE_RESP: u32 = 87;
 pub const ARRAY_SHARD_SURROGATE_BITMAP_REQ: u32 = 88;
 /// Shard → coordinator: surrogate bitmap result.
 pub const ARRAY_SHARD_SURROGATE_BITMAP_RESP: u32 = 89;
+/// Coordinator → shard: pair two arrays' cells and apply a binary op.
+pub const ARRAY_SHARD_ELEMENTWISE_REQ: u32 = 90;
+/// Shard → coordinator: paired result rows.
+pub const ARRAY_SHARD_ELEMENTWISE_RESP: u32 = 91;
+/// Coordinator → shard: flush or compact an array.
+pub const ARRAY_SHARD_MAINT_REQ: u32 = 92;
+/// Shard → coordinator: maintenance acknowledgement.
+pub const ARRAY_SHARD_MAINT_RESP: u32 = 93;

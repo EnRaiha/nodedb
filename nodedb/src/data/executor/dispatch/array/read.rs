@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ArrayOp::Slice` and `ArrayOp::Project` handlers.
+//! `ArrayOp::Slice` handler.
 //!
-//! Both are read-only fan-outs over the engine's tile scan. Slice
-//! prunes by per-dim coord ranges and (optionally) projects an attribute
-//! subset; Project is a pure attribute projection over every cell.
+//! A read-only fan-out over the engine's tile scan. Slice prunes by
+//! per-dim coord ranges and (optionally) projects an attribute subset.
+//! `ARRAY_PROJECT` plans to a slice over the whole domain.
 //!
 //! Decoded slice payloads ride as zerompk bytes — matching the
 //! contract documented on `ArrayOp::Slice::slice_msgpack`. Each emitted
 //! row is the named map `slice_row::named_cell_row` builds.
 
 use nodedb_array::query::project::{Projection, project_sparse};
+use nodedb_array::query::region::ArrayRegion;
 use nodedb_array::query::slice::{Slice, slice_sparse_owned, tile_overlaps_slice};
-use nodedb_array::segment::{MbrQueryPredicate, TilePayload};
-use nodedb_array::tile::sparse_tile::SparseTile;
 use nodedb_array::types::ArrayId;
 use nodedb_types::array_route::shard_bucket_admits;
 use nodedb_types::{ShardBucket, SurrogateBitmap, SystemTimeScope, Value};
@@ -46,7 +45,7 @@ use crate::data::executor::handlers::transaction::overlay::ArrayOverlayMergePara
 use crate::data::executor::task::ExecutionTask;
 
 use super::convert::{cell_value_to_value, coord_value_to_value, sparse_tile_to_array_cells};
-use super::encode::{encode_row_bytes, encode_slice_rows};
+use super::encode::encode_slice_rows;
 use super::slice_row::named_cell_row;
 
 impl CoreLoop {
@@ -205,18 +204,21 @@ impl CoreLoop {
                         );
                     }
                 };
-                let (mut resolved_tiles, truncated_before_horizon) =
-                    match store.scan_shard_tiles_at(cutoff, valid_at_ms, shard_bucket) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: format!("array bitemporal scan: {e}"),
-                                },
-                            );
-                        }
-                    };
+                // The slice prunes whole prefixes by footer MBR before decode.
+                let region = ArrayRegion::new(slice.clone(), None);
+                let (mut resolved_tiles, truncated_before_horizon) = match store
+                    .scan_shard_tiles_at(cutoff, valid_at_ms, shard_bucket, Some(&region))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("array bitemporal scan: {e}"),
+                            },
+                        );
+                    }
+                };
                 // Read-your-own-writes: a live read inside a transaction sees
                 // that transaction's staged cells. `AsOf` is a snapshot of
                 // committed history and skips the overlay.
@@ -360,105 +362,6 @@ fn domain_bound_to_coord_value(
         DomainBound::Float64(v) => Some(CoordValue::Float64(*v)),
         DomainBound::TimestampMs(v) => Some(CoordValue::TimestampMs(*v)),
         DomainBound::String(v) => Some(CoordValue::String(v.clone())),
-    }
-}
-
-impl CoreLoop {
-    pub(in crate::data::executor) fn dispatch_array_project(
-        &mut self,
-        task: &ExecutionTask,
-        array_id: &ArrayId,
-        attr_indices: &[u32],
-    ) -> Response {
-        if let Err(resp) = self.ensure_array_open(task, array_id) {
-            return resp;
-        }
-        let schema = match self.array_engine.store(array_id) {
-            Ok(store) => store.schema().clone(),
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Unsupported {
-                        detail: format!("array '{}' not open: {e}", array_id.name),
-                    },
-                );
-            }
-        };
-
-        let mut tiles = match self
-            .array_engine
-            .scan_tiles(array_id, &MbrQueryPredicate::default())
-        {
-            Ok(t) => t,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("array project scan: {e}"),
-                    },
-                );
-            }
-        };
-        // Read-your-own-writes for a same-transaction read.
-        if let Err(e) = self.merge_array_overlay_payloads(
-            ArrayOverlayMergeParams {
-                txn_id: task.request.txn_id,
-                array_id,
-                schema: &schema,
-                valid_at_ms: None,
-            },
-            &mut tiles,
-        ) {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("array project overlay merge: {e}"),
-                },
-            );
-        }
-
-        let proj = Projection::new(attr_indices.iter().map(|&i| i as usize).collect());
-
-        let mut rows: Vec<Vec<u8>> = Vec::new();
-        for tile in tiles {
-            let sparse: SparseTile = match tile {
-                TilePayload::Sparse(s) => s,
-                TilePayload::Dense(_) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Unsupported {
-                            detail: "dense tile payload in project".to_string(),
-                        },
-                    );
-                }
-            };
-            let projected = match project_sparse(&sparse, &proj) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("array project: {e}"),
-                        },
-                    );
-                }
-            };
-            for cell in sparse_tile_to_array_cells(&schema, &projected) {
-                match named_cell_row(&schema, cell.coords, cell.attrs, Some(&proj), None) {
-                    Ok(row) => rows.push(row),
-                    Err(e) => {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!("array project row: {e}"),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        encode_row_bytes(self, task, &rows)
     }
 }
 

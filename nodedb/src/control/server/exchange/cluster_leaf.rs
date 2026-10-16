@@ -2,8 +2,9 @@
 
 //! A cross-node gather of a plan whose rows are spread by tile or node key.
 //!
-//! - A cluster array read (`ClusterArray` `Slice` / `Agg`) runs through the
-//!   array executor, which already knows the shard that owns each tile. A
+//! - A cluster array read (`ClusterArray` `Slice` / `Agg` / `Elementwise`)
+//!   runs through the array executor, which already knows the shard that
+//!   owns each tile. A
 //!   leaf nested under a coordinator-local wrapper (aggregate, join input,
 //!   post-process, set operation, lateral outer plan) is read first and
 //!   inlined as a `ProviderScan`. The rest of the plan then gathers like any
@@ -11,9 +12,9 @@
 //!   raises the client notice its own shaping will report.
 //! - Graph reads never reach a gather: the SQL planner emits no graph leaf,
 //!   and every graph read runs through `graph_dispatch`. A local `Array` plan
-//!   never reaches one in a cluster either, which plans arrays as
-//!   `ClusterArray`. Either one is refused rather than read from this node's
-//!   partitions alone.
+//!   reads one core's tiles only, and a server plans every array read as
+//!   `ClusterArray`. Either kind of leaf is refused rather than read from
+//!   one partition alone.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -22,13 +23,12 @@ use std::sync::Arc;
 use nodedb_physical::physical_plan::{ClusterArrayOp, ExchangeOp, PhysicalPlan, QueryOp};
 
 use crate::control::cluster::ClusterArrayExecutor;
-use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::server::shared::authorization::gathered_sources;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::ArraySliceResponse;
-use crate::types::{Lsn, TxnId};
+use crate::types::TxnId;
 
-use super::gather::GatherOutcome;
+use super::gather_outcome::GatherOutcome;
 use super::read_scope::ReadScope;
 use super::resolve::exchange::provider_scan_of_rows;
 
@@ -41,7 +41,7 @@ pub(super) async fn gather_cluster_partitioned(
 ) -> crate::Result<GatherOutcome> {
     if let PhysicalPlan::ClusterArray(op) = &plan {
         let rows = read_cluster_array(state, op, scope.txn_id).await?;
-        return Ok(outcome_of(rows));
+        return Ok(GatherOutcome::unversioned(vec![rows]));
     }
     let mut local = plan;
     inline_cluster_arrays(state, &mut local, scope).await?;
@@ -64,8 +64,9 @@ pub(super) async fn gather_cluster_partitioned(
 /// as one msgpack array.
 ///
 /// The rows are already relational: a slice row holds one field per dim
-/// and attr, keyed by name, and an aggregate row is `{group, result}` or
-/// `{result}`. They reach a relational operator as is. The storage flatten
+/// and attr, keyed by name, an aggregate row is `{group, result}` or
+/// `{result}`, and an elementwise row is `{coords, attrs}`. They reach a
+/// relational operator as is. The storage flatten
 /// would read an attr named `data` as a `{id, data}` row envelope.
 async fn read_cluster_array(
     state: &SharedState,
@@ -74,10 +75,13 @@ async fn read_cluster_array(
 ) -> crate::Result<Vec<u8>> {
     if matches!(
         op,
-        ClusterArrayOp::Put { .. } | ClusterArrayOp::Delete { .. }
+        ClusterArrayOp::Put { .. }
+            | ClusterArrayOp::Delete { .. }
+            | ClusterArrayOp::Flush { .. }
+            | ClusterArrayOp::Compact { .. }
     ) {
         return Err(crate::Error::Internal {
-            detail: "a cluster array write reached a cross-node gather".into(),
+            detail: "a cluster array write or maintenance op reached a cross-node gather".into(),
         });
     }
     let transport = state
@@ -106,7 +110,7 @@ async fn read_cluster_array(
 ///
 /// A `Slice` answers an `ArraySliceResponse` envelope whose `rows_msgpack` is
 /// the row array. An `Agg` answers the row array itself (`{group, result}` or
-/// `{result}` maps). A slice whose `truncated_before_horizon` is set raises
+/// `{result}` maps), and an `Elementwise` its `{coords, attrs}` row array. A slice whose `truncated_before_horizon` is set raises
 /// the same client notice a slice shaped on its own reports
 /// (`response_shape::compose::array_slice`), through the statement notice
 /// slot (`session::statement_notice`).
@@ -125,9 +129,12 @@ fn cluster_array_rows(op: &ClusterArrayOp, payload: Vec<u8>) -> crate::Result<Ve
             }
             Ok(response.rows_msgpack)
         }
-        ClusterArrayOp::Agg { .. } | ClusterArrayOp::Put { .. } | ClusterArrayOp::Delete { .. } => {
-            Ok(payload)
-        }
+        ClusterArrayOp::Agg { .. }
+        | ClusterArrayOp::Elementwise { .. }
+        | ClusterArrayOp::Put { .. }
+        | ClusterArrayOp::Delete { .. }
+        | ClusterArrayOp::Flush { .. }
+        | ClusterArrayOp::Compact { .. } => Ok(payload),
     }
 }
 
@@ -179,27 +186,41 @@ fn inline_cluster_arrays<'a>(
                     inline_cluster_arrays(state, child, scope).await?;
                 }
             }
-            _ => {}
+            // `plan_contains_cluster_partitioned_leaf` looks through none of
+            // these, so no cluster array leaf sits below them.
+            PhysicalPlan::Query(
+                QueryOp::ProviderScan { .. }
+                | QueryOp::PartialAggregate { .. }
+                | QueryOp::PartialAggregateState { .. }
+                | QueryOp::ShuffleJoinConsume { .. }
+                | QueryOp::ShuffleAggregateConsume { .. }
+                | QueryOp::NestedLoopJoin { .. }
+                | QueryOp::SortMergeJoin { .. }
+                | QueryOp::FacetCounts { .. }
+                | QueryOp::RecursiveScan { .. }
+                | QueryOp::RecursiveValue { .. },
+            )
+            | PhysicalPlan::Vector(_)
+            | PhysicalPlan::Graph(_)
+            | PhysicalPlan::Document(_)
+            | PhysicalPlan::Kv(_)
+            | PhysicalPlan::Text(_)
+            | PhysicalPlan::Columnar(_)
+            | PhysicalPlan::Timeseries(_)
+            | PhysicalPlan::Spatial(_)
+            | PhysicalPlan::Crdt(_)
+            | PhysicalPlan::Meta(_)
+            | PhysicalPlan::Array(_)
+            | PhysicalPlan::ClusterEvent(_) => {}
         }
         Ok(())
     })
 }
 
-/// A gather outcome holding one payload.
-fn outcome_of(payload: Vec<u8>) -> GatherOutcome {
-    let merged_array = encode_msgpack_array(&extract_msgpack_elements(&payload));
-    GatherOutcome {
-        raw: payload,
-        merged_array,
-        watermark_lsn: Lsn::ZERO,
-        read_versions: crate::types::ReadVersions::new(),
-        shard_watermarks: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 
     /// One flat row, the plain msgpack map `{"k": value}` a shard emits.
     /// `nodedb_types::Value` encodes as a tagged array, not a plain map, so
@@ -237,6 +258,7 @@ mod tests {
             prefix_bits: 0,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         }
     }
 
@@ -249,7 +271,7 @@ mod tests {
         })
         .expect("encode slice envelope");
         let out = cluster_array_rows(&slice_op(), envelope).expect("slice rows");
-        assert_eq!(extract_msgpack_elements(&out), rows);
+        assert_eq!(extract_msgpack_elements(&out).expect("extract"), rows);
     }
 
     /// A named slice row whose attr is called `data` stays a whole row: the
@@ -264,7 +286,10 @@ mod tests {
         })
         .expect("encode slice envelope");
         let out = cluster_array_rows(&slice_op(), envelope).expect("slice rows");
-        assert_eq!(extract_msgpack_elements(&out), vec![named]);
+        assert_eq!(
+            extract_msgpack_elements(&out).expect("extract"),
+            vec![named]
+        );
     }
 
     #[tokio::test]
@@ -292,6 +317,22 @@ mod tests {
     fn an_aggregate_payload_yields_its_rows() {
         let rows = vec![row(10), row(20), row(30)];
         let out = cluster_array_rows(&agg_op(), encode_msgpack_array(&rows)).expect("agg rows");
-        assert_eq!(extract_msgpack_elements(&out), rows);
+        assert_eq!(extract_msgpack_elements(&out).expect("extract"), rows);
+    }
+
+    #[test]
+    fn an_elementwise_payload_yields_its_rows() {
+        let op = ClusterArrayOp::Elementwise {
+            left: array_id(),
+            right: array_id(),
+            op: nodedb_physical::physical_plan::ArrayBinaryOp::Add,
+            attr_idx: 0,
+            prefix_bits: 0,
+            system_as_of: None,
+            valid_at_ms: None,
+        };
+        let rows = vec![row(1), row(2)];
+        let out = cluster_array_rows(&op, encode_msgpack_array(&rows)).expect("elementwise rows");
+        assert_eq!(extract_msgpack_elements(&out).expect("extract"), rows);
     }
 }

@@ -4,6 +4,7 @@
 //! and response-opcode → `VShardMessageType` lookup for the local-dispatch
 //! fast path.
 
+use nodedb_cluster::distributed_array::ArrayAggGroupKey;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_cluster::distributed_array::scatter::{ArrayCoordError, ShardFailure};
 use nodedb_cluster::error::ClusterError;
@@ -19,6 +20,7 @@ use crate::Error;
 pub(super) enum AggValue {
     Float(f64),
     Int(i64),
+    Str(String),
     Bool(bool),
     Null,
 }
@@ -28,9 +30,21 @@ impl zerompk::ToMessagePack for AggValue {
         match self {
             AggValue::Float(f) => writer.write_f64(*f),
             AggValue::Int(i) => writer.write_i64(*i),
+            AggValue::Str(s) => writer.write_string(s),
             AggValue::Bool(b) => writer.write_boolean(*b),
             AggValue::Null => writer.write_nil(),
         }
+    }
+}
+
+/// The `group` cell of a grouped row: the dim value, typed as the single-node
+/// path writes it. A scalar partial carries no group, so it writes NULL.
+fn group_cell(key: &ArrayAggGroupKey) -> AggValue {
+    match key {
+        ArrayAggGroupKey::Int64(v) | ArrayAggGroupKey::TimestampMs(v) => AggValue::Int(*v),
+        ArrayAggGroupKey::Float64(v) => AggValue::Float(*v),
+        ArrayAggGroupKey::String(s) => AggValue::Str(s.clone()),
+        ArrayAggGroupKey::Scalar => AggValue::Null,
     }
 }
 
@@ -38,7 +52,8 @@ impl zerompk::ToMessagePack for AggValue {
 /// the local `ArrayOp::Aggregate` path produces via `encode_agg_rows`.
 ///
 /// For scalar (no group-by), returns a single `[{"result": f64}]`.
-/// For group-by, returns one `{"group": i64, "result": f64}` per partial.
+/// For group-by, returns one `{"group": <dim value>, "result": f64}` per
+/// partial, the dim value typed as its dim.
 /// When `emit_horizon` is set (temporal queries only), a trailing
 /// `{"truncated_before_horizon": bool}` summary row is appended. This mirrors
 /// the single-node path (`dispatch::array::aggregate`) exactly — including the
@@ -74,7 +89,7 @@ pub(super) fn finalize_agg_partials(
         .map(|p| {
             let mut row = std::collections::BTreeMap::new();
             if is_grouped {
-                row.insert("group".to_string(), AggValue::Int(p.group_key));
+                row.insert("group".to_string(), group_cell(&p.group_key));
             }
             row.insert("result".to_string(), finalize(p));
             row
@@ -94,6 +109,26 @@ pub(super) fn finalize_agg_partials(
     }
 
     rows
+}
+
+/// One msgpack array holding the already-encoded `rows`, the shape a local
+/// array read answers with.
+pub(super) fn encode_row_array(rows: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + rows.iter().map(Vec::len).sum::<usize>());
+    let n = rows.len();
+    if n <= 15 {
+        out.push(0x90 | (n as u8));
+    } else if n <= u16::MAX as usize {
+        out.push(0xdc);
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+    } else {
+        out.push(0xdd);
+        out.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+    for row in rows {
+        out.extend_from_slice(row);
+    }
+    out
 }
 
 /// Map an array coordinator error to an [`Error`].
@@ -202,7 +237,8 @@ pub(super) fn encode_err(e: zerompk::Error) -> Error {
     }
 }
 
-/// Map a numeric response opcode (81, 83, 85, 87, 89) to its `VShardMessageType`.
+/// Map a numeric response opcode (81, 83, 85, 87, 89, 91, 93) to its
+/// `VShardMessageType`.
 ///
 /// Used by the local-dispatch fast path to build the response envelope without
 /// going through the QUIC transport layer.
@@ -213,6 +249,8 @@ pub(super) fn array_resp_msg_type(opcode: u32) -> Option<VShardMessageType> {
         85 => Some(VShardMessageType::ArrayShardPutResp),
         87 => Some(VShardMessageType::ArrayShardDeleteResp),
         89 => Some(VShardMessageType::ArrayShardSurrogateBitmapResp),
+        91 => Some(VShardMessageType::ArrayShardElementwiseResp),
+        93 => Some(VShardMessageType::ArrayShardMaintResp),
         _ => None,
     }
 }
@@ -221,6 +259,27 @@ pub(super) fn array_resp_msg_type(opcode: u32) -> Option<VShardMessageType> {
 mod tests {
     use super::*;
     use crate::bridge::envelope::ErrorCode;
+
+    /// A grouped row writes its dim value typed as the dim: a Float64 dim
+    /// writes the float and a String dim the string, never a bit pattern or
+    /// a hash.
+    #[test]
+    fn a_grouped_row_writes_the_typed_dim_value() {
+        use nodedb_physical::physical_plan::ArrayReducer;
+        let partials = vec![
+            ArrayAggPartial::from_single(ArrayAggGroupKey::Float64(101.5), 2.0),
+            ArrayAggPartial::from_single(ArrayAggGroupKey::String("chrX".into()), 3.0),
+            ArrayAggPartial::from_single(ArrayAggGroupKey::Int64(7), 4.0),
+        ];
+        let rows = finalize_agg_partials(&partials, &ArrayReducer::Sum, 0, false, false);
+        let bytes = zerompk::to_msgpack_vec(&rows).expect("encode rows");
+        let json = nodedb_types::msgpack_to_json_string(&bytes).expect("rows to json");
+        let rows: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+        assert_eq!(rows[0]["group"].as_f64(), Some(101.5));
+        assert_eq!(rows[1]["group"].as_str(), Some("chrX"));
+        assert_eq!(rows[2]["group"].as_i64(), Some(7));
+        assert_eq!(rows[2]["result"].as_f64(), Some(4.0));
+    }
 
     /// A shard request that never went out answers `NoLeader` for that
     /// shard: nothing ran, so the refusal is definite.

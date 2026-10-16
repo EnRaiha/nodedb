@@ -94,7 +94,6 @@ pub(super) fn convert_body_to_single_plan(
         | SqlPlan::InsertArray { .. }
         | SqlPlan::DeleteArray { .. }
         | SqlPlan::ArraySlice { .. }
-        | SqlPlan::ArrayProject { .. }
         | SqlPlan::ArrayAgg { .. }
         | SqlPlan::ArrayElementwise { .. }
         | SqlPlan::ArrayFlush { .. }

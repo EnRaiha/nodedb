@@ -20,7 +20,6 @@ pub(super) fn inject_array(_ctx: &RlsCtx<'_>, op: &ArrayOp) -> crate::Result<()>
         // No-op: cell reads, addressed by `ArrayId`, which no policy can be
         // keyed on.
         ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => Ok(()),
@@ -47,8 +46,11 @@ pub(super) fn inject_cluster_array(_ctx: &RlsCtx<'_>, op: &ClusterArrayOp) -> cr
         // addressed by the same `ArrayId`.
         ClusterArrayOp::Slice { .. }
         | ClusterArrayOp::Agg { .. }
+        | ClusterArrayOp::Elementwise { .. }
         | ClusterArrayOp::Put { .. }
-        | ClusterArrayOp::Delete { .. } => Ok(()),
+        | ClusterArrayOp::Delete { .. }
+        | ClusterArrayOp::Flush { .. }
+        | ClusterArrayOp::Compact { .. } => Ok(()),
     }
 }
 

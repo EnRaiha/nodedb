@@ -123,7 +123,6 @@ impl CoreLoop {
             PhysicalPlan::Array(
                 ArrayOp::OpenArray { .. }
                 | ArrayOp::Slice { .. }
-                | ArrayOp::Project { .. }
                 | ArrayOp::Aggregate { .. }
                 | ArrayOp::Elementwise { .. }
                 | ArrayOp::Flush { .. }

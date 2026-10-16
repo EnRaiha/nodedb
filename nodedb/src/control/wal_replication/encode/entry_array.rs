@@ -42,7 +42,6 @@ pub(super) fn array_write(op: &ArrayOp) -> Option<ReplicatedWrite> {
         | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => None,

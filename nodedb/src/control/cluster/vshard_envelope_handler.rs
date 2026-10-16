@@ -111,6 +111,8 @@ mod tests {
             (85, VShardMessageType::ArrayShardPutResp),
             (87, VShardMessageType::ArrayShardDeleteResp),
             (89, VShardMessageType::ArrayShardSurrogateBitmapResp),
+            (91, VShardMessageType::ArrayShardElementwiseResp),
+            (93, VShardMessageType::ArrayShardMaintResp),
         ];
         for (opcode, expected) in responses {
             let resolved = resolve_vshard_msg_type(opcode)
@@ -121,7 +123,7 @@ mod tests {
 
     #[test]
     fn an_unknown_opcode_is_a_codec_error() {
-        assert!(resolve_vshard_msg_type(90).is_err());
+        assert!(resolve_vshard_msg_type(94).is_err());
         assert!(resolve_vshard_msg_type(u32::from(u16::MAX) + 1).is_err());
     }
 }

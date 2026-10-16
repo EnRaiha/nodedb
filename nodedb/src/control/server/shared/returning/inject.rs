@@ -434,7 +434,6 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
             | ArrayOp::Put { .. }
             | ArrayOp::Delete { .. }
             | ArrayOp::Slice { .. }
-            | ArrayOp::Project { .. }
             | ArrayOp::Aggregate { .. }
             | ArrayOp::Elementwise { .. }
             | ArrayOp::Flush { .. }
@@ -447,8 +446,11 @@ pub fn inject_returning_spec(plan: &mut PhysicalPlan, spec: ReturningSpec) {
         | PhysicalPlan::ClusterArray(
             ClusterArrayOp::Slice { .. }
             | ClusterArrayOp::Agg { .. }
+            | ClusterArrayOp::Elementwise { .. }
             | ClusterArrayOp::Put { .. }
-            | ClusterArrayOp::Delete { .. },
+            | ClusterArrayOp::Delete { .. }
+            | ClusterArrayOp::Flush { .. }
+            | ClusterArrayOp::Compact { .. },
         )
         | PhysicalPlan::ClusterEvent(
             ClusterEventOp::ConsumeStream { .. }

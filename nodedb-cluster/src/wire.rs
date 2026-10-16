@@ -143,6 +143,14 @@ pub enum VShardMessageType {
     ArrayShardSurrogateBitmapReq = 88,
     /// Gather: shard returns the surrogate bitmap for matching cells.
     ArrayShardSurrogateBitmapResp = 89,
+    /// Scatter: coordinator asks a shard to pair two arrays' cells.
+    ArrayShardElementwiseReq = 90,
+    /// Gather: shard returns its paired rows.
+    ArrayShardElementwiseResp = 91,
+    /// Scatter: coordinator asks a shard to flush or compact an array.
+    ArrayShardMaintReq = 92,
+    /// Gather: shard acknowledges the maintenance.
+    ArrayShardMaintResp = 93,
 }
 
 /// Current wire protocol version.
@@ -263,6 +271,10 @@ impl VShardMessageType {
             87 => VShardMessageType::ArrayShardDeleteResp,
             88 => VShardMessageType::ArrayShardSurrogateBitmapReq,
             89 => VShardMessageType::ArrayShardSurrogateBitmapResp,
+            90 => VShardMessageType::ArrayShardElementwiseReq,
+            91 => VShardMessageType::ArrayShardElementwiseResp,
+            92 => VShardMessageType::ArrayShardMaintReq,
+            93 => VShardMessageType::ArrayShardMaintResp,
             _ => return None,
         };
         Some(msg_type)
@@ -334,6 +346,10 @@ mod tests {
             VShardMessageType::ArrayShardDeleteResp,
             VShardMessageType::ArrayShardSurrogateBitmapReq,
             VShardMessageType::ArrayShardSurrogateBitmapResp,
+            VShardMessageType::ArrayShardElementwiseReq,
+            VShardMessageType::ArrayShardElementwiseResp,
+            VShardMessageType::ArrayShardMaintReq,
+            VShardMessageType::ArrayShardMaintResp,
         ];
 
         for msg_type in types {

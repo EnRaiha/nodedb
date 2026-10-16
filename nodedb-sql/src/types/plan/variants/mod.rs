@@ -17,8 +17,8 @@ mod vector_primary;
 mod writes;
 
 pub use array::{
-    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArrayProjectPlan, ArraySlicePlan,
-    CreateArrayPlan, DeleteArrayPlan, InsertArrayPlan,
+    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan, CreateArrayPlan,
+    DeleteArrayPlan, InsertArrayPlan,
 };
 pub use cte::CtePlan;
 pub use hybrid::{HybridSearchPlan, HybridSearchTriplePlan};

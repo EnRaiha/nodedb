@@ -2,16 +2,16 @@
 
 //! `ArrayOp::SurrogateBitmapScan` handler.
 //!
-//! Scans the array's tiles, applies the slice predicate, and emits one
-//! row per matching cell where `id` is the cell's bound `Surrogate`
-//! formatted as 8-char zero-padded lowercase hex (substrate row-key
-//! format). Used by the cross-engine fusion path: the vector engine
-//! invokes this as an `inline_prefilter_plan` and reads the response
-//! through `collect_surrogates` to materialize a `SurrogateBitmap`.
+//! Reads each live cell of this core once at its newest version, applies
+//! the slice predicate, and emits one row per matching cell where `id` is
+//! the cell's bound `Surrogate` formatted as 8-char zero-padded lowercase
+//! hex (substrate row-key format). The cluster coordinator unions the shard
+//! answers into the prefilter bitmap of a vector search. A vector search
+//! that still carries this scan as its `inline_prefilter_plan` reads it
+//! through `collect_surrogates`.
 
+use nodedb_array::query::region::ArrayRegion;
 use nodedb_array::query::slice::{Slice, slice_sparse, tile_overlaps_slice};
-use nodedb_array::segment::{MbrQueryPredicate, TilePayload};
-use nodedb_array::tile::sparse_tile::SparseTile;
 use nodedb_array::types::ArrayId;
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -53,11 +53,23 @@ impl CoreLoop {
             }
         };
 
-        let tiles = match self
-            .array_engine
-            .scan_tiles(array_id, &MbrQueryPredicate::default())
-        {
-            Ok(t) => t,
+        // Each cell once at its newest version: a deleted or overwritten
+        // cell's older version admits no surrogate. The slice prunes whole
+        // prefixes by footer MBR before decode.
+        let region = ArrayRegion::new(slice.clone(), None);
+        let scanned = match self.array_engine.store(array_id) {
+            Ok(store) => store.scan_shard_tiles_at(i64::MAX, None, None, Some(&region)),
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Unsupported {
+                        detail: format!("array '{}' not open: {e}", array_id.name),
+                    },
+                );
+            }
+        };
+        let tiles = match scanned {
+            Ok((tiles, _)) => tiles,
             Err(e) => {
                 return self.response_error(
                     task,
@@ -69,18 +81,7 @@ impl CoreLoop {
         };
 
         let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
-        for tile in tiles {
-            let sparse: SparseTile = match tile {
-                TilePayload::Sparse(s) => s,
-                TilePayload::Dense(_) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Unsupported {
-                            detail: "dense tile payload in surrogate-scan".to_string(),
-                        },
-                    );
-                }
-            };
+        for (_, sparse) in tiles {
             if !tile_overlaps_slice(&sparse.mbr.dim_mins, &sparse.mbr.dim_maxs, &slice) {
                 continue;
             }

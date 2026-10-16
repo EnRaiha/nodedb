@@ -189,7 +189,7 @@ The 4th-argument `limit` caps the cells the slice reads before any clause applie
 
 ### ARRAY_PROJECT — Select Attributes
 
-Returns all cells with only the listed attributes. The attribute list is required and must not be empty:
+Returns all cells with only the listed attributes. The attribute list is required and must not be empty. It reads the whole domain, as an `ARRAY_SLICE` with no bounds does, and honors `AS OF` the same way:
 
 ```sql
 SELECT * FROM ARRAY_PROJECT(
@@ -212,9 +212,29 @@ SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'SUM', 'x');
 
 The result has a `result` column. A grouped call also has a `group` column that holds the dimension value. Reducers are case-insensitive: `'SUM'`, `'COUNT'`, `'MIN'`, `'MAX'`, and `'MEAN'` (or `'AVG'`).
 
+Three more optional arguments bound the cells the reducer reads:
+
+- **5th, box**: a slice predicate in the `ARRAY_SLICE` form, such as `'{lon: [101, 103], lat: [2, 4]}'`. Bounds are inclusive.
+- **6th and 7th, zone**: a WKT `POLYGON` or `MULTIPOLYGON`, then the two dimensions it is drawn over, x first, such as `ARRAY['lon', 'lat']`. Both dimensions must be `INT64` or `FLOAT64`. Pass both arguments or neither.
+
+Pass `NULL` for an argument to skip it:
+
+```sql
+-- Mean NDVI inside a field boundary
+SELECT * FROM ARRAY_AGG(
+  'scene', 'ndvi', 'MEAN', NULL, NULL,
+  'POLYGON((101 2, 103 2, 103 4, 101 4, 101 2))', ARRAY['lon', 'lat']
+);
+
+-- Sum per lon value inside a box
+SELECT * FROM ARRAY_AGG('scene', 'ndvi', 'SUM', 'lon', '{lon: [101, 103]}');
+```
+
+A cell is in a zone when it lies inside one member polygon and outside that polygon's holes. Edges are half-open: on a rectangle, a cell on the lower x or y edge is inside and a cell on the upper edge is outside. A region that holds no cell returns `NULL` for every reducer, `COUNT` included. Tiles whose bounding boxes miss the region are skipped before decode.
+
 ### ARRAY_ELEMENTWISE — Element-wise Operations
 
-Applies an operation between two arrays of the same shape:
+Applies an operation between two arrays of the same shape. Both arrays must have the same dimensions, attributes, tile extents, cell order, and `prefix_bits`. Arrays that differ are refused at planning:
 
 ```sql
 -- Subtract a baseline from all cells
@@ -226,7 +246,9 @@ SELECT * FROM ARRAY_ELEMENTWISE(
 );
 ```
 
-The result has `coords` and `attrs` columns, both JSON.
+The result has `coords` and `attrs` columns, both JSON. `attrs` holds one value: the operation applied to the named attribute. A coordinate present in one array only takes that array's value.
+
+`AS OF SYSTEM TIME` and `AS OF VALID TIME` apply to both arrays. A temporal query appends one `{"truncated_before_horizon": bool}` row, as `ARRAY_AGG` does. `AS OF SYSTEM TIME NULL` is refused.
 
 ## Maintenance Functions
 
@@ -250,7 +272,7 @@ SELECT ARRAY_COMPACT('spatial_grid');
 -- Returns: {"compacted": 1}
 ```
 
-Returns one object `{"compacted": n}`. `n` is `1` when a merge ran and `0` when the compaction picker found nothing to merge. A failure raises an error. Compaction is background-automatic, but can be triggered manually.
+Returns one object `{"compacted": n}`. `n` counts the cores that merged segments. It is `0` when the compaction picker found nothing to merge. A failure raises an error. Compaction is background-automatic, but can be triggered manually.
 
 ## Bitemporal Support
 

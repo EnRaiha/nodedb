@@ -30,15 +30,6 @@ pub(super) fn encode_value_rows(core: &CoreLoop, task: &ExecutionTask, rows: &[V
     }
 }
 
-/// Answer with already-encoded rows as one msgpack array.
-pub(super) fn encode_row_bytes(
-    core: &CoreLoop,
-    task: &ExecutionTask,
-    rows: &[Vec<u8>],
-) -> Response {
-    core.response_with_payload(task, concat_rows(rows))
-}
-
 /// Encode already-encoded slice rows into an `ArraySliceResponse` envelope
 /// carrying the below-horizon flag.
 pub(super) fn encode_slice_rows(

@@ -102,6 +102,10 @@ pub fn dispatch_by_type(envelope: &VShardEnvelope) -> DispatchTarget {
         VShardMessageType::ArrayShardDeleteResp => DispatchTarget::ArrayCoordinator,
         VShardMessageType::ArrayShardSurrogateBitmapReq => DispatchTarget::ArrayShard,
         VShardMessageType::ArrayShardSurrogateBitmapResp => DispatchTarget::ArrayCoordinator,
+        VShardMessageType::ArrayShardElementwiseReq => DispatchTarget::ArrayShard,
+        VShardMessageType::ArrayShardElementwiseResp => DispatchTarget::ArrayCoordinator,
+        VShardMessageType::ArrayShardMaintReq => DispatchTarget::ArrayShard,
+        VShardMessageType::ArrayShardMaintResp => DispatchTarget::ArrayCoordinator,
     }
 }
 
@@ -248,6 +252,10 @@ mod tests {
             VShardMessageType::ArrayShardDeleteResp,
             VShardMessageType::ArrayShardSurrogateBitmapReq,
             VShardMessageType::ArrayShardSurrogateBitmapResp,
+            VShardMessageType::ArrayShardElementwiseReq,
+            VShardMessageType::ArrayShardElementwiseResp,
+            VShardMessageType::ArrayShardMaintReq,
+            VShardMessageType::ArrayShardMaintResp,
         ];
         for msg_type in all_types {
             let env = VShardEnvelope::new(msg_type, 1, 2, 0, vec![]);
