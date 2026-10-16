@@ -3,17 +3,19 @@
 //! LIMIT / OFFSET application.
 //!
 //! Each plan variant owns a different slot for the row bound — a scan's
-//! `limit`/`offset`, a search plan's `top_k`, an array slice's `u32` cap. A
-//! variant with no slot at all gets a post-processing tail rather than
-//! silently losing the clause.
+//! `limit`/`offset`, a search plan's `top_k`. A variant with no slot at all
+//! gets a post-processing tail rather than silently losing the clause. An
+//! array slice reaches here only as the body of the relation a SELECT reads,
+//! so the LIMIT lands on that read; the slice's own cap folds in during
+//! planning of the read.
 
 use super::post_process::post_process;
 use super::query_tail::QueryTail;
-use crate::error::{Result, SqlError};
+use crate::error::Result;
 use crate::types::SqlPlan;
 use crate::types::{
-    ArraySlicePlan, CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan,
-    TextSearchPlan, TextSearchShape, TimeseriesScanPlan,
+    CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, TextSearchPlan,
+    TextSearchShape, TimeseriesScanPlan,
 };
 
 /// Default `ef_search` multiplier applied when LIMIT is the only signal
@@ -109,17 +111,6 @@ pub(in crate::planner::select) fn apply_limit(
         } => {
             if let Some(lv) = limit_val {
                 *l = lv;
-            }
-        }
-        SqlPlan::ArraySlice(ArraySlicePlan {
-            limit: ref mut l, ..
-        }) => {
-            if let Some(lv) = limit_val {
-                // The slice bound is a `u32` (0 = unlimited); a LIMIT that
-                // does not fit would wrap into a smaller bound.
-                *l = u32::try_from(lv).map_err(|_| SqlError::Unsupported {
-                    detail: format!("LIMIT {lv} exceeds the array slice row bound"),
-                })?;
             }
         }
         // Search plans rank rows and return the best `top_k`, so the query's

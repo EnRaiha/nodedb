@@ -1,6 +1,10 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
-use nodedb_sql::types::{CtePlan, Filter, Projection, SortKey, SqlPlan, WindowSpec};
+//! CTE inlining: a plan that reads a CTE by name, rewritten to read the
+//! CTE's body. Pure `SqlPlan` → `SqlPlan`, shared by every executor that
+//! lowers a `SqlPlan::Cte`.
+
+use crate::types::{CtePlan, Filter, Projection, SortKey, SqlPlan, WindowSpec};
 
 /// Replace scans on `cte_name` with the CTE's actual subquery plan.
 ///
@@ -18,11 +22,7 @@ use nodedb_sql::types::{CtePlan, Filter, Projection, SortKey, SqlPlan, WindowSpe
 /// body's materialized rows. Computed projection entries and window functions
 /// always take that path: the body does not evaluate them, and a name lookup
 /// at the response boundary yields NULL.
-pub(in crate::control::planner::sql_plan_convert) fn inline_cte(
-    plan: &SqlPlan,
-    cte_name: &str,
-    cte_plan: &SqlPlan,
-) -> SqlPlan {
+pub fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> SqlPlan {
     match plan {
         // Direct scan on CTE name → replace with CTE plan.
         SqlPlan::Scan {
@@ -416,7 +416,7 @@ fn merge_into_vector_search_body(outer: ScanRef<'_>, cte_plan: &SqlPlan) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_sql::types::{CompareOp, EngineType, Filter, FilterExpr, SortKey, SqlValue};
+    use crate::types::{CompareOp, EngineType, Filter, FilterExpr, SortKey, SqlValue};
 
     fn vector_search_body() -> SqlPlan {
         SqlPlan::VectorSearch {
@@ -425,10 +425,10 @@ mod tests {
             query_vector: vec![0.1, 0.2],
             top_k: 3,
             ef_search: 64,
-            metric: nodedb_sql::types::DistanceMetric::L2,
+            metric: crate::types::DistanceMetric::L2,
             filters: Vec::new(),
             array_prefilter: None,
-            ann_options: nodedb_sql::types::VectorAnnOptions::default(),
+            ann_options: crate::types::VectorAnnOptions::default(),
             skip_payload_fetch: false,
             payload_filters: Vec::new(),
             pk_prefilter: None,
@@ -448,7 +448,7 @@ mod tests {
             offset: 0,
             distinct: false,
             window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
+            temporal: crate::TemporalScope::default(),
         }
     }
 
@@ -528,13 +528,13 @@ mod tests {
             offset,
             distinct,
             window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
+            temporal: crate::TemporalScope::default(),
         }
     }
 
     fn id_sort_key() -> SortKey {
         SortKey {
-            expr: nodedb_sql::types::SqlExpr::Column {
+            expr: crate::types::SqlExpr::Column {
                 table: Some("s".to_string()),
                 name: "id".to_string(),
             },
@@ -603,20 +603,20 @@ mod tests {
 
     fn doubled_x() -> Projection {
         Projection::Computed {
-            expr: nodedb_sql::types::SqlExpr::BinaryOp {
-                left: Box::new(nodedb_sql::types::SqlExpr::Column {
+            expr: crate::types::SqlExpr::BinaryOp {
+                left: Box::new(crate::types::SqlExpr::Column {
                     table: None,
                     name: "x".to_string(),
                 }),
-                op: nodedb_sql::types::BinaryOp::Mul,
-                right: Box::new(nodedb_sql::types::SqlExpr::Literal(SqlValue::Int(2))),
+                op: crate::types::BinaryOp::Mul,
+                right: Box::new(crate::types::SqlExpr::Literal(SqlValue::Int(2))),
             },
             alias: "y".to_string(),
         }
     }
 
-    fn row_number_spec() -> nodedb_sql::types::WindowSpec {
-        nodedb_sql::types::WindowSpec {
+    fn row_number_spec() -> crate::types::WindowSpec {
+        crate::types::WindowSpec {
             function: "row_number".to_string(),
             args: Vec::new(),
             partition_by: Vec::new(),
@@ -629,7 +629,7 @@ mod tests {
     /// A CTE-referencing scan carrying an outer projection and window list.
     fn scan_on_cte_projected(
         projection: Vec<Projection>,
-        window_functions: Vec<nodedb_sql::types::WindowSpec>,
+        window_functions: Vec<crate::types::WindowSpec>,
     ) -> SqlPlan {
         SqlPlan::Scan {
             collection: "knn".to_string(),
@@ -642,7 +642,7 @@ mod tests {
             offset: 0,
             distinct: false,
             window_functions,
-            temporal: nodedb_sql::TemporalScope::default(),
+            temporal: crate::TemporalScope::default(),
         }
     }
 
@@ -735,7 +735,7 @@ mod tests {
             offset: 0,
             distinct: false,
             window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
+            temporal: crate::TemporalScope::default(),
         }
     }
 
@@ -769,7 +769,7 @@ mod tests {
             offset: 0,
             distinct: false,
             window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
+            temporal: crate::TemporalScope::default(),
         };
         match inline_cte(&scan_on_cte(vec![tag_filter()], Some(2)), "knn", &body) {
             SqlPlan::Scan {
@@ -798,7 +798,7 @@ mod tests {
             engine: EngineType::DocumentSchemaless,
             filters: Vec::new(),
             projection: vec![Projection::Computed {
-                expr: nodedb_sql::types::SqlExpr::Column {
+                expr: crate::types::SqlExpr::Column {
                     table: None,
                     name: "qty".to_string(),
                 },
@@ -809,7 +809,7 @@ mod tests {
             offset: 0,
             distinct: false,
             window_functions: Vec::new(),
-            temporal: nodedb_sql::TemporalScope::default(),
+            temporal: crate::TemporalScope::default(),
         };
         match inline_cte(
             &scan_on_cte_projected(vec![doubled_x()], Vec::new()),
@@ -842,7 +842,7 @@ mod tests {
             left: Box::new(other_side),
             right: Box::new(scan_on_cte(Vec::new(), None)),
             on: vec![("orders.id".to_string(), "knn.id".to_string())],
-            join_type: nodedb_sql::types::query::JoinType::Inner,
+            join_type: crate::types::query::JoinType::Inner,
             condition: None,
             limit: None,
             projection: Vec::new(),

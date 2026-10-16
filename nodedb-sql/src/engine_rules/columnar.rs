@@ -125,6 +125,11 @@ impl EngineRules for ColumnarRules {
         }])
     }
 
+    /// Each row loads as one INSERT.
+    fn plan_bulk_load(&self, _p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        Ok(BulkLoadPlan::RowInserts)
+    }
+
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
         if p.temporal.is_temporal() && !p.bitemporal {
             return Err(SqlError::Unsupported {

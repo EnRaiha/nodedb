@@ -13,6 +13,9 @@ use nodedb_sql::types::{
     VectorPrimaryUpdatePlan,
 };
 
+use nodedb_array::types::coord::value::CoordValue;
+use nodedb_sql::types_array::ArrayInsertRow;
+
 use super::super::convert::ConvertContext;
 use super::super::value::{sql_value_to_bytes, sql_value_to_string};
 use super::crdt_gate::document_collection_is_crdt;
@@ -31,6 +34,17 @@ pub(in super::super) struct KeyBatch<'p> {
     pub binds: bool,
     /// How many rows conversion mints a fresh surrogate for.
     pub fresh: usize,
+    /// For an `INSERT INTO ARRAY`: the plan's rows and their coerced
+    /// coordinates. The bind step keeps them with `pks`, so conversion
+    /// coerces and encodes no coordinate again.
+    pub array_rows: Option<ArrayBatchRows<'p>>,
+}
+
+/// The rows of one `INSERT INTO ARRAY` plan and their coerced coordinates,
+/// in row order.
+pub(in super::super) struct ArrayBatchRows<'p> {
+    pub rows: &'p [ArrayInsertRow],
+    pub coords: Vec<Vec<CoordValue>>,
 }
 
 /// The key batches of every plan in `plans`, in plan order. A plan whose
@@ -134,6 +148,7 @@ fn plan_key_batch<'p>(
                 .collect(),
             binds: true,
             fresh: 0,
+            array_rows: None,
         },
         SqlPlan::Update {
             collection,
@@ -147,6 +162,7 @@ fn plan_key_batch<'p>(
                 pks: kv_keys(target_keys),
                 binds: true,
                 fresh: 0,
+                array_rows: None,
             },
             EngineType::Timeseries | EngineType::Columnar | EngineType::Spatial => {
                 return Ok(None);
@@ -164,6 +180,7 @@ fn plan_key_batch<'p>(
                     pks: document_keys(target_keys),
                     binds: crdt,
                     fresh: 0,
+                    array_rows: None,
                 }
             }
         },
@@ -178,6 +195,7 @@ fn plan_key_batch<'p>(
             pks: document_keys(std::slice::from_ref(key_value)),
             binds: false,
             fresh: 0,
+            array_rows: None,
         },
         SqlPlan::Delete {
             collection,
@@ -194,6 +212,7 @@ fn plan_key_batch<'p>(
                 pks: document_keys(target_keys),
                 binds: false,
                 fresh: 0,
+                array_rows: None,
             },
         },
         SqlPlan::VectorPrimaryDelete(VectorPrimaryDeletePlan {
@@ -210,6 +229,7 @@ fn plan_key_batch<'p>(
             pks: document_keys(target_keys),
             binds: false,
             fresh: 0,
+            array_rows: None,
         },
         // Every timeseries row takes a fresh identity.
         SqlPlan::TimeseriesIngest(TimeseriesIngestPlan {
@@ -219,18 +239,26 @@ fn plan_key_batch<'p>(
             pks: Vec::new(),
             binds: true,
             fresh: rows.len(),
+            array_rows: None,
         },
-        SqlPlan::InsertArray(InsertArrayPlan { name, rows }) => KeyBatch {
-            collection: name,
-            pks: super::super::array_convert::insert_array_cell_pks(
+        SqlPlan::InsertArray(InsertArrayPlan { name, rows }) => {
+            let keys = super::super::array_convert::insert_array_cell_keys(
                 name,
                 rows,
                 ctx.tenant_id,
                 ctx,
-            )?,
-            binds: true,
-            fresh: 0,
-        },
+            )?;
+            KeyBatch {
+                collection: name,
+                pks: keys.pks,
+                binds: true,
+                fresh: 0,
+                array_rows: Some(ArrayBatchRows {
+                    rows,
+                    coords: keys.coords,
+                }),
+            }
+        }
         _ => return Ok(None),
     };
     Ok((!batch.pks.is_empty() || batch.fresh > 0).then_some(batch))
@@ -257,6 +285,7 @@ fn row_identity_batch<'p>(
             .collect(),
         binds: true,
         fresh: fresh_identity_count(primary_key, declared.as_deref(), rows),
+        array_rows: None,
     })
 }
 

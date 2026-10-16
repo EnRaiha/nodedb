@@ -6,10 +6,7 @@
 
 use nodedb_physical::physical_plan::ArrayOp;
 
-use crate::engine::array::wal::{
-    ArrayDeleteCell, ArrayDeletePayload, ArrayPutCell, ArrayPutPayload, encode_delete_with_version,
-    encode_put_with_version,
-};
+use crate::engine::array::wal::{encode_delete_spliced, encode_put_spliced};
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalAppender;
 
@@ -33,22 +30,14 @@ pub(super) fn wal_append_array_op(
             provenance,
             ..
         } => {
-            let cells = zerompk::from_msgpack::<Vec<ArrayPutCell>>(cells_msgpack).map_err(|e| {
+            // The plan's cell bytes go into the record as they are: the
+            // record is byte-identical to one encoded from the decoded cells.
+            let bytes = encode_put_spliced(array_id, cells_msgpack, provenance).map_err(|e| {
                 crate::Error::Serialization {
                     format: "msgpack".into(),
-                    detail: format!("wal array put decode cells: {e}"),
+                    detail: format!("wal array put encode: {e}"),
                 }
             })?;
-            let payload = ArrayPutPayload {
-                array_id: array_id.clone(),
-                cells,
-                provenance: provenance.clone(),
-            };
-            let bytes =
-                encode_put_with_version(&payload).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal array put encode: {e}"),
-                })?;
             Some(wal.append_array_put(tenant_id, vshard_id, database_id, &bytes)?)
         }
         ArrayOp::Delete {
@@ -57,22 +46,12 @@ pub(super) fn wal_append_array_op(
             provenance,
             ..
         } => {
-            let cells =
-                zerompk::from_msgpack::<Vec<ArrayDeleteCell>>(coords_msgpack).map_err(|e| {
+            let bytes =
+                encode_delete_spliced(array_id, coords_msgpack, provenance).map_err(|e| {
                     crate::Error::Serialization {
                         format: "msgpack".into(),
-                        detail: format!("wal array delete decode cells: {e}"),
+                        detail: format!("wal array delete encode: {e}"),
                     }
-                })?;
-            let payload = ArrayDeletePayload {
-                array_id: array_id.clone(),
-                cells,
-                provenance: provenance.clone(),
-            };
-            let bytes =
-                encode_delete_with_version(&payload).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal array delete encode: {e}"),
                 })?;
             Some(wal.append_array_delete(tenant_id, vshard_id, database_id, &bytes)?)
         }
@@ -100,6 +79,7 @@ pub(super) fn wal_append_array_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::array::wal::ArrayPutCell;
     use crate::wal::manager::WalManager;
     use nodedb_array::types::ArrayId;
     use nodedb_physical::physical_plan::PhysicalPlan;

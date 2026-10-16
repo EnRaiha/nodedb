@@ -14,14 +14,16 @@ use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
 use nodedb_sql::types::query::Projection;
 use nodedb_sql::types::{
-    ArrayProjectPlan, ArraySlicePlan, CtePlan, DocumentIndexLookupPlan, HybridSearchPlan,
-    HybridSearchTriplePlan, InsertPlan, KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan,
-    RangeScanPlan, RecursiveScanPlan, RecursiveValuePlan, SqlPlan, TextSearchPlan,
-    TimeseriesIngestPlan, TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan,
-    VectorPrimaryInsertPlan, VectorPrimaryUpdatePlan,
+    ArrayProjectPlan, CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan,
+    InsertPlan, KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan,
+    RecursiveScanPlan, RecursiveValuePlan, SqlPlan, TextSearchPlan, TimeseriesIngestPlan,
+    TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan,
+    VectorPrimaryUpdatePlan,
 };
 
-use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
+use crate::control::server::response_shape::schema::{
+    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type,
+};
 use crate::control::server::response_shape::types::DdlColType;
 
 use super::super::columns::{
@@ -263,24 +265,24 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
             let types = HashMap::new();
             schema_from_projection(projection, &types, &[])
         }
-        SqlPlan::ArraySlice(ArraySlicePlan {
-            attr_projection, ..
-        })
-        | SqlPlan::ArrayProject(ArrayProjectPlan {
-            attr_projection, ..
-        }) => OutputSchema {
-            columns: attr_projection
-                .iter()
-                .map(|name| OutputColumn {
-                    display_name: name.clone(),
-                    lookup_key: name.clone(),
-                    ty: DdlColType::Text,
-                })
-                .collect(),
-            is_star: false,
-            cp_computed: Vec::new(),
-            declared_key: None,
-        },
+        // A cell read announces the columns its rows carry: every dim, then
+        // the requested attrs, each typed from the array schema.
+        SqlPlan::ArraySlice(slice) => {
+            let view = array_view(catalog, &slice.name)?;
+            array_columns_schema(&nodedb_sql::resolver::array_tvf::array_slice_columns(
+                &view, slice,
+            ))
+        }
+        SqlPlan::ArrayProject(ArrayProjectPlan {
+            name,
+            attr_projection,
+        }) => {
+            let view = array_view(catalog, name)?;
+            array_columns_schema(&nodedb_sql::resolver::array_tvf::array_relation_columns(
+                &view,
+                attr_projection,
+            ))
+        }
         // A write announces exactly what its `RETURNING` clause projects, from
         // the target collection's declared columns. `RETURNING` is a
         // projection, so it is typed like one: a `SELECT ts, host, v` and an
@@ -326,6 +328,37 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         // `OutputSchema`. An empty schema here is therefore correct.
         SqlPlan::ArrayAgg { .. } | SqlPlan::ArrayElementwise { .. } => OutputSchema::default(),
     })
+}
+
+/// The array `name` names, or the unknown-table error a plan over a dropped
+/// array reports.
+fn array_view<C: SqlCatalog + ?Sized>(
+    catalog: &C,
+    name: &str,
+) -> Result<nodedb_sql::types::ArrayCatalogView, SqlError> {
+    catalog
+        .lookup_array(name)
+        .ok_or_else(|| SqlError::UnknownTable {
+            name: name.to_string(),
+        })
+}
+
+/// One output column per relation column, in order, under its own name and
+/// its wire type.
+fn array_columns_schema(columns: &[nodedb_sql::types::ColumnInfo]) -> OutputSchema {
+    OutputSchema {
+        columns: columns
+            .iter()
+            .map(|column| OutputColumn {
+                display_name: column.name.clone(),
+                lookup_key: column.name.clone(),
+                ty: sql_data_type_to_ddl_col_type(&column.data_type),
+            })
+            .collect(),
+        is_star: false,
+        cp_computed: Vec::new(),
+        declared_key: None,
+    }
 }
 
 #[cfg(test)]

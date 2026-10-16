@@ -94,7 +94,26 @@ impl MbrBuilder {
         }
     }
 
+    /// Fold one live cell: its coordinate, each of its attrs, and its count.
     pub fn fold(&mut self, coord: &[CoordValue], attrs: &[CellValue]) {
+        self.fold_coord(coord);
+        for (i, a) in attrs.iter().take(self.n_attrs).enumerate() {
+            self.fold_attr(i, a);
+        }
+        self.nnz += 1;
+    }
+
+    /// Fold one live cell whose attr `i` is `attr(i)`, for a caller that
+    /// holds the attrs column-wise rather than as one slice.
+    pub fn fold_with<'v>(&mut self, coord: &[CoordValue], attr: impl Fn(usize) -> &'v CellValue) {
+        self.fold_coord(coord);
+        for i in 0..self.n_attrs {
+            self.fold_attr(i, attr(i));
+        }
+        self.nnz += 1;
+    }
+
+    fn fold_coord(&mut self, coord: &[CoordValue]) {
         for (i, c) in coord.iter().take(self.arity).enumerate() {
             let lo_replaces = self.dim_mins[i].as_ref().is_none_or(|cur| coord_lt(c, cur));
             if lo_replaces {
@@ -105,27 +124,25 @@ impl MbrBuilder {
                 self.dim_maxs[i] = Some(c.clone());
             }
         }
-        for (i, a) in attrs.iter().take(self.n_attrs).enumerate() {
-            self.attr_total[i] += 1;
-            match a {
-                CellValue::Null => self.attr_nulls[i] += 1,
-                CellValue::Int64(v) => {
-                    fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], *v as f64)
-                }
-                CellValue::Float64(v) => {
-                    fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], *v)
-                }
-                CellValue::String(s) => {
-                    self.attr_is_categorical[i] = true;
-                    self.attr_distinct[i].insert(s.as_bytes().to_vec());
-                }
-                CellValue::Bytes(b) => {
-                    self.attr_is_categorical[i] = true;
-                    self.attr_distinct[i].insert(b.clone());
-                }
+    }
+
+    fn fold_attr(&mut self, i: usize, a: &CellValue) {
+        self.attr_total[i] += 1;
+        match a {
+            CellValue::Null => self.attr_nulls[i] += 1,
+            CellValue::Int64(v) => {
+                fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], *v as f64)
+            }
+            CellValue::Float64(v) => fold_numeric(&mut self.attr_min[i], &mut self.attr_max[i], *v),
+            CellValue::String(s) => {
+                self.attr_is_categorical[i] = true;
+                self.attr_distinct[i].insert(s.as_bytes().to_vec());
+            }
+            CellValue::Bytes(b) => {
+                self.attr_is_categorical[i] = true;
+                self.attr_distinct[i].insert(b.clone());
             }
         }
-        self.nnz += 1;
     }
 
     pub fn build(self) -> TileMBR {

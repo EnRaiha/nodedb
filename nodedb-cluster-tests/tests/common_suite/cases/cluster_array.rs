@@ -143,9 +143,8 @@ async fn cluster_array_slice_spans_multiple_shards() {
 
 async fn assert_chr1_slice(client: &tokio_postgres::Client, node_idx: usize) {
     // Slice chr=1, pos 0..99 — should return exactly the 3 cells for chr=1.
-    // ARRAY_SLICE projects one pgwire field per declared column: a
-    // `coords` JSON-array column followed by an `attrs` JSON-array column
-    // carrying the requested attribute values in projection order.
+    // ARRAY_SLICE projects one pgwire field per dim, then one per requested
+    // attr, each named after it.
     let rows = query_named_rows(
         client,
         "SELECT * FROM ARRAY_SLICE('genome', '{chr: [1, 1], pos: [0, 99]}', ['qual'], 100)",
@@ -161,16 +160,17 @@ async fn assert_chr1_slice(client: &tokio_postgres::Client, node_idx: usize) {
     let mut quals: Vec<f64> = rows
         .iter()
         .map(|row| {
-            let attrs_text = row
-                .get("attrs")
-                .unwrap_or_else(|| panic!("missing attrs column in {row:?}"));
-            let attrs: serde_json::Value = serde_json::from_str(attrs_text)
-                .unwrap_or_else(|e| panic!("attrs not JSON: {attrs_text}: {e}"));
-            attrs
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_f64())
-                .unwrap_or_else(|| panic!("missing qual in row: {row:?}"))
+            assert_eq!(
+                row.get("chr").map(String::as_str),
+                Some("1"),
+                "node {node_idx}: every row is on chr=1: {row:?}"
+            );
+            assert!(row.contains_key("pos"), "missing pos column in {row:?}");
+            let qual = row
+                .get("qual")
+                .unwrap_or_else(|| panic!("missing qual column in {row:?}"));
+            qual.parse::<f64>()
+                .unwrap_or_else(|e| panic!("qual not a float: {qual}: {e}"))
         })
         .collect();
     quals.sort_by(|a, b| a.partial_cmp(b).unwrap());

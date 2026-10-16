@@ -162,7 +162,7 @@ AS OF SYSTEM TIME NULL  -- returns every system-time version, ascending
 ORDER BY _ts_system ASC;
 ```
 
-`AS OF SYSTEM TIME NULL` returns every system-time version of each matching row, ordered ascending. Each version row carries the user columns plus three synthetic temporal columns: `_ts_system`, `_ts_valid_from`, and `_ts_valid_until`. Unbounded valid-time ends surface as the raw `i64::MIN` / `i64::MAX` sentinels (matching the Columnar and Timeseries engines). It is supported on the Document (strict and schemaless), Columnar, and Timeseries engines, and on `ARRAY_SLICE`. It is not supported on the Graph engine or on `ARRAY_AGG`, nor when reading through a database clone — those return a typed error rather than collapsing to a single version.
+`AS OF SYSTEM TIME NULL` returns every system-time version of each matching row, ordered ascending. Each version row carries the user columns plus three synthetic temporal columns: `_ts_system`, `_ts_valid_from`, and `_ts_valid_until`. Unbounded valid-time ends surface as the raw `i64::MIN` / `i64::MAX` sentinels (matching the Columnar and Timeseries engines). It is supported on the Document (strict and schemaless), Columnar, and Timeseries engines, and on `ARRAY_SLICE`. An `ARRAY_SLICE` version row carries the dimension and attribute columns plus `_ts_system` only. It is not supported on the Graph engine or on `ARRAY_AGG`, nor when reading through a database clone — those return a typed error rather than collapsing to a single version.
 
 `AS OF` reads run at parity with non-temporal reads: `WHERE` predicates (including on strict Binary-Tuple collections), `ORDER BY`, computed columns, and window functions all apply to temporal queries.
 

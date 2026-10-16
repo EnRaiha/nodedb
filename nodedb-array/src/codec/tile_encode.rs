@@ -212,6 +212,10 @@ mod tests {
         assert_eq!(decoded.surrogates, tile.surrogates);
         assert_eq!(decoded.attr_cols, tile.attr_cols);
         assert_eq!(decoded.dim_dicts.len(), tile.dim_dicts.len());
+        // Readers count and bound a tile by its MBR, so a structural tile
+        // decodes with the MBR it was built with.
+        assert_eq!(decoded.nnz(), 100);
+        assert_eq!(decoded.mbr, tile.mbr);
     }
 
     #[test]
@@ -284,6 +288,9 @@ mod tests {
         assert_eq!(decoded.surrogates, tile.surrogates);
         assert_eq!(decoded.surrogates[0], None);
         assert_eq!(decoded.surrogates[1], Some(Surrogate::new(101)));
+        // The MBR folds live rows only, as the builder does.
+        assert_eq!(decoded.mbr, tile.mbr);
+        assert_eq!(decoded.nnz(), 13);
     }
 
     /// A derived result tile holds no identity, so it is never written.

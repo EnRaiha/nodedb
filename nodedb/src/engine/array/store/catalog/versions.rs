@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cross-source (memtable + segment) version resolution helpers for
-//! [`ArrayStore`]'s bitemporal scans.
+//! Cross-source (memtable + segment) version metadata and single-cell
+//! version lookup for [`ArrayStore`]'s bitemporal reads.
 
 use std::collections::HashSet;
 
@@ -10,7 +10,6 @@ use nodedb_array::types::TileId;
 use nodedb_array::types::coord::value::CoordValue;
 
 use super::ArrayStore;
-use crate::engine::array::memtable::Memtable;
 
 impl ArrayStore {
     /// Collect every distinct `hilbert_prefix` present in any tile version,
@@ -28,49 +27,21 @@ impl ArrayStore {
         all_prefixes
     }
 
-    /// Collect every distinct cell coordinate for a given `hilbert_prefix`,
-    /// scanning all versions across the memtable and all segments. Order is
-    /// insertion order (memtable coords first); callers that need a stable
-    /// ordering must sort the result themselves.
-    pub(super) fn distinct_coords_for_prefix(
-        &self,
-        prefix: u64,
-    ) -> Result<Vec<Vec<CoordValue>>, nodedb_array::ArrayError> {
-        let mut coords: Vec<Vec<CoordValue>> = Vec::new();
-
-        // From memtable versions.
-        for (_, buf) in self.memtable.iter_tile_versions(prefix, i64::MAX) {
-            for coord_key in buf.all_coord_keys() {
-                let coord = Memtable::decode_coord_key(coord_key)?;
-                if !coords.contains(&coord) {
-                    coords.push(coord);
-                }
-            }
-        }
-
-        // From segment versions (newest-first per segment, but we only need
-        // coords here so order within a segment doesn't matter).
-        for h in self.segments.values() {
-            let reader = h.reader();
-            for item in reader.iter_tile_versions(prefix, i64::MAX)? {
-                let (_, tile_payload) = item?;
-                if let TilePayload::Sparse(sparse) = &tile_payload {
-                    let n = sparse.nnz() as usize;
-                    for row in 0..n {
-                        let coord: Vec<CoordValue> = sparse
-                            .dim_dicts
-                            .iter()
-                            .map(|d| d.values[d.indices[row] as usize].clone())
-                            .collect();
-                        if !coords.contains(&coord) {
-                            coords.push(coord);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(coords)
+    /// Whether any tile version is at or before `system_as_of`, across every
+    /// prefix of the store. Read from the segment footers and the memtable's
+    /// tile ids, so no tile is decoded. A stored tile version holds at least
+    /// one row: flush and compaction write no empty tile.
+    pub(super) fn any_version_at_or_before(&self, system_as_of: i64) -> bool {
+        let in_segments = self.segments.values().any(|h| {
+            h.reader()
+                .tiles()
+                .iter()
+                .any(|entry| entry.tile_id.system_from_ms <= system_as_of)
+        });
+        in_segments
+            || self.memtable.iter().any(|(tile_id, buf)| {
+                buf.entry_count() > 0 && tile_id.system_from_ms <= system_as_of
+            })
     }
 
     /// Build a `(TileId, raw_bytes)` list for a specific `coord` across all

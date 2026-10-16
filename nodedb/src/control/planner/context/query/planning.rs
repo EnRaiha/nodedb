@@ -25,7 +25,7 @@ use crate::control::server::shared::returning::{
 /// and the parameterized path ([`QueryContext::plan_sql_with_params_and_rls_and_versions`])
 /// resolve the clause before conversion and need the same output schema built
 /// from it, so the pairing lives here once.
-fn resolve_returning_and_output_schema<C: nodedb_sql::catalog::SqlCatalog>(
+pub(super) fn resolve_returning_and_output_schema<C: nodedb_sql::catalog::SqlCatalog>(
     plans: &[nodedb_sql::types::SqlPlan],
     returning_items: Option<&str>,
     catalog: &C,
@@ -269,50 +269,8 @@ impl QueryContext {
         let (mut tasks, output_schema, mut version_set, cache_eligibility) = self
             .plan_with_nodedb_sql_for_purpose(sql, tenant_id, database_id, purpose, returning_items)
             .await?;
-
-        // Versions read BEFORE injection, never after: injection reads live
-        // policy/grant state under its own lock, and a mutation racing in
-        // between will otherwise let a post-injection read stamp a version
-        // newer than what was actually filtered against, making a plan built
-        // from stale state compare as fresh forever. A pre-injection read
-        // only ever under-states freshness (an extra harmless replan), never
-        // over-states it.
-        //
-        // The permission tree is read here, after planning's last await, so
-        // no lock is held across a request to a surrogate's collection home.
-        let permission_view = sec.permission_tree.read().await;
-        let permission_cache = permission_view.as_deref();
-        let permission_tree_version = permission_cache
-            .map(|c| c.tenant_version(tenant_id.as_u64()))
-            .unwrap_or(0);
-        let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
-
-        // Inject RLS predicates.
-        crate::control::planner::rls_injection::inject_rls(
-            &mut tasks,
-            sec.rls_store,
-            self.catalog_inputs.credentials.catalog(),
-            sec.auth,
-        )?;
-
-        // Refuse what column redaction cannot cover (aggregates over a
-        // redacted column, graph traversals), before anything is dispatched.
-        crate::control::planner::redaction_refusal::refuse_unredactable_tasks(
-            &tasks,
-            sec.auth,
-            sec.redaction_store,
-        )?;
-
-        // Inject permission tree filters (hierarchical ACL).
-        if let Some(cache) = permission_cache {
-            crate::control::planner::rls_injection::inject_permission_tree(
-                &mut tasks, cache, sec.auth,
-            )?;
-        }
-
-        version_set.set_permission_tree_version(permission_tree_version);
-        version_set.set_rls_version(rls_version);
-
+        self.apply_task_policy(&mut tasks, sec, tenant_id, &mut version_set)
+            .await?;
         Ok((tasks, output_schema, version_set, cache_eligibility))
     }
 
@@ -400,42 +358,9 @@ impl QueryContext {
         if let Some(clause) = &returning {
             attach_returning_spec(&mut tasks, &clause.spec)?;
         }
-
-        // Versions read BEFORE injection — see the comment on the sibling
-        // planning path in this file for why a post-injection read is unsafe,
-        // and why the permission tree is read only after the last await.
-        let permission_view = sec.permission_tree.read().await;
-        let permission_cache = permission_view.as_deref();
-        let permission_tree_version = permission_cache
-            .map(|c| c.tenant_version(tenant_id.as_u64()))
-            .unwrap_or(0);
-        let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
-
-        // Inject RLS predicates.
-        crate::control::planner::rls_injection::inject_rls(
-            &mut tasks,
-            sec.rls_store,
-            self.catalog_inputs.credentials.catalog(),
-            sec.auth,
-        )?;
-
-        // Refuse what column redaction cannot cover (aggregates over a
-        // redacted column, graph traversals), before anything is dispatched.
-        crate::control::planner::redaction_refusal::refuse_unredactable_tasks(
-            &tasks,
-            sec.auth,
-            sec.redaction_store,
-        )?;
-
-        if let Some(cache) = permission_cache {
-            crate::control::planner::rls_injection::inject_permission_tree(
-                &mut tasks, cache, sec.auth,
-            )?;
-        }
-
         let mut version_set = catalog.take_recorded_versions();
-        version_set.set_permission_tree_version(permission_tree_version);
-        version_set.set_rls_version(rls_version);
+        self.apply_task_policy(&mut tasks, sec, tenant_id, &mut version_set)
+            .await?;
         Ok((tasks, output_schema, version_set))
     }
 }

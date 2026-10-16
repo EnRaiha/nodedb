@@ -7,48 +7,22 @@
 
 use crate::harness::TestServer;
 
-/// Parse the `attrs` array from a slice result row's JSON.
+/// The requested attribute values of one ARRAY_SLICE row.
 ///
-/// Each row returned by ARRAY_SLICE is a JSON object:
-/// Helper: extract the requested attribute values from an ARRAY_SLICE row.
-///
-/// ARRAY_SLICE projects one column per requested attribute (named after
-/// the attribute) plus a `coords` column.  Older versions returned a
-/// single `attrs` JSON array column; this helper accepts either shape so
-/// the assertions stay schema-agnostic.
+/// A slice row holds one column per dim and one per requested attr, each
+/// named after it. Every requested attr must be present as its own column.
 fn parse_attrs(
     row: &std::collections::HashMap<String, String>,
     requested: &[&str],
 ) -> Vec<serde_json::Value> {
-    // Shape A: AS OF queries route through a different codec path that
-    // wraps the cell into a single `result` column containing the full
-    // JSON envelope (`{"coords": [...], "attrs": [...]}`).
-    if let Some(envelope_text) = row.get("result") {
-        let v: serde_json::Value = serde_json::from_str(envelope_text)
-            .unwrap_or_else(|e| panic!("result not JSON: {envelope_text}: {e}"));
-        if let Some(arr) = v.get("attrs").and_then(|a| a.as_array()) {
-            return arr.clone();
-        }
-        panic!("result envelope missing attrs array: {envelope_text}");
-    }
-    // Shape B: live ARRAY_SLICE projects a single `attrs` column carrying
-    // the JSON array of attribute values.
-    if let Some(attrs_text) = row.get("attrs") {
-        let v: serde_json::Value = serde_json::from_str(attrs_text)
-            .unwrap_or_else(|e| panic!("attrs not JSON: {attrs_text}: {e}"));
-        return match v {
-            serde_json::Value::Array(items) => items,
-            other => panic!("attrs not an array: {other}"),
-        };
-    }
-    // Shape C: per-attribute columns named after the requested attrs.
     requested
         .iter()
         .map(|name| {
             let cell = row
                 .get(*name)
-                .unwrap_or_else(|| panic!("missing attr '{name}' in {row:?}"));
-            serde_json::from_str(cell).unwrap_or_else(|_| serde_json::Value::String(cell.clone()))
+                .unwrap_or_else(|| panic!("missing attr column '{name}' in {row:?}"));
+            serde_json::from_str(cell)
+                .unwrap_or_else(|e| panic!("attr '{name}' is not a number: {cell}: {e}"))
         })
         .collect()
 }

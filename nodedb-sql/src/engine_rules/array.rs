@@ -76,6 +76,21 @@ impl EngineRules for ArrayRules {
         ))
     }
 
+    /// A bulk load decodes its rows against the array's schema and loads them
+    /// in chunks. One chunk is one `InsertArray` plan, so each chunk is one
+    /// cell batch and one WAL record.
+    fn plan_bulk_load(&self, p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        if p.cells.is_empty() {
+            return Ok(BulkLoadPlan::CellChunks(Vec::new()));
+        }
+        Ok(BulkLoadPlan::CellChunks(vec![SqlPlan::InsertArray(
+            InsertArrayPlan {
+                name: p.collection,
+                rows: p.cells,
+            },
+        )]))
+    }
+
     fn plan_aggregate(&self, _p: AggregateParams) -> Result<SqlPlan> {
         Err(unsupported(
             "GROUP BY",
@@ -115,6 +130,38 @@ mod tests {
             if_absent: false,
             column_schema: vec![],
             primary_key: None,
+        }
+    }
+
+    #[test]
+    fn bulk_load_plans_one_insert_array_per_chunk() {
+        let probe = ArrayRules
+            .plan_bulk_load(BulkLoadParams {
+                collection: "g".into(),
+                cells: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(probe, BulkLoadPlan::CellChunks(ref p) if p.is_empty()));
+
+        let row = crate::types_array::ArrayInsertRow {
+            coords: vec![crate::types_array::ArrayCoordLiteral::Int64(1)],
+            attrs: vec![crate::types_array::ArrayAttrLiteral::Float64(0.5)],
+        };
+        let chunk = ArrayRules
+            .plan_bulk_load(BulkLoadParams {
+                collection: "g".into(),
+                cells: vec![row.clone(), row],
+            })
+            .unwrap();
+        match chunk {
+            BulkLoadPlan::CellChunks(plans) => {
+                assert_eq!(plans.len(), 1);
+                assert!(matches!(
+                    &plans[0],
+                    SqlPlan::InsertArray(InsertArrayPlan { name, rows }) if name == "g" && rows.len() == 2
+                ));
+            }
+            BulkLoadPlan::RowInserts => panic!("an array loads in cell chunks"),
         }
     }
 

@@ -137,6 +137,50 @@ SELECT * FROM ARRAY_SLICE(
 | `attrs`   | No       | ARRAY[STRING] | Attributes to project. `NULL` = all attributes                  |
 | `limit`   | No       | INT64         | Max cells returned. `NULL` = no limit                           |
 
+#### Result Relation
+
+`ARRAY_SLICE` and `ARRAY_PROJECT` return one row per cell. The row has one column per dimension, then one column per requested attribute, or every attribute when the list is empty. Each column carries its declared type:
+
+| Declared type | Column type        |
+| ------------- | ------------------ |
+| `INT64`       | `bigint`           |
+| `FLOAT64`     | `double precision` |
+| `TIMESTAMP`   | `timestamp`        |
+| `STRING`      | `text`             |
+| `BYTES`       | `bytea` (attribute only) |
+
+`SELECT *` lists the dimensions first, then the attributes, in schema order. For a 2-D image with `nir` and `red` bands:
+
+```sql
+SELECT * FROM ARRAY_SLICE('img', '{x: [0, 3], y: [0, 3]}');
+--  x | y | nir  | red
+-- ---+---+------+------
+--  0 | 0 | 0.80 | 0.20
+--  0 | 1 | 0.60 | 0.30
+```
+
+Every SELECT clause applies to the rows: `WHERE`, computed columns, `GROUP BY`, aggregates, `HAVING`, `ORDER BY`, `DISTINCT`, `LIMIT` / `OFFSET`, and window functions. Qualify a column with the call's alias, or with the array name when the call has no alias.
+
+```sql
+-- NDVI per cell, vegetated cells only, greenest first
+SELECT x, y, (nir - red) / (nir + red) AS ndvi
+FROM ARRAY_SLICE('img', '{x: [0, 3], y: [0, 3]}') AS t
+WHERE t.nir > t.red
+ORDER BY ndvi DESC
+LIMIT 10;
+
+-- Mean NIR per column of pixels
+SELECT x, AVG(nir) AS mean_nir
+FROM ARRAY_SLICE('img', '{x: [0, 3], y: [0, 3]}')
+GROUP BY x;
+```
+
+The 4th-argument `limit` caps the cells the slice reads before any clause applies. An outer `LIMIT` applies to the query's result, and a smaller one also lowers the read cap when no other clause reads past the cut. A `WHERE` bound on a dimension narrows the read range only when the slice has no cap, so a capped slice keeps the cells its cap selects.
+
+`AS OF SYSTEM TIME NULL` adds a `_ts_system` column: the version's system time in milliseconds. `SELECT *` omits it. Name it to read it.
+
+`ARRAY_AGG` and `ARRAY_ELEMENTWISE` return rows of their own shape, not dimensions and attributes. A query over them takes `*` or their own output columns, and `LIMIT`. Every other clause is refused with an error that names the clause. Use `ARRAY_SLICE` to filter, group, or order cells.
+
 ### ARRAY_PROJECT — Select Attributes
 
 Returns all cells, optionally filtered to specific attributes:

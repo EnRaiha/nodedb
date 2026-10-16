@@ -89,14 +89,12 @@ pub async fn try_dispatch(
         // parse refusal answers one class wherever it is raised.
         Some(Err(e)) => return Some(Err(DdlError::from_sql_error(e, identity.tenant_id))),
         None => {
-            // Bulk import: `COPY <collection> FROM STDIN [WITH (...)]`. The
-            // file-path form (`COPY … FROM '<path>'`) parses into a typed
-            // `MiscStmt::CopyFromFile`, handled by the typed arm above; the
-            // STDIN form parses into no typed variant (`ddl_ast::parse`
-            // returns `None`) and reached the pgwire `dsl` string router, which
-            // ran after the typed-AST parse gate. Recognizing it here in the
-            // `None` branch preserves that ordering exactly — the file form never
-            // reaches this arm, so it is not diverted from the typed handler.
+            // Bulk import: a `COPY … FROM STDIN` whose relation is more than
+            // one name, such as `COPY tenant_restore(1) FROM STDIN` on a
+            // transport with no COPY stream. The file-path form parses into
+            // `MiscStmt::CopyFromFile` and a one-name STDIN form into
+            // `MiscStmt::CopyFromStdin`, both handled by the typed arms, so
+            // neither reaches this arm.
             let tokens = RouteTokens::new(sql);
             if is_copy_from(&tokens) {
                 let parts: Vec<&str> = sql.split_whitespace().collect();

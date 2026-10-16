@@ -17,7 +17,7 @@ use crate::control::state::SharedState;
 
 use super::super::connection_identity::PgConnectionContext;
 use super::super::connection_registry::{ConnectionRegistry, ConnectionRegistryError};
-use super::super::handler::{NodeDbCopyHandler, NodeDbPgHandler};
+use super::super::handler::{ArrayCopyState, NodeDbCopyHandler, NodeDbPgHandler};
 use super::super::wire_safe_error::WireSafeErrorHandler;
 use super::auth::NodeDbAuthSource;
 use super::provider::nodedb_parameter_provider;
@@ -65,6 +65,7 @@ pub struct NodeDbPgHandlerFactory {
     state: Arc<SharedState>,
     sessions: Arc<SessionStore>,
     restore_state: Arc<crate::control::backup::RestoreState>,
+    array_copy: Arc<ArrayCopyState>,
     registry: Arc<ConnectionRegistry>,
 }
 
@@ -76,6 +77,7 @@ impl NodeDbPgHandlerFactory {
             state,
             sessions: Arc::new(SessionStore::new()),
             restore_state: Arc::new(crate::control::backup::RestoreState::new()),
+            array_copy: Arc::new(ArrayCopyState::new()),
             registry: Arc::new(ConnectionRegistry::new()),
         }
     }
@@ -106,6 +108,7 @@ impl NodeDbPgHandlerFactory {
             self.auth_mode.clone(),
             Arc::clone(&self.sessions),
             Arc::clone(&self.restore_state),
+            Arc::clone(&self.array_copy),
             Arc::clone(&self.registry),
             context.id,
         ));
@@ -133,6 +136,8 @@ impl NodeDbPgHandlerFactory {
             copy: Arc::new(NodeDbCopyHandler {
                 state: Arc::clone(&self.state),
                 restore_state: Arc::clone(&self.restore_state),
+                array_copy: Arc::clone(&self.array_copy),
+                sessions: Arc::clone(&self.sessions),
                 connection_id: context.id,
             }),
             cancel: Arc::new(NoopHandler),
@@ -146,6 +151,7 @@ impl NodeDbPgHandlerFactory {
             self.auth_mode.clone(),
             Arc::clone(&self.sessions),
             Arc::clone(&self.restore_state),
+            Arc::clone(&self.array_copy),
             Arc::clone(&self.registry),
             id,
         );
@@ -199,6 +205,10 @@ impl NodeDbPgHandlerFactory {
             .is_err()
         {
             warn!(connection_id = id.get(), %peer_addr, "pgwire restore cleanup panicked");
+        }
+        if std::panic::catch_unwind(AssertUnwindSafe(|| self.array_copy.cancel(id.get()))).is_err()
+        {
+            warn!(connection_id = id.get(), %peer_addr, "pgwire array COPY cleanup panicked");
         }
         if std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.sessions

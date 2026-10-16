@@ -38,12 +38,36 @@ pub fn value_to_msgpack(value: &crate::Value) -> zerompk::Result<Vec<u8>> {
     zerompk::to_msgpack_vec(&NativeRef(value))
 }
 
+/// Serialize `fields` as one standard msgpack map whose keys keep the given
+/// order.
+///
+/// A `Value::Object` writes its keys in hash order, which differs between
+/// two maps of the same keys. A row whose bytes must be reproducible, or
+/// whose columns must read in a fixed order, is written through this.
+pub fn ordered_map_to_msgpack(fields: &[(&str, &crate::Value)]) -> zerompk::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&OrderedMapRef(fields))
+}
+
 /// A borrowed `Value` written in its plain msgpack form.
 struct NativeRef<'a>(&'a crate::Value);
 
 impl zerompk::ToMessagePack for NativeRef<'_> {
     fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
         write_native_value(writer, self.0)
+    }
+}
+
+/// Borrowed key/value pairs written as one plain msgpack map, in order.
+struct OrderedMapRef<'a>(&'a [(&'a str, &'a crate::Value)]);
+
+impl zerompk::ToMessagePack for OrderedMapRef<'_> {
+    fn write<W: Write>(&self, writer: &mut W) -> zerompk::Result<()> {
+        writer.write_map_len(self.0.len())?;
+        for (key, value) in self.0 {
+            writer.write_string(key)?;
+            write_native_value(writer, value)?;
+        }
+        Ok(())
     }
 }
 
@@ -137,4 +161,25 @@ fn write_instant_ext<W: Write>(
     micros: i64,
 ) -> zerompk::Result<()> {
     writer.write_ext(kind.ext_type(), &micros.to_be_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ordered_map_keeps_its_key_order_and_reads_back() {
+        let x = crate::Value::Integer(3);
+        let nir = crate::Value::Float(0.5);
+        let bytes = ordered_map_to_msgpack(&[("x", &x), ("nir", &nir)]).expect("encode");
+        // fixmap of 2, then fixstr "x" first.
+        assert_eq!(&bytes[..3], &[0x82, 0xa1, b'x']);
+        match crate::json_msgpack::value_from_msgpack(&bytes).expect("decode") {
+            crate::Value::Object(map) => {
+                assert_eq!(map.get("x"), Some(&x));
+                assert_eq!(map.get("nir"), Some(&nir));
+            }
+            other => panic!("expected an object, got {other:?}"),
+        }
+    }
 }

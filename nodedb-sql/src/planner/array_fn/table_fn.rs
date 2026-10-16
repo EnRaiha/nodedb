@@ -18,22 +18,57 @@ use crate::temporal::TemporalScope;
 use crate::types::{SqlCatalog, SqlPlan};
 use crate::types_array::{ArrayBinaryOpAst, ArrayReducerAst, ArraySliceAst, NamedDimRange};
 
+/// One planned array table-valued function call.
+///
+/// `Slice` and `Project` read cells: their rows carry the array's dims and
+/// the requested attrs, so a SELECT reads them as a relation. `Agg` and
+/// `Elementwise` emit rows of their own shape and form no such relation.
+#[derive(Debug, Clone)]
+pub enum ArrayTableFn {
+    Slice(ArraySlicePlan),
+    Project(ArrayProjectPlan),
+    Agg(ArrayAggPlan),
+    Elementwise(ArrayElementwisePlan),
+}
+
+impl ArrayTableFn {
+    /// The plan that reads this call's rows.
+    pub fn into_plan(self) -> SqlPlan {
+        match self {
+            ArrayTableFn::Slice(plan) => SqlPlan::ArraySlice(plan),
+            ArrayTableFn::Project(plan) => SqlPlan::ArrayProject(plan),
+            ArrayTableFn::Agg(plan) => SqlPlan::ArrayAgg(plan),
+            ArrayTableFn::Elementwise(plan) => SqlPlan::ArrayElementwise(plan),
+        }
+    }
+
+    /// The SQL name of the function, as an error message names it.
+    pub fn sql_name(&self) -> &'static str {
+        match self {
+            ArrayTableFn::Slice(_) => "ARRAY_SLICE",
+            ArrayTableFn::Project(_) => "ARRAY_PROJECT",
+            ArrayTableFn::Agg(_) => "ARRAY_AGG",
+            ArrayTableFn::Elementwise(_) => "ARRAY_ELEMENTWISE",
+        }
+    }
+}
+
 /// Try to intercept a `SELECT * FROM array_xxx(...)` table-valued
-/// function call. Returns `Ok(Some(plan))` on a match, `Ok(None)` if
+/// function call. Returns `Ok(Some(call))` on a match, `Ok(None)` if
 /// the FROM is not an array function (caller falls through to normal
 /// catalog resolution).
 ///
 /// `temporal` carries any `AS OF SYSTEM TIME` / `AS OF VALID TIME` qualifiers
-/// extracted by the pre-processor. It is propagated verbatim into
-/// `SqlPlan::ArraySlice` and `SqlPlan::ArrayAgg` so the planner-to-physical
-/// conversion can populate the corresponding `ArrayOp` fields. When neither
-/// clause was present, `temporal` is `TemporalScope::default()`, which maps to
-/// the live-state fast path in the Data Plane handler.
+/// extracted by the pre-processor. It is propagated verbatim into the slice
+/// and aggregate plans so the planner-to-physical conversion can populate
+/// the corresponding `ArrayOp` fields. When neither clause was present,
+/// `temporal` is `TemporalScope::default()`, which maps to the live-state
+/// fast path in the Data Plane handler.
 pub fn try_plan_array_table_fn(
     from: &[ast::TableWithJoins],
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
-) -> Result<Option<SqlPlan>> {
+) -> Result<Option<ArrayTableFn>> {
     if from.len() != 1 {
         return Ok(None);
     }
@@ -58,10 +93,18 @@ pub fn try_plan_array_table_fn(
     let fn_name = crate::parser::normalize::normalize_object_name_checked(name)?;
     let arg_exprs = collect_args(&args.args);
     match fn_name.as_str() {
-        "array_slice" => Ok(Some(plan_slice(&arg_exprs, catalog, temporal)?)),
-        "array_project" => Ok(Some(plan_project(&arg_exprs, catalog)?)),
-        "array_agg" => Ok(Some(plan_agg(&arg_exprs, catalog, temporal)?)),
-        "array_elementwise" => Ok(Some(plan_elementwise(&arg_exprs, catalog)?)),
+        "array_slice" => Ok(Some(ArrayTableFn::Slice(plan_slice(
+            &arg_exprs, catalog, temporal,
+        )?))),
+        "array_project" => Ok(Some(ArrayTableFn::Project(plan_project(
+            &arg_exprs, catalog,
+        )?))),
+        "array_agg" => Ok(Some(ArrayTableFn::Agg(plan_agg(
+            &arg_exprs, catalog, temporal,
+        )?))),
+        "array_elementwise" => Ok(Some(ArrayTableFn::Elementwise(plan_elementwise(
+            &arg_exprs, catalog,
+        )?))),
         _ => Ok(None),
     }
 }
@@ -70,7 +113,7 @@ fn plan_slice(
     args: &[ast::Expr],
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
-) -> Result<SqlPlan> {
+) -> Result<ArraySlicePlan> {
     if args.len() < 2 || args.len() > 4 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -146,16 +189,16 @@ fn plan_slice(
         0
     };
 
-    Ok(SqlPlan::ArraySlice(ArraySlicePlan {
+    Ok(ArraySlicePlan {
         name,
         slice: ArraySliceAst { dim_ranges },
         attr_projection,
         limit,
         temporal,
-    }))
+    })
 }
 
-fn plan_project(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlPlan> {
+fn plan_project(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<ArrayProjectPlan> {
     if args.len() != 2 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -183,17 +226,17 @@ fn plan_project(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlPlan>
             });
         }
     }
-    Ok(SqlPlan::ArrayProject(ArrayProjectPlan {
+    Ok(ArrayProjectPlan {
         name,
         attr_projection,
-    }))
+    })
 }
 
 fn plan_agg(
     args: &[ast::Expr],
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
-) -> Result<SqlPlan> {
+) -> Result<ArrayAggPlan> {
     if args.len() < 3 || args.len() > 4 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -233,16 +276,16 @@ fn plan_agg(
         None
     };
 
-    Ok(SqlPlan::ArrayAgg(ArrayAggPlan {
+    Ok(ArrayAggPlan {
         name,
         attr,
         reducer,
         group_by_dim,
         temporal,
-    }))
+    })
 }
 
-fn plan_elementwise(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlPlan> {
+fn plan_elementwise(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<ArrayElementwisePlan> {
     if args.len() != 4 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -280,12 +323,12 @@ fn plan_elementwise(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlP
             detail: format!("ARRAY_ELEMENTWISE: array '{left}' has no attr '{attr}'"),
         });
     }
-    Ok(SqlPlan::ArrayElementwise(ArrayElementwisePlan {
+    Ok(ArrayElementwisePlan {
         left,
         right,
         op,
         attr,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -377,13 +420,27 @@ mod tests {
         )
     }
 
+    /// The body a relational array read plans to: the one definition of the
+    /// CTE its outer query reads.
+    fn relation_body(plan: SqlPlan) -> SqlPlan {
+        match plan {
+            SqlPlan::Cte(crate::types::CtePlan {
+                mut definitions, ..
+            }) => {
+                assert_eq!(definitions.len(), 1, "one array relation definition");
+                definitions.remove(0).1
+            }
+            other => panic!("expected Cte over the array relation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn slice_happy() {
         let p = plan_one(
             "SELECT * FROM ARRAY_SLICE('g', '{chrom: [1,1], pos: [0, 100]}', ['qual'], 50)",
         )
         .unwrap();
-        match p {
+        match relation_body(p) {
             SqlPlan::ArraySlice(ArraySlicePlan {
                 name,
                 slice,
@@ -411,7 +468,7 @@ mod tests {
     #[test]
     fn project_happy() {
         let p = plan_one("SELECT * FROM ARRAY_PROJECT('g', ['qual', 'variant'])").unwrap();
-        match p {
+        match relation_body(p) {
             SqlPlan::ArrayProject(ArrayProjectPlan {
                 name,
                 attr_projection,

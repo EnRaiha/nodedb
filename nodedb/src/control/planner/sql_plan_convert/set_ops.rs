@@ -10,7 +10,6 @@ use nodedb_physical::physical_plan::*;
 
 use super::body::convert_body_to_single_plan;
 use super::convert::{ConvertContext, convert_one};
-use super::expr::inline_cte;
 use super::value::{sql_value_to_nodedb_value, sql_value_to_string};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::Value;
@@ -226,7 +225,7 @@ pub(super) fn convert_cte(
     // earlier definition, and the passes that follow resolve that name.
     let mut resolved = outer.clone();
     for (name, cte_plan) in definitions.iter().rev() {
-        resolved = inline_cte(&resolved, name, cte_plan);
+        resolved = nodedb_sql::planner::cte::inline_cte(&resolved, name, cte_plan);
     }
     convert_one(&resolved, tenant_id, ctx)
 }

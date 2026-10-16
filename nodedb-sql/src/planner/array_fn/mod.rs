@@ -16,7 +16,9 @@
 
 mod helpers;
 mod maint_fn;
+mod pushdown;
 mod table_fn;
 
 pub use maint_fn::try_plan_array_maint_fn;
-pub use table_fn::try_plan_array_table_fn;
+pub use pushdown::push_down_into_slice;
+pub use table_fn::{ArrayTableFn, try_plan_array_table_fn};

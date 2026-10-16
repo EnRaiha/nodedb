@@ -4,6 +4,7 @@
 
 use sqlparser::ast::{self, Select};
 
+use super::array_from::try_plan_array_from;
 use super::comma_lateral::try_plan_comma_lateral;
 use super::derived_from::try_plan_derived_from;
 use super::helpers::{convert_projection, convert_where_to_filters};
@@ -41,15 +42,10 @@ pub(super) fn plan_select(
 ) -> Result<PlannedSelect> {
     // 0. Intercept array table-valued functions before catalog resolution
     //    so a name like `ARRAY_SLICE` is not looked up as a collection.
-    if let Some(plan) =
-        crate::planner::array_fn::try_plan_array_table_fn(&select.from, catalog, temporal)?
+    if let Some(planned) =
+        try_plan_array_from(select, catalog, functions, temporal, tail, statement_output)?
     {
-        // `resolve_from` synthesizes a relation from the array's dims and
-        // attrs, so ORDER BY and the tail clauses resolve its columns.
-        return Ok(PlannedSelect {
-            plan,
-            scope: TableScope::resolve_from(catalog, functions, temporal, &select.from)?,
-        });
+        return Ok(planned);
     }
 
     // 0.5. Derived FROM subquery: `FROM (SELECT ...) AS t`.

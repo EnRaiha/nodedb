@@ -8,6 +8,8 @@ use nodedb_physical::physical_plan::{
     plan_contains_cluster_partitioned_leaf,
 };
 
+use super::super::array_read_rows::ArrayReadShape;
+
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
 use crate::control::server::exchange::gather::{
     GatherOutcome, finalize_aggregate, gather_all_vshards,
@@ -52,6 +54,9 @@ enum HitShape {
     /// Hybrid (RRF) fusion hits: `{doc_id: <surrogate hex>, <score alias>,
     /// ...}` with no body. Resolve `doc_id` to the user PK as `id`.
     Hybrid,
+    /// An array read, whose rows are already relational (see
+    /// [`ArrayReadShape`]).
+    Array(ArrayReadShape),
     /// Flat storage rows (`{id, data}` document / text, columnar, spatial) or
     /// computed rows — already fully columned after the storage flatten.
     None,
@@ -59,6 +64,9 @@ enum HitShape {
 
 /// Classify a resolved `PostProcess` child by the row shape its engine emits.
 fn classify_hit_shape(plan: &PhysicalPlan) -> HitShape {
+    if let Some(shape) = ArrayReadShape::of(plan) {
+        return HitShape::Array(shape);
+    }
     match plan {
         PhysicalPlan::Vector(
             VectorOp::Search { .. }
@@ -265,6 +273,7 @@ pub(super) async fn materialize_child_rows(
             let surrogate = parse_surrogate_hex(key)?;
             resolve_surrogate_pk(state, database_id, tenant_id, &coll, surrogate)
         }),
+        HitShape::Array(shape) => shape.rows(merged)?,
         HitShape::None => flatten_to_relational_rows(&merged),
     };
     Ok(ChildRows::Rows { rows, sources })

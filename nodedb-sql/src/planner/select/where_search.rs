@@ -390,7 +390,7 @@ fn plan_spatial_from_where(
             detail: format!("invalid geometry in {name}: {e}"),
         }
     })?;
-    let issues = nodedb_spatial::validate::validate_geometry(&geometry);
+    let issues = nodedb_spatial::validate::validate_geometry(&geometry.geometry);
     if !issues.is_empty() {
         return Err(SqlError::InvalidFunction {
             detail: format!("invalid geometry in {name}: {}", issues.join("; ")),

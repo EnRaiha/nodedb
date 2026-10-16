@@ -8,6 +8,7 @@ mod cluster_admin;
 mod collection;
 mod conflict_policy;
 mod copy_from;
+mod copy_from_stdin;
 mod copy_to;
 mod custom_type;
 pub mod database;

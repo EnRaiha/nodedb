@@ -30,6 +30,7 @@
 //!      finalized rows into a `Resolved::Gathered` response (distributed GROUP BY).
 //!    - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
+mod array_read_rows;
 mod cagg_rows;
 mod capture;
 pub mod exchange;

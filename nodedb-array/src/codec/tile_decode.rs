@@ -16,8 +16,10 @@ use crate::codec::limits::{
 };
 use crate::codec::tag::{CodecTag, peek_tag};
 use crate::error::{ArrayError, ArrayResult};
-use crate::tile::mbr::TileMBR;
-use crate::tile::sparse_tile::{RowKind, SparseTile};
+use crate::tile::mbr::{MbrBuilder, TileMBR};
+use crate::tile::sparse_tile::{DimDict, RowKind, SparseTile};
+use crate::types::cell_value::value::CellValue;
+use crate::types::coord::value::CoordValue;
 
 const SUPPORTED_PAYLOAD_VERSION: u8 = 1;
 
@@ -49,8 +51,23 @@ fn read_framed<'a>(data: &'a [u8], pos: &mut usize) -> ArrayResult<&'a [u8]> {
 /// Decode a tile payload previously written by `encode_sparse_tile`.
 ///
 /// The `payload` slice must start at the tag byte (i.e. after BlockFraming
-/// has been unwrapped by the segment reader).
+/// has been unwrapped by the segment reader). A structural payload stores no
+/// MBR, so this rebuilds it from the rows. A segment reader holds the MBR in
+/// the tile's footer entry and decodes with [`decode_sparse_tile_with_mbr`].
 pub fn decode_sparse_tile(payload: &[u8]) -> ArrayResult<SparseTile> {
+    decode_sparse_tile_inner(payload, None)
+}
+
+/// Decode a tile payload whose MBR is `stored_mbr`, the one its segment
+/// footer entry holds. A raw payload carries its own MBR and keeps it.
+pub fn decode_sparse_tile_with_mbr(payload: &[u8], stored_mbr: TileMBR) -> ArrayResult<SparseTile> {
+    decode_sparse_tile_inner(payload, Some(stored_mbr))
+}
+
+fn decode_sparse_tile_inner(
+    payload: &[u8],
+    stored_mbr: Option<TileMBR>,
+) -> ArrayResult<SparseTile> {
     if payload.len() < 2 {
         return Err(ArrayError::SegmentCorruption {
             detail: "sparse tile payload too short".into(),
@@ -77,7 +94,7 @@ pub fn decode_sparse_tile(payload: &[u8]) -> ArrayResult<SparseTile> {
 
     match tag_result {
         CodecTag::Raw => decode_raw(&payload[2..]),
-        CodecTag::Structural => decode_structural(&payload[2..]),
+        CodecTag::Structural => decode_structural(&payload[2..], stored_mbr),
     }
 }
 
@@ -90,7 +107,7 @@ fn decode_raw(body: &[u8]) -> ArrayResult<SparseTile> {
     Ok(tile)
 }
 
-fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
+fn decode_structural(body: &[u8], stored_mbr: Option<TileMBR>) -> ArrayResult<SparseTile> {
     let mut pos = 0;
 
     if pos + 8 > body.len() {
@@ -174,12 +191,6 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
         attr_cols.push(col);
     }
 
-    // Reconstruct MBR from decoded data — we don't persist the MBR inside the
-    // structural payload (it lives in the footer TileEntry instead).
-    // Use a zero-dimension MBR so the tile can be used for reads; compaction
-    // re-derives the full MBR if needed.
-    let mbr = TileMBR::new(axis_count, attr_count);
-
     // Validate sizes match cell_count.
     if row_kinds.len() != cell_count {
         return Err(ArrayError::SegmentCorruption {
@@ -190,6 +201,13 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
         });
     }
     let surrogates = spread_live_surrogates(&row_kinds, live_surrogates)?;
+    // The structural payload stores no MBR. Readers count and bound a tile by
+    // its MBR: the segment footer's copy when the caller has it, else one
+    // rebuilt from the decoded rows.
+    let mbr = match stored_mbr {
+        Some(mbr) => mbr,
+        None => rebuild_mbr(&dim_dicts, &attr_cols, &row_kinds)?,
+    };
 
     let tile = SparseTile {
         dim_dicts,
@@ -202,6 +220,45 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
     };
     tile.check_stored_identities()?;
     Ok(tile)
+}
+
+/// The MBR the tile builder folds for these rows: every live row's coords
+/// and attrs, and no sentinel row. Attr columns hold one value per live row.
+fn rebuild_mbr(
+    dim_dicts: &[DimDict],
+    attr_cols: &[Vec<CellValue>],
+    row_kinds: &[u8],
+) -> ArrayResult<TileMBR> {
+    let mut mbr = MbrBuilder::new(dim_dicts.len(), attr_cols.len());
+    let mut coord: Vec<CoordValue> = Vec::with_capacity(dim_dicts.len());
+    let mut attrs: Vec<CellValue> = Vec::with_capacity(attr_cols.len());
+    let mut live = 0usize;
+    for (row, &kind) in row_kinds.iter().enumerate() {
+        if RowKind::from_u8(kind)? != RowKind::Live {
+            continue;
+        }
+        coord.clear();
+        for dict in dim_dicts {
+            let value = dict
+                .indices
+                .get(row)
+                .and_then(|&i| dict.values.get(i as usize))
+                .ok_or_else(|| ArrayError::SegmentCorruption {
+                    detail: format!("structural tile: row {row} has no coordinate on an axis"),
+                })?;
+            coord.push(value.clone());
+        }
+        attrs.clear();
+        for col in attr_cols {
+            let value = col.get(live).ok_or_else(|| ArrayError::SegmentCorruption {
+                detail: format!("structural tile: live row {live} has no value in an attr column"),
+            })?;
+            attrs.push(value.clone());
+        }
+        mbr.fold(&coord, &attrs);
+        live += 1;
+    }
+    Ok(mbr.build())
 }
 
 /// Place the live-row surrogate column back onto every row: a live row takes
@@ -381,7 +438,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(&0u32.to_le_bytes());
         body.extend_from_slice(&(MAX_AXES_PER_TILE as u32).to_le_bytes());
-        let error = decode_structural(&body).unwrap_err();
+        let error = decode_structural(&body, None).unwrap_err();
         assert!(matches!(error, ArrayError::SegmentCorruption { .. }));
     }
 

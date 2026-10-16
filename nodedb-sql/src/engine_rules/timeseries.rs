@@ -115,6 +115,16 @@ impl EngineRules for TimeseriesRules {
         }])
     }
 
+    fn plan_bulk_load(&self, p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "COPY: collection '{}' uses the timeseries engine; \
+                 use ILP or INSERT with explicit time column instead",
+                p.collection
+            ),
+        })
+    }
+
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
         if p.temporal.is_temporal() && !p.bitemporal {
             return Err(SqlError::Unsupported {

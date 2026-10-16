@@ -23,4 +23,6 @@ pub use elementwise::{BinaryOp, elementwise};
 pub use project::{Projection, project_sparse};
 pub use rechunk::rechunk_sparse;
 pub use retention::{RetentionMergeResult, merge_for_retention};
-pub use slice::{DimRange, Slice, slice_sparse, tile_overlaps_slice};
+pub use slice::{
+    DimRange, Slice, slice_sparse, slice_sparse_owned, tile_overlaps_slice, tile_within_slice,
+};

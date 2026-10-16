@@ -7,6 +7,7 @@ use sqlparser::ast::{self, Select};
 use super::cte_catalog::CteCatalog;
 use super::derived_output::rekey_join_output;
 use super::entry::plan_query;
+use super::helpers::plain_table_factor;
 use super::query_tail::QueryTail;
 use super::select_stmt::{PlannedSelect, plan_select};
 use crate::error::Result;
@@ -76,20 +77,7 @@ pub(in crate::planner::select) fn try_plan_derived_from(
         )],
     };
     let mut outer_select = select.clone();
-    outer_select.from[0].relation = ast::TableFactor::Table {
-        name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(
-            alias_ident.name.clone(),
-        )]),
-        alias: None,
-        args: None,
-        with_hints: Vec::new(),
-        version: None,
-        with_ordinality: false,
-        partitions: Vec::new(),
-        json_path: None,
-        sample: None,
-        index_hints: Vec::new(),
-    };
+    outer_select.from[0].relation = plain_table_factor(alias_ident.name.clone(), None);
     // The outer SELECT keeps the caller's output standing; the derived body
     // planned above is nested.
     let outer = plan_select(

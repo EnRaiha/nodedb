@@ -10,10 +10,13 @@ mod snapshot_rt_common;
 mod support;
 
 mod alert_rule_replication_apply;
+mod array_auto_flush_visibility;
 mod array_cluster_sync;
 mod array_codec_roundtrip;
 mod array_restore_settings;
+mod array_scan_cost;
 mod array_sql;
+mod array_sql_relation;
 mod array_sync_gc;
 mod array_sync_system_catalog;
 mod auth_admin_ddl_gating;

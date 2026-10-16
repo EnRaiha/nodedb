@@ -12,6 +12,7 @@ use crate::data::executor::response_codec::flatten_to_relational_rows;
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
 use crate::control::server::exchange::gather::{finalize_aggregate, gather_all_vshards};
 
+use super::array_read_rows::ArrayReadShape;
 use super::capture::DistributedReadCapture;
 use super::exchange::provider_scan_of_rows;
 use crate::control::server::shared::authorization::gathered_sources;
@@ -60,10 +61,10 @@ pub(super) async fn resolve_join_input(
             // only the groups this node replicates, and confirms each leg as
             // `scope` requires.
             let sources = gathered_sources(&child, database_id)?;
+            let array_shape = ArrayReadShape::of(&child);
             let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
-            let provider_scan =
-                provider_scan_of_rows(flatten_to_relational_rows(&outcome.merged_array), sources);
-            Ok(Some(Box::new(provider_scan)))
+            let rows = relational_rows(array_shape, outcome.merged_array)?;
+            Ok(Some(Box::new(provider_scan_of_rows(rows, sources))))
         }
 
         // Exchange{Shuffle} inside a join input is never a shape the emit
@@ -108,6 +109,7 @@ pub(super) async fn resolve_join_input(
                 None
             };
             let sources = gathered_sources(&child, database_id)?;
+            let array_shape = ArrayReadShape::of(&child);
             // Read from every vShard's owner, as the Broadcast arm does.
             let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
             if let Some(coll) = child_collection
@@ -128,8 +130,8 @@ pub(super) async fn resolve_join_input(
             } else {
                 outcome.merged_array
             };
-            let provider_scan = provider_scan_of_rows(flatten_to_relational_rows(&merged), sources);
-            Ok(Some(Box::new(provider_scan)))
+            let rows = relational_rows(array_shape, merged)?;
+            Ok(Some(Box::new(provider_scan_of_rows(rows, sources))))
         }
 
         // Already resolved (ProviderScan{None, ..} or any other plan):
@@ -221,4 +223,13 @@ pub(super) async fn gather_join_build_side(
         flatten_to_relational_rows(&outcome.merged_array),
         sources,
     ))))
+}
+
+/// The relational rows of a gathered join input: an array read's rows as
+/// it emits them, any other plan's rows through the storage flatten.
+fn relational_rows(array_shape: Option<ArrayReadShape>, merged: Vec<u8>) -> crate::Result<Vec<u8>> {
+    match array_shape {
+        Some(shape) => shape.rows(merged),
+        None => Ok(flatten_to_relational_rows(&merged)),
+    }
 }

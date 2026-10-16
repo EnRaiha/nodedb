@@ -27,6 +27,29 @@ pub(super) fn source_projection(plan: &SqlPlan) -> Vec<Projection> {
     }
 }
 
+/// A FROM factor that names the relation `name`, under `alias` when given.
+///
+/// A derived table or a table-function call is replanned as a read of the
+/// relation its body exposes. This factor names that relation in the outer
+/// SELECT, so the outer query resolves it like a stored collection.
+pub(super) fn plain_table_factor(
+    name: ast::Ident,
+    alias: Option<ast::TableAlias>,
+) -> ast::TableFactor {
+    ast::TableFactor::Table {
+        name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(name)]),
+        alias,
+        args: None,
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    }
+}
+
 /// Convert SELECT projection items.
 ///
 /// An item over a relation that calls a sequence accessor becomes

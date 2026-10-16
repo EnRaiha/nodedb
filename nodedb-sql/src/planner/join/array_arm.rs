@@ -6,9 +6,8 @@
 //! sibling read TVFs), the planner lowers it to the corresponding
 //! `SqlPlan::Array*` variant directly — bypassing catalog lookup.
 //! The TVF's output rows participate in the join key resolution like
-//! any other relation; the dispatch handler emits `(coords, attrs)`
-//! tuples that include the array's surrogate-equivalent identity
-//! columns so equi-join keys work naturally.
+//! any other relation. A slice or project row holds one field per dim
+//! and per attr, keyed by name, so equi-join keys read them directly.
 
 use sqlparser::ast;
 
@@ -46,7 +45,12 @@ pub(super) fn try_plan_relation(
         relation: rel.clone(),
         joins: Vec::new(),
     };
-    super::super::array_fn::try_plan_array_table_fn(std::slice::from_ref(&twj), catalog, temporal)
+    Ok(super::super::array_fn::try_plan_array_table_fn(
+        std::slice::from_ref(&twj),
+        catalog,
+        temporal,
+    )?
+    .map(super::super::array_fn::ArrayTableFn::into_plan))
 }
 
 fn is_array_tvf(name: &str) -> bool {

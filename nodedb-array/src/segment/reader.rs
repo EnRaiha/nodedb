@@ -11,7 +11,9 @@ use super::format::{
     SegmentFooter, SegmentHeader, TileEntry, TileKind, framing::BlockFraming, header::HEADER_SIZE,
 };
 use crate::codec::tag::peek_tag;
-use crate::codec::tile_decode::decode_sparse_tile;
+use std::sync::Arc;
+
+use crate::codec::tile_decode::decode_sparse_tile_with_mbr;
 use crate::error::{ArrayError, ArrayResult};
 use crate::tile::cell_payload::{CELL_GDPR_ERASURE_SENTINEL, CELL_TOMBSTONE_SENTINEL, CellPayload};
 use crate::tile::dense_tile::DenseTile;
@@ -112,9 +114,12 @@ pub fn extract_cell_bytes(tile: &SparseTile, coord: &[CoordValue]) -> ArrayResul
 ///
 /// - Recognized tag (0 or 1): delegate to `decode_sparse_tile`.
 /// - Empty payload or unrecognized byte: return a corruption error.
-fn read_sparse_tile(payload: &[u8]) -> ArrayResult<SparseTile> {
+///
+/// The footer entry holds the tile's MBR, so the decode takes it instead
+/// of rebuilding it from the rows.
+fn read_sparse_tile(payload: &[u8], entry: &TileEntry) -> ArrayResult<SparseTile> {
     match peek_tag(payload) {
-        Some(_) => decode_sparse_tile(payload),
+        Some(_) => decode_sparse_tile_with_mbr(payload, entry.mbr.clone()),
         None => Err(ArrayError::SegmentCorruption {
             detail: format!(
                 "sparse tile has unrecognized tag byte {:#04x}",
@@ -134,10 +139,26 @@ pub enum TilePayload {
 pub struct SegmentReader<'a> {
     bytes: &'a [u8],
     header: SegmentHeader,
-    footer: SegmentFooter,
+    footer: Arc<SegmentFooter>,
 }
 
 impl<'a> SegmentReader<'a> {
+    /// A reader over `bytes` whose header and footer were decoded from those
+    /// same bytes by an earlier [`Self::open`]. An open segment keeps them,
+    /// so each read does not decode the footer again.
+    pub fn from_parts(bytes: &'a [u8], header: SegmentHeader, footer: Arc<SegmentFooter>) -> Self {
+        Self {
+            bytes,
+            header,
+            footer,
+        }
+    }
+
+    /// The decoded footer, shared with every reader built from it.
+    pub fn footer(&self) -> &Arc<SegmentFooter> {
+        &self.footer
+    }
+
     pub fn open(bytes: &'a [u8]) -> ArrayResult<Self> {
         if bytes.len() < HEADER_SIZE {
             return Err(ArrayError::SegmentCorruption {
@@ -157,7 +178,7 @@ impl<'a> SegmentReader<'a> {
         Ok(Self {
             bytes,
             header,
-            footer,
+            footer: Arc::new(footer),
         })
     }
 
@@ -284,7 +305,7 @@ impl<'a> SegmentReader<'a> {
         let (payload, _) = BlockFraming::decode(&self.bytes[off..end])?;
         match entry.kind {
             TileKind::Sparse => {
-                let t = read_sparse_tile(payload)?;
+                let t = read_sparse_tile(payload, entry)?;
                 Ok(TilePayload::Sparse(t))
             }
             TileKind::Dense => {
@@ -308,7 +329,7 @@ pub struct OwnedSegmentReader {
     /// Decrypted plaintext segment bytes.
     plaintext: Vec<u8>,
     header: SegmentHeader,
-    footer: SegmentFooter,
+    footer: Arc<SegmentFooter>,
 }
 
 impl OwnedSegmentReader {
@@ -344,7 +365,7 @@ impl OwnedSegmentReader {
         Ok(Self {
             plaintext,
             header,
-            footer,
+            footer: Arc::new(footer),
         })
     }
 

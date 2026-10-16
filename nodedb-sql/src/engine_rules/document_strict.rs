@@ -140,6 +140,11 @@ impl EngineRules for StrictRules {
         }])
     }
 
+    /// Each row loads as one INSERT.
+    fn plan_bulk_load(&self, _p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        Ok(BulkLoadPlan::RowInserts)
+    }
+
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
         let base_scan = SqlPlan::Scan {
             collection: p.collection,

@@ -7,6 +7,7 @@
 //! Data-Plane only (`!Send`-compatible — no atomics, no shared mutability).
 
 mod error;
+mod resolve;
 mod scan;
 mod segments;
 mod store;

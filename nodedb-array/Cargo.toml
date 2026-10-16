@@ -23,6 +23,7 @@ crc32c = { workspace = true }
 uuid = { workspace = true }
 loro = { workspace = true }
 nodedb-wal = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

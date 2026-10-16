@@ -8,8 +8,9 @@ use std::sync::Arc;
 use nodedb_sql::types::SqlPlan;
 use nodedb_types::CollectionKey;
 
+use super::super::array_convert::ArrayCellKeys;
 use super::super::convert::ConvertContext;
-use super::super::dml::plan_key_batches;
+use super::super::dml::{ArrayBatchRows, KeyBatch, plan_key_batches};
 use super::cache::{PrefetchedSurrogates, SurrogateMisses};
 use crate::control::surrogate::SurrogateAssigner;
 use crate::types::TenantId;
@@ -33,19 +34,34 @@ pub async fn prefetch_plan_surrogates(
     let resolver = Resolver::new(ctx)?;
     let mut prefetched = PrefetchedSurrogates::default();
     for batch in plan_key_batches(plans, ctx) {
-        let pks: Vec<&[u8]> = batch.pks.iter().map(Vec::as_slice).collect();
-        let (binds, lookups) = if batch.binds {
-            (pks, Vec::new())
-        } else {
-            (Vec::new(), pks)
-        };
-        let request = KeyRequest {
-            key: ctx.collection_key(batch.collection),
-            binds: &binds,
-            lookups: &lookups,
-            fresh: batch.fresh,
-        };
-        resolver.resolve(request, &mut prefetched).await?;
+        let KeyBatch {
+            collection,
+            pks,
+            binds: binding,
+            fresh,
+            array_rows,
+        } = batch;
+        let key = ctx.collection_key(collection);
+        {
+            let refs: Vec<&[u8]> = pks.iter().map(Vec::as_slice).collect();
+            let (binds, lookups) = if binding {
+                (refs, Vec::new())
+            } else {
+                (Vec::new(), refs)
+            };
+            let request = KeyRequest {
+                key,
+                binds: &binds,
+                lookups: &lookups,
+                fresh,
+            };
+            resolver.resolve(request, &mut prefetched).await?;
+        }
+        // An array batch's coordinates and keys stay for conversion, which
+        // then neither coerces nor encodes a coordinate again.
+        if let Some(ArrayBatchRows { rows, coords }) = array_rows {
+            prefetched.keep_array_keys(key, rows, ArrayCellKeys { coords, pks });
+        }
     }
     Ok(prefetched)
 }

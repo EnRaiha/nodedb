@@ -113,3 +113,121 @@ async fn wal_restart_durability() {
         "expected persisted array cell after restart"
     );
 }
+
+/// A 4x4 two-band image: cell `(x, y)` has `nir = (4x + y + 1) / 20` and
+/// `red = (16 - (4x + y)) / 40`.
+async fn create_img(srv: &TestServer, name: &str) {
+    srv.exec(&format!(
+        "CREATE ARRAY {name} \
+         DIMS (x INT64 [0..3], y INT64 [0..3]) \
+         ATTRS (nir FLOAT64, red FLOAT64) \
+         TILE_EXTENTS (2, 2)"
+    ))
+    .await
+    .unwrap();
+    let cells: Vec<String> = (0..4i64)
+        .flat_map(|x| {
+            (0..4i64).map(move |y| {
+                let k = 4 * x + y;
+                format!(
+                    "COORDS ({x}, {y}) VALUES ({}, {})",
+                    (k + 1) as f64 / 20.0,
+                    (16 - k) as f64 / 40.0
+                )
+            })
+        })
+        .collect();
+    srv.exec(&format!("INSERT INTO ARRAY {name} {}", cells.join(", ")))
+        .await
+        .unwrap();
+}
+
+/// NDVI over the wire: a computed column, an attr filter, and an ordering
+/// over it all apply to the slice's rows.
+#[tokio::test]
+async fn array_slice_ndvi_where_order_wire() {
+    let srv = TestServer::start().await;
+    create_img(&srv, "img_ndvi").await;
+
+    let rows = srv
+        .query_rows(
+            "SELECT x, y, (nir - red) / (nir + red) AS ndvi \
+             FROM ARRAY_SLICE('img_ndvi', '{x: [0, 3], y: [0, 3]}') AS t \
+             WHERE t.nir > t.red \
+             ORDER BY ndvi DESC \
+             LIMIT 3",
+        )
+        .await
+        .unwrap();
+    let got: Vec<(i64, i64, f64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].parse().unwrap(),
+                r[1].parse().unwrap(),
+                r[2].parse().unwrap(),
+            )
+        })
+        .collect();
+    // NDVI rises with k, so the three greenest cells are k = 15, 14, 13.
+    let expected = [(3, 3), (3, 2), (3, 1)];
+    assert_eq!(got.len(), 3, "LIMIT 3 keeps three rows: {got:?}");
+    for ((x, y, ndvi), (ex, ey)) in got.iter().zip(expected) {
+        assert_eq!(
+            (*x, *y),
+            (ex, ey),
+            "rows ordered by ndvi descending: {got:?}"
+        );
+        let k = 4 * ex + ey;
+        let (nir, red) = ((k + 1) as f64 / 20.0, (16 - k) as f64 / 40.0);
+        assert!(((nir - red) / (nir + red) - ndvi).abs() < 1e-9);
+    }
+}
+
+/// The extended protocol describes the slice's columns with the types its
+/// rows carry: `int8` dims and `float8` attrs. Each cell decodes as that
+/// type in the binary result format.
+#[tokio::test]
+async fn array_slice_describe_types_match_rows() {
+    const INT8: u32 = 20;
+    const FLOAT8: u32 = 701;
+    let srv = TestServer::start().await;
+    create_img(&srv, "img_describe").await;
+
+    let stmt = srv
+        .client
+        .prepare("SELECT * FROM ARRAY_SLICE('img_describe', '{x: [1, 1], y: [0, 3]}')")
+        .await
+        .expect("prepare slice");
+    let described: Vec<(String, u32)> = stmt
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_string(), c.type_().oid()))
+        .collect();
+    assert_eq!(
+        described,
+        [
+            ("x".to_string(), INT8),
+            ("y".to_string(), INT8),
+            ("nir".to_string(), FLOAT8),
+            ("red".to_string(), FLOAT8),
+        ]
+    );
+
+    let rows = srv.client.query(&stmt, &[]).await.expect("execute slice");
+    assert_eq!(rows.len(), 4, "x = 1 holds four cells");
+    let mut ys = Vec::new();
+    for row in &rows {
+        let x: i64 = row.get("x");
+        let y: i64 = row.get("y");
+        let nir: f64 = row.get("nir");
+        let red: f64 = row.get("red");
+        assert_eq!(x, 1);
+        let k = 4 * x + y;
+        assert!((nir - (k + 1) as f64 / 20.0).abs() < 1e-9);
+        assert!((red - (16 - k) as f64 / 40.0).abs() < 1e-9);
+        ys.push(y);
+    }
+    ys.sort_unstable();
+    assert_eq!(ys, [0, 1, 2, 3]);
+}

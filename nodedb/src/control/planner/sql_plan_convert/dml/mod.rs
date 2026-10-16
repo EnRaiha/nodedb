@@ -17,7 +17,7 @@ pub(super) use insert::{ConvertInsertArgs, convert_insert, declared_primary_key_
 pub(crate) use insert::{DEFAULT_IDENTITY_COLUMN, build_columnar_schema};
 pub(super) use kv_insert::convert_kv_insert;
 pub(super) use merge::{ConvertMergeArgs, convert_merge};
-pub(super) use surrogate_keys::plan_key_batches;
+pub(super) use surrogate_keys::{ArrayBatchRows, KeyBatch, plan_key_batches};
 pub(super) use update_delete::{
     UpdateFromParams, UpdateParams, convert_delete, convert_update, convert_update_from,
 };

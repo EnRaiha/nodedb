@@ -347,6 +347,16 @@ impl ClusterArrayExecutor {
         // actually wrote. `{"inserted": n}` matches what the local
         // `ArrayOp::Put` handler emits, so `extract_affected_count` reads both.
         let affected: u64 = resps.iter().map(|r| r.affected).sum();
+        // Every cell of a put writes one cell version, a repeated coordinate
+        // included. Fewer means a shard dropped cells it acknowledged.
+        if affected != cells.len() as u64 {
+            return Err(crate::Error::Internal {
+                detail: format!(
+                    "array put: the shards wrote {affected} of {} cells",
+                    cells.len()
+                ),
+            });
+        }
         response_codec::encode_count("inserted", affected as usize)
     }
 

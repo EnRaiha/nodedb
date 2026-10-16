@@ -25,7 +25,7 @@ use crate::control::cluster::ClusterArrayExecutor;
 use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::server::shared::authorization::gathered_sources;
 use crate::control::state::SharedState;
-use crate::data::executor::response_codec::{ArraySliceResponse, flatten_to_relational_rows};
+use crate::data::executor::response_codec::ArraySliceResponse;
 use crate::types::{Lsn, TxnId};
 
 use super::gather::GatherOutcome;
@@ -41,7 +41,7 @@ pub(super) async fn gather_cluster_partitioned(
 ) -> crate::Result<GatherOutcome> {
     if let PhysicalPlan::ClusterArray(op) = &plan {
         let rows = read_cluster_array(state, op, scope.txn_id).await?;
-        return Ok(outcome_of(flatten_to_relational_rows(&rows)));
+        return Ok(outcome_of(rows));
     }
     let mut local = plan;
     inline_cluster_arrays(state, &mut local, scope).await?;
@@ -62,6 +62,11 @@ pub(super) async fn gather_cluster_partitioned(
 
 /// Read one cluster array op through the array executor and return its rows
 /// as one msgpack array.
+///
+/// The rows are already relational: a slice row holds one field per dim
+/// and attr, keyed by name, and an aggregate row is `{group, result}` or
+/// `{result}`. They reach a relational operator as is. The storage flatten
+/// would read an attr named `data` as a `{id, data}` row envelope.
 async fn read_cluster_array(
     state: &SharedState,
     op: &ClusterArrayOp,
@@ -139,7 +144,7 @@ fn inline_cluster_arrays<'a>(
             PhysicalPlan::ClusterArray(op) => {
                 let rows = read_cluster_array(state, op, scope.txn_id).await?;
                 let sources = gathered_sources(plan, scope.database_id)?;
-                *plan = provider_scan_of_rows(flatten_to_relational_rows(&rows), sources);
+                *plan = provider_scan_of_rows(rows, sources);
             }
             PhysicalPlan::Query(QueryOp::Aggregate { input, .. }) => {
                 if let Some(child) = input.as_deref_mut() {
@@ -236,17 +241,30 @@ mod tests {
     }
 
     #[test]
-    fn a_slice_envelope_flattens_to_its_rows() {
+    fn a_slice_envelope_yields_its_rows() {
         let rows = vec![row(1), row(2)];
         let envelope = zerompk::to_msgpack_vec(&ArraySliceResponse {
             rows_msgpack: encode_msgpack_array(&rows),
             truncated_before_horizon: false,
         })
         .expect("encode slice envelope");
-        let flat = flatten_to_relational_rows(
-            &cluster_array_rows(&slice_op(), envelope).expect("slice rows"),
-        );
-        assert_eq!(extract_msgpack_elements(&flat), rows);
+        let out = cluster_array_rows(&slice_op(), envelope).expect("slice rows");
+        assert_eq!(extract_msgpack_elements(&out), rows);
+    }
+
+    /// A named slice row whose attr is called `data` stays a whole row: the
+    /// rows reach the relational tail unflattened.
+    #[test]
+    fn an_attr_named_data_is_a_column_not_an_envelope() {
+        // fixmap of 2: "x" => 1, "data" => 7.
+        let named = vec![0x82, 0xa1, b'x', 1, 0xa4, b'd', b'a', b't', b'a', 7];
+        let envelope = zerompk::to_msgpack_vec(&ArraySliceResponse {
+            rows_msgpack: encode_msgpack_array(std::slice::from_ref(&named)),
+            truncated_before_horizon: false,
+        })
+        .expect("encode slice envelope");
+        let out = cluster_array_rows(&slice_op(), envelope).expect("slice rows");
+        assert_eq!(extract_msgpack_elements(&out), vec![named]);
     }
 
     #[tokio::test]
@@ -271,11 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn an_aggregate_payload_flattens_to_its_rows() {
+    fn an_aggregate_payload_yields_its_rows() {
         let rows = vec![row(10), row(20), row(30)];
-        let flat = flatten_to_relational_rows(
-            &cluster_array_rows(&agg_op(), encode_msgpack_array(&rows)).expect("agg rows"),
-        );
-        assert_eq!(extract_msgpack_elements(&flat), rows);
+        let out = cluster_array_rows(&agg_op(), encode_msgpack_array(&rows)).expect("agg rows");
+        assert_eq!(extract_msgpack_elements(&out), rows);
     }
 }

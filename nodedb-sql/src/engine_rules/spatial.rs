@@ -126,6 +126,16 @@ impl EngineRules for SpatialRules {
         }])
     }
 
+    fn plan_bulk_load(&self, p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "COPY: collection '{}' uses the spatial engine; \
+                 use INSERT with a WKT/GeoJSON geometry column instead",
+                p.collection
+            ),
+        })
+    }
+
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
         let base_scan = SqlPlan::Scan {
             collection: p.collection,

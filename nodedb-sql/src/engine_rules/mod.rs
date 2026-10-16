@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod array;
+mod bulk_load;
 pub mod columnar;
 pub mod continuous_aggregate;
 pub mod document_schemaless;
@@ -14,6 +15,7 @@ pub mod spatial;
 pub mod timeseries;
 mod timeseries_native;
 
+pub use bulk_load::{BulkLoadParams, BulkLoadPlan};
 pub(crate) use index_lookup::try_document_index_lookup;
 pub use params::{
     AggregateParams, DeleteParams, InsertParams, InsertSelectParams, MergeParams, PointGetParams,

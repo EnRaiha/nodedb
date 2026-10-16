@@ -156,7 +156,8 @@ pub fn merge_slice_rows(
 /// coord proxy) before applying the limit.
 ///
 /// Each row is the native (untagged) msgpack map emitted by the array slice
-/// handler — `{"coords": [...], "attrs": [...], "_ts_system": <int>}`. In
+/// handler — one field per dim and per attr, then `"_ts_system": <int>`,
+/// written in schema order so one cell's rows encode identically. In
 /// audit-log mode every row carries `_ts_system`; a row that fails to decode
 /// or is missing that column is a wire-contract violation (corruption or a
 /// handler bug), so this function returns an error rather than silently

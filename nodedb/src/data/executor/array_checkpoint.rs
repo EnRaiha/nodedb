@@ -383,12 +383,10 @@ mod tests {
             .expect("slice rows array")
             .iter()
             .map(|row| {
-                let coords = row["coords"].as_array().expect("coords");
-                let attrs = row["attrs"].as_array().expect("attrs");
                 (
-                    coords[0].as_i64().expect("x"),
-                    coords[1].as_i64().expect("y"),
-                    attrs[0].as_i64().expect("v"),
+                    row["x"].as_i64().expect("x"),
+                    row["y"].as_i64().expect("y"),
+                    row["v"].as_i64().expect("v"),
                 )
             })
             .collect();

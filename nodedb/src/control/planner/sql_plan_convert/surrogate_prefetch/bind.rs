@@ -29,7 +29,11 @@ pub async fn convert_bound(
     ctx: &mut ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     ctx.prefetched = prefetch_plan_surrogates(plans, ctx).await?;
-    convert_resolving_misses(plans, tenant_id, ctx).await
+    let converted = convert_resolving_misses(plans, tenant_id, ctx).await;
+    // The kept array keys are keyed by the address of `plans`' rows, which
+    // stays valid only while `plans` is borrowed here.
+    ctx.prefetched.forget_array_keys();
+    converted
 }
 
 /// Convert each of `plans` with the answers `ctx` holds, resolving the misses

@@ -13,11 +13,23 @@ use std::sync::Mutex;
 
 use nodedb_types::{CollectionKey, DatabaseId, Surrogate};
 
+use super::super::array_convert::ArrayCellKeys;
+
 /// One collection: its database and bare catalog name.
 type CollectionSlot = (DatabaseId, String);
 
 /// A fresh identity drawn ahead: its surrogate and its identity string.
 type FreshIdentity = (Surrogate, String);
+
+/// One `INSERT INTO ARRAY` row batch: its array, and the address and length
+/// of the plan's rows. The bind step borrows the plans for its whole run, so
+/// the address names one batch until [`PrefetchedSurrogates::forget_array_keys`]
+/// runs at its end.
+type ArrayRowsSlot = (CollectionSlot, usize, usize);
+
+/// One collection's bind answers: primary key to its bound surrogate, or
+/// `None` when the key's home binds none.
+type KeyAnswers = HashMap<Vec<u8>, Option<Surrogate>>;
 
 /// The bind step's answer for each `(collection, primary key)`: the bound
 /// surrogate, or `None` when the key's home binds none. Also the fresh
@@ -25,7 +37,12 @@ type FreshIdentity = (Surrogate, String);
 /// running conversion pass. All hold for the one plan batch they belong to.
 #[derive(Debug, Default)]
 pub struct PrefetchedSurrogates {
-    answers: HashMap<(CollectionSlot, Vec<u8>), Option<Surrogate>>,
+    /// Keyed database, then collection, then key, so a lookup borrows its
+    /// key and allocates nothing.
+    answers: HashMap<DatabaseId, HashMap<String, KeyAnswers>>,
+    /// The coerced coordinates and identity keys of each `INSERT INTO ARRAY`
+    /// row batch the bind step read, so conversion encodes neither again.
+    array_keys: HashMap<ArrayRowsSlot, ArrayCellKeys>,
     /// Conversion reads through a shared reference, so the fresh pool and
     /// the misses sit behind locks.
     fresh: Mutex<FreshPool>,
@@ -106,15 +123,63 @@ impl SurrogateMisses {
 impl PrefetchedSurrogates {
     /// Keep the answer for `pk` in `key`.
     pub fn insert(&mut self, key: CollectionKey<'_>, pk: &[u8], answer: Option<Surrogate>) {
-        self.answers.insert((slot_of(key), pk.to_vec()), answer);
+        let by_name = self.answers.entry(key.database_id()).or_default();
+        // The collection's map exists after its first key, so later keys
+        // allocate no name.
+        if let Some(keys) = by_name.get_mut(key.name()) {
+            match keys.get_mut(pk) {
+                Some(slot) => *slot = answer,
+                None => {
+                    keys.insert(pk.to_vec(), answer);
+                }
+            }
+            return;
+        }
+        let mut keys = HashMap::new();
+        keys.insert(pk.to_vec(), answer);
+        by_name.insert(key.name().to_string(), keys);
     }
 
     /// The answer for `pk` in `key`. `None` when the key has no answer.
     pub fn get(&self, key: CollectionKey<'_>, pk: &[u8]) -> Option<Option<Surrogate>> {
-        if self.answers.is_empty() {
+        self.answers
+            .get(&key.database_id())?
+            .get(key.name())?
+            .get(pk)
+            .copied()
+    }
+
+    /// Keep the coerced coordinates and identity keys the bind step read off
+    /// the `INSERT INTO ARRAY` rows at `rows` in `key`.
+    pub(in crate::control::planner::sql_plan_convert) fn keep_array_keys<T>(
+        &mut self,
+        key: CollectionKey<'_>,
+        rows: &[T],
+        keys: ArrayCellKeys,
+    ) {
+        self.array_keys.insert(array_rows_slot(key, rows), keys);
+    }
+
+    /// The coordinates and identity keys kept for the rows at `rows` in
+    /// `key`. `None` when the bind step kept none, or kept them for a batch
+    /// of another length.
+    pub(in crate::control::planner::sql_plan_convert) fn array_keys<T>(
+        &self,
+        key: CollectionKey<'_>,
+        rows: &[T],
+    ) -> Option<&ArrayCellKeys> {
+        if self.array_keys.is_empty() {
             return None;
         }
-        self.answers.get(&(slot_of(key), pk.to_vec())).copied()
+        self.array_keys
+            .get(&array_rows_slot(key, rows))
+            .filter(|keys| keys.pks.len() == rows.len())
+    }
+
+    /// Drop every kept array row batch. Runs when the bind step ends, before
+    /// the plans whose addresses key them are released.
+    pub(in crate::control::planner::sql_plan_convert) fn forget_array_keys(&mut self) {
+        self.array_keys.clear();
     }
 
     /// The bound surrogate of `pk` in `key`, when the answer binds one.
@@ -194,6 +259,10 @@ fn slot_of(key: CollectionKey<'_>) -> CollectionSlot {
     (key.database_id(), key.name().to_string())
 }
 
+fn array_rows_slot<T>(key: CollectionKey<'_>, rows: &[T]) -> ArrayRowsSlot {
+    (slot_of(key), rows.as_ptr() as usize, rows.len())
+}
+
 #[cfg(test)]
 mod tests {
     use nodedb_types::{CollectionKey, DatabaseId, Surrogate};
@@ -260,6 +329,34 @@ mod tests {
             prefetched.take_fresh(users).map(|f| f.0),
             Some(Surrogate::new(4))
         );
+    }
+
+    #[test]
+    fn array_keys_are_kept_per_row_batch_until_forgotten() {
+        use nodedb_array::types::coord::value::CoordValue;
+
+        use super::ArrayCellKeys;
+
+        let scene = CollectionKey::from_bare(DatabaseId::DEFAULT, "scene");
+        let rows = vec![1u8, 2];
+        let other_rows = vec![1u8, 2];
+        let mut prefetched = PrefetchedSurrogates::default();
+        prefetched.keep_array_keys(
+            scene,
+            &rows,
+            ArrayCellKeys {
+                coords: vec![vec![CoordValue::Int64(1)], vec![CoordValue::Int64(2)]],
+                pks: vec![b"a".to_vec(), b"b".to_vec()],
+            },
+        );
+
+        let kept = prefetched.array_keys(scene, &rows).expect("kept");
+        assert_eq!(kept.pks[1], b"b".to_vec());
+        assert!(prefetched.array_keys(scene, &other_rows).is_none());
+        assert!(prefetched.array_keys(scene, &rows[..1]).is_none());
+
+        prefetched.forget_array_keys();
+        assert!(prefetched.array_keys(scene, &rows).is_none());
     }
 
     #[test]

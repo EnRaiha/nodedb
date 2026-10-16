@@ -314,7 +314,9 @@ impl CoreLoop {
                 })?;
         }
         let objects: Vec<Value> = images.into_iter().map(|(_, _, image)| image).collect();
-        let delta = self.index_columnar_geometry_columns(task, &schema, collection, &objects);
+        let delta = self
+            .index_columnar_geometry_columns(task, &schema, collection, &objects)
+            .map_err(ErrorCode::from)?;
         if recording {
             let mut undo = Vec::new();
             Self::push_geometry_index_undo(&mut undo, delta);

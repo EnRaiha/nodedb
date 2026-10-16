@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod array_batch;
 pub mod auth;
 pub mod batch;
 pub mod error_cause;
@@ -9,6 +10,7 @@ pub mod opcodes;
 pub mod request_fields;
 pub mod text_fields;
 
+pub use array_batch::{ArrayCellWrite, ArrayPutBatch};
 pub use auth::{AuthMethod, AuthResponse};
 pub use batch::{BatchDocument, BatchVector};
 pub use error_cause::ErrorCausePayload;

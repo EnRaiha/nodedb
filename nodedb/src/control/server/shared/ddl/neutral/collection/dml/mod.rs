@@ -16,5 +16,6 @@ pub use upsert::upsert_document;
 // Shared with the `copy_from` bulk-import handlers (same collection-DML
 // family): building INSERT SQL from a field map and planning/dispatching it.
 pub(in crate::control::server::shared::ddl::neutral::collection) use parse::{
-    authorize_write_target, fields_to_insert_sql, plan_and_dispatch,
+    PlanBuilder, authorize_write_target, fields_to_insert_sql, plan_and_dispatch,
+    plan_and_dispatch_built,
 };

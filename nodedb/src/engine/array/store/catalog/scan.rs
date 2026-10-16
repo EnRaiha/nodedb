@@ -4,9 +4,10 @@
 
 use nodedb_array::query::ceiling::{CeilingParams, CeilingResult, ceiling_resolve_cell};
 use nodedb_array::segment::{MbrQueryPredicate, TilePayload};
-use nodedb_array::tile::cell_payload::{CellPayload, is_cell_sentinel};
-use nodedb_array::tile::sparse_tile::{SparseTile, SparseTileBuilder};
+use nodedb_array::tile::sparse_tile::SparseTile;
 use nodedb_array::types::coord::value::CoordValue;
+use nodedb_types::ShardBucket;
+use nodedb_types::array_route::shard_bucket_admits;
 
 use super::{ArrayStore, CellVersion};
 
@@ -69,67 +70,37 @@ impl ArrayStore {
         system_as_of: i64,
         valid_at_ms: Option<i64>,
     ) -> Result<(Vec<(u64, SparseTile)>, bool), nodedb_array::ArrayError> {
+        self.scan_shard_tiles_at(system_as_of, valid_at_ms, None)
+    }
+
+    /// [`scan_tiles_at`](Self::scan_tiles_at) over the prefixes that
+    /// `shard_bucket` admits. A prefix the bucket rejects is never decoded.
+    /// `truncated_before_horizon` is computed over the whole store.
+    pub fn scan_shard_tiles_at(
+        &self,
+        system_as_of: i64,
+        valid_at_ms: Option<i64>,
+        shard_bucket: Option<ShardBucket>,
+    ) -> Result<(Vec<(u64, SparseTile)>, bool), nodedb_array::ArrayError> {
         let params = CeilingParams {
             system_as_of,
             valid_at_ms,
         };
-
-        // Collect all distinct hilbert_prefix values present in any version.
         let all_prefixes = self.all_hilbert_prefixes();
-
-        // Did any version exist at all in the store?
-        let any_versions = !all_prefixes.is_empty();
+        let truncated_before_horizon =
+            !all_prefixes.is_empty() && !self.any_version_at_or_before(system_as_of);
 
         let mut out: Vec<(u64, SparseTile)> = Vec::new();
-        let mut any_qualifying = false;
-
         for prefix in all_prefixes {
-            // Collect all distinct coords across every version for this prefix.
-            let coords = self.distinct_coords_for_prefix(prefix)?;
-
-            let mut builder = SparseTileBuilder::new(&self.schema);
-            for coord in &coords {
-                // Build the version iterator for this coord across all sources.
-                // Memtable versions (newer) first, then segment versions (older).
-                let cell_versions = self.cell_versions_for_coord(prefix, coord, i64::MAX)?;
-
-                // Check if there are any versions at or before the cutoff.
-                if cell_versions
-                    .iter()
-                    .any(|(tid, _)| tid.system_from_ms <= system_as_of)
-                {
-                    any_qualifying = true;
-                }
-
-                let iter = cell_versions
-                    .iter()
-                    .map(|(tid, bytes)| (*tid, bytes.as_slice()));
-                match ceiling_resolve_cell(iter, coord, &params)? {
-                    CeilingResult::Live(payload) => {
-                        builder
-                            .push_row(nodedb_array::tile::sparse_tile::SparseRow::live(
-                                coord,
-                                &payload.attrs,
-                                payload.surrogate,
-                                payload.valid_from_ms,
-                                payload.valid_until_ms,
-                            ))
-                            .map_err(|e| nodedb_array::ArrayError::SegmentCorruption {
-                                detail: format!("scan_tiles_at builder: {e}"),
-                            })?;
-                    }
-                    CeilingResult::Tombstoned | CeilingResult::Erased | CeilingResult::NotFound => {
-                    }
-                }
+            if !shard_bucket_admits(shard_bucket, prefix) {
+                continue;
             }
-
-            let tile = builder.build();
-            if tile.nnz() > 0 {
+            if let Some(tile) = self.resolve_prefix_at(prefix, &params)?
+                && tile.nnz() > 0
+            {
                 out.push((prefix, tile));
             }
         }
-
-        let truncated_before_horizon = any_versions && !any_qualifying;
         Ok((out, truncated_before_horizon))
     }
 
@@ -140,43 +111,21 @@ impl ArrayStore {
     /// in the document engine.
     ///
     /// When `valid_at_ms` is `Some(vt)`, only versions whose
-    /// `valid_from_ms <= vt < valid_until_ms` are included.
+    /// `valid_from_ms <= vt < valid_until_ms` are included. Only prefixes
+    /// that `shard_bucket` admits are read.
     ///
     /// The caller is responsible for sorting and applying limits.
     pub fn scan_tiles_all_versions(
         &self,
         valid_at_ms: Option<i64>,
+        shard_bucket: Option<ShardBucket>,
     ) -> Result<Vec<CellVersion>, nodedb_array::ArrayError> {
-        // Collect all distinct (hilbert_prefix, coord) pairs.
-        let all_prefixes = self.all_hilbert_prefixes();
-
         let mut out: Vec<CellVersion> = Vec::new();
-
-        for prefix in all_prefixes {
-            // Collect all distinct coords for this prefix (across all versions).
-            let coords = self.distinct_coords_for_prefix(prefix)?;
-
-            for coord in &coords {
-                // All versions for this coord across memtable + segments,
-                // newest-first by system_from_ms.
-                let versions = self.cell_versions_for_coord(prefix, coord, i64::MAX)?;
-                for (tile_id, bytes) in &versions {
-                    // Skip tombstones and erasures — emit only live payloads.
-                    if is_cell_sentinel(bytes) {
-                        continue;
-                    }
-                    let payload = CellPayload::decode(bytes)?;
-                    // Apply valid-time point filter if requested.
-                    if let Some(vt) = valid_at_ms
-                        && !(payload.valid_from_ms <= vt && vt < payload.valid_until_ms)
-                    {
-                        continue;
-                    }
-                    out.push((prefix, coord.clone(), tile_id.system_from_ms, payload));
-                }
+        for prefix in self.all_hilbert_prefixes() {
+            if shard_bucket_admits(shard_bucket, prefix) {
+                self.prefix_live_versions(prefix, valid_at_ms, &mut out)?;
             }
         }
-
         Ok(out)
     }
 

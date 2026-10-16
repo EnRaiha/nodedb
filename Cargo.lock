@@ -4044,6 +4044,7 @@ dependencies = [
  "nodedb-codec",
  "nodedb-types",
  "nodedb-wal",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -4095,6 +4096,8 @@ dependencies = [
  "serde_json",
  "sonic-rs",
  "tempfile",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "tokio-postgres",
 ]

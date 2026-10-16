@@ -19,16 +19,12 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 
-use nodedb_types::document::Document;
-use nodedb_types::dropped_collection::DroppedCollection;
-use nodedb_types::error::NodeDbResult;
-use nodedb_types::filter::{EdgeFilter, MetadataFilter};
-use nodedb_types::graph::GraphStats;
-use nodedb_types::id::{EdgeId, NodeId};
-use nodedb_types::protocol::Limits;
-use nodedb_types::result::{QueryResult, SearchResult, SubGraph};
-use nodedb_types::text_search::TextSearchParams;
-use nodedb_types::value::Value;
+use nodedb_types::{
+    document::Document, dropped_collection::DroppedCollection, error::NodeDbResult,
+    filter::EdgeFilter, filter::MetadataFilter, graph::GraphStats, id::EdgeId, id::NodeId,
+    protocol::ArrayCellWrite, protocol::Limits, result::QueryResult, result::SearchResult,
+    result::SubGraph, text_search::TextSearchParams, value::Value,
+};
 
 use super::default_impls;
 use super::marker::NodeDbMarker;
@@ -420,6 +416,15 @@ pub trait NodeDb: NodeDbMarker {
         edges: &[(&str, &str, &str)],
     ) -> NodeDbResult<()> {
         default_impls::batch_graph_insert_edges_default(self, collection, edges).await
+    }
+
+    /// Load `cells` into `array` through the bulk path. Returns the count.
+    /// A cell holds one coordinate per dim and one value per attr, in schema
+    /// order. Outside a block a bad cell stops the load, earlier chunks kept.
+    /// On Native: `OpCode::ArrayPutBatch` requests, each under one frame.
+    /// The default returns `Err`: the pgwire client does not implement it.
+    async fn array_put_cells(&self, array: &str, cells: Vec<ArrayCellWrite>) -> NodeDbResult<u64> {
+        default_impls::array_put_cells_default(array, cells)
     }
 
     /// The protocol version negotiated during the connection handshake.

@@ -10,7 +10,7 @@
 //! body gives it, exactly as a plain `SELECT` of the body does.
 
 use nodedb_sql::SqlError;
-use nodedb_sql::catalog::{SqlCatalog, SqlCatalogError};
+use nodedb_sql::catalog::{ArrayCatalogView, SqlCatalog, SqlCatalogError};
 use nodedb_sql::types::query::EngineType;
 use nodedb_sql::types::{CollectionInfo, ColumnInfo, SqlPlan};
 use nodedb_sql::types_expr::SqlDataType;
@@ -25,8 +25,8 @@ use super::build::build_output_schema;
 ///
 /// Schema derivation recurses through nested CTE plans. Each level reads its
 /// catalog as `&dyn SqlCatalog`, so the recursion instantiates a finite set
-/// of generic functions. Schema derivation reads relations only, so only the
-/// relation lookups are passed through.
+/// of generic functions. Schema derivation reads relations and arrays, so
+/// those lookups are passed through.
 pub(super) struct CatalogRef<'a, C: ?Sized>(pub(super) &'a C);
 
 impl<C: SqlCatalog + ?Sized> SqlCatalog for CatalogRef<'_, C> {
@@ -44,6 +44,10 @@ impl<C: SqlCatalog + ?Sized> SqlCatalog for CatalogRef<'_, C> {
         name: &str,
     ) -> Result<Option<CollectionInfo>, SqlCatalogError> {
         self.0.resolve_relation(database_id, name)
+    }
+
+    fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
+        self.0.lookup_array(name)
     }
 }
 
@@ -92,6 +96,10 @@ impl SqlCatalog for CteTypesCatalog<'_> {
             return Ok(Some(info.clone()));
         }
         self.inner.get_collection(database_id, name)
+    }
+
+    fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
+        self.inner.lookup_array(name)
     }
 }
 

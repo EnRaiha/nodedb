@@ -85,7 +85,7 @@ async fn native_cluster_array_insert_reports_affected_count() {
 }
 
 /// `SELECT * FROM ARRAY_SLICE(...)` over the native wire returns the
-/// inserted cells as rows, with the coordinate and attribute columns.
+/// inserted cells as rows, one column per dim and per attr.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_cluster_array_slice_returns_rows() {
     let server = TestServer::start().await;
@@ -107,19 +107,29 @@ async fn native_cluster_array_slice_returns_rows() {
         "SELECT * FROM ARRAY_SLICE('narr_slice', '{\"row\":[1,1],\"col\":[1,3]}', '*', 100)",
     )
     .await;
-    // An array cell row carries its coordinate tuple and attribute list as
-    // two columns, the same shape pgwire renders.
+    // A cell row carries the dims, then the attrs, in schema order — the
+    // same columns pgwire renders.
     let columns = sliced.columns.expect("slice response carries columns");
-    assert!(
-        columns.iter().any(|c| c == "coords"),
-        "slice columns must include the coordinate tuple: {columns:?}"
-    );
-    assert!(
-        columns.iter().any(|c| c == "attrs"),
-        "slice columns must include the attribute list: {columns:?}"
+    assert_eq!(
+        columns,
+        ["row", "col", "value"],
+        "slice columns must be the dims then the attrs"
     );
     let rows = sliced.rows.expect("slice response carries rows");
     assert_eq!(rows.len(), 3, "slice must return all three inserted cells");
+    let mut cells: Vec<(i64, i64, f64)> = rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                nodedb_types::Value::Integer(r),
+                nodedb_types::Value::Integer(c),
+                nodedb_types::Value::Float(v),
+            ] => (*r, *c, *v),
+            other => panic!("unexpected slice row {other:?}"),
+        })
+        .collect();
+    cells.sort_by(|a, b| a.partial_cmp(b).expect("finite cells"));
+    assert_eq!(cells, [(1, 1, 10.0), (1, 2, 20.0), (1, 3, 30.0)]);
 }
 
 /// `SELECT * FROM ARRAY_AGG(...)` over the native wire returns the
@@ -271,4 +281,67 @@ async fn native_cluster_array_multi_statement_batch_folds_rows() {
         "a two-statement native batch of ClusterArray reads must fold both statements' rows \
          into one response, got {rows:?}"
     );
+}
+
+/// NDVI over a cluster array read on the native wire: the computed column,
+/// the attr filter, the ordering and the row bound all apply to the slice's
+/// named rows, which the cluster coordinator gathers from every shard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_cluster_array_slice_ndvi_where_order() {
+    let server = TestServer::start().await;
+    let mut stream = native_session(&server).await;
+    exec(
+        &mut stream,
+        1,
+        "CREATE ARRAY narr_ndvi \
+         DIMS (x INT64 [0..15], y INT64 [0..15]) \
+         ATTRS (nir FLOAT64, red FLOAT64) \
+         TILE_EXTENTS (2, 2)",
+    )
+    .await;
+    // Cells on tiles far apart, so the slice spans several shards. NDVI is
+    // (nir - red) / (nir + red): 0.6, 0.2, -0.2 and 0.8 in insert order.
+    exec(
+        &mut stream,
+        2,
+        "INSERT INTO ARRAY narr_ndvi \
+         COORDS (0, 0) VALUES (0.8, 0.2), \
+         COORDS (5, 9) VALUES (0.6, 0.4), \
+         COORDS (11, 3) VALUES (0.4, 0.6), \
+         COORDS (15, 15) VALUES (0.9, 0.1)",
+    )
+    .await;
+
+    let resp = exec(
+        &mut stream,
+        3,
+        "SELECT x, y, (nir - red) / (nir + red) AS ndvi \
+         FROM ARRAY_SLICE('narr_ndvi', '{x: [0, 15], y: [0, 15]}') \
+         WHERE nir > red \
+         ORDER BY ndvi DESC \
+         LIMIT 2",
+    )
+    .await;
+    assert_eq!(
+        resp.columns.expect("columns"),
+        ["x", "y", "ndvi"],
+        "the SELECT list names the columns"
+    );
+    let rows = resp.rows.expect("rows");
+    let got: Vec<(i64, i64, f64)> = rows
+        .iter()
+        .map(|row| match row.as_slice() {
+            [
+                nodedb_types::Value::Integer(x),
+                nodedb_types::Value::Integer(y),
+                nodedb_types::Value::Float(ndvi),
+            ] => (*x, *y, *ndvi),
+            other => panic!("unexpected NDVI row {other:?}"),
+        })
+        .collect();
+    assert_eq!(got.len(), 2, "LIMIT 2 keeps two rows: {got:?}");
+    assert_eq!((got[0].0, got[0].1), (15, 15));
+    assert_eq!((got[1].0, got[1].1), (0, 0));
+    assert!((got[0].2 - 0.8).abs() < 1e-9, "ndvi of (15, 15): {got:?}");
+    assert!((got[1].2 - 0.6).abs() < 1e-9, "ndvi of (0, 0): {got:?}");
 }

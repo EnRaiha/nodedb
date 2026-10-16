@@ -2,9 +2,11 @@
 
 //! Shaping for an `ArrayOp::Slice` response.
 
+use crate::control::sequence::SequenceAccess;
 use crate::data::executor::response_codec::{ArraySliceResponse, decode_payload_value};
 
 use super::super::redaction::RedactionCtx;
+use super::super::schema::OutputSchema;
 use super::super::types::ShapedRows;
 use super::kernel::{empty_shaped, shape_decoded_rows};
 
@@ -15,17 +17,19 @@ pub(crate) const TRUNCATED_BEFORE_HORIZON_NOTICE: &str = "AS OF SYSTEM TIME cuto
      results may be incomplete";
 
 /// Shape an `ArrayOp::Slice` response: decode the `ArraySliceResponse`
-/// envelope (falling back to a plain payload decode for legacy shapes),
-/// unwrap the row envelope, and surface `truncated_before_horizon` as a
-/// notice.
+/// envelope (a cluster slice answers its rows bare), project the rows to
+/// `projection`, and surface `truncated_before_horizon` as a notice.
 ///
-/// Array slices never carry a SELECT-list projection, so `shape_decoded_rows`
-/// is always called with a `None` projection and no sequence access here —
-/// but redaction still applies to the cells. A payload that decodes to no
-/// value shapes as an empty result set.
+/// Each row holds one field per dim and per attr, keyed by name. The
+/// projection the planner announces for the slice's relation names those
+/// fields in schema order with their types, so the client receives typed
+/// columns in that order. Redaction applies to the cells. A payload that
+/// decodes to no value shapes as an empty result set.
 pub(super) fn shape_array_slice(
     payload: &[u8],
+    projection: Option<&OutputSchema>,
     redaction: Option<RedactionCtx<'_>>,
+    sequences: Option<&dyn SequenceAccess>,
 ) -> crate::Result<ShapedRows> {
     if payload.is_empty() {
         return Ok(empty_shaped());
@@ -41,7 +45,7 @@ pub(super) fn shape_array_slice(
     let notice = truncated.then(|| TRUNCATED_BEFORE_HORIZON_NOTICE.to_string());
 
     let mut shaped = match rows {
-        Ok(value) => shape_decoded_rows(value, None, redaction, None)?,
+        Ok(value) => shape_decoded_rows(value, projection, redaction, sequences)?,
         Err(_) => empty_shaped(),
     };
     shaped.notice = notice;

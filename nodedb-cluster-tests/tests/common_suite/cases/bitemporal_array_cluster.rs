@@ -53,31 +53,11 @@ async fn query_col0(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// Parse the `attrs[0]` int64 from a single ARRAY_SLICE result row.
-///
-/// `SELECT *` over ARRAY_SLICE expands to one pgwire field per declared
-/// column.  This test uses the column-0 helper, which lands on the
-/// `attrs` JSON-array column for the slice TVF (e.g. `[99]`).  Older
-/// codecs returned the full `{"coords": [...], "attrs": [v]}` envelope
-/// in that slot — accept either shape so the test stays robust to the
-/// projection tightening.
+/// Parse the int64 attr value of a single-column `SELECT v FROM
+/// ARRAY_SLICE(...)` row. A slice row names each attr as its own column.
 fn parse_int_attr(row: &str) -> i64 {
-    let v: serde_json::Value =
-        serde_json::from_str(row).unwrap_or_else(|e| panic!("row is not JSON: {row}: {e}"));
-    let arr = match v {
-        // Bare attrs array — `[99]`.
-        serde_json::Value::Array(a) => a,
-        // Envelope with `attrs` field.
-        serde_json::Value::Object(map) => map
-            .get("attrs")
-            .and_then(|a| a.as_array())
-            .cloned()
-            .unwrap_or_else(|| panic!("envelope missing attrs array: {row}")),
-        _ => panic!("row is neither array nor object: {row}"),
-    };
-    arr.first()
-        .and_then(|n| n.as_i64())
-        .unwrap_or_else(|| panic!("cannot extract attrs[0] as i64 from: {row}"))
+    row.parse()
+        .unwrap_or_else(|e| panic!("attr `v` is not an int64: {row}: {e}"))
 }
 
 /// Wall-clock milliseconds since the Unix epoch.
@@ -251,7 +231,7 @@ async fn cluster_array_as_of_returns_consistent_version_across_shards() {
     // Live read (no AS OF) must return v2 = 99.
     let live_rows = query_col0(
         client,
-        "SELECT * FROM ARRAY_SLICE('bt2', '{x: [0, 0]}', ['v'], 10)",
+        "SELECT v FROM ARRAY_SLICE('bt2', '{x: [0, 0]}', ['v'], 10)",
     )
     .await;
     assert_eq!(
@@ -269,7 +249,7 @@ async fn cluster_array_as_of_returns_consistent_version_across_shards() {
     let as_of_rows = query_col0(
         client,
         &format!(
-            "SELECT * FROM ARRAY_SLICE('bt2', '{{x: [0, 0]}}', ['v'], 10) \
+            "SELECT v FROM ARRAY_SLICE('bt2', '{{x: [0, 0]}}', ['v'], 10) \
              AS OF SYSTEM TIME {cutoff_ms}"
         ),
     )
@@ -291,7 +271,7 @@ async fn cluster_array_as_of_returns_consistent_version_across_shards() {
     // before the earliest stamp.
     let before_rows = query_col0(
         client,
-        "SELECT * FROM ARRAY_SLICE('bt2', '{x: [0, 0]}', ['v'], 10) \
+        "SELECT v FROM ARRAY_SLICE('bt2', '{x: [0, 0]}', ['v'], 10) \
          AS OF SYSTEM TIME 1",
     )
     .await;

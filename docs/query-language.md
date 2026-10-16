@@ -1153,6 +1153,24 @@ COPY users FROM STDIN;
 COPY users FROM STDIN WITH (FORMAT csv);
 ```
 
+### Array bulk load
+
+```sql
+-- Columns: the dims in schema order, then the attrs in schema order.
+COPY scene FROM STDIN WITH (FORMAT csv);
+COPY scene FROM STDIN WITH (FORMAT csv, DELIMITER ';', HEADER);
+COPY scene FROM STDIN;                       -- text format, tab-delimited
+```
+
+- Each value parses by its column's declared type. No type is guessed.
+- With `HEADER`, the first line must name the dims, then the attrs, in schema order. A mismatch is `42703`.
+- A wrong column count or an unparsable value is `22P02`. A NULL in a NOT NULL attr is `23502`. A coordinate outside its dim domain is `22003`.
+- The load streams. Rows are checked as they arrive and load in chunks of about 4 MiB. Each chunk is written before the next rows are read, so the server holds a few chunks whatever the input size. A repeated coordinate keeps its last value.
+- Outside a transaction block each chunk commits on its own, as each row of a collection `COPY` does. A bad row or a refused chunk, such as `53200` under memory pressure, stops the load. The chunks before it stay committed. The error names the row and the committed row count: `COPY: CSV row 150000: ... (139810 rows committed)`. Those rows are in the array.
+- Inside `BEGIN` every chunk stages, and an error aborts the block, so the load commits or rolls back whole. A chunk that takes the staged redo past the 64 MiB WAL record cap is refused with `54000` before it stages. Load more than that outside a block.
+- A record must end within the array engine's memory headroom. A record with no line break past it is `54000`.
+- The native protocol loads the same way through the `ArrayPutBatch` opcode (`NodeDb::array_put_cells` in `nodedb-client`). The same rules apply to each request.
+
 ## Introspection
 
 ```sql

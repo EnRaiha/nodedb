@@ -185,7 +185,7 @@ impl CoreLoop {
             .store(array_id)
             .map_err(|e| format!("array '{}' not open: {e}", array_id.name))?;
         let (mut resolved_tiles, truncated_before_horizon) = store
-            .scan_tiles_at(cutoff, valid_at_ms)
+            .scan_shard_tiles_at(cutoff, valid_at_ms, shard_bucket)
             .map_err(|e| format!("array aggregate scan: {e}"))?;
         // Staged cells join the SAME tile set the base cells reduce through,
         // ahead of the shard bucket filter, so they fold into the same partial

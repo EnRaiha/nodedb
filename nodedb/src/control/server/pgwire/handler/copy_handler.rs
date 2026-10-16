@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! pgwire COPY-protocol bridge for backup/restore wire surface.
+//! pgwire COPY-protocol bridge for the backup/restore wire surface and for
+//! `COPY <array> FROM STDIN`, whose load lives in `array_copy`.
 //!
 //! - `intent_to_response()` runs in `SimpleQueryHandler::do_query`
 //!   when `backup::detect()` recognises a wire COPY shape. It either
 //!   returns a `Response::CopyOut` whose stream pulls bytes from
 //!   `backup_tenant`, or registers per-connection state and returns
 //!   `Response::CopyIn` so the client begins streaming bytes.
-//! - `CopyHandler::on_copy_data` accumulates client bytes (size-capped).
+//! - `CopyHandler::on_copy_data` streams an array COPY's bytes into its
+//!   load, or accumulates a restore's bytes (size-capped).
 //! - `CopyHandler::on_copy_done` validates the envelope and dispatches
 //!   `restore::restore_tenant`.
 
@@ -35,10 +37,11 @@ use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::backup_metering::{
     admit_backup_restore_quota, meter_backup_restore,
 };
-use crate::control::server::shared::session::{ConnectionId, SessionId};
+use crate::control::server::shared::session::{ConnectionId, SessionId, SessionStore};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
+use super::array_copy::{ArrayCopyConn, ArrayCopyState, feed_array_copy, finish_array_copy};
 use super::core::NodeDbPgHandler;
 
 /// Hard cap on accumulated COPY IN bytes for one restore. 16 GiB matches
@@ -182,6 +185,10 @@ impl NodeDbPgHandler {
 pub struct NodeDbCopyHandler {
     pub state: Arc<SharedState>,
     pub restore_state: Arc<backup::RestoreState>,
+    /// Open `COPY <array> FROM STDIN` loads, keyed by connection.
+    pub array_copy: Arc<ArrayCopyState>,
+    /// The session store, for the transaction an array load runs in.
+    pub sessions: Arc<SessionStore>,
     pub connection_id: ConnectionId,
 }
 
@@ -194,6 +201,16 @@ impl CopyHandler for NodeDbCopyHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let id = self.connection_id.get();
+        let array_conn = ArrayCopyConn {
+            state: &self.state,
+            sessions: &self.sessions,
+            session_id: SessionId::Connection(self.connection_id),
+            copies: &self.array_copy,
+            conn_id: id,
+        };
+        if feed_array_copy(&array_conn, &copy_data.data).await? {
+            return Ok(());
+        }
         match self.restore_state.append(id, &copy_data.data) {
             Ok(()) => Ok(()),
             Err(e @ AppendError::NotPending) => {
@@ -212,6 +229,9 @@ impl CopyHandler for NodeDbCopyHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.array_copy.take(self.connection_id.get()).is_some() {
+            return sqlstate(ss::QUERY_CANCELED.0, "COPY aborted by the client");
+        }
         cancel_restore(&self.restore_state, self.connection_id);
         sqlstate(ss::QUERY_CANCELED.0, "COPY restore aborted")
     }
@@ -223,6 +243,11 @@ impl CopyHandler for NodeDbCopyHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let id = self.connection_id.get();
+        if let Some(pending) = self.array_copy.take(id) {
+            let session_id = SessionId::Connection(self.connection_id);
+            let rows = finish_array_copy(&self.state, &self.sessions, session_id, pending).await?;
+            return complete_copy_in(client, Tag::new("COPY").with_rows(rows as usize)).await;
+        }
         let pending = self.restore_state.take(id).ok_or_else(|| {
             sqlstate(
                 ss::FEATURE_NOT_SUPPORTED,
@@ -265,22 +290,31 @@ impl CopyHandler for NodeDbCopyHandler {
         // back in `intent_to_response`, carried through `RestorePending`
         // since this per-connection `CopyHandler` has no identity of its own.
         meter_backup_restore(&self.state, &scope, pending.tenant_id, Some(rows as u64));
-        let tag = Tag::new("RESTORE TENANT").with_rows(rows);
-        client
-            .send(PgWireBackendMessage::CommandComplete(tag.into()))
-            .await
-            .map_err(|e| {
-                sqlstate(
-                    ss::INTERNAL_ERROR,
-                    &format!("CommandComplete send failed: {e:?}"),
-                )
-            })?;
-        // Leave the COPY-in-progress state so the next Sync from the
-        // client gets dispatched normally. pgwire's `process_message`
-        // only routes Sync via the `AwaitingSync` arm.
-        client.set_state(PgWireConnectionState::AwaitingSync);
-        Ok(())
+        complete_copy_in(client, Tag::new("RESTORE TENANT").with_rows(rows)).await
     }
+}
+
+/// Send the COPY's CommandComplete `tag` and leave the COPY-in state.
+async fn complete_copy_in<C>(client: &mut C, tag: Tag) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    client
+        .send(PgWireBackendMessage::CommandComplete(tag.into()))
+        .await
+        .map_err(|e| {
+            sqlstate(
+                ss::INTERNAL_ERROR,
+                &format!("CommandComplete send failed: {e:?}"),
+            )
+        })?;
+    // Leave the COPY-in-progress state so the next Sync from the
+    // client gets dispatched normally. pgwire's `process_message`
+    // only routes Sync via the `AwaitingSync` arm.
+    client.set_state(PgWireConnectionState::AwaitingSync);
+    Ok(())
 }
 
 fn cancel_restore(state: &backup::RestoreState, connection_id: ConnectionId) {
