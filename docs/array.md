@@ -50,13 +50,37 @@ CREATE ARRAY spatial_grid
 | Parameter         | Required | Default     | Description                                                                                                        |
 | ----------------- | -------- | ----------- | ------------------------------------------------------------------------------------------------------------------ |
 | `DIMS`            | Yes      | —           | List of dimensions. Each has a name, type (`INT64`, `FLOAT64`, `TIMESTAMP_MS`, `STRING`), and optional domain bounds `[lo..hi]`. |
-| `ATTRS`           | Yes      | —           | List of attributes (cell values). Each has a name, a type (`INT64`, `FLOAT64`, `STRING`, `BYTES`), and an optional `NOT NULL`. |
+| `ATTRS`           | Yes      | —           | List of attributes (cell values). Each has a name, a type (see [Attribute Types](#attribute-types)), and an optional `NOT NULL`. |
 | `TILE_EXTENTS`    | Yes      | —           | Tuple of tile extent per dimension. All > 0. Determines cell locality and compression block granularity.           |
 | `CELL_ORDER`      | No       | `HILBERT`   | Unquoted: `ROW_MAJOR`, `COL_MAJOR`, `HILBERT`, or `ZORDER` (`Z_ORDER` is accepted). Affects spatial cache locality. |
 | `TILE_ORDER`      | No       | `HILBERT`   | Unquoted: `ROW_MAJOR`, `COL_MAJOR`, `HILBERT`, or `ZORDER` (`Z_ORDER` is accepted). Affects tile layout.           |
 | `prefix_bits`     | No       | `8`         | Bits for key prefix compression (1–16). Lower = better compression, higher = faster prefix filtering.              |
 | `audit_retain_ms` | No       | `NULL`      | Milliseconds. Tiles older than now - `audit_retain_ms` (by system time) are eligible for purge. `NULL` = keep all. |
 | `minimum_audit_retain_ms` | No | —        | Minimum retention window enforced for compliance.                                                                  |
+
+### Attribute Types
+
+An attribute stores each cell at its declared width. A value outside the width is refused with SQLSTATE `22003` on `INSERT`, `COPY`, and the native bulk load. It is never wrapped or clamped.
+
+| Type      | Aliases                    | Range                              | Column type (OID)         |
+| --------- | -------------------------- | ---------------------------------- | ------------------------- |
+| `UINT8`   |                            | 0 to 255                           | `smallint` (21)           |
+| `INT16`   | `SMALLINT`, `INT2`         | -32768 to 32767                    | `smallint` (21)           |
+| `UINT16`  |                            | 0 to 65535                         | `integer` (23)            |
+| `INT32`   | `INTEGER`, `INT`, `INT4`   | -2147483648 to 2147483647          | `integer` (23)            |
+| `UINT32`  |                            | 0 to 4294967295                    | `bigint` (20)             |
+| `INT64`   | `BIGINT`                   | 64-bit signed                      | `bigint` (20)             |
+| `FLOAT32` | `REAL`, `FLOAT4`           | 32-bit IEEE float                  | `real` (700)              |
+| `FLOAT64` | `DOUBLE`, `FLOAT`          | 64-bit IEEE float                  | `double precision` (701)  |
+| `STRING`  | `TEXT`, `VARCHAR`          | UTF-8 text                         | `text` (25)               |
+| `BYTES`   | `BLOB`, `BYTEA`            | raw bytes                          | `bytea` (17)              |
+
+- An unsigned type reads as the next wider signed column type, so every stored value fits.
+- `INT` is the 4-byte `INT32`, as in PostgreSQL. A bare `FLOAT` is the 8-byte `FLOAT64`.
+- A float written to a `FLOAT32` attribute rounds to the nearest `f32`. Only a finite value past the `f32` range is refused. `0.1` stored as `FLOAT32` reads back as `0.1`.
+- An integer literal is accepted by every integer and float type. A float literal is accepted by `FLOAT32` and `FLOAT64` only.
+- An integer column compresses by its value range, so a `UINT16` column takes the same bytes on disk as an `INT64` column of the same values. A `FLOAT32` column stores at most 4 bytes per value, half the raw width of `FLOAT64`.
+- A `NULL` stays `NULL` through a flush and a compaction, in every type.
 
 ## Examples
 
@@ -149,7 +173,11 @@ SELECT * FROM ARRAY_SLICE(
 
 | Declared type | Column type        |
 | ------------- | ------------------ |
+| `UINT8`, `INT16` (attribute only) | `smallint` |
+| `UINT16`, `INT32` (attribute only) | `integer` |
+| `UINT32` (attribute only) | `bigint` |
 | `INT64`       | `bigint`           |
+| `FLOAT32` (attribute only) | `real` |
 | `FLOAT64`     | `double precision` |
 | `TIMESTAMP_MS` (dimension) | `timestamp` |
 | `STRING`      | `text`             |
@@ -212,6 +240,17 @@ SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'SUM', 'x');
 
 The result has a `result` column. A grouped call also has a `group` column that holds the dimension value. Reducers are case-insensitive: `'SUM'`, `'COUNT'`, `'MIN'`, `'MAX'`, and `'MEAN'` (or `'AVG'`).
 
+The `result` type follows the reducer and the attribute type:
+
+| Reducer       | Integer attribute                      | Float attribute    |
+| ------------- | -------------------------------------- | ------------------ |
+| `COUNT`       | `bigint`                               | `bigint`           |
+| `SUM`         | `bigint`, exact                        | `double precision` |
+| `MIN` / `MAX` | the attribute's own column type, exact | the attribute's own column type |
+| `MEAN`        | `double precision`                     | `double precision` |
+
+An integer `SUM` adds exactly, so `2^53 + 1` stays `9007199254740993`. A `SUM` past the `bigint` range is refused with SQLSTATE `22003`. `MIN` and `MAX` sort `NaN` above every other float, as PostgreSQL does.
+
 Three more optional arguments bound the cells the reducer reads:
 
 - **5th, box**: a slice predicate in the `ARRAY_SLICE` form, such as `'{lon: [101, 103], lat: [2, 4]}'`. Bounds are inclusive.
@@ -247,6 +286,8 @@ SELECT * FROM ARRAY_ELEMENTWISE(
 ```
 
 The result has `coords` and `attrs` columns, both JSON. `attrs` holds one value: the operation applied to the named attribute. A coordinate present in one array only takes that array's value.
+
+On integer attributes, `add`, `sub`, and `mul` are exact 64-bit integers, and a result past the `bigint` range is refused with SQLSTATE `22003`. `div`, and every operation on a float attribute, yields a 64-bit float. Division by zero yields `NULL`.
 
 `AS OF SYSTEM TIME` and `AS OF VALID TIME` apply to both arrays. A temporal query appends one `{"truncated_before_horizon": bool}` row, as `ARRAY_AGG` does. `AS OF SYSTEM TIME NULL` is refused.
 

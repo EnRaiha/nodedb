@@ -1030,7 +1030,30 @@ SELECT * FROM ARRAY_ELEMENTWISE(
 -- Flush and compact
 SELECT ARRAY_FLUSH('spatial_grid');
 SELECT ARRAY_COMPACT('spatial_grid');
+
+-- Narrow attribute types store each cell at its declared width
+CREATE ARRAY scene
+  DIMS (y INT64 [0..10979], x INT64 [0..10979])
+  ATTRS (b04 UINT16, b08 UINT16, scl UINT8, ndvi FLOAT32)
+  TILE_EXTENTS (512, 512);
 ```
+
+Attribute types and the column type each reads as:
+
+| Attribute type | Aliases                  | Column type (OID)        |
+| -------------- | ------------------------ | ------------------------ |
+| `UINT8`        |                          | `smallint` (21)          |
+| `INT16`        | `SMALLINT`, `INT2`       | `smallint` (21)          |
+| `UINT16`       |                          | `integer` (23)           |
+| `INT32`        | `INTEGER`, `INT`, `INT4` | `integer` (23)           |
+| `UINT32`       |                          | `bigint` (20)            |
+| `INT64`        | `BIGINT`                 | `bigint` (20)            |
+| `FLOAT32`      | `REAL`, `FLOAT4`         | `real` (700)             |
+| `FLOAT64`      | `DOUBLE`, `FLOAT`        | `double precision` (701) |
+| `STRING`       | `TEXT`, `VARCHAR`        | `text` (25)              |
+| `BYTES`        | `BLOB`, `BYTEA`          | `bytea` (17)             |
+
+A value outside an attribute's width is `22003`. `ARRAY_AGG` `SUM` over an integer attribute is an exact `bigint`, and `22003` past its range. See [Array](array.md#attribute-types).
 
 ## Temporal Queries (Bitemporal)
 
@@ -1180,7 +1203,7 @@ COPY scene FROM STDIN;                       -- text format, tab-delimited
 - `FORMAT` is `csv` or `text`. The default is `text`, tab-delimited. `HEADER` is off unless given. A bare `HEADER` turns it on. The file form `COPY <array> FROM '<path>'` takes CSV only, and its `HEADER` defaults to `true`.
 - Each value parses by its column's declared type. No type is guessed.
 - With `HEADER`, the first line must name the dims, then the attrs, in schema order. A mismatch is `42703`.
-- A wrong column count or an unparsable value is `22P02`. A NULL in a NOT NULL attr is `23502`. A coordinate outside its dim domain is `22003`.
+- A wrong column count or an unparsable value is `22P02`. A NULL in a NOT NULL attr is `23502`. A coordinate outside its dim domain is `22003`. A value outside its attr's width, such as `256` in a `UINT8` attr, is `22003`.
 - The load streams. Rows are checked as they arrive and load in chunks of about 4 MiB. Each chunk is written before the next rows are read, so the server holds a few chunks whatever the input size. A repeated coordinate keeps its last value.
 - Outside a transaction block each chunk commits on its own, as each row of a collection `COPY` does. A bad row or a refused chunk, such as `53200` under memory pressure, stops the load. The chunks before it stay committed. The error names the row and the committed row count: `COPY: CSV row 150000: ... (139810 rows committed)`. Those rows are in the array.
 - Inside `BEGIN` every chunk stages, and an error aborts the block, so the load commits or rolls back whole. A chunk that takes the staged redo past the 64 MiB WAL record cap is refused with `54000` before it stages. Load more than that outside a block.
