@@ -19,7 +19,7 @@ Spatial is a **columnar profile**. Collections with a `SPATIAL_INDEX` column mod
 - **H3 hexagonal index** — Uber's H3 via h3o for uniform-area spatial binning
 - **OGC predicates** — `ST_Contains`, `ST_Intersects`, `ST_Within`, `ST_Disjoint`, `ST_DWithin`, `ST_IsValid`
 - **Geometry constructors** — `ST_Point`, `ST_MakePoint`, `ST_GeomFromText` (WKT), `ST_GeomFromWKB`, `ST_GeomFromGeoJSON`, `ST_MakeLine`, `ST_MakePolygon`, `ST_MakeEnvelope`
-- **Accessors and measures** — `ST_AsText`, `ST_AsGeoJSON`, `ST_X`, `ST_Y`, `ST_GeometryType`, `ST_NPoints`, `ST_SRID`, `ST_Distance`, `ST_Length`, `ST_Perimeter`, `ST_Area`
+- **Accessors and measures** — `ST_AsText`, `ST_AsGeoJSON`, `ST_X`, `ST_Y`, `ST_GeometryType`, `ST_NPoints`, `ST_SRID`, `ST_SetSRID`, `ST_Transform`, `ST_Distance`, `ST_Length`, `ST_Perimeter`, `ST_Area`
 - **Geometry operations** — `ST_Buffer`, `ST_Envelope`, `ST_Centroid`, `ST_Union`, `ST_Intersection`
 - **Format support** — WKB, WKT, GeoJSON interchange. GeoParquet v1.1.0 + GeoArrow metadata.
 - **Hybrid spatial-vector** — Spatial R\*-tree narrows candidates by location, then HNSW ranks by semantic similarity in one query
@@ -117,12 +117,48 @@ A string literal in geometry position is read as either WKT or GeoJSON, so
 | `ST_X(geom)` / `ST_Y(geom)` | Ordinate of a Point; NULL for any other geometry |
 | `ST_GeometryType(geom)` | Type name, e.g. `Point` |
 | `ST_NPoints(geom)` | Total vertex count |
-| `ST_SRID(geom)` | Always `4326` — geometry is stored as GeoJSON, which RFC 7946 defines as WGS 84 |
+| `ST_SRID(geom)` | SRID of the geometry; `4326` unless the geometry carries another SRID. See [Spatial reference systems](#spatial-reference-systems) |
 | `ST_IsValid(geom)` | Whether the geometry is well-formed |
+
+### Spatial reference systems
+
+Every geometry carries an SRID. The default is `4326` (WGS 84, longitude and latitude in degrees). GeoJSON reads and writes a `crs` member for any SRID other than `4326`.
+
+| SRID | System | Unit |
+| --- | --- | --- |
+| `4326` | WGS 84 geographic | degrees |
+| `32647` | UTM zone 47N on WGS 84 | metres |
+| `32648` | UTM zone 48N on WGS 84 | metres |
+| `3375` | GDM2000 Peninsula RSO | metres |
+| `3376` | GDM2000 East Malaysia (Borneo) RSO | metres |
+
+The set is closed. Any other SRID is refused.
+
+| Function | Result |
+| --- | --- |
+| `ST_SRID(geom)` | SRID of the geometry |
+| `ST_SetSRID(geom, srid)` | Geometry relabeled with `srid`. Coordinates stay as they are. |
+| `ST_Transform(geom, srid)` | Geometry with every coordinate reprojected into `srid` |
+
+`ST_GeomFromText` and `ST_GeomFromWKB` take an optional `srid` argument. `ST_SetSRID` and `ST_Transform` return NULL when `srid` is NULL.
+
+```sql
+SELECT ST_Transform(ST_Point(101.7117, 3.1579), 32647);
+```
+
+Geometry functions read the SRID of each operand. They never transform implicitly. These cases raise a data exception with SQLSTATE `22000`:
+
+- Two operands in different SRIDs. The error reads `operands have different SRIDs <left> and <right>; use ST_Transform`.
+- An SRID outside the supported set. The error lists the supported codes.
+- A coordinate outside the region the target projection is defined on.
+
+Call `ST_Transform` on one operand to bring both into the same SRID.
+
+A spatial index fixes its SRID at its first entry. It refuses geometries in any other SRID.
 
 ### Measures
 
-Every measure is geodesic: lengths in meters, areas in square meters.
+Every measure is in meters, and square meters for area. A WGS 84 (`4326`) geometry is measured geodesically. A geometry in a projected SRID is measured in planar grid meters. `ST_Distance` needs both operands in the same SRID.
 
 | Function | Result |
 | --- | --- |
@@ -138,7 +174,7 @@ Every measure is geodesic: lengths in meters, areas in square meters.
 | `ST_Contains(a, b)` | Whether `a` contains `b` |
 | `ST_Within(a, b)` | Whether `a` lies within `b` — the converse of `ST_Contains` |
 | `ST_Intersects(a, b)` / `ST_Disjoint(a, b)` | Whether the two geometries share any point |
-| `ST_DWithin(a, b, meters)` | Whether the two geometries lie within a geodesic distance |
+| `ST_DWithin(a, b, meters)` | Whether the two geometries lie within a distance: geodesic for `4326`, planar for a projected SRID |
 | `ST_Buffer(geom, meters [, segments])` | Geometry grown by a distance |
 | `ST_Envelope(geom)` | Bounding rectangle |
 | `ST_Centroid(geom)` | Centroid, weighted by the highest dimension present |
