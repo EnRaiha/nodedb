@@ -122,6 +122,7 @@ impl RetryableSchemaChange for Error {
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }
+            | Error::MixedSrid { .. }
             | Error::NumericValueOutOfRange { .. }
             | Error::InvalidTextRepresentation { .. }
             | Error::DatatypeMismatch { .. }

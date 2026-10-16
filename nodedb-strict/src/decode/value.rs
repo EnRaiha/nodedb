@@ -87,13 +87,12 @@ pub(super) fn decode_variable_value(col_type: &ColumnType, raw: &[u8]) -> Value 
             Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string())
         }
         ColumnType::Bytes => Value::Bytes(raw.to_vec()),
-        ColumnType::Geometry => {
-            if let Ok(geometry) = sonic_rs::from_slice::<nodedb_types::geometry::Geometry>(raw) {
-                Value::Geometry(geometry)
-            } else {
-                Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string())
-            }
-        }
+        // GeoJSON with an optional `crs` member, which carries the SRID.
+        // Any other text (WKT) stays a string.
+        ColumnType::Geometry => match nodedb_types::geometry::parse_geojson_slice(raw) {
+            Ok(geometry) => Value::Geometry(geometry),
+            Err(_) => Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string()),
+        },
         ColumnType::Json => match nodedb_types::value_from_msgpack(raw) {
             Ok(value) => value,
             Err(error) => {
@@ -127,6 +126,22 @@ fn decode_typed_msgpack(raw: &[u8], accepts: impl FnOnce(&Value) -> bool) -> Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_geometry_decodes_with_its_srid() {
+        use nodedb_types::geometry::{Geometry, Srid, SridGeometry};
+        let g = SridGeometry::new(Srid::Utm48N, Geometry::point(134_445.5, 349_624.7));
+        let raw = sonic_rs::to_vec(&g).unwrap();
+        assert_eq!(
+            decode_variable_value(&ColumnType::Geometry, &raw),
+            Value::Geometry(g)
+        );
+        let plain = sonic_rs::to_vec(&SridGeometry::wgs84(Geometry::point(1.0, 2.0))).unwrap();
+        assert!(
+            !String::from_utf8(plain).unwrap().contains("crs"),
+            "4326 writes no crs member"
+        );
+    }
 
     #[test]
     fn vector_dimension_larger_than_raw_bytes_returns_null_without_reserving() {

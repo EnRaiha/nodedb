@@ -15,7 +15,10 @@ impl From<nodedb_query::EvalError> for ErrorCode {
             nodedb_query::EvalError::UnknownFunction { name } => Self::UndefinedFunction { name },
             e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
             | nodedb_query::EvalError::ArgumentType { .. }
-            | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
+            | nodedb_query::EvalError::InvalidJsonPath { .. }
+            | nodedb_query::EvalError::UnsupportedSrid { .. }
+            | nodedb_query::EvalError::MixedSrid { .. }
+            | nodedb_query::EvalError::ProjectionDomain { .. }) => Self::DataException {
                 detail: e.to_string(),
             },
             e @ nodedb_query::EvalError::NumericOverflow { .. } => Self::NumericValueOutOfRange {
@@ -160,7 +163,8 @@ impl From<crate::Error> for ErrorCode {
             // Class `22`, the class the Control Plane gives both.
             e @ (crate::Error::OffsetRegression { .. }
             | crate::Error::BackupTenantMismatch { .. }
-            | crate::Error::InvalidLimitValue { .. }) => Self::DataException {
+            | crate::Error::InvalidLimitValue { .. }
+            | crate::Error::MixedSrid { .. }) => Self::DataException {
                 detail: e.to_string(),
             },
             // `22003`, as the Control Plane gives it.

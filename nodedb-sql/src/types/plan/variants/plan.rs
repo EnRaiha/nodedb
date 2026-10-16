@@ -296,7 +296,9 @@ pub enum SqlPlan {
         collection: String,
         field: String,
         predicate: SpatialPredicate,
-        query_geometry: nodedb_types::geometry::Geometry,
+        /// The query geometry and its SRID. A scan whose index is in another
+        /// SRID is refused, never transformed implicitly.
+        query_geometry: nodedb_types::geometry::SridGeometry,
         distance_meters: f64,
         attribute_filters: Vec<Filter>,
         limit: usize,

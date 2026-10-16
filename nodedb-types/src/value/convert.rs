@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::datetime::{NdbDateTime, NdbDuration};
-use crate::geometry::Geometry;
+use crate::geometry::{Geometry, SridGeometry};
 use crate::value::core::Value;
 
 impl From<&str> for Value {
@@ -92,8 +92,15 @@ impl From<rust_decimal::Decimal> for Value {
     }
 }
 
+/// An untagged shape is WGS 84, the SRID of untagged GeoJSON.
 impl From<Geometry> for Value {
     fn from(g: Geometry) -> Self {
+        Value::Geometry(SridGeometry::wgs84(g))
+    }
+}
+
+impl From<SridGeometry> for Value {
+    fn from(g: SridGeometry) -> Self {
         Value::Geometry(g)
     }
 }

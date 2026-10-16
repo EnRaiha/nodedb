@@ -99,6 +99,15 @@ impl CoreLoop {
         // names the R-tree entries the old row owns.
         let old_pks = rows.iter().map(|r| &r.0);
         let pre_images = self.read_geometry_pre_images(key, has_geometry, old_pks)?;
+        // Every post-image geometry's SRID is checked before the first row
+        // changes, so a mixed-SRID statement changes nothing.
+        if has_geometry {
+            let post_images: Vec<Value> = rows
+                .iter()
+                .map(|(_, new_row)| row_values_to_object(schema, new_row))
+                .collect();
+            self.check_columnar_geometry_srids(task, schema, collection, &post_images)?;
+        }
 
         for ((old_pk, new_row), pre_image) in rows.iter().zip(pre_images) {
             let old_pk_bytes = encode_pk(old_pk);
@@ -167,12 +176,27 @@ impl CoreLoop {
                         key.0, key.1, collection, schema, row,
                     ));
                 }
-                let delta = self.index_columnar_geometry_columns(
+                let delta = match self.index_columnar_geometry_columns(
                     task,
                     schema,
                     collection,
                     &[row_values_to_object(schema, new_row)],
-                );
+                ) {
+                    Ok(delta) => delta,
+                    Err(error) => {
+                        let mut undo = Vec::new();
+                        push_removed_spatial_undo(&mut undo, spatial_removed);
+                        Self::push_geometry_index_undo(&mut undo, geometry_delta);
+                        undo.push(UndoEntry::ColumnarUpdate {
+                            collection_key: key.clone(),
+                            row_count_before,
+                            inserted_pks: outcome.inserted_pks,
+                            displaced: outcome.displaced,
+                            restored: outcome.restored,
+                        });
+                        return Err(self.reverse_columnar_statement(key, undo, error));
+                    }
+                };
                 geometry_delta.removed.extend(delta.removed);
                 geometry_delta.inserted.extend(delta.inserted);
             }

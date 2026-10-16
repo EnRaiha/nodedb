@@ -11,15 +11,19 @@
 use nodedb_types::geometry::{Geometry, point_in_polygon};
 use nodedb_types::geometry_bbox;
 
-use super::edge::{point_on_ring_boundary, ring_edges, segments_intersect};
+use super::edge::{is_collection, point_on_ring_boundary, ring_edges, segments_intersect};
 
 /// ST_Intersects(a, b) — do geometries A and B share any space?
 pub fn st_intersects(a: &Geometry, b: &Geometry) -> bool {
-    // Bbox pre-filter.
-    let a_bb = geometry_bbox(a);
-    let b_bb = geometry_bbox(b);
-    if !a_bb.intersects(&b_bb) {
-        return false;
+    // Bbox pre-filter. A GeometryCollection skips it: its bbox is a union
+    // whose wrap rule depends on the SRID, and the recursion below filters
+    // each member on its own.
+    if !is_collection(a) && !is_collection(b) {
+        let a_bb = geometry_bbox(a);
+        let b_bb = geometry_bbox(b);
+        if !a_bb.intersects(&b_bb) {
+            return false;
+        }
     }
 
     match (a, b) {

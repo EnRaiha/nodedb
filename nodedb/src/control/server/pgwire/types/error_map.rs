@@ -125,6 +125,7 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::DataException { detail } => {
             ("ERROR", sqlstate::DATA_EXCEPTION, detail.clone())
         }
+        crate::Error::MixedSrid { .. } => ("ERROR", sqlstate::DATA_EXCEPTION, err.to_string()),
         crate::Error::NumericValueOutOfRange { detail } => (
             "ERROR",
             sqlstate::NUMERIC_VALUE_OUT_OF_RANGE,

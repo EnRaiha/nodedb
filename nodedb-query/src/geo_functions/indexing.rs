@@ -5,8 +5,9 @@
 use std::collections::HashMap;
 
 use nodedb_types::Value;
+use nodedb_types::geometry::SridGeometry;
 
-use super::helpers::{num_arg, str_arg};
+use super::helpers::{GeoEval, num_arg, str_arg};
 
 /// Geohash precision used when the caller does not specify one — ~1.2 km
 /// cells, the conventional default for point-of-interest bucketing.
@@ -15,7 +16,13 @@ const DEFAULT_GEOHASH_PRECISION: u8 = 6;
 /// H3 resolution used when the caller does not specify one — ~5 km hexes.
 const DEFAULT_H3_RESOLUTION: u8 = 7;
 
-pub(super) fn eval(canonical: &str, args: &[Value]) -> Option<Value> {
+/// Geohash and H3 functions never fail the statement: an unreadable input
+/// yields NULL.
+pub(super) fn eval(canonical: &'static str, args: &[Value]) -> GeoEval {
+    eval_infallible(canonical, args).map(Ok)
+}
+
+fn eval_infallible(canonical: &str, args: &[Value]) -> Option<Value> {
     let result = match canonical {
         "st_geohash" | "geo_h3" => {
             let (Some(lng), Some(lat)) = (num_arg(args, 0), num_arg(args, 1)) else {
@@ -83,7 +90,7 @@ pub(super) fn eval(canonical: &str, args: &[Value]) -> Option<Value> {
         },
         "geo_h3_to_boundary" => match h3_index(args) {
             Some(index) => match nodedb_spatial::h3::h3_to_boundary(index) {
-                Some(geom) => Value::Geometry(geom),
+                Some(geom) => Value::Geometry(SridGeometry::wgs84(geom)),
                 None => Value::Null,
             },
             None => Value::Null,
@@ -127,6 +134,10 @@ fn precision_arg(args: &[Value], idx: usize, default: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn eval(canonical: &str, args: &[Value]) -> Option<Value> {
+        eval_infallible(canonical, args)
+    }
 
     #[test]
     fn geohash_encodes_and_decodes() {

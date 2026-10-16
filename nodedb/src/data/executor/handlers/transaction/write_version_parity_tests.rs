@@ -12,7 +12,7 @@ use nodedb_physical::physical_plan::{
     CrdtWriteVerb, DocumentOp, GraphOp, KvOp, MetaOp, PhysicalPlan, RedoOrigin, SpatialOp, TextOp,
     TimeseriesOp, VectorOp,
 };
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::{Geometry, SridGeometry};
 use nodedb_types::{DatabaseId, QualifiedCollection, RlsWriteCheck, Surrogate, Value};
 
 use crate::bridge::envelope::{Response, Status};
@@ -266,9 +266,9 @@ fn a_spatial_slice_records_its_collection_floor() {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
         field: "geom".to_string(),
         surrogate: Surrogate::new(81),
-        geometry: Geometry::Point {
+        geometry: SridGeometry::wgs84(Geometry::Point {
             coordinates: [1.0, 2.0],
-        },
+        }),
         provenance: None,
     });
     staged_slice_parity(&[plan]);

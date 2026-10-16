@@ -16,7 +16,7 @@ use nodedb_array::types::domain::{Domain, DomainBound};
 use nodedb_physical::physical_plan::{
     ArrayOp, CrdtOp, CrdtWriteVerb, DocumentOp, KvOp, PhysicalPlan, SpatialOp, VectorOp,
 };
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::{Geometry, SridGeometry};
 use nodedb_types::{DatabaseId, QualifiedCollection, RlsWriteCheck, Surrogate, TenantId, Value};
 
 use crate::bridge::envelope::{ErrorCode, Response, Status};
@@ -230,9 +230,9 @@ fn spatial_insert() -> PhysicalPlan {
         collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
         field: "geom".to_string(),
         surrogate: Surrogate::new(81),
-        geometry: Geometry::Point {
+        geometry: SridGeometry::wgs84(Geometry::Point {
             coordinates: [1.0, 2.0],
-        },
+        }),
         provenance: None,
     })
 }

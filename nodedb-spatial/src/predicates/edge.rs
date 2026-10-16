@@ -16,6 +16,14 @@ pub enum Orientation {
     CounterClockwise,
 }
 
+/// Whether `geom` is a GeometryCollection.
+pub fn is_collection(geom: &nodedb_types::geometry::Geometry) -> bool {
+    matches!(
+        geom,
+        nodedb_types::geometry::Geometry::GeometryCollection { .. }
+    )
+}
+
 /// Compute orientation of ordered triplet (p, q, r).
 pub fn orientation(p: [f64; 2], q: [f64; 2], r: [f64; 2]) -> Orientation {
     let val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1]);

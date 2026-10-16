@@ -125,6 +125,7 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::UnknownStrictField { .. }
         | crate::Error::DivisionByZero
         | crate::Error::DataException { .. }
+        | crate::Error::MixedSrid { .. }
         | crate::Error::NumericValueOutOfRange { .. }
         | crate::Error::InvalidLimitValue { .. }
         | crate::Error::RetryableLeaderChange { .. }

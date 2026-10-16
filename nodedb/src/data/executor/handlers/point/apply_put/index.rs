@@ -11,8 +11,8 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::columnar_write::RemovedSpatialEntry;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
-use crate::data::executor::spatial_key::SpatialIndexKey;
 use crate::engine::document::store::StorageKey;
 
 /// Entry id of one row in a spatial R-tree: `fnv1a_hash` of the row's identity text.
@@ -55,6 +55,11 @@ impl CoreLoop {
     /// of the document it removes, then a `SpatialInsert` for each entry it
     /// inserts. Rollback runs the log in reverse, so it removes the new
     /// entries before it puts the prior ones back.
+    ///
+    /// Every geometry's SRID is checked against its field's R-tree before
+    /// anything changes. A geometry in an SRID other than a non-empty
+    /// index's fails the put with `Error::MixedSrid` and leaves every index
+    /// untouched; the caller's abort path then drops the row write.
     pub(in crate::data::executor) fn apply_point_put_spatial(
         &mut self,
         database_id: u64,
@@ -63,7 +68,7 @@ impl CoreLoop {
         storage_key: StorageKey,
         value: &[u8],
         undo: &mut Vec<UndoEntry>,
-    ) {
+    ) -> crate::Result<()> {
         // Rendered once here; every reverse-map / hash use below shares it.
         let document_id = storage_key.to_string();
         let document_id = document_id.as_str();
@@ -92,7 +97,7 @@ impl CoreLoop {
             for (field_name, field_value) in obj {
                 let parsed_geom = match field_value {
                     serde_json::Value::String(s) => nodedb_types::geometry::from_geojson_str(s),
-                    _ => serde_json::from_value::<nodedb_types::geometry::Geometry>(
+                    _ => serde_json::from_value::<nodedb_types::geometry::SridGeometry>(
                         field_value.clone(),
                     )
                     .ok(),
@@ -100,6 +105,23 @@ impl CoreLoop {
                 if let Some(geom) = parsed_geom {
                     geometries.push((field_name.clone(), geom));
                 }
+            }
+        }
+
+        let db_id = nodedb_types::DatabaseId::new(database_id);
+        let tid_id = crate::types::TenantId::new(tid);
+        // Check every SRID before any mutation: a refused put changes no index.
+        for (field_name, geom) in &geometries {
+            let spatial_key = (db_id, tid_id, collection.to_string(), field_name.clone());
+            if let Some(rtree) = self.spatial_indexes.get(&spatial_key)
+                && !rtree.accepts_srid(geom.srid)
+            {
+                return Err(crate::Error::MixedSrid {
+                    collection: collection.to_string(),
+                    field: field_name.clone(),
+                    index_srid: rtree.srid().code(),
+                    row_srid: geom.srid.code(),
+                });
             }
         }
 
@@ -116,11 +138,9 @@ impl CoreLoop {
             spatial_entry_id,
             undo,
         );
-        let db_id = nodedb_types::DatabaseId::new(database_id);
-        let tid_id = crate::types::TenantId::new(tid);
         let entry_id = spatial_entry_id.as_u64();
         for (field_name, geom) in geometries {
-            let bbox = nodedb_types::bbox::geometry_bbox(&geom);
+            let bbox = geom.bbox();
             let spatial_key = (db_id, tid_id, collection.to_string(), field_name.clone());
             let memory = nodedb_mem::ScopedMemory::new(
                 self.governor.clone(),
@@ -131,7 +151,17 @@ impl CoreLoop {
             let rtree = self
                 .spatial_indexes
                 .entry(spatial_key.clone())
-                .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
+                .or_insert_with(|| crate::engine::spatial::RTree::new(memory, geom.srid));
+            // The pre-check above admitted this SRID. The prior-entry removal
+            // can only empty the tree, so binding cannot refuse here.
+            rtree
+                .bind_srid(geom.srid)
+                .map_err(|m| crate::Error::MixedSrid {
+                    collection: collection.to_string(),
+                    field: field_name.clone(),
+                    index_srid: m.index.code(),
+                    row_srid: m.entry.code(),
+                })?;
             rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
             // Maintain reverse map: entry_id → document_id.
             self.spatial_doc_map.insert(
@@ -143,6 +173,7 @@ impl CoreLoop {
                 entry_id,
             });
         }
+        Ok(())
     }
 
     /// [`Self::remove_document_spatial_indexes`], pushing a `SpatialDelete`
@@ -156,12 +187,13 @@ impl CoreLoop {
         undo: &mut Vec<UndoEntry>,
     ) {
         let removed = self.remove_document_spatial_indexes(database_id, tid, collection, entry_id);
-        for (key, entry_id, bbox, document_id) in removed {
+        for (key, entry_id, bbox, document_id, srid) in removed {
             undo.push(UndoEntry::SpatialDelete {
                 key,
                 entry_id,
                 bbox,
                 document_id,
+                srid,
             });
         }
     }
@@ -178,15 +210,15 @@ impl CoreLoop {
     /// removed geometry) so a transactional caller can push
     /// `UndoEntry::SpatialDelete` re-insert reversals — the reverse
     /// `spatial_doc_map` stores only the doc id. Returns the removed
-    /// `(spatial_index_key, entry_id, bbox, document_id)` tuples; empty when the
-    /// document had no spatial fields.
+    /// `(spatial_index_key, entry_id, bbox, document_id, srid)` tuples, `srid`
+    /// being the tree's; empty when the document had no spatial fields.
     pub(in crate::data::executor) fn remove_document_spatial_indexes(
         &mut self,
         database_id: u64,
         tid: u64,
         collection: &str,
         entry_id: SpatialEntryId,
-    ) -> Vec<(SpatialIndexKey, u64, nodedb_types::BoundingBox, String)> {
+    ) -> Vec<RemovedSpatialEntry> {
         let mut spatial_deletes = Vec::new();
         let entry_id = entry_id.as_u64();
         let db_id = nodedb_types::DatabaseId::new(database_id);
@@ -202,11 +234,13 @@ impl CoreLoop {
             // Read the bbox BEFORE deleting — the R-tree `delete` does not
             // return the removed geometry, so a reversible undo must capture
             // it here (the reverse `spatial_doc_map` stores only the doc id).
-            let bbox = self
-                .spatial_indexes
-                .get(&skey)
-                .and_then(|rtree| rtree.entries().into_iter().find(|e| e.id == entry_id))
-                .map(|e| e.bbox);
+            let found = self.spatial_indexes.get(&skey).and_then(|rtree| {
+                rtree
+                    .entries()
+                    .into_iter()
+                    .find(|e| e.id == entry_id)
+                    .map(|e| (e.bbox, rtree.srid()))
+            });
             if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
                 rtree.delete(entry_id);
             }
@@ -217,8 +251,8 @@ impl CoreLoop {
                 field,
                 entry_id,
             ));
-            if let (Some(bbox), Some(doc)) = (bbox, removed_doc) {
-                spatial_deletes.push((skey, entry_id, bbox, doc));
+            if let (Some((bbox, srid)), Some(doc)) = (found, removed_doc) {
+                spatial_deletes.push((skey, entry_id, bbox, doc, srid));
             }
         }
         spatial_deletes
@@ -421,6 +455,78 @@ mod tests {
             .scan_collection(DatabaseId::DEFAULT.as_u64(), 1, coll, usize::MAX)
             .unwrap();
         assert_eq!(scanned.len(), 4, "every document must be scanned");
+    }
+
+    /// The index SRID is fixed by its first entry. A later row in another
+    /// SRID is refused before anything changes: the R-tree keeps its single
+    /// entry and no row is stored, for a new row and for an overwrite alike.
+    #[test]
+    fn a_row_in_another_srid_is_refused_and_changes_nothing() {
+        use crate::engine::document::store::StorageKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let coll = "geo_srid";
+        let put = |core: &mut crate::data::executor::core_loop::CoreLoop,
+                   id: &str,
+                   surrogate: u32,
+                   doc: &[u8]| {
+            let task = point_put_task(coll, id, doc);
+            core.execute_point_put(
+                &task,
+                PointPutExec {
+                    tid: 1,
+                    collection: coll,
+                    document_id: id,
+                    surrogate: Surrogate::new(surrogate),
+                    value: doc,
+                    returning: None,
+                    rls_filters: &[],
+                    resolved_sum_targets: &[],
+                },
+            )
+        };
+
+        let wgs84 = br#"{"loc":{"type":"Point","coordinates":[101.7,3.1]}}"#;
+        assert_eq!(put(&mut core, "a", 1, wgs84).status, Status::Ok);
+
+        let utm = br#"{"loc":{"type":"Point","coordinates":[134445.5,349624.7],"crs":{"type":"name","properties":{"name":"EPSG:32648"}}}}"#;
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            coll.to_string(),
+            "loc".to_string(),
+        );
+        let before = core.spatial_indexes.get(&key).unwrap().entries()[0].bbox;
+
+        // A new row in another SRID.
+        assert_eq!(put(&mut core, "b", 2, utm).status, Status::Error);
+        // An overwrite of the first row into another SRID.
+        assert_eq!(put(&mut core, "a", 1, utm).status, Status::Error);
+
+        let rtree = core.spatial_indexes.get(&key).unwrap();
+        assert_eq!(rtree.srid(), nodedb_types::geometry::Srid::Wgs84);
+        let entries = rtree.entries();
+        assert_eq!(entries.len(), 1, "the refused puts added no entry");
+        assert_eq!(entries[0].bbox, before, "the first entry is unchanged");
+
+        let db = DatabaseId::DEFAULT.as_u64();
+        let stored_b = core
+            .sparse
+            .get(db, 1, coll, &StorageKey::for_surrogate(Surrogate::new(2)))
+            .unwrap();
+        assert!(stored_b.is_none(), "the refused new row was not stored");
+        let stored_a = core
+            .sparse
+            .get(db, 1, coll, &StorageKey::for_surrogate(Surrogate::new(1)))
+            .unwrap()
+            .expect("the first row stays stored");
+        let doc = crate::data::executor::doc_format::decode_document_value(&stored_a).unwrap();
+        let geom = nodedb_types::geometry::SridGeometry::from_value(
+            doc.get("loc").expect("geometry field"),
+        )
+        .expect("stored geometry");
+        assert_eq!(geom.srid, nodedb_types::geometry::Srid::Wgs84);
     }
 
     /// A put that overwrites a geometry row and then aborts puts the row's

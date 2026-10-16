@@ -43,6 +43,7 @@ static GEOMETRY_2_DISTANCE: &[ArgTypeSpec] = &[
     arg("geom2", GEOMETRY),
     arg("distance_m", FLOAT),
 ];
+static GEOMETRY_SRID: &[ArgTypeSpec] = &[arg("geom", GEOMETRY), arg("srid", INT)];
 static GEOMETRY_BUFFER: &[ArgTypeSpec] = &[
     arg("geom", GEOMETRY),
     arg("distance_m", FLOAT),
@@ -84,6 +85,7 @@ pub(super) fn arg_types(shape: GeoArgShape) -> &'static [ArgTypeSpec] {
         GeoArgShape::Geometry1 => GEOMETRY_1,
         GeoArgShape::Geometry2 => GEOMETRY_2,
         GeoArgShape::Geometry2Distance => GEOMETRY_2_DISTANCE,
+        GeoArgShape::GeometrySrid => GEOMETRY_SRID,
         GeoArgShape::GeometryBuffer => GEOMETRY_BUFFER,
         GeoArgShape::LngLat => LNG_LAT,
         GeoArgShape::LngLatZ => LNG_LAT_Z,

@@ -32,14 +32,14 @@ use std::collections::HashSet;
 use nodedb_physical::physical_plan::SpatialPredicate;
 use nodedb_types::Surrogate;
 use nodedb_types::columnar::ColumnarSchema;
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::SridGeometry;
 use nodedb_types::value::Value;
 
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::columnar_read::convert::row_to_projected_value;
 use crate::data::executor::handlers::spatial_refine::{
-    SpatialHit, apply_predicate, extract_geometry, project_doc,
+    SpatialHit, apply_predicate, extract_geometry, mixed_srid_error, project_doc,
 };
 use crate::data::executor::handlers::transaction::overlay::Staged;
 use crate::engine::document::store::StorageKey;
@@ -51,7 +51,7 @@ pub(in crate::data::executor) struct SpatialOverlayMergeParams<'a> {
     pub coll_key: &'a (DatabaseId, TenantId, String),
     pub field: &'a str,
     pub predicate: &'a SpatialPredicate,
-    pub query_geom: &'a Geometry,
+    pub query_geom: &'a SridGeometry,
     pub distance_meters: f64,
     pub projection: &'a [String],
     pub attr_filters: &'a [ScanFilter],
@@ -124,7 +124,10 @@ impl CoreLoop {
             let Some(doc_geom) = extract_geometry(doc, field) else {
                 return Ok(false);
             };
-            if !apply_predicate(predicate, query_geom, &doc_geom, distance_meters) {
+            // A staged row in another SRID fails the scan, as a base row does.
+            if !apply_predicate(predicate, query_geom, &doc_geom, distance_meters)
+                .map_err(|m| mixed_srid_error(&coll_key.2, field, m))?
+            {
                 return Ok(false);
             }
             Ok(ScanFilter::all_match_value(attr_filters, doc)?

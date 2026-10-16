@@ -22,7 +22,7 @@ use super::{
 /// - a name no family module implements returns
 ///   `Err(EvalError::UnknownFunction)`, never a silent `NULL`.
 ///
-/// The fallible families (`math`, `vector`, `json`) return
+/// The fallible families (`math`, `vector`, `json`, geo) return
 /// `Option<Result<Value, EvalError>>`. The rest stay `Option<Value>`-shaped
 /// and are wrapped in `Ok` at this dispatch boundary.
 pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
@@ -62,10 +62,14 @@ pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     if let Some(v) = text_chunk::try_eval(name, args) {
         return Ok(v);
     }
-    // Geo / Spatial functions — delegated to geo_functions module.
-    crate::geo_functions::eval_geo_function(name, args).ok_or_else(|| EvalError::UnknownFunction {
-        name: name.to_owned(),
-    })
+    // Geo / Spatial functions — delegated to geo_functions module. A geo
+    // fault (unsupported or mixed SRID, projection domain) fails the call.
+    match crate::geo_functions::eval_geo_function(name, args) {
+        Some(r) => r,
+        None => Err(EvalError::UnknownFunction {
+            name: name.to_owned(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -321,7 +325,7 @@ mod tests {
 
     fn point_value(lng: f64, lat: f64) -> Value {
         let geom = nodedb_types::geometry::Geometry::point(lng, lat);
-        Value::Geometry(geom)
+        Value::Geometry(nodedb_types::geometry::SridGeometry::wgs84(geom))
     }
 
     fn square_value() -> Value {
@@ -332,7 +336,7 @@ mod tests {
             [0.0, 10.0],
             [0.0, 0.0],
         ]]);
-        Value::Geometry(geom)
+        Value::Geometry(nodedb_types::geometry::SridGeometry::wgs84(geom))
     }
 
     #[test]
@@ -392,10 +396,9 @@ mod tests {
 
     #[test]
     fn geo_length_sql() {
-        let line = Value::Geometry(nodedb_types::geometry::Geometry::line_string(vec![
-            [0.0, 0.0],
-            [0.0, 1.0],
-        ]));
+        let line = Value::Geometry(nodedb_types::geometry::SridGeometry::wgs84(
+            nodedb_types::geometry::Geometry::line_string(vec![[0.0, 0.0], [0.0, 1.0]]),
+        ));
         let result = eval_fn("geo_length", vec![line]);
         let d = result.as_f64().unwrap();
         assert!((d - 111_195.0).abs() < 500.0, "got {d}");

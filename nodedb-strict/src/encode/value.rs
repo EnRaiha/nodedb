@@ -140,6 +140,7 @@ pub(super) fn encode_variable(
         (ColumnType::Bytes | ColumnType::SparseVector, Value::Bytes(b)) => {
             var_data.extend_from_slice(b);
         }
+        // GeoJSON, with a `crs` member for any SRID other than 4326.
         (ColumnType::Geometry, Value::Geometry(g)) => {
             let json = sonic_rs::to_vec(g).map_err(|e| {
                 invalid_value(col, format!("geometry does not serialize to GeoJSON: {e}"))

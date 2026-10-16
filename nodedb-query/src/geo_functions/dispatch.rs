@@ -5,7 +5,8 @@
 use nodedb_types::Value;
 
 use super::catalog;
-use super::{accessors, constructors, indexing, measures, predicates};
+use super::{accessors, constructors, crs, indexing, measures, predicates};
+use crate::expr::EvalError;
 
 /// Evaluate a geospatial function.
 ///
@@ -14,8 +15,10 @@ use super::{accessors, constructors, indexing, measures, predicates};
 /// before dispatch, so every spelling of a capability behaves identically.
 ///
 /// Returns `None` only when `name` is not a geospatial function at all, so the
-/// caller can fall through to its own function table.
-pub fn eval_geo_function(name: &str, args: &[Value]) -> Option<Value> {
+/// caller can fall through to its own function table. `Some(Err(_))` is a
+/// fault that fails the statement: an unsupported SRID, operands in different
+/// SRIDs, or a coordinate outside a projection's domain.
+pub fn eval_geo_function(name: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
     let spec = catalog::lookup(name)?;
     eval_canonical(spec.canonical, args)
 }
@@ -25,10 +28,11 @@ pub fn eval_geo_function(name: &str, args: &[Value]) -> Option<Value> {
 /// A `None` here means the catalog declares a function the evaluators do not
 /// implement. That drift is caught by `every_catalog_entry_is_evaluable`
 /// below rather than being allowed to surface as a silent NULL at runtime.
-fn eval_canonical(canonical: &str, args: &[Value]) -> Option<Value> {
+fn eval_canonical(canonical: &'static str, args: &[Value]) -> Option<Result<Value, EvalError>> {
     predicates::eval(canonical, args)
         .or_else(|| measures::eval(canonical, args))
         .or_else(|| accessors::eval(canonical, args))
+        .or_else(|| crs::eval(canonical, args))
         .or_else(|| constructors::eval(canonical, args))
         .or_else(|| indexing::eval(canonical, args))
 }
@@ -36,14 +40,14 @@ fn eval_canonical(canonical: &str, args: &[Value]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, SridGeometry};
 
     /// Arguments that satisfy any catalog shape: enough geometry-shaped and
     /// number-shaped values that no evaluator indexes past the end.
     fn probe_args() -> Vec<Value> {
         vec![
-            Value::Geometry(Geometry::point(1.0, 2.0)),
-            Value::Geometry(Geometry::point(3.0, 4.0)),
+            Value::Geometry(SridGeometry::wgs84(Geometry::point(1.0, 2.0))),
+            Value::Geometry(SridGeometry::wgs84(Geometry::point(3.0, 4.0))),
             Value::Float(5.0),
             Value::Float(6.0),
         ]
@@ -101,18 +105,38 @@ mod tests {
     #[test]
     fn standard_accessor_names_read_stored_geometry() {
         use crate::value_ops::to_value_number;
-        let point = vec![Value::Geometry(Geometry::point(1.0, 2.0))];
+        let point = vec![Value::Geometry(SridGeometry::wgs84(Geometry::point(
+            1.0, 2.0,
+        )))];
         assert_eq!(
             eval_geo_function("st_x", &point),
-            Some(to_value_number(1.0))
+            Some(Ok(to_value_number(1.0)))
         );
         assert_eq!(
             eval_geo_function("st_y", &point),
-            Some(to_value_number(2.0))
+            Some(Ok(to_value_number(2.0)))
         );
         assert!(matches!(
             eval_geo_function("st_astext", &point),
-            Some(Value::String(_))
+            Some(Ok(Value::String(_)))
         ));
+    }
+
+    /// `ST_SRID(ST_SetSRID(ST_Point(1, 2), 32648))` is 32648.
+    #[test]
+    fn setsrid_then_srid_round_trips() {
+        let Some(Ok(point)) =
+            eval_geo_function("st_point", &[Value::Float(1.0), Value::Float(2.0)])
+        else {
+            panic!("expected a point");
+        };
+        let Some(Ok(tagged)) = eval_geo_function("ST_SetSRID", &[point, Value::Integer(32648)])
+        else {
+            panic!("expected a geometry");
+        };
+        assert_eq!(
+            eval_geo_function("ST_SRID", &[tagged]),
+            Some(Ok(Value::Integer(32648)))
+        );
     }
 }

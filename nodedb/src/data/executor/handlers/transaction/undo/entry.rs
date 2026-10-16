@@ -205,12 +205,14 @@ pub(in crate::data::executor) enum UndoEntry {
     ///
     /// `bbox` is the entry's geometry captured BEFORE the forward `delete`
     /// (the R-tree `delete` does not return it); `document_id` is the reverse
-    /// map value removed by the forward cascade.
+    /// map value removed by the forward cascade. `srid` is the SRID of the
+    /// tree the entry left, which the re-insert binds the tree back to.
     SpatialDelete {
         key: SpatialIndexKey,
         entry_id: u64,
         bbox: nodedb_types::BoundingBox,
         document_id: String,
+        srid: nodedb_types::geometry::Srid,
     },
     /// Undo a graph edge write: remove the version it added and put the CSR
     /// back.

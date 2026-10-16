@@ -10,4 +10,4 @@ pub mod tree;
 
 pub use node::{EntryId, RTreeEntry};
 pub use search::NnResult;
-pub use tree::RTree;
+pub use tree::{RTree, SridMismatch};

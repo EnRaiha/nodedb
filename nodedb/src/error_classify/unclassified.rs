@@ -92,6 +92,7 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::UnknownStrictField { .. }
         | Error::DivisionByZero
         | Error::DataException { .. }
+        | Error::MixedSrid { .. }
         | Error::NumericValueOutOfRange { .. }
         | Error::InvalidTextRepresentation { .. }
         | Error::DatatypeMismatch { .. }

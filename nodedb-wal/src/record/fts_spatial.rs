@@ -304,8 +304,9 @@ impl FtsDeletePayload {
 
 /// WAL payload for `RecordType::SpatialPut`.
 ///
-/// `geometry_bytes` is a MessagePack-serialised `nodedb_types::geometry::Geometry`
-/// value (the same encoding used in `SpatialInsertMsg`).
+/// `geometry_bytes` is a MessagePack-serialised
+/// `nodedb_types::geometry::SridGeometry` value, `[srid_code_u32, geometry]`
+/// (the same encoding used in `SpatialInsertMsg`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpatialPutPayload {
     pub provenance: SyncProvenance,

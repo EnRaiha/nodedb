@@ -95,6 +95,7 @@ impl GatewayErrorMap {
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }
+            | Error::MixedSrid { .. }
             | Error::NumericValueOutOfRange { .. }
             | Error::InvalidTextRepresentation { .. }
             | Error::DatatypeMismatch { .. }

@@ -1,6 +1,6 @@
 use nodedb_strict::{TupleDecoder, TupleEncoder};
 use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::{Geometry, SridGeometry};
 use nodedb_types::value::Value;
 use nodedb_types::{NdbDateTime, NdbDuration};
 
@@ -97,10 +97,10 @@ fn valid_value(column_type: ColumnType, seed: u8) -> Option<Value> {
             ]))
         }
         ColumnType::SparseVector => Some(Value::String("{1: 1.0}".to_owned())),
-        ColumnType::Geometry => Some(Value::Geometry(Geometry::point(
+        ColumnType::Geometry => Some(Value::Geometry(SridGeometry::wgs84(Geometry::point(
             f64::from(seed) - 128.0,
             f64::from(seed % 181) - 90.0,
-        ))),
+        )))),
         ColumnType::Json => Some(Value::Array(vec![Value::Integer(i64::from(seed))])),
         ColumnType::Ulid => Some(Value::Ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())),
         ColumnType::Duration => Some(Value::Duration(NdbDuration::from_micros(i64::from(seed)))),

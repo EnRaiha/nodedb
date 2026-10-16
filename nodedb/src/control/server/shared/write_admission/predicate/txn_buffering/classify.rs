@@ -434,7 +434,7 @@ mod tests {
     use nodedb_types::calvin::{
         EngineKeySet, EngineTag, PassiveReadKey, ReadKeyIdent, SortedVec, VersionedReadEntry,
     };
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, SridGeometry};
     use nodedb_types::id::{RequestId, TxnId, VShardId};
     use nodedb_types::timeseries::continuous_agg::{ContinuousAggregateDef, RefreshPolicy};
     use nodedb_types::vector_distance::DistanceMetric;
@@ -1584,7 +1584,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 surrogate: Surrogate::new(1),
-                geometry: Geometry::point(0.0, 0.0),
+                geometry: SridGeometry::wgs84(Geometry::point(0.0, 0.0)),
                 provenance: None,
             }),
             PhysicalPlan::Spatial(SpatialOp::Delete {
@@ -1597,7 +1597,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 predicate: SpatialPredicate::Contains,
-                query_geometry: Geometry::point(0.0, 0.0),
+                query_geometry: SridGeometry::wgs84(Geometry::point(0.0, 0.0)),
                 distance_meters: 0.0,
                 attribute_filters: Vec::new(),
                 limit: 0,

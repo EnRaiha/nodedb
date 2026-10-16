@@ -5,6 +5,7 @@
 pub mod accessors;
 pub mod catalog;
 pub mod constructors;
+pub mod crs;
 pub mod dispatch;
 pub mod helpers;
 pub mod indexing;

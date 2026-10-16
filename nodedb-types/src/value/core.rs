@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::array_cell::ArrayCell;
 use crate::datetime::{NdbDateTime, NdbDuration};
-use crate::geometry::Geometry;
+use crate::geometry::SridGeometry;
 use crate::json_msgpack::InstantKind;
 
 /// A dynamic value that can represent any field type in a document
@@ -83,8 +83,9 @@ pub enum Value {
     Duration(NdbDuration),
     /// Arbitrary-precision decimal (financial calculations, exact arithmetic).
     Decimal(rust_decimal::Decimal),
-    /// GeoJSON-compatible geometry (Point, LineString, Polygon, etc.).
-    Geometry(Geometry),
+    /// GeoJSON-compatible geometry (Point, LineString, Polygon, etc.) and
+    /// the SRID its coordinates are in.
+    Geometry(SridGeometry),
     /// Ordered set of unique values (auto-deduplicated, maintains insertion order).
     Set(Vec<Value>),
     /// Compiled regex pattern (stored as pattern string).
@@ -222,7 +223,7 @@ impl Value {
     }
 
     /// Try to extract as Geometry.
-    pub fn as_geometry(&self) -> Option<&Geometry> {
+    pub fn as_geometry(&self) -> Option<&SridGeometry> {
         match self {
             Value::Geometry(g) => Some(g),
             _ => None,

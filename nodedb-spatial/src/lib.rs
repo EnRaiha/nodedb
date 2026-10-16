@@ -10,6 +10,7 @@
 //! and use the columnar storage core; this crate provides the index
 //! structures and predicate evaluators only.
 
+pub mod crs;
 pub mod geo_meta;
 pub mod geohash;
 pub mod geohash_index;
@@ -18,6 +19,7 @@ pub mod hybrid;
 pub mod measures;
 pub mod operations;
 pub mod persist;
+pub mod planar;
 pub mod predicates;
 pub mod rtree;
 pub mod spatial_join;
@@ -27,6 +29,7 @@ pub mod validate;
 pub mod wkb;
 pub mod wkt;
 
+pub use crs::{CrsError, transform_geometry};
 pub use geohash::{geohash_decode, geohash_encode, geohash_neighbors};
 pub use geohash_index::GeohashIndex;
 pub use h3::{
@@ -34,16 +37,19 @@ pub use h3::{
     h3_to_boundary, h3_to_center,
 };
 pub use hybrid::{SpatialPreFilterResult, bitmap_contains, ids_to_bitmap, spatial_prefilter};
-pub use measures::{st_area, st_centroid};
-pub use operations::{st_buffer, st_envelope, st_union};
+pub use measures::{st_area, st_centroid, st_centroid_in};
+pub use operations::{st_buffer, st_buffer_in, st_envelope, st_envelope_in, st_union};
 pub use persist::{
     RTreeCheckpointError, SpatialIndexMeta, SpatialIndexType, deserialize_meta, meta_storage_key,
     rtree_storage_key, serialize_meta,
 };
+pub use planar::{
+    planar_area, planar_buffer, planar_distance, planar_dwithin, planar_length, planar_perimeter,
+};
 pub use predicates::{
     st_contains, st_disjoint, st_distance, st_dwithin, st_intersection, st_intersects, st_within,
 };
-pub use rtree::{RTree, RTreeEntry};
+pub use rtree::{RTree, RTreeEntry, SridMismatch};
 pub use validate::{is_valid, validate_geometry};
-pub use wkb::{geometry_from_wkb, geometry_to_wkb};
+pub use wkb::{geometry_from_wkb, geometry_to_ewkb, geometry_to_wkb};
 pub use wkt::{geometry_from_wkt, geometry_to_wkt};

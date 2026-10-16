@@ -217,7 +217,7 @@ mod tests {
     use nodedb_physical::physical_plan::{SpatialOp, TextOp};
     use nodedb_types::QualifiedCollection;
     use nodedb_types::Surrogate;
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, SridGeometry};
 
     fn open_wal(dir: &std::path::Path) -> WalManager {
         WalManager::open_for_testing(&dir.join("test.wal")).expect("open wal")
@@ -361,7 +361,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(9),
-            geometry: Geometry::point(10.0, 20.0),
+            geometry: SridGeometry::wgs84(Geometry::point(10.0, 20.0)),
             provenance: None,
         });
 
@@ -383,9 +383,9 @@ mod tests {
             nodedb_wal::record::SpatialPutPayload::from_bytes(&record.payload).expect("decode");
         assert_eq!(decoded.collection, "places");
         assert_eq!(decoded.field, "loc");
-        let geometry: Geometry =
+        let geometry: SridGeometry =
             zerompk::from_msgpack(&decoded.geometry_bytes).expect("decode geometry");
-        assert_eq!(geometry, Geometry::point(10.0, 20.0));
+        assert_eq!(geometry, SridGeometry::wgs84(Geometry::point(10.0, 20.0)));
     }
 
     #[test]
@@ -443,7 +443,7 @@ mod tests {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "docs"),
             field: "loc".to_string(),
             surrogate: Surrogate::new(1),
-            geometry: Geometry::point(1.0, 2.0),
+            geometry: SridGeometry::wgs84(Geometry::point(1.0, 2.0)),
             provenance: None,
         });
         wal_append_if_write(

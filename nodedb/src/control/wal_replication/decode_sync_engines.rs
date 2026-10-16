@@ -152,7 +152,7 @@ pub fn spatial_insert(
     geometry_bytes: &[u8],
     prov_bytes: &Option<Vec<u8>>,
 ) -> crate::Result<PhysicalPlan> {
-    let geometry = zerompk::from_msgpack::<nodedb_types::geometry::Geometry>(geometry_bytes)
+    let geometry = zerompk::from_msgpack::<nodedb_types::geometry::SridGeometry>(geometry_bytes)
         .map_err(|e| crate::Error::Internal {
             detail: format!("SpatialInsert geometry decode failed: {e}"),
         })?;
@@ -706,9 +706,12 @@ mod tests {
             stream_id: 2,
             seq: 44,
         };
-        let geometry = Geometry::Point {
-            coordinates: [-73.985, 40.758],
-        };
+        let geometry = nodedb_types::geometry::SridGeometry::new(
+            nodedb_types::geometry::Srid::PeninsularRso,
+            Geometry::Point {
+                coordinates: [412_834.0, 349_472.0],
+            },
+        );
 
         let plan = PhysicalPlan::Spatial(SpatialOp::Insert {
             collection: QualifiedCollection::new(DatabaseId::DEFAULT, "places"),

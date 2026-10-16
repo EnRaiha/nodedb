@@ -42,7 +42,10 @@ pub static GEO_FUNCTIONS: &[GeoFunctionSpec] = &[
     f("st_asgeojson", &["geo_as_geojson"], Geometry1, Text),
     f("st_geometrytype", &["geo_type"], Geometry1, Text),
     f("st_npoints", &["geo_num_points"], Geometry1, Int),
+    // ── Spatial reference systems ──
     f("st_srid", &[], Geometry1, Int),
+    f("st_setsrid", &[], GeometrySrid, Geometry),
+    f("st_transform", &[], GeometrySrid, Geometry),
     // ── Constructors ──
     f("st_point", &["geo_point"], LngLat, Geometry),
     f("st_makepoint", &[], LngLatZ, Geometry),

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use super::core::Value;
 use crate::array_cell::ArrayCell;
 use crate::datetime::{NdbDateTime, NdbDuration};
-use crate::geometry::Geometry;
+use crate::geometry::{Geometry, Srid, SridGeometry};
 
 impl zerompk::ToMessagePack for Value {
     fn write<W: zerompk::Write>(&self, writer: &mut W) -> zerompk::Result<()> {
@@ -80,10 +80,12 @@ impl zerompk::ToMessagePack for Value {
                 writer.write_u8(12)?;
                 writer.write_binary(&d.serialize())
             }
+            // `[13, srid_code_u32, geometry]`.
             Value::Geometry(g) => {
-                writer.write_array_len(2)?;
+                writer.write_array_len(3)?;
                 writer.write_u8(13)?;
-                g.write(writer)
+                g.srid.write(writer)?;
+                g.geometry.write(writer)
             }
             Value::Set(s) => {
                 writer.write_array_len(2)?;
@@ -163,7 +165,17 @@ impl<'a> zerompk::FromMessagePack<'a> for Value {
                 buf.copy_from_slice(&cow);
                 Ok(Value::Decimal(rust_decimal::Decimal::deserialize(buf)))
             }
-            13 => Ok(Value::Geometry(Geometry::read(reader)?)),
+            13 => {
+                if len != 3 {
+                    return Err(zerompk::Error::ArrayLengthMismatch {
+                        expected: 3,
+                        actual: len,
+                    });
+                }
+                let srid = Srid::read(reader)?;
+                let geometry = Geometry::read(reader)?;
+                Ok(Value::Geometry(SridGeometry::new(srid, geometry)))
+            }
             14 => Ok(Value::Set(Vec::<Value>::read(reader)?)),
             15 => Ok(Value::Regex(reader.read_string()?.into_owned())),
             16 => {
@@ -204,6 +216,21 @@ impl<'a> zerompk::FromMessagePack<'a> for Value {
                 Ok(Value::Vector(floats))
             }
             _ => Err(zerompk::Error::InvalidMarker(tag)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_round_trip_keeps_srid() {
+        for srid in Srid::SUPPORTED {
+            let value = Value::Geometry(SridGeometry::new(srid, Geometry::point(1.0, 2.0)));
+            let bytes = zerompk::to_msgpack_vec(&value).unwrap();
+            let back: Value = zerompk::from_msgpack(&bytes).unwrap();
+            assert_eq!(back, value);
         }
     }
 }

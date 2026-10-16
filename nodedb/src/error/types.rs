@@ -374,6 +374,20 @@ pub enum Error {
     #[error("{detail}")]
     DataException { detail: String },
 
+    /// A geometry's SRID differs from the SRID of the spatial index it
+    /// writes to or queries. The index SRID is fixed by its first entry, and
+    /// no implicit transform runs. Rendered as SQLSTATE `22000`
+    /// (data_exception) at the pgwire layer.
+    #[error(
+        "spatial index on {collection}.{field} is SRID {index_srid}; geometry is SRID {row_srid}"
+    )]
+    MixedSrid {
+        collection: String,
+        field: String,
+        index_srid: u32,
+        row_srid: u32,
+    },
+
     /// A value does not fit its numeric type: an integer past a column's
     /// declared width, a float that overflows `REAL`, a literal past the exact
     /// numeric range, or arithmetic that overflows. Rendered as SQLSTATE

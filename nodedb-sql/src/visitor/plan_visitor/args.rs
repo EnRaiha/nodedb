@@ -214,7 +214,7 @@ pub struct SpatialScanVisitArgs<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub predicate: &'a SpatialPredicate,
-    pub query_geometry: &'a nodedb_types::geometry::Geometry,
+    pub query_geometry: &'a nodedb_types::geometry::SridGeometry,
     pub distance_meters: f64,
     pub attribute_filters: &'a [Filter],
     pub limit: usize,

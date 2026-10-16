@@ -214,6 +214,12 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
         },
         E::DivisionByZero,
         E::DataException { detail: text() },
+        E::MixedSrid {
+            collection: collection(),
+            field: "loc".into(),
+            index_srid: 4326,
+            row_srid: 32648,
+        },
         E::NumericValueOutOfRange { detail: text() },
         E::InvalidTextRepresentation { detail: text() },
         E::DatatypeMismatch { detail: text() },

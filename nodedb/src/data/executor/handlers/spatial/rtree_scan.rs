@@ -8,7 +8,8 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::columnar_read::filter::decode_rls_filters;
 use crate::data::executor::handlers::spatial_refine::{
-    SpatialHit, apply_predicate, expand_bbox, extract_geometry, hit_rows, project_doc,
+    SpatialHit, apply_predicate, expand_bbox, extract_geometry, hit_rows, mixed_srid_error,
+    project_doc,
 };
 use crate::data::executor::handlers::transaction::overlay::SpatialOverlayMergeParams;
 use crate::data::executor::response_codec;
@@ -26,7 +27,7 @@ pub(in crate::data::executor) struct SpatialScanParams<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub predicate: &'a SpatialPredicate,
-    pub query_geometry: &'a nodedb_types::geometry::Geometry,
+    pub query_geometry: &'a nodedb_types::geometry::SridGeometry,
     pub distance_meters: f64,
     pub attribute_filters: &'a [u8],
     pub limit: usize,
@@ -100,10 +101,12 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
-        // 3. Compute search bbox (expand by distance for ST_DWithin).
-        let query_bbox = nodedb_types::bbox::geometry_bbox(query_geom);
+        // 3. Compute search bbox (expand by distance for ST_DWithin) in the
+        // query SRID's space.
+        let space = query_geom.srid.bbox_space();
+        let query_bbox = query_geom.bbox();
         let search_bbox = if distance_meters > 0.0 {
-            expand_bbox(&query_bbox, distance_meters)
+            expand_bbox(&query_bbox, distance_meters, space)
         } else {
             query_bbox
         };
@@ -112,6 +115,18 @@ impl CoreLoop {
         let tid_id = crate::types::TenantId::new(tid);
         let spatial_key = (db_id, tid_id, collection.to_string(), field.to_string());
         let has_index = self.spatial_indexes.contains_key(&spatial_key);
+
+        // A query in an SRID other than the index's is refused before the
+        // scan. No implicit transform runs.
+        if let Some(rtree) = self.spatial_indexes.get(&spatial_key)
+            && !rtree.accepts_srid(query_geom.srid)
+        {
+            let mismatch = nodedb_spatial::SridMismatch {
+                index: rtree.srid(),
+                entry: query_geom.srid,
+            };
+            return self.response_error(task, mixed_srid_error(collection, field, mismatch));
+        }
         // `limit` is the statement's LIMIT, `usize::MAX` without one. A
         // `LIMIT 0` returns no rows.
         // No R-tree: full scan with predicate post-filter.
@@ -283,8 +298,13 @@ impl CoreLoop {
                 None => continue,
             };
 
-            if !apply_predicate(predicate, query_geom, &doc_geom, distance_meters) {
-                continue;
+            match apply_predicate(predicate, query_geom, &doc_geom, distance_meters) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(mismatch) => {
+                    return self
+                        .response_error(task, mixed_srid_error(collection, field, mismatch));
+                }
             }
 
             match ScanFilter::all_match_value(&attr_filters, &doc) {
@@ -438,7 +458,9 @@ mod tests {
         let rtree = core
             .spatial_indexes
             .entry(spatial_key.clone())
-            .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
+            .or_insert_with(|| {
+                crate::engine::spatial::RTree::new(memory, nodedb_types::geometry::Srid::Wgs84)
+            });
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         core.spatial_doc_map.insert(
             (
@@ -455,8 +477,10 @@ mod tests {
     }
 
     /// GeoJSON Point query centred on (0.0, 0.0) for DWithin.
-    fn origin_point() -> nodedb_types::geometry::Geometry {
-        nodedb_types::geometry::Geometry::point(0.0, 0.0)
+    fn origin_point() -> nodedb_types::geometry::SridGeometry {
+        nodedb_types::geometry::SridGeometry::wgs84(nodedb_types::geometry::Geometry::point(
+            0.0, 0.0,
+        ))
     }
 
     fn dummy_spatial_plan() -> PhysicalPlan {
@@ -518,5 +542,34 @@ mod tests {
         let decoded: Vec<nodedb_types::Value> =
             zerompk::from_msgpack(resp.payload.as_bytes()).unwrap_or_default();
         assert!(decoded.is_empty(), "empty prefilter must return no results");
+    }
+
+    /// A query in an SRID other than the index's is refused before the scan.
+    #[test]
+    fn query_in_another_srid_is_refused() {
+        let (mut core, _resp_rx, _dir) = make_core();
+        let tid = 1u64;
+        insert_spatial_doc(&mut core, tid, "geo", "loc", Surrogate(10), 0.0, 0.0);
+
+        let query = nodedb_types::geometry::SridGeometry::new(
+            nodedb_types::geometry::Srid::Utm48N,
+            nodedb_types::geometry::Geometry::point(500_000.0, 0.0),
+        );
+        let task = make_task(dummy_spatial_plan());
+        let resp = core.execute_spatial_scan(SpatialScanParams {
+            task: &task,
+            tid,
+            collection: "geo",
+            field: "loc",
+            predicate: &nodedb_physical::physical_plan::SpatialPredicate::DWithin,
+            query_geometry: &query,
+            distance_meters: 1_000.0,
+            attribute_filters: &[],
+            limit: 100,
+            projection: &[],
+            rls_filters: &[],
+            prefilter: None,
+        });
+        assert_eq!(resp.status, Status::Error);
     }
 }

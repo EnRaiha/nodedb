@@ -12,9 +12,15 @@ use crate::data::executor::handlers::point::apply_put::SpatialEntryId;
 use crate::data::executor::spatial_key::SpatialIndexKey;
 
 /// One R-tree entry the cascade removed: enough to re-insert it on undo
-/// (`UndoEntry::SpatialDelete`).
-pub(in crate::data::executor) type RemovedSpatialEntry =
-    (SpatialIndexKey, u64, nodedb_types::BoundingBox, String);
+/// (`UndoEntry::SpatialDelete`): the index key, entry id, bbox, reverse-map
+/// document id, and the SRID of the tree it left.
+pub(in crate::data::executor) type RemovedSpatialEntry = (
+    SpatialIndexKey,
+    u64,
+    nodedb_types::BoundingBox,
+    String,
+    nodedb_types::geometry::Srid,
+);
 
 /// Whether `schema` declares at least one `Geometry` column, i.e. whether
 /// the collection's rows can carry R-tree entries at all.

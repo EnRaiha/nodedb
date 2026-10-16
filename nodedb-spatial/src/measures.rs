@@ -9,6 +9,7 @@
 //! present, so a `GeometryCollection` of a polygon and a stray point returns
 //! the polygon's centroid, not a blend of the two.
 
+use nodedb_types::BboxSpace;
 use nodedb_types::geometry::Geometry;
 
 /// Mean Earth radius in meters, matching `nodedb_types::geometry`'s haversine.
@@ -79,9 +80,36 @@ fn ring_area(ring: &[[f64; 2]]) -> f64 {
 /// vertices at all, or when every component of its winning dimension is
 /// degenerate (zero area / zero length) — those fall back to the next
 /// dimension down rather than returning nothing.
+///
+/// Weights are geodesic (spherical area, haversine length). Same as
+/// `st_centroid_in(geom, BboxSpace::Geographic)`.
 pub fn st_centroid(geom: &Geometry) -> Option<Geometry> {
-    let [lng, lat] = centroid_coords(geom)?;
+    st_centroid_in(geom, BboxSpace::Geographic)
+}
+
+/// Centroid of a geometry in `space`, as a `Point`.
+///
+/// Planar space weights components by planar area and Euclidean length, so
+/// a projected geometry's centroid is in the same metres as its input.
+pub fn st_centroid_in(geom: &Geometry, space: BboxSpace) -> Option<Geometry> {
+    let [lng, lat] = centroid_coords(geom, space)?;
     Some(Geometry::point(lng, lat))
+}
+
+/// Unsigned area of a ring in `space`: square metres in either space.
+fn ring_weight(ring: &[[f64; 2]], space: BboxSpace) -> f64 {
+    match space {
+        BboxSpace::Geographic => ring_area(ring),
+        BboxSpace::Planar => crate::planar::area::planar_ring_area(ring),
+    }
+}
+
+/// Length of one segment in `space`, metres.
+fn segment_weight(a: [f64; 2], b: [f64; 2], space: BboxSpace) -> f64 {
+    match space {
+        BboxSpace::Geographic => nodedb_types::geometry::haversine_distance(a[0], a[1], b[0], b[1]),
+        BboxSpace::Planar => (b[0] - a[0]).hypot(b[1] - a[1]),
+    }
 }
 
 /// A weighted point accumulator: `(Σ w·lng, Σ w·lat, Σ w)`.
@@ -114,26 +142,26 @@ impl Weighted {
     }
 }
 
-fn centroid_coords(geom: &Geometry) -> Option<[f64; 2]> {
-    areal_centroid(geom)
+fn centroid_coords(geom: &Geometry, space: BboxSpace) -> Option<[f64; 2]> {
+    areal_centroid(geom, space)
         .and_then(Weighted::resolve)
-        .or_else(|| linear_centroid(geom).and_then(Weighted::resolve))
+        .or_else(|| linear_centroid(geom, space).and_then(Weighted::resolve))
         .or_else(|| punctual_centroid(geom).and_then(Weighted::resolve))
 }
 
 /// Area-weighted centroid of every areal component, or `None` if there are no
 /// areal components at all.
-fn areal_centroid(geom: &Geometry) -> Option<Weighted> {
+fn areal_centroid(geom: &Geometry, space: BboxSpace) -> Option<Weighted> {
     match geom {
-        Geometry::Polygon { coordinates } => Some(polygon_centroid(coordinates)),
+        Geometry::Polygon { coordinates } => Some(polygon_centroid(coordinates, space)),
         Geometry::MultiPolygon { coordinates } => {
             let mut acc = Weighted::default();
             for rings in coordinates {
-                acc.merge(polygon_centroid(rings));
+                acc.merge(polygon_centroid(rings, space));
             }
             Some(acc)
         }
-        Geometry::GeometryCollection { geometries } => collect(geometries, areal_centroid),
+        Geometry::GeometryCollection { geometries } => collect(geometries, space, areal_centroid),
         Geometry::Point { .. }
         | Geometry::LineString { .. }
         | Geometry::MultiPoint { .. }
@@ -145,17 +173,17 @@ fn areal_centroid(geom: &Geometry) -> Option<Weighted> {
 }
 
 /// Length-weighted centroid of every linear component.
-fn linear_centroid(geom: &Geometry) -> Option<Weighted> {
+fn linear_centroid(geom: &Geometry, space: BboxSpace) -> Option<Weighted> {
     match geom {
-        Geometry::LineString { coordinates } => Some(line_centroid(coordinates)),
+        Geometry::LineString { coordinates } => Some(line_centroid(coordinates, space)),
         Geometry::MultiLineString { coordinates } => {
             let mut acc = Weighted::default();
             for line in coordinates {
-                acc.merge(line_centroid(line));
+                acc.merge(line_centroid(line, space));
             }
             Some(acc)
         }
-        Geometry::GeometryCollection { geometries } => collect(geometries, linear_centroid),
+        Geometry::GeometryCollection { geometries } => collect(geometries, space, linear_centroid),
         Geometry::Point { .. }
         | Geometry::MultiPoint { .. }
         | Geometry::Polygon { .. }
@@ -178,11 +206,15 @@ fn punctual_centroid(geom: &Geometry) -> Option<Weighted> {
 
 /// Merge the per-component results of `f` across a collection, yielding `None`
 /// when no member contributed at that dimension.
-fn collect(geometries: &[Geometry], f: fn(&Geometry) -> Option<Weighted>) -> Option<Weighted> {
+fn collect(
+    geometries: &[Geometry],
+    space: BboxSpace,
+    f: fn(&Geometry, BboxSpace) -> Option<Weighted>,
+) -> Option<Weighted> {
     let mut acc = Weighted::default();
     let mut any = false;
     for member in geometries {
-        if let Some(part) = f(member) {
+        if let Some(part) = f(member, space) {
             acc.merge(part);
             any = true;
         }
@@ -192,18 +224,18 @@ fn collect(geometries: &[Geometry], f: fn(&Geometry) -> Option<Weighted>) -> Opt
 
 /// Centroid of one polygon, weighting the exterior ring positively and each
 /// hole negatively so the hole's mass is removed from the result.
-fn polygon_centroid(rings: &[Vec<[f64; 2]>]) -> Weighted {
+fn polygon_centroid(rings: &[Vec<[f64; 2]>], space: BboxSpace) -> Weighted {
     let mut acc = Weighted::default();
     let mut iter = rings.iter();
     let Some(exterior) = iter.next() else {
         return acc;
     };
     if let Some(point) = ring_centroid(exterior) {
-        acc.add(point, ring_area(exterior));
+        acc.add(point, ring_weight(exterior, space));
     }
     for hole in iter {
         if let Some(point) = ring_centroid(hole) {
-            acc.add(point, -ring_area(hole));
+            acc.add(point, -ring_weight(hole, space));
         }
     }
     // Holes can only ever cancel the exterior down to nothing; a negative
@@ -243,12 +275,12 @@ fn ring_centroid(ring: &[[f64; 2]]) -> Option<[f64; 2]> {
 }
 
 /// Length-weighted centroid of a polyline: each segment contributes its
-/// midpoint weighted by its geodesic length.
-fn line_centroid(coords: &[[f64; 2]]) -> Weighted {
+/// midpoint weighted by its length in `space`.
+fn line_centroid(coords: &[[f64; 2]], space: BboxSpace) -> Weighted {
     let mut acc = Weighted::default();
     for pair in coords.windows(2) {
         let (a, b) = (pair[0], pair[1]);
-        let length = nodedb_types::geometry::haversine_distance(a[0], a[1], b[0], b[1]);
+        let length = segment_weight(a, b, space);
         acc.add([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0], length);
     }
     acc

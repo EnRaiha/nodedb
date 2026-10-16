@@ -85,7 +85,7 @@ pub use ascii::{
     starts_with_ascii_case_insensitive, strip_prefix_ascii_case_insensitive,
 };
 pub use audit_dml::AuditDmlMode;
-pub use bbox::{BoundingBox, geometry_bbox};
+pub use bbox::{BboxSpace, BoundingBox, geometry_bbox, geometry_bbox_in};
 pub use clone::{CloneOrigin, CloneStatus, MAX_CLONE_DEPTH};
 pub use collection::{CollectionType, CollectionTypeParseError};
 pub use collection_config::{
@@ -111,8 +111,8 @@ pub use id::{
 pub use identity::KeyRepr;
 pub use json_msgpack::{
     InstantKind, JsonValue, MsgpackError, MsgpackResult, NativeCell, json_from_msgpack,
-    json_to_msgpack, json_to_msgpack_or_empty, msgpack_to_json_string, read_instant,
-    value_from_msgpack, value_to_msgpack, write_instant,
+    json_to_msgpack, json_to_msgpack_or_empty, msgpack_to_json_string, ordered_map_to_msgpack,
+    read_instant, value_from_msgpack, value_to_msgpack, write_instant,
 };
 pub use kv::{KV_DEFAULT_INLINE_THRESHOLD, KvConfig, KvTtlPolicy, is_valid_kv_key_type};
 pub use lsn::Lsn;

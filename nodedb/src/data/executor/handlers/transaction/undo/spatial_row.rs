@@ -24,9 +24,9 @@ pub(in crate::data::executor) struct SpatialRowUndo {
     pub prior_row: Option<Vec<u8>>,
     /// The R-tree entry id the write keys on.
     pub entry_id: u64,
-    /// The R-tree entry and its reverse-map value before the write, `None`
-    /// when the field held no entry for the row.
-    pub prior_entry: Option<(BoundingBox, String)>,
+    /// The R-tree entry, its reverse-map value and the tree's SRID before the
+    /// write, `None` when the field held no entry for the row.
+    pub prior_entry: Option<(BoundingBox, String, nodedb_types::geometry::Srid)>,
 }
 
 impl CoreLoop {
@@ -56,14 +56,13 @@ impl CoreLoop {
             .spatial_doc_map
             .get(&doc_map_key)
             .and_then(|document_id| {
-                let bbox = self
-                    .spatial_indexes
-                    .get(&key)?
+                let rtree = self.spatial_indexes.get(&key)?;
+                let bbox = rtree
                     .entries()
                     .into_iter()
                     .find(|entry| entry.id == entry_id)
                     .map(|entry| entry.bbox)?;
-                Some((bbox, document_id.clone()))
+                Some((bbox, document_id.clone(), rtree.srid()))
             });
         Ok(UndoEntry::SpatialRow(Box::new(SpatialRowUndo {
             key,
@@ -112,17 +111,33 @@ impl CoreLoop {
         }
         let doc_map_key = (key.0, key.1, key.2.clone(), key.3.clone(), entry_id);
         match prior_entry {
-            Some((bbox, document_id)) => {
+            Some((bbox, document_id, srid)) => {
                 let memory = nodedb_mem::ScopedMemory::new(
                     self.governor.clone(),
                     key.0,
                     key.1,
                     nodedb_mem::EngineId::Spatial,
                 );
-                self.spatial_indexes
+                let (collection, field) = (key.2.clone(), key.3.clone());
+                let rtree = self
+                    .spatial_indexes
                     .entry(key)
-                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory))
-                    .insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
+                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory, srid));
+                // Undo runs in reverse, so the tree holds no later entry in
+                // another SRID and binds back to the row's.
+                rtree.bind_srid(srid).map_err(|m| {
+                    UndoError::failed(
+                        entry_index,
+                        format!("restoring spatial entry in '{collection}.{field}'"),
+                        crate::Error::MixedSrid {
+                            collection: collection.clone(),
+                            field: field.clone(),
+                            index_srid: m.index.code(),
+                            row_srid: m.entry.code(),
+                        },
+                    )
+                })?;
+                rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                 self.spatial_doc_map.insert(doc_map_key, document_id);
             }
             None => {
