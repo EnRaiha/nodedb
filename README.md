@@ -119,7 +119,7 @@ Requires Linux kernel >= 5.1 (io_uring). Connect:
 
 ```bash
 ndb                              # native CLI (connects to localhost:6433)
-psql -h localhost -p 6432 -U nodedb   # password: <data_dir>/.superuser_password, or set NODEDB_SUPERUSER_PASSWORD
+psql -h localhost -p 6432 -U nodedb -d default   # password: <data_dir>/.superuser_password, or set NODEDB_SUPERUSER_PASSWORD
 ```
 
 ```sql

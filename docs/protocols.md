@@ -21,7 +21,7 @@ NodeDB speaks six wire protocols. All SQL-capable protocols share the same query
 Standard PostgreSQL wire protocol. Any tool that speaks Postgres works with NodeDB.
 
 ```bash
-psql -h localhost -p 6432
+psql -h localhost -p 6432 -U nodedb -d default
 
 # Or any Postgres-compatible client
 # JDBC, libpq, SQLAlchemy, Prisma, etc.

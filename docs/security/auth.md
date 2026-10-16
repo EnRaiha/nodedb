@@ -25,7 +25,7 @@ SHOW USERS;
 Connect via psql:
 
 ```bash
-psql -h localhost -p 6432 -U alice
+psql -h localhost -p 6432 -U alice -d default
 ```
 
 ## API Keys

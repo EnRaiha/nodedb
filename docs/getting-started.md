@@ -734,10 +734,10 @@ You get a full TUI with syntax highlighting, tab completion, and history search.
 ### With psql
 
 ```bash
-psql -h localhost -p 6432 -U nodedb
+psql -h localhost -p 6432 -U nodedb -d default
 ```
 
-The server starts in password mode with the superuser `nodedb`. Set `NODEDB_SUPERUSER_PASSWORD` before the first start, or read the generated password from `<data_dir>/.superuser_password`.
+The server starts in password mode with the superuser `nodedb`. Set `NODEDB_SUPERUSER_PASSWORD` before the first start, or read the generated password from `<data_dir>/.superuser_password`. `-d default` names the built-in database. Without it, psql asks for a database named after the user, and the server refuses the connection with `3D000`.
 
 NodeDB speaks PostgreSQL's wire protocol, so standard tools like `psql`, ORMs, and BI tools work out of the box.
 
