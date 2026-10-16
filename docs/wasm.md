@@ -146,19 +146,19 @@ const results = await db.sql(
 // Create array
 await db.sql(`
   CREATE ARRAY spatial_grid
-  DIMS (x INT64 DOMAIN [0, 1000), y INT64 DOMAIN [0, 1000))
-  ATTRS (temperature FLOAT32)
+  DIMS (x INT64 [0..1000], y INT64 [0..1000])
+  ATTRS (temperature FLOAT64)
   TILE_EXTENTS (64, 64)
 `);
 
 // Insert cells
 await db.sql(
-  "INSERT INTO spatial_grid (x, y, temperature) VALUES (10, 20, 23.5)",
+  "INSERT INTO ARRAY spatial_grid COORDS (10, 20) VALUES (23.5)",
 );
 
 // Query slice
 const results = await db.sql(
-  `SELECT * FROM ARRAY_SLICE('spatial_grid', {x: [0, 100), y: [0, 100)}, ['temperature'])`,
+  `SELECT * FROM ARRAY_SLICE('spatial_grid', '{x: [0, 99], y: [0, 99]}', ['temperature'])`,
 );
 ```
 

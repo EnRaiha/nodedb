@@ -115,11 +115,11 @@ Retrieve array cells as they existed at a point in time:
 -- Multidimensional scientific data with temporal audit trail
 CREATE ARRAY climate_grid
   DIMS (
-    lon INT32 DOMAIN [-180, 180),
-    lat INT32 DOMAIN [-90, 90)
+    lon INT64 [-180..180],
+    lat INT64 [-90..90]
   )
   ATTRS (
-    temp_c FLOAT32
+    temp_c FLOAT64
   )
   TILE_EXTENTS (64, 64)
   WITH (audit_retain_ms = 7776000000);  -- 90 days
@@ -127,7 +127,7 @@ CREATE ARRAY climate_grid
 -- Query cells as they were committed yesterday
 SELECT lon, lat, temp_c FROM ARRAY_SLICE(
     'climate_grid',
-    {lon: [-10, 10), lat: [0, 20)},
+    '{lon: [-10, 9], lat: [0, 19]}',
     ['temp_c']
 )
 AS OF SYSTEM TIME '2026-06-06T00:00:00Z';

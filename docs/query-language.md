@@ -988,39 +988,42 @@ SELECT crdt_apply('collab_docs', 'doc123', '<delta_bytes>');
 -- Create array with dimensions and attributes
 CREATE ARRAY spatial_grid
   DIMS (
-    x INT64 DOMAIN [0, 1000),
-    y INT64 DOMAIN [0, 1000),
-    z INT64 DOMAIN [0, 1000)
+    x INT64 [0..1000],
+    y INT64 [0..1000],
+    z INT64 [0..1000]
   )
   ATTRS (
-    temperature FLOAT32,
-    pressure FLOAT32
+    temperature FLOAT64,
+    pressure FLOAT64
   )
   TILE_EXTENTS (64, 64, 64);
 
--- Insert cells
-INSERT INTO spatial_grid (x, y, z, temperature, pressure) VALUES
-  (10, 20, 5, 23.5, 1013.2),
-  (10, 20, 10, 22.1, 1013.1);
+-- Insert cells: COORDS lists the dims, VALUES lists the attrs
+INSERT INTO ARRAY spatial_grid
+  COORDS (10, 20, 5) VALUES (23.5, 1013.2),
+  COORDS (10, 20, 10) VALUES (22.1, 1013.1);
 
--- Slice: range query over dimensions
+-- Delete cells by coordinate
+DELETE FROM ARRAY spatial_grid WHERE COORDS IN ((10, 20, 10));
+
+-- Slice: range query over dimensions (closed ranges, quoted object literal)
 SELECT x, y, z, temperature FROM ARRAY_SLICE(
   'spatial_grid',
-  {x: [0, 100), y: [0, 100), z: [0, 50)},
+  '{x: [0, 99], y: [0, 99], z: [0, 49]}',
   ['temperature']
 );
 
 -- Project: select specific attributes
 SELECT * FROM ARRAY_PROJECT('spatial_grid', ['temperature', 'pressure']);
 
--- Aggregate: reduce dimensionality via aggregation
+-- Aggregate: reduce an attribute, grouped by the dimension x
 SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'AVG', 'x');
 
--- Element-wise operations
+-- Element-wise operations ('add', 'sub', 'mul', 'div')
 SELECT * FROM ARRAY_ELEMENTWISE(
   'current',
   'baseline',
-  'SUBTRACT',
+  'sub',
   'temperature'
 );
 
@@ -1142,16 +1145,28 @@ SELECT * FROM WEIGHTED_PICK('reward_pool', weight => 'chance', count => 5,
 
 Returns rows with columns: `pick_index`, `key`, `weight`. Uses Vose's alias method (O(N) setup, O(1) per pick). Default RNG is ChaCha-based CSPRNG; `SEED` enables deterministic reproducibility.
 
-## Bulk Import
+## Bulk Import and Export
 
-Bytes stream from the client over pgwire COPY; the database never opens
-a file by a caller-named path.
+A collection loads from a file on the server. An array also loads from a client stream with `COPY <array> FROM STDIN`.
 
 ```sql
--- Import from a client-side file (NDJSON, JSON array, or CSV)
-COPY users FROM STDIN;
-COPY users FROM STDIN WITH (FORMAT csv);
+-- Import a server-side file into a collection (NDJSON, JSON array, or CSV)
+COPY users FROM '/data/users.ndjson';
+COPY users FROM '/data/users.json';
+COPY orders FROM '/data/orders.csv' WITH (FORMAT csv, DELIMITER ';', HEADER false);
+
+-- Export a collection or a query to a server-side file
+COPY users TO '/exports/users.ndjson';
+COPY (SELECT id, name FROM users WHERE status = 'active') TO '/exports/active.csv' WITH (FORMAT csv);
 ```
+
+- A path must be absolute and must not contain `..`. A relative path is `42601`. A path with `..` is `42501`.
+- `FORMAT` is `ndjson` (or `jsonl`), `json`, or `csv`. Without `FORMAT`, the extension decides: `.ndjson`, `.jsonl`, `.json`, `.csv`. `DELIMITER` is one character. `HEADER` defaults to `true`.
+- `COPY <collection> FROM STDIN` is refused with `0A000`. Use the server-path form.
+- A collection on the `timeseries` or `spatial` engine refuses `COPY FROM` with `0A000`.
+- A file over 16 GiB is `54000`.
+- `COPY TO` writes `<path>.tmp` and renames it to `<path>`. It is not transactional.
+- `COPY <array> FROM '<path>'` loads CSV only. Use `WITH (FORMAT csv)`.
 
 ### Array bulk load
 
@@ -1162,6 +1177,7 @@ COPY scene FROM STDIN WITH (FORMAT csv, DELIMITER ';', HEADER);
 COPY scene FROM STDIN;                       -- text format, tab-delimited
 ```
 
+- `FORMAT` is `csv` or `text`. The default is `text`, tab-delimited. `HEADER` is off unless given. A bare `HEADER` turns it on. The file form `COPY <array> FROM '<path>'` takes CSV only, and its `HEADER` defaults to `true`.
 - Each value parses by its column's declared type. No type is guessed.
 - With `HEADER`, the first line must name the dims, then the attrs, in schema order. A mismatch is `42703`.
 - A wrong column count or an unparsable value is `22P02`. A NULL in a NOT NULL attr is `23502`. A coordinate outside its dim domain is `22003`.
@@ -1325,7 +1341,7 @@ SHOW USERS;
 | `WITH RECURSIVE`              | Supported     | Iterative fixed-point execution. For graph traversal, the native `GRAPH TRAVERSE`, `GRAPH PATH`, and algorithm functions remain more efficient.                                                                                                                                                                                     |
 | `UPDATE/DELETE ... JOIN`      | Not supported | The Data Plane executes mutations as single-collection atomic operations through the SPSC bridge. Multi-collection mutations would require cross-engine coordination that breaks the isolation model. Rewrite as a subquery: `DELETE FROM orders WHERE user_id IN (SELECT id FROM users WHERE ...)`.                                |
 | `FOREIGN KEY`                 | Not enforced  | In a distributed system with CRDT sync and eventual consistency at the edge, enforcing FK constraints across collections would require cross-shard coordination on every write — killing write throughput. CRDT constraint validation (UNIQUE, FK, CHECK) is enforced at delta-apply time for synced collections, but not for general SQL. |
-| `COPY TO` (export)            | Not supported | The Data Plane is write-optimized with io_uring for ingest, but export requires serialization across all shards and cores. Use the HTTP API (`/v1/query/stream`) for NDJSON export or query into Parquet via L2 cold storage.                                                                                                       |
+| `COPY TO` (export)            | Supported     | Writes a collection or a query result to an absolute server-side path as NDJSON, JSON array, or CSV. See [Bulk Import and Export](#bulk-import-and-export).                                                                                                                                                                      |
 | `UPDATE/DELETE` on timeseries | Not supported | Timeseries collections use append-only columnar memtables with cascading compression (ALP + FastLanes + FSST + Gorilla + LZ4). In-place mutation would break compression chains and invalidate block statistics. Use retention policies to age out old data.                                                                        |
 | `EXPLAIN ANALYZE`             | Not yet       | Requires instrumentation across the SPSC bridge to collect per-core execution stats from the Data Plane and merge them on the Control Plane. The bridge currently returns results but not timing metadata. Planned.                                                                                                                 |
 
