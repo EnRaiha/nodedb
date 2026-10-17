@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::control::security::audit::event::AuditEvent;
-use crate::control::security::audit::guard::lock_audit_log;
 use crate::control::security::audit::log::AuditLog;
+use crate::control::security::audit::{AuditAuth, AuditRecordInput, record_concurrent};
 use crate::control::security::sessions::SessionRegistry;
 
 use super::session_invalidation::SessionInvalidated;
@@ -156,9 +156,9 @@ fn handle_session_invalidated(
     // Audit row written BEFORE closing any connection — durable even if
     // the close subsequently fails.
     let detail = format!("user_id={} reason={}", event.user_id, event.reason.as_str());
-    lock_audit_log(audit).record(
+    record_bus_audit(
+        audit,
         AuditEvent::SessionRevoked,
-        None,
         "session_invalidation_bus",
         &detail,
     );
@@ -176,16 +176,31 @@ fn handle_session_invalidated(
 
 fn handle_user_changed(audit: &Arc<Mutex<AuditLog>>, event: &UserChanged) {
     let detail = format!("user_id={} credential_mutation", event.user_id);
-    lock_audit_log(audit).record(
+    record_bus_audit(
+        audit,
         AuditEvent::PrivilegeChange,
-        None,
         "user_change_bus",
         &detail,
     );
 }
 
 fn record_lagged(audit: &Arc<Mutex<AuditLog>>, detail: &str) {
-    lock_audit_log(audit).record(AuditEvent::AuditBusLagged, None, "bus_consumer", detail);
+    record_bus_audit(audit, AuditEvent::AuditBusLagged, "bus_consumer", detail);
+}
+
+/// Record one bus entry, with the sync wait outside the audit lock.
+fn record_bus_audit(audit: &Mutex<AuditLog>, event: AuditEvent, source: &str, detail: &str) {
+    record_concurrent(
+        audit,
+        AuditRecordInput {
+            event,
+            tenant_id: None,
+            database_id: None,
+            source,
+            detail,
+            auth: &AuditAuth::default(),
+        },
+    );
 }
 
 #[cfg(test)]

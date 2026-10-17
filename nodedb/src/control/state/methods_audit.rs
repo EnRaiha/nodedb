@@ -148,37 +148,78 @@ impl SharedState {
         detail: &str,
         auth: &crate::control::security::audit::AuditAuth,
     ) -> (crate::Result<()>, u64, bool) {
-        // The guard exports the entry to SIEM after it unlocks.
-        let mut log = crate::control::security::audit::lock_audit_log(&self.audit);
-        let durable =
-            log.record_with_auth_durable(event, tenant_id, database_id, source, detail, auth);
-        let (seq, backpressure) = (log.last_seq(), log.needs_backpressure());
-        drop(log);
-        (durable.map(|_| ()), seq, backpressure)
+        // The sync wait runs with the audit lock released, so concurrent recorders share one fsync.
+        // Each guard drop exports the published entries to SIEM after it unlocks.
+        let outcome = crate::control::security::audit::record_batch_concurrent(
+            &self.audit,
+            [crate::control::security::audit::AuditRecordInput {
+                event,
+                tenant_id,
+                database_id,
+                source,
+                detail,
+                auth,
+            }],
+        );
+        let backpressure =
+            crate::control::security::audit::lock_audit_log(&self.audit).needs_backpressure();
+        match outcome {
+            Ok(seqs) => (Ok(()), seqs.first().copied().unwrap_or(0), backpressure),
+            Err(e) => {
+                let seq = crate::control::security::audit::lock_audit_log(&self.audit).last_seq();
+                (Err(e), seq, backpressure)
+            }
+        }
     }
 
-    /// Record one Event Plane audit record handed over by the recorder channel, with no backpressure wait.
+    /// Record a batch of Event Plane audit records with one WAL sync, with no backpressure wait.
     ///
     /// Runs on the recorder's blocking task, never on the Event Plane.
-    pub fn record_pending_audit(&self, record: &crate::control::security::audit::PendingAudit) {
-        let (durable, seq, _) = self.audit_record_buffered(
-            record.event.clone(),
-            record.tenant_id,
-            record.database_id,
-            &record.source,
-            &record.detail,
-        );
+    /// `commit` is marked once the batch is staged in the log, under the audit lock.
+    /// The sync wait then runs with the lock released, and the batch is published after it.
+    /// A panic before staging returns the whole batch. A panic after it returns nothing.
+    pub fn record_pending_batch(
+        &self,
+        records: &[crate::control::security::audit::PendingAudit],
+        commit: &crate::control::security::audit::recorder::BatchCommit,
+    ) {
+        let auth = crate::control::security::audit::AuditAuth::default();
+        let staged = {
+            let mut log = crate::control::security::audit::lock_audit_log(&self.audit);
+            let staged = log.stage_batch(records.iter().map(|record| {
+                crate::control::security::audit::AuditRecordInput {
+                    event: record.event.clone(),
+                    tenant_id: record.tenant_id,
+                    database_id: record.database_id,
+                    source: &record.source,
+                    detail: &record.detail,
+                    auth: &auth,
+                }
+            }));
+            commit.mark_committed();
+            staged
+        };
+        let last = staged.last_seq();
+        let (_, durable) = staged.wait_durable();
+        let seq = last.unwrap_or(0);
+        if let Some(last) = last {
+            crate::control::security::audit::lock_audit_log(&self.audit).publish_through(last);
+        }
         if let Err(e) = durable {
-            error!(error = %e, seq, "audit WAL write failed — entry recorded in-memory only");
+            error!(
+                error = %e,
+                seq,
+                count = records.len(),
+                "audit WAL write failed — batch recorded in-memory only"
+            );
             crate::diag::audit_wal_append_failed(&e, seq);
         }
     }
 
-    /// Record Event Plane audit records in order, then apply the backpressure wait once.
+    /// Record Event Plane audit records with one WAL sync, then apply the backpressure wait once.
     pub fn record_pending_audits(&self, records: &[crate::control::security::audit::PendingAudit]) {
-        for record in records {
-            self.record_pending_audit(record);
-        }
+        let commit = crate::control::security::audit::recorder::BatchCommit::default();
+        self.record_pending_batch(records, &commit);
         self.await_audit_backpressure();
     }
 
@@ -201,21 +242,24 @@ impl SharedState {
     /// The Control Plane recorder for Event Plane audit records. The first call spawns it.
     ///
     /// The task holds weak references, so it never keeps this state alive.
-    /// It records one entry at a time, so a failure partway returns only the unrecorded tail.
+    /// It records each batch with one WAL sync, and commits per batch.
     pub fn audit_recorder(self: &Arc<Self>) -> &crate::control::security::audit::AuditRecorder {
         use crate::control::security::audit::PendingAudit;
+        use crate::control::security::audit::recorder::BatchCommit;
 
         self.audit_recorder.get_or_init(|| {
             let for_record = Arc::downgrade(self);
             let for_wait = Arc::downgrade(self);
             crate::control::security::audit::AuditRecorder::spawn(
                 crate::control::security::audit::recorder::RECORDER_CHANNEL_CAPACITY,
-                Arc::new(move |record: &PendingAudit| match for_record.upgrade() {
-                    Some(state) => {
-                        state.record_pending_audit(record);
-                        true
+                Arc::new(move |records: &[PendingAudit], commit: &BatchCommit| {
+                    match for_record.upgrade() {
+                        Some(state) => {
+                            state.record_pending_batch(records, commit);
+                            true
+                        }
+                        None => false,
                     }
-                    None => false,
                 }),
                 Arc::new(move || {
                     if let Some(state) = for_wait.upgrade() {

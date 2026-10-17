@@ -53,13 +53,16 @@ pub(super) fn apply_ca_trust_change(
         "removed_fingerprint": remove.map(nodedb_cluster::ca_fingerprint_hex),
     }))
     .unwrap_or_default();
-    crate::control::security::audit::lock_audit_log(&shared.audit).record_with_auth(
-        AuditEvent::CertRotation,
-        None,
-        None,
-        "metadata_group",
-        &detail,
-        &AuditAuth::default(),
+    crate::control::security::audit::record_concurrent(
+        &shared.audit,
+        crate::control::security::audit::AuditRecordInput {
+            event: AuditEvent::CertRotation,
+            tenant_id: None,
+            database_id: None,
+            source: "metadata_group",
+            detail: &detail,
+            auth: &AuditAuth::default(),
+        },
     );
     Ok(())
 }
@@ -132,17 +135,20 @@ pub(super) fn emit_ddl_audit(
     // other audit writer.
     let audit = std::sync::Arc::clone(&shared.audit);
     let emit = move || {
-        let mut log = crate::control::security::audit::lock_audit_log(&audit);
-        log.record_with_auth(
-            AuditEvent::DdlChange,
-            None,
-            None,
-            "metadata_group",
-            &detail_json,
-            &AuditAuth {
-                user_id,
-                user_name,
-                session_id: String::new(),
+        let auth = AuditAuth {
+            user_id,
+            user_name,
+            session_id: String::new(),
+        };
+        crate::control::security::audit::record_concurrent(
+            &audit,
+            crate::control::security::audit::AuditRecordInput {
+                event: AuditEvent::DdlChange,
+                tenant_id: None,
+                database_id: None,
+                source: "metadata_group",
+                detail: &detail_json,
+                auth: &auth,
             },
         );
     };

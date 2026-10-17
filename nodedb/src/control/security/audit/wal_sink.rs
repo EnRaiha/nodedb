@@ -7,13 +7,20 @@ use crate::wal::WalManager;
 
 /// Durable append target for audit entries.
 ///
-/// `AuditLog` calls `append` under its own lock, once per entry, in seq order.
-/// So positions ascend with seq.
+/// `AuditLog` calls `append_batch` under its own lock, once per record call, in seq order.
+/// So positions ascend with seq, and WAL order equals seq order.
+/// The record call then waits in `sync_through`, after it releases the audit lock.
 /// The sink holds every entry no flush has committed, and boot replays it into the catalog.
 pub trait AuditWalSink: Send + Sync {
-    /// Append one entry durably and return its position.
-    /// The entry is on stable storage when this returns `Ok`.
-    fn append(&self, entry: &AuditEntry) -> crate::Result<u64>;
+    /// Append every entry of `entries` in order, with no sync.
+    ///
+    /// Returns the position of each entry, in order.
+    fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>>;
+
+    /// Wait until every entry at or below `position` is durable.
+    ///
+    /// Concurrent callers share one sync. A failed sync reaches every caller it covered.
+    fn sync_through(&self, position: u64) -> crate::Result<()>;
 
     /// Drop every record at or below `position`.
     ///
@@ -22,13 +29,24 @@ pub trait AuditWalSink: Send + Sync {
 }
 
 impl AuditWalSink for WalManager {
-    fn append(&self, entry: &AuditEntry) -> crate::Result<u64> {
-        let bytes = zerompk::to_msgpack_vec(entry).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("audit entry serialization failed: {e}"),
-        })?;
+    fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>> {
         let data_lsn = self.next_lsn().as_u64();
-        self.append_audit_durable(&bytes, data_lsn)
+        let records = entries
+            .iter()
+            .map(|entry| {
+                zerompk::to_msgpack_vec(entry)
+                    .map(|bytes| (bytes, data_lsn))
+                    .map_err(|e| crate::Error::Serialization {
+                        format: "msgpack".into(),
+                        detail: format!("audit entry serialization failed: {e}"),
+                    })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        self.append_audit_batch(&records)
+    }
+
+    fn sync_through(&self, position: u64) -> crate::Result<()> {
+        self.sync_audit_through(position)
     }
 
     fn truncate_through(&self, position: u64) -> crate::Result<()> {

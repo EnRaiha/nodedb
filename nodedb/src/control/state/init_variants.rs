@@ -159,11 +159,16 @@ impl SharedState {
         let audit = Arc::clone(&state.audit);
         state.session_handles.set_audit_hook(move |event| {
             // A poisoned log still records: dropping a security event is worse than a warning.
-            crate::control::security::audit::lock_audit_log(&audit).record(
-                event,
-                None,
-                "session_handle",
-                "",
+            crate::control::security::audit::record_concurrent(
+                &audit,
+                crate::control::security::audit::AuditRecordInput {
+                    event,
+                    tenant_id: None,
+                    database_id: None,
+                    source: "session_handle",
+                    detail: "",
+                    auth: &crate::control::security::audit::AuditAuth::default(),
+                },
             );
         });
     }

@@ -10,59 +10,80 @@ use nodedb_types::DatabaseId;
 use crate::types::TenantId;
 
 use super::auth::AuditAuth;
-use super::entry::{AuditEntry, hash_entry, now_us};
+use super::entry::AuditEntry;
 use super::event::AuditEvent;
 use super::export_sink::AuditExportSink;
 use super::flush_control::{AuditFlushControl, BACKPRESSURE_MULTIPLE};
 use super::level::AuditLevel;
 use super::wal_sink::AuditWalSink;
 
+/// One audit event to record, borrowed from the caller.
+pub struct AuditRecordInput<'a> {
+    pub event: AuditEvent,
+    pub tenant_id: Option<TenantId>,
+    pub database_id: Option<DatabaseId>,
+    pub source: &'a str,
+    pub detail: &'a str,
+    pub auth: &'a AuditAuth,
+}
+
 /// Append-only audit log.
 ///
 /// Entries are immutable once appended.
-/// Every record call appends the entry to the WAL sink before the lock releases.
-/// So a crash never loses a recorded entry, and boot replays the sink into the catalog.
-/// The buffer holds every entry until a flush commits it to the catalog.
+/// A record call allocates seqs, chains, and appends to the WAL sink under the lock.
+/// So WAL order equals seq order.
+/// Its entries wait in `staged` until the WAL sync covers them, and only then are published.
+/// Readers, flushes and export see published entries only, so they never see a non-durable entry.
+/// The buffer holds every published entry until a flush commits it to the catalog.
 /// The buffer never drops an entry to stay under its bound.
 /// At `flush_bound` entries the log requests an early flush.
 /// At `BACKPRESSURE_MULTIPLE * flush_bound` a recorder that can wait waits for a flush.
 ///
 /// Lives on the Control Plane (Send + Sync).
 pub struct AuditLog {
-    entries: VecDeque<AuditEntry>,
+    pub(super) entries: VecDeque<AuditEntry>,
+    /// Entries appended to the WAL sink and not yet published, in seq order.
+    pub(super) staged: VecDeque<AuditEntry>,
     /// Separate auth event stream for login/logout/MFA/deactivation.
-    auth_events: VecDeque<AuditEntry>,
+    pub(super) auth_events: VecDeque<AuditEntry>,
     /// Buffer length that requests an early flush.
-    flush_bound: usize,
-    /// Next sequence number.
-    next_seq: u64,
-    /// Total entries ever recorded.
-    total_entries: u64,
-    /// Hash of the last recorded entry (for chain continuity).
-    last_hash: String,
+    pub(super) flush_bound: usize,
+    /// Next sequence number to allocate.
+    pub(super) next_seq: u64,
+    /// Total entries ever published.
+    pub(super) total_entries: u64,
+    /// Hash of the last allocated entry, staged or published (for chain continuity).
+    pub(super) staged_hash: String,
+    /// Seq of the last published entry.
+    pub(super) published_seq: u64,
+    /// Hash of the last published entry.
+    pub(super) published_hash: String,
     /// Current audit level (controls which events are recorded).
     level: AuditLevel,
     /// Early-flush signal and flush serialization, shared with the flush task.
-    flush_control: Arc<AuditFlushControl>,
+    pub(super) flush_control: Arc<AuditFlushControl>,
     /// Durable append target. `None` only in a log built with no WAL.
-    wal_sink: Option<Arc<dyn AuditWalSink>>,
-    /// `(seq, WAL position)` of each buffered entry the WAL sink took, in seq order.
-    wal_positions: VecDeque<(u64, u64)>,
+    pub(super) wal_sink: Option<Arc<dyn AuditWalSink>>,
+    /// `(seq, WAL position)` of each staged or buffered entry the WAL sink took, in seq order.
+    pub(super) wal_positions: VecDeque<(u64, u64)>,
     /// Export target, such as the SIEM exporter.
-    export_sink: Option<Arc<dyn AuditExportSink>>,
-    /// Entries recorded for export since the last [`Self::take_export_pending`].
-    export_pending: Vec<AuditEntry>,
+    pub(super) export_sink: Option<Arc<dyn AuditExportSink>>,
+    /// Entries published for export since the last [`Self::take_export_pending`].
+    pub(super) export_pending: Vec<AuditEntry>,
 }
 
 impl AuditLog {
     pub fn new(flush_bound: usize) -> Self {
         Self {
             entries: VecDeque::with_capacity(flush_bound.min(10_000)),
+            staged: VecDeque::new(),
             auth_events: VecDeque::with_capacity(1_000),
             flush_bound: flush_bound.max(1),
             next_seq: 1,
             total_entries: 0,
-            last_hash: String::new(),
+            staged_hash: String::new(),
+            published_seq: 0,
+            published_hash: String::new(),
             level: AuditLevel::default(),
             flush_control: Arc::new(AuditFlushControl::default()),
             wal_sink: None,
@@ -115,9 +136,9 @@ impl AuditLog {
         self.entries.len() >= self.flush_bound.saturating_mul(BACKPRESSURE_MULTIPLE)
     }
 
-    /// The seq of the last recorded entry, or 0 when nothing is recorded.
+    /// The seq of the last published entry, or 0 when nothing is published.
     pub fn last_seq(&self) -> u64 {
-        self.next_seq.saturating_sub(1)
+        self.published_seq
     }
 
     /// Set the audit level.
@@ -133,11 +154,13 @@ impl AuditLog {
     /// Set the next sequence number (used on startup to resume from catalog).
     pub fn set_next_seq(&mut self, seq: u64) {
         self.next_seq = seq;
+        self.published_seq = seq.saturating_sub(1);
     }
 
     /// Set the last hash (used on startup to continue the chain from catalog).
     pub fn set_last_hash(&mut self, hash: String) {
-        self.last_hash = hash;
+        self.published_hash.clone_from(&hash);
+        self.staged_hash = hash;
     }
 
     /// Record an audit event with hash chain (legacy — no auth context).
@@ -214,53 +237,15 @@ impl AuditLog {
         detail: &str,
         auth: &AuditAuth,
     ) -> crate::Result<u64> {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let prev_hash = self.last_hash.clone();
-
-        let entry = AuditEntry {
-            seq,
-            timestamp_us: now_us(),
-            event: event.clone(),
+        let seqs = self.record_batch_durable([AuditRecordInput {
+            event,
             tenant_id,
             database_id,
-            auth_user_id: auth.user_id.clone(),
-            auth_user_name: auth.user_name.clone(),
-            session_id: auth.session_id.clone(),
-            source: source.to_string(),
-            detail: detail.to_string(),
-            prev_hash,
-        };
-
-        self.last_hash = hash_entry(&entry);
-
-        // Route auth events to the separate auth_events stream.
-        if event.is_auth_event() {
-            if self.auth_events.len() >= 10_000 {
-                self.auth_events.pop_front();
-            }
-            self.auth_events.push_back(entry.clone());
-        }
-
-        let durable = match &self.wal_sink {
-            Some(sink) => sink.append(&entry).map(|position| {
-                self.wal_positions.push_back((seq, position));
-            }),
-            None => Ok(()),
-        };
-        if self
-            .export_sink
-            .as_ref()
-            .is_some_and(|sink| sink.is_active())
-        {
-            self.export_pending.push(entry.clone());
-        }
-        self.entries.push_back(entry);
-        self.total_entries += 1;
-        if self.entries.len() >= self.flush_bound {
-            self.flush_control.request_flush();
-        }
-        durable.map(|()| seq)
+            source,
+            detail,
+            auth,
+        }])?;
+        Ok(seqs.first().copied().unwrap_or_else(|| self.last_seq()))
     }
 
     /// Filter in-memory entries by database id.
@@ -352,15 +337,16 @@ impl AuditLog {
         committed_position
     }
 
-    /// Get the current last hash (for chain continuity on restart).
+    /// The hash of the last published entry, the tail a chain reader checks against.
     pub fn last_hash(&self) -> &str {
-        &self.last_hash
+        &self.published_hash
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::security::audit::entry::hash_entry;
 
     #[test]
     fn empty_log() {
@@ -462,8 +448,8 @@ mod tests {
     }
 
     impl AuditWalSink for RecordingSink {
-        fn append(&self, entry: &AuditEntry) -> crate::Result<u64> {
-            if entry.seq == self.fail_seq {
+        fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>> {
+            if entries.iter().any(|entry| entry.seq == self.fail_seq) {
                 return Err(crate::Error::Internal {
                     detail: "injected audit WAL error".into(),
                 });
@@ -471,14 +457,112 @@ mod tests {
             self.appended
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .push(entry.seq);
+                .extend(entries.iter().map(|entry| entry.seq));
             // The position is the seq times 10, so a test can tell the two apart.
-            Ok(entry.seq * 10)
+            Ok(entries.iter().map(|entry| entry.seq * 10).collect())
+        }
+
+        fn sync_through(&self, _position: u64) -> crate::Result<()> {
+            Ok(())
         }
 
         fn truncate_through(&self, _position: u64) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    /// Counts `sync_through` calls, one per sync.
+    #[derive(Default)]
+    struct SyncCountingSink {
+        syncs: std::sync::atomic::AtomicUsize,
+        appended: std::sync::atomic::AtomicUsize,
+        panic_on_append: bool,
+    }
+
+    impl AuditWalSink for SyncCountingSink {
+        fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>> {
+            if self.panic_on_append {
+                panic!("injected audit WAL panic");
+            }
+            self.appended
+                .fetch_add(entries.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(entries.iter().map(|entry| entry.seq).collect())
+        }
+
+        fn sync_through(&self, _position: u64) -> crate::Result<()> {
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn truncate_through(&self, _position: u64) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn batch_inputs<'a>(
+        details: &'a [String],
+        auth: &'a AuditAuth,
+    ) -> impl Iterator<Item = AuditRecordInput<'a>> {
+        details.iter().map(move |detail| AuditRecordInput {
+            event: AuditEvent::DmlAudit,
+            tenant_id: None,
+            database_id: None,
+            source: "batch",
+            detail,
+            auth,
+        })
+    }
+
+    #[test]
+    fn a_64_entry_batch_issues_one_sync() {
+        let sink = Arc::new(SyncCountingSink::default());
+        let mut log = AuditLog::new(1_000);
+        log.set_wal_sink(Arc::clone(&sink) as Arc<dyn AuditWalSink>);
+        let details: Vec<String> = (0..64).map(|i| format!("dml-{i}")).collect();
+        let auth = AuditAuth::default();
+
+        let seqs = log
+            .record_batch_durable(batch_inputs(&details, &auth))
+            .expect("record batch");
+
+        assert_eq!(
+            seqs,
+            (1..=64).collect::<Vec<u64>>(),
+            "seq order follows input order"
+        );
+        assert_eq!(sink.syncs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sink.appended.load(std::sync::atomic::Ordering::SeqCst), 64);
+        let entries = log.all();
+        for pair in entries.iter().collect::<Vec<_>>().windows(2) {
+            assert_eq!(
+                pair[1].prev_hash,
+                hash_entry(pair[0]),
+                "the batch stays chained"
+            );
+        }
+        assert_eq!(log.last_hash(), hash_entry(&entries[63]));
+    }
+
+    #[test]
+    fn a_sink_panic_leaves_the_log_untouched() {
+        let mut log = AuditLog::new(1_000);
+        log.record(AuditEvent::AdminAction, None, "src", "before");
+        let (last_seq, last_hash) = (log.last_seq(), log.last_hash().to_string());
+        log.set_wal_sink(Arc::new(SyncCountingSink {
+            panic_on_append: true,
+            ..SyncCountingSink::default()
+        }) as Arc<dyn AuditWalSink>);
+        let details: Vec<String> = (0..3).map(|i| format!("dml-{i}")).collect();
+        let auth = AuditAuth::default();
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.record_batch_durable(batch_inputs(&details, &auth))
+        }));
+
+        assert!(outcome.is_err(), "the sink panic must propagate");
+        assert_eq!(log.len(), 1, "no entry of the batch is buffered");
+        assert_eq!(log.last_seq(), last_seq, "no seq of the batch is consumed");
+        assert_eq!(log.last_hash(), last_hash);
     }
 
     #[test]
