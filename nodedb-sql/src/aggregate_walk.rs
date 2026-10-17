@@ -46,6 +46,23 @@ pub fn contains_aggregate(expr: &Expr, functions: &FunctionRegistry) -> bool {
     detector.found
 }
 
+/// Return `true` if `expr` is one aggregate call and nothing else, past any
+/// parentheses: `SUM(x)`, not `ROUND(SUM(x), 1)` or `SUM(x) / 2`.
+pub fn is_bare_aggregate_call(expr: &Expr, functions: &FunctionRegistry) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_bare_aggregate_call(inner, functions),
+        Expr::Function(f) => functions.is_aggregate(&function_name(f)) && f.over.is_none(),
+        _ => false,
+    }
+}
+
+/// Return `true` if `expr` computes over an aggregate: it holds an aggregate
+/// call and is not one bare aggregate call. A grouped plan emits the
+/// aggregate's value, so such an expression is evaluated over the group row.
+pub fn computes_over_aggregate(expr: &Expr, functions: &FunctionRegistry) -> bool {
+    contains_aggregate(expr, functions) && !is_bare_aggregate_call(expr, functions)
+}
+
 /// Extract every aggregate function call from `expr`, binding each to
 /// the given output `alias`. Nested aggregates (e.g. `SUM(AVG(x))`,
 /// which is illegal SQL in Postgres and most other systems) are

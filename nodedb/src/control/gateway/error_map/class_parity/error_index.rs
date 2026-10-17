@@ -3,7 +3,7 @@
 //! A dense index per `crate::Error` variant.
 
 /// The number of `crate::Error` variants [`error_variant_index`] numbers.
-pub(super) const ERROR_VARIANT_COUNT: usize = 125;
+pub(super) const ERROR_VARIANT_COUNT: usize = 126;
 
 /// A dense index per `crate::Error` variant. Exhaustive, so a new variant
 /// fails to compile here until it gets an index, and
@@ -137,5 +137,6 @@ pub(crate) fn error_variant_index(err: &crate::Error) -> usize {
         E::DatetimeFieldOverflow { .. } => 120,
         E::WrongObjectType { .. } => 123,
         E::MixedSrid { .. } => 124,
+        E::UngroupedColumn { .. } => 125,
     }
 }

@@ -71,6 +71,9 @@ pub(crate) fn map_plan_error(
         nodedb_sql::SqlError::AmbiguousColumn { column } => {
             crate::Error::AmbiguousColumn { column }
         }
+        nodedb_sql::SqlError::UngroupedColumn { column } => {
+            crate::Error::UngroupedColumn { column }
+        }
         nodedb_sql::SqlError::TextColumn {
             collection,
             column,

@@ -246,6 +246,7 @@ pub(in crate::planner::select) fn apply_order_by(
             tiered,
             temporal,
             output,
+            group_keys,
             ..
         }) => Ok(SqlPlan::TimeseriesScan(TimeseriesScanPlan {
             collection: collection.clone(),
@@ -262,6 +263,7 @@ pub(in crate::planner::select) fn apply_order_by(
             tiered: *tiered,
             temporal: *temporal,
             output: output.clone(),
+            group_keys: group_keys.clone(),
         })),
         // Cte wraps an inner outer plan; push ORDER BY into that outer
         // so derived-table queries (`SELECT … FROM (…) AS t ORDER BY …`)

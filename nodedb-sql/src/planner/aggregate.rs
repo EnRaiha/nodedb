@@ -89,11 +89,25 @@ pub fn plan_aggregate(query: AggregateQuery<'_>, functions: &FunctionRegistry) -
         // A native grouped timeseries scan emits its group rows under fixed
         // keys. The SELECT-list order and aliases are recorded here, so the
         // response shaper reads each key under the name the client asked for.
-        scan.output = timeseries_agg_output(
+        //
+        // An item the scan does not emit as a column (`ROUND(AVG(v), 1)`) is
+        // evaluated over the group rows by a tail, which can read any key or
+        // aggregate. The scan then emits every key and every aggregate, and
+        // the tail restates the SELECT list.
+        let order = if crate::planner::aggregate_cp_wrap::items_need_group_row_tail(
             &group_keys,
-            &clauses.group_by_aliases,
-            &clauses.output_order,
-        );
+            &select.projection,
+            functions,
+            scope,
+        )? {
+            (0..group_keys.len())
+                .map(AggOutputSlot::GroupKey)
+                .chain((0..scan.aggregates.len()).map(AggOutputSlot::Aggregate))
+                .collect()
+        } else {
+            clauses.output_order
+        };
+        scan.output = timeseries_agg_output(&group_keys, &clauses.group_by_aliases, &order);
     }
     Ok(plan)
 }
@@ -302,6 +316,16 @@ pub fn extract_aggregates_from_projection(
         };
         let mut extracted =
             crate::aggregate_walk::extract_aggregates(expr, &alias, functions, scope)?;
+        // An item that computes over its aggregates (`ROUND(AVG(v), 1) AS m`,
+        // `SUM(a) / COUNT(*)`) is evaluated over the group row by a tail. Its
+        // aggregates are not output columns, so each takes its own canonical
+        // key: two aggregates of one item never share a name, and the item's
+        // alias stays free for the tail's result.
+        if crate::aggregate_walk::computes_over_aggregate(expr, functions) {
+            for agg in &mut extracted {
+                agg.alias = super::agg_naming::aggregate_output_key(agg);
+            }
+        }
         aggregates.append(&mut extracted);
     }
     Ok(aggregates)

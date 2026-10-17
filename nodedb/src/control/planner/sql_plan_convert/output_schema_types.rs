@@ -62,7 +62,7 @@ pub fn infer_computed_expr_type(expr: &SqlExpr, types: &HashMap<String, DdlColTy
             // wire type — stay Text.
             _ => DdlColType::Text,
         },
-        SqlExpr::BinaryOp { op, .. } => match op {
+        SqlExpr::BinaryOp { left, op, right } => match op {
             // Comparison and logical operators yield a boolean.
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -72,19 +72,37 @@ pub fn infer_computed_expr_type(expr: &SqlExpr, types: &HashMap<String, DdlColTy
             | BinaryOp::Le
             | BinaryOp::And
             | BinaryOp::Or => DdlColType::Bool,
-            // Arithmetic promotion (int vs float vs numeric) is too subtle to
-            // type safely here; `||` is string concatenation. All stay Text.
-            BinaryOp::Add
-            | BinaryOp::Sub
-            | BinaryOp::Mul
-            | BinaryOp::Div
-            | BinaryOp::Mod
-            | BinaryOp::Concat => DdlColType::Text,
+            // Integer and float operands evaluate in `f64` and yield an
+            // integer when the result is whole, else a float. Integer `+`,
+            // `-`, `*`, `%` stay whole, so they are `Int8`. Integer `/`
+            // yields `5` for `10 / 2` and `3.5` for `7 / 2`. `Numeric`
+            // renders both as the evaluator produced them. A float operand
+            // makes the result `Float8`. A numeric (decimal) or text operand
+            // stays Text.
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                match (
+                    numeric_class(infer_computed_expr_type(left, types)),
+                    numeric_class(infer_computed_expr_type(right, types)),
+                ) {
+                    (Some(NumericClass::Integer), Some(NumericClass::Integer)) => match op {
+                        BinaryOp::Div => DdlColType::Numeric,
+                        _ => DdlColType::Int8,
+                    },
+                    (Some(_), Some(_)) => DdlColType::Float8,
+                    _ => DdlColType::Text,
+                }
+            }
+            // `||` is string concatenation.
+            BinaryOp::Concat => DdlColType::Text,
         },
-        SqlExpr::UnaryOp { op, .. } => match op {
+        SqlExpr::UnaryOp { op, expr } => match op {
             UnaryOp::Not => DdlColType::Bool,
-            // `-x` preserves a numeric operand's type; anything else is Text.
-            UnaryOp::Neg => DdlColType::Text,
+            // `-x` keeps an integer or float operand's class.
+            UnaryOp::Neg => match numeric_class(infer_computed_expr_type(expr, types)) {
+                Some(NumericClass::Integer) => DdlColType::Int8,
+                Some(NumericClass::Float) => DdlColType::Float8,
+                None => DdlColType::Text,
+            },
         },
         SqlExpr::IsNull { .. }
         | SqlExpr::InList { .. }
@@ -98,15 +116,81 @@ pub fn infer_computed_expr_type(expr: &SqlExpr, types: &HashMap<String, DdlColTy
                 _ => DdlColType::Text,
             }
         }
+        // A math function computes in `f64` and yields an integer when the
+        // result is whole, else a float: `Float8` renders both. Its first
+        // argument must be an integer or a float.
+        SqlExpr::Function { name, args, .. } if is_float_math_function(name) => {
+            match args
+                .first()
+                .and_then(|arg| numeric_class(infer_computed_expr_type(arg, types)))
+            {
+                Some(_) => DdlColType::Float8,
+                None => DdlColType::Text,
+            }
+        }
+        // A CASE yields one of its branches. When every non-NULL branch has
+        // one type, that is the CASE's type.
+        SqlExpr::Case {
+            when_then,
+            else_expr,
+            ..
+        } => {
+            let mut branch_types = when_then
+                .iter()
+                .map(|(_, then)| then)
+                .chain(else_expr.as_deref())
+                .filter(|branch| !matches!(branch, SqlExpr::Literal(SqlValue::Null)))
+                .map(|branch| infer_computed_expr_type(branch, types));
+            match branch_types.next() {
+                Some(first) if branch_types.all(|ty| ty == first) => first,
+                Some(_) | None => DdlColType::Text,
+            }
+        }
         // String functions, casts, subqueries, wildcards, array literals and
         // any other function call are not certainly non-TEXT — stay Text.
         SqlExpr::Function { .. }
-        | SqlExpr::Case { .. }
         | SqlExpr::Cast { .. }
         | SqlExpr::Subquery(_)
         | SqlExpr::Wildcard
         | SqlExpr::ArrayLiteral(_) => DdlColType::Text,
     }
+}
+
+/// Whether a numeric wire type holds integer or float cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericClass {
+    Integer,
+    Float,
+}
+
+/// The class of an integer or float wire type. `None` for every other type,
+/// `Numeric` included: a decimal operand evaluates as a decimal.
+fn numeric_class(ty: DdlColType) -> Option<NumericClass> {
+    match ty {
+        DdlColType::Int8 | DdlColType::Int4 | DdlColType::Int2 => Some(NumericClass::Integer),
+        DdlColType::Float8 | DdlColType::Float4 => Some(NumericClass::Float),
+        DdlColType::Text
+        | DdlColType::Varchar
+        | DdlColType::Bool
+        | DdlColType::Bytea
+        | DdlColType::Json
+        | DdlColType::Jsonb
+        | DdlColType::Timestamp
+        | DdlColType::Timestamptz
+        | DdlColType::Numeric
+        | DdlColType::Uuid
+        | DdlColType::Float4Array
+        | DdlColType::Float8Array => None,
+    }
+}
+
+/// Whether `name` is a math function that computes in `f64`.
+fn is_float_math_function(name: &str) -> bool {
+    const FLOAT_MATH: &[&str] = &[
+        "abs", "round", "ceil", "ceiling", "floor", "power", "pow", "sqrt", "mod", "sign", "log",
+        "ln", "log10", "log2", "exp",
+    ];
+    FLOAT_MATH.iter().any(|f| name.eq_ignore_ascii_case(f))
 }
 
 /// The result type of a `time_bucket` call over a column of type `source`.
@@ -210,6 +294,63 @@ mod tests {
             infer_computed_expr_type(&bucket(vec![interval(), column("amount")]), &t),
             DdlColType::Text
         );
+    }
+
+    /// Math functions and arithmetic over integer and float operands take a
+    /// numeric type. A CASE takes its branches' one type.
+    #[test]
+    fn numeric_expressions_take_a_numeric_type() {
+        let t = types_map();
+        let call = |name: &str, args: Vec<SqlExpr>| SqlExpr::Function {
+            name: name.to_string(),
+            args,
+            distinct: false,
+        };
+        let binary = |left: SqlExpr, op: BinaryOp, right: SqlExpr| SqlExpr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        };
+        let one = || SqlExpr::Literal(SqlValue::Int(1));
+        assert_eq!(
+            infer_computed_expr_type(&call("round", vec![column("amount"), one()]), &t),
+            DdlColType::Float8
+        );
+        assert_eq!(
+            infer_computed_expr_type(&call("round", vec![column("label"), one()]), &t),
+            DdlColType::Text
+        );
+        assert_eq!(
+            infer_computed_expr_type(&binary(column("n"), BinaryOp::Add, one()), &t),
+            DdlColType::Int8
+        );
+        assert_eq!(
+            infer_computed_expr_type(&binary(column("amount"), BinaryOp::Div, column("n")), &t),
+            DdlColType::Float8
+        );
+        assert_eq!(
+            infer_computed_expr_type(&binary(column("n"), BinaryOp::Div, column("n")), &t),
+            DdlColType::Numeric
+        );
+        assert_eq!(
+            infer_computed_expr_type(&binary(column("n"), BinaryOp::Mod, column("n")), &t),
+            DdlColType::Int8
+        );
+        let case = SqlExpr::Case {
+            operand: None,
+            when_then: vec![(
+                binary(column("n"), BinaryOp::Gt, one()),
+                SqlExpr::Literal(SqlValue::String("many".into())),
+            )],
+            else_expr: Some(Box::new(SqlExpr::Literal(SqlValue::String("one".into())))),
+        };
+        assert_eq!(infer_computed_expr_type(&case, &t), DdlColType::Text);
+        let mixed = SqlExpr::Case {
+            operand: None,
+            when_then: vec![(binary(column("n"), BinaryOp::Gt, one()), column("amount"))],
+            else_expr: Some(Box::new(SqlExpr::Literal(SqlValue::Null))),
+        };
+        assert_eq!(infer_computed_expr_type(&mixed, &t), DdlColType::Float8);
     }
 
     #[test]

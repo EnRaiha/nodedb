@@ -1,35 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wrapping a grouped plan so a Control-Plane-computed SELECT-list item keeps
-//! its position.
+//! Wrapping a grouped plan so every SELECT-list item keeps its position and
+//! its value.
 //!
-//! An `Aggregate` plan emits group keys and aggregate values only. A SELECT
-//! item that calls a sequence accessor is neither, so the aggregate cannot
-//! carry it. The planner wraps the finished aggregate in a `Subquery` whose
-//! projection restates every output column in SELECT-list order and places a
-//! [`crate::types::Projection::CpComputed`] entry at the item's position. The wrap runs
-//! after ORDER BY and LIMIT are attached, so those stay on the aggregate.
+//! A grouped plan (`Aggregate`, or an aggregating timeseries scan) emits
+//! group keys and aggregate values only. A SELECT item that is neither, such
+//! as a sequence accessor call, `ROUND(AVG(v), 1)`, `SUM(a) / COUNT(*)`, or
+//! `UPPER(host)` over the key `host`, is evaluated over the finalized group
+//! rows. The planner wraps the finished plan in a `Subquery` whose projection
+//! restates every output column in SELECT-list order and evaluates each such
+//! item at its position. The wrap runs after ORDER BY and LIMIT are attached,
+//! so those stay on the grouped plan.
 
 use crate::types::CtePlan;
 use sqlparser::ast;
 
-use super::projection::aggregate_cp_projection;
+use super::projection::{aggregate_cp_projection, items_need_group_row_tail};
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::cp_projection::ast_sequence_accessor;
 use crate::resolver::columns::TableScope;
-use crate::types::SqlPlan;
+use crate::types::{SqlExpr, SqlPlan, TimeseriesScanPlan};
 
-/// Wrap `plan` when `items` hold a sequence accessor the aggregate cannot
-/// carry. A plan with no such item, or one that is not grouped, returns
-/// unchanged: `convert_projection` marks the item on a row plan itself.
+/// Wrap `plan` when `items` hold an item the grouped plan cannot carry. A
+/// plan with no such item, or one that is not grouped, returns unchanged:
+/// `convert_projection` marks a sequence accessor on a row plan itself.
 ///
 /// `grouped` says whether the SELECT aggregates (GROUP BY, or an aggregate
 /// call in its list). `scope` is the relation set the SELECT resolved
-/// against. A grouped SELECT that does not produce the statement's output
-/// rows (a subquery, CTE body, UNION branch, derived table) refuses the
-/// item: the aggregate planner never converts a bare non-key item, so
-/// nothing else reports it.
+/// against. A sequence accessor in a grouped SELECT that does not produce
+/// the statement's output rows (a subquery, CTE body, UNION branch, derived
+/// table) is refused: no session evaluates it there.
 pub fn wrap_aggregate_cp_items(
     plan: SqlPlan,
     items: &[ast::SelectItem],
@@ -40,11 +41,24 @@ pub fn wrap_aggregate_cp_items(
     if !grouped || !scope.is_row_scope() {
         return Ok(plan);
     }
-    let Some(accessor) = items.iter().find_map(item_accessor) else {
-        return Ok(plan);
-    };
-    if !scope.is_statement_output() {
-        return Err(SqlError::SequencePerRowUnsupported { name: accessor });
+    let accessor = items.iter().find_map(item_accessor);
+    if let Some(name) = &accessor
+        && !scope.is_statement_output()
+    {
+        return Err(SqlError::SequencePerRowUnsupported { name: name.clone() });
+    }
+    if accessor.is_none() {
+        let needs_tail = match grouped_keys(&plan) {
+            Some(group_by) => items_need_group_row_tail(group_by, items, functions, scope)?,
+            // A shape this wrap cannot restate is refused below when an item
+            // computes over an aggregate. Every other item it carries.
+            None => items
+                .iter()
+                .any(|item| item_computes_over_aggregate(item, functions)),
+        };
+        if !needs_tail {
+            return Ok(plan);
+        }
     }
     match plan {
         SqlPlan::Cte(CtePlan { definitions, outer }) => Ok(SqlPlan::Cte(CtePlan {
@@ -53,7 +67,7 @@ pub fn wrap_aggregate_cp_items(
                 *outer, items, grouped, functions, scope,
             )?),
         })),
-        SqlPlan::Aggregate { .. } => {
+        SqlPlan::Aggregate { .. } | SqlPlan::TimeseriesScan(_) => {
             let projection = aggregate_cp_projection(&plan, items, functions, scope)?;
             Ok(SqlPlan::Subquery {
                 input: Box::new(plan),
@@ -79,7 +93,11 @@ pub fn wrap_aggregate_cp_items(
             offset,
             distinct,
             limit,
-        } if matches!(*input, SqlPlan::Aggregate { .. }) && projection.is_empty() => {
+        } if matches!(
+            *input,
+            SqlPlan::Aggregate { .. } | SqlPlan::TimeseriesScan(_)
+        ) && projection.is_empty() =>
+        {
             let projection = aggregate_cp_projection(&input, items, functions, scope)?;
             Ok(SqlPlan::Subquery {
                 input,
@@ -93,16 +111,48 @@ pub fn wrap_aggregate_cp_items(
             })
         }
         // A grouped query the engine rules planned as another shape (a
-        // timeseries bucket scan, a grouped query joined to a scalar
-        // subquery) names its output columns by rules this wrap does not
-        // restate. Refusing beats dropping the item from the result.
+        // grouped query joined to a scalar subquery) names its output columns
+        // by rules this wrap does not restate. Refusing beats dropping the
+        // item from the result, or returning it unevaluated.
         other => Err(SqlError::Unsupported {
             detail: format!(
-                "a sequence accessor in the SELECT list of a grouped query planned as {}; \
-                 call it in a FROM-less SELECT instead",
+                "a computed item in the SELECT list of a grouped query planned as {}",
                 other.variant_name()
             ),
         }),
+    }
+}
+
+/// The GROUP BY keys of the grouped plan `plan` wraps, when it is one.
+///
+/// A raw timeseries scan is not grouped. Neither is any other shape: the wrap
+/// leaves it as planned.
+fn grouped_keys(plan: &SqlPlan) -> Option<&[SqlExpr]> {
+    match plan {
+        SqlPlan::Aggregate { group_by, .. } => Some(group_by),
+        SqlPlan::TimeseriesScan(scan) if is_grouped_scan(scan) => Some(&scan.group_keys),
+        SqlPlan::Cte(CtePlan { outer, .. }) => grouped_keys(outer),
+        SqlPlan::Subquery {
+            input, projection, ..
+        } if projection.is_empty() => grouped_keys(input),
+        _ => None,
+    }
+}
+
+/// Whether a timeseries scan groups or aggregates, rather than reading rows.
+fn is_grouped_scan(scan: &TimeseriesScanPlan) -> bool {
+    !scan.aggregates.is_empty() || scan.bucket_interval_ms > 0 || !scan.group_by.is_empty()
+}
+
+/// Whether a SELECT item computes over an aggregate: `ROUND(AVG(v), 1)`.
+fn item_computes_over_aggregate(item: &ast::SelectItem, functions: &FunctionRegistry) -> bool {
+    match item {
+        ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
+            crate::aggregate_walk::computes_over_aggregate(expr, functions)
+        }
+        ast::SelectItem::ExprWithAliases { .. }
+        | ast::SelectItem::Wildcard(_)
+        | ast::SelectItem::QualifiedWildcard(..) => false,
     }
 }
 
@@ -315,9 +365,47 @@ mod tests {
     fn a_grouped_accessor_item_may_reference_group_keys_only() {
         let err = plan_err("SELECT grp, COUNT(*), nextval('s') + other FROM t GROUP BY grp");
         assert!(
-            matches!(err, SqlError::Unsupported { ref detail } if detail.contains("'other'")),
+            matches!(err, SqlError::UngroupedColumn { ref column } if column == "other"),
             "got {err:?}"
         );
+    }
+
+    /// A column inside a GROUP BY expression is not a key by itself, as
+    /// PostgreSQL rules. The key expression itself reads the key.
+    #[test]
+    fn a_column_inside_a_group_by_expression_is_ungrouped() {
+        let err = plan_err("SELECT other, COUNT(*) FROM t GROUP BY other / 2");
+        assert!(
+            matches!(err, SqlError::UngroupedColumn { ref column } if column == "other"),
+            "got {err:?}"
+        );
+        plan("SELECT other / 2 AS half, COUNT(*) FROM t GROUP BY other / 2");
+    }
+
+    /// An aggregate inside a scalar function, a CASE, or arithmetic binds to
+    /// its group-row column. The item is computed over that row.
+    #[test]
+    fn an_aggregate_inside_any_expression_binds_to_its_row_column() {
+        for sql in [
+            "SELECT ROUND(AVG(other), 1) AS m FROM t",
+            "SELECT grp, CASE WHEN COUNT(*) > 1 THEN 'many' ELSE 'one' END AS s FROM t GROUP BY grp",
+            "SELECT grp, ROUND(ABS(MIN(other) - MAX(other)), 2) AS w FROM t GROUP BY grp",
+        ] {
+            let plan = plan(sql);
+            let SqlPlan::Subquery { projection, .. } = plan else {
+                panic!("{sql}: expected a group-row tail, got {plan:?}");
+            };
+            let Some(Projection::Computed { expr, .. }) = projection.last() else {
+                panic!("{sql}: expected a computed item, got {projection:?}");
+            };
+            let rendered = format!("{expr:?}");
+            assert!(
+                !rendered.contains("name: \"avg\"")
+                    && !rendered.contains("name: \"count\"")
+                    && !rendered.contains("name: \"min\""),
+                "{sql}: an aggregate call is left unbound: {rendered}"
+            );
+        }
     }
 
     #[test]

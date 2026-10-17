@@ -193,6 +193,10 @@ pub(crate) fn classify(e: &Error) -> NodeDbError {
             fault,
         } => crate::error_from_data_plane::text_column_to_public(collection, column, fault),
         Error::AmbiguousColumn { column } => NodeDbError::ambiguous_column(column.clone()),
+        // The public class `code_for_sqlstate` gives `42803`.
+        e @ Error::UngroupedColumn { .. } => {
+            NodeDbError::from_wire(nodedb_types::error::ErrorCode::BAD_REQUEST, e.to_string())
+        }
         Error::UnknownStrictField { column, .. } => NodeDbError::undefined_column(column.clone()),
         Error::DivisionByZero => NodeDbError::division_by_zero(),
         Error::DataException { detail } => NodeDbError::data_exception(detail.clone()),

@@ -117,6 +117,7 @@ fn classified_sqlstates() -> Vec<(usize, &'static str)> {
         (118, sqlstate::DATATYPE_MISMATCH),
         (119, sqlstate::INVALID_DATETIME_FORMAT),
         (120, sqlstate::DATETIME_FIELD_OVERFLOW),
+        (125, sqlstate::GROUPING_ERROR),
     ]
 }
 

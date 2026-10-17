@@ -404,6 +404,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::UndefinedColumn { .. }
             | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }
+            | Error::UngroupedColumn { .. }
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }

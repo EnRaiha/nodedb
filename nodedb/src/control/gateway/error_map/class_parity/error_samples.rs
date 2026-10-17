@@ -208,6 +208,7 @@ pub(crate) fn error_samples() -> Vec<crate::Error> {
         E::AmbiguousColumn {
             column: "id".into(),
         },
+        E::UngroupedColumn { column: "x".into() },
         E::UnknownStrictField {
             collection: collection(),
             column: "x".into(),

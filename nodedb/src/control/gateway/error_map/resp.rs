@@ -92,6 +92,7 @@ impl GatewayErrorMap {
             | Error::UndefinedColumn { .. }
             | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }
+            | Error::UngroupedColumn { .. }
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }

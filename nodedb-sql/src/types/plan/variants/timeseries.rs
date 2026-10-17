@@ -5,7 +5,7 @@
 use crate::temporal::TemporalScope;
 use crate::types::filter::Filter;
 use crate::types::query::{AggregateExpr, Projection, SortKey};
-use crate::types_expr::SqlValue;
+use crate::types_expr::{SqlExpr, SqlValue};
 
 /// Payload of [`SqlPlan::TimeseriesScan`](crate::types::SqlPlan::TimeseriesScan).
 #[derive(Debug, Clone)]
@@ -32,6 +32,10 @@ pub struct TimeseriesScanPlan {
     /// The SELECT-list output columns of an aggregating scan, in SELECT-list
     /// order. Empty on a raw scan, and on a scan planned without a SELECT list.
     pub output: Vec<TimeseriesAggOutput>,
+    /// The GROUP BY keys as planned, the `time_bucket` key among them. A tail
+    /// that evaluates an item over the group rows matches its sub-expressions
+    /// against these keys. Empty on a raw scan.
+    pub group_keys: Vec<SqlExpr>,
 }
 
 /// One SELECT-list output column of an aggregating timeseries scan.

@@ -317,6 +317,7 @@ mod tests {
             tiered: false,
             temporal: nodedb_sql::temporal::TemporalScope::default(),
             output,
+            group_keys: Vec::new(),
         }
     }
 

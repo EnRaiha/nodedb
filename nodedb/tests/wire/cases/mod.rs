@@ -216,6 +216,7 @@ mod sorted_index_authorization;
 mod spatial_cp_dp_query;
 mod spatial_crs;
 mod sql_aggregate_functions;
+mod sql_aggregate_computed_items;
 mod sql_alter_after_drop;
 mod sql_arithmetic_overflow;
 mod sql_backup_calvin_cut;

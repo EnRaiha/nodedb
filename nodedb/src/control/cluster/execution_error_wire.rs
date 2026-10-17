@@ -122,6 +122,7 @@ pub(crate) fn execution_error_to_typed(err: crate::Error) -> TypedClusterError {
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }
+        | crate::Error::UngroupedColumn { .. }
         | crate::Error::UnknownStrictField { .. }
         | crate::Error::DivisionByZero
         | crate::Error::DataException { .. }

@@ -248,6 +248,8 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             tiered,
             temporal,
             output,
+            // Read by the planner's group-row tail, not by execution.
+            group_keys: _,
         }) => visitor.timeseries_scan(TimeseriesScanVisitArgs {
             collection,
             time_range: *time_range,

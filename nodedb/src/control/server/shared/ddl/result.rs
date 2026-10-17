@@ -258,6 +258,9 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         sqlstate::UNDEFINED_FUNCTION => ErrorCode::UNDEFINED_FUNCTION,
         sqlstate::UNDEFINED_COLUMN => ErrorCode::UNDEFINED_COLUMN,
         sqlstate::AMBIGUOUS_COLUMN => ErrorCode::AMBIGUOUS_COLUMN,
+        // A column read outside GROUP BY and outside every aggregate: a
+        // non-retriable client error.
+        sqlstate::GROUPING_ERROR => ErrorCode::BAD_REQUEST,
         sqlstate::DATA_EXCEPTION => ErrorCode::DATA_EXCEPTION,
         // A bad parameter value, text representation, datetime format or
         // datetime range is a data exception: class `22`, the class the code

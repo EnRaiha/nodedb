@@ -270,6 +270,7 @@ impl From<crate::Error> for ErrorCode {
             | crate::Error::MirrorReadOnly { .. }
             | crate::Error::WrongObjectType { .. }
             | crate::Error::AmbiguousColumn { .. }
+            | crate::Error::UngroupedColumn { .. }
             | crate::Error::ExecutionLimitExceeded { .. }
             | crate::Error::LimitExceeded { .. }
             | crate::Error::Promql(_)

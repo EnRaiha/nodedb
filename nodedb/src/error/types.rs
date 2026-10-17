@@ -355,6 +355,15 @@ pub enum Error {
     #[error("column reference \"{column}\" is ambiguous")]
     AmbiguousColumn { column: String },
 
+    /// A grouped SELECT list read a column that is neither a GROUP BY key
+    /// nor inside an aggregate. Propagated from `SqlError::UngroupedColumn`;
+    /// the pgwire layer renders it as SQLSTATE `42803` (grouping_error).
+    #[error(
+        "column \"{column}\" must appear in the GROUP BY clause or be used in an \
+         aggregate function"
+    )]
+    UngroupedColumn { column: String },
+
     /// A write body carried a field the collection's strict schema does not
     /// declare. The same condition the planner reports as an unknown column,
     /// detected at encode time for the transports that bypass the planner:

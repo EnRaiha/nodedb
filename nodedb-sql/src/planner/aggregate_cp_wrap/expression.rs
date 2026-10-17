@@ -4,17 +4,40 @@
 
 use crate::types::SqlExpr;
 
-/// `expr` with every column reference stripped of its table qualifier and
-/// renamed to the key a finalized group row carries it under.
+/// How an expression over the input relations reads a finalized group row.
+pub(super) struct GroupRowNames {
+    /// `(bare name, row name)` of each GROUP BY key the row carries under
+    /// another name: an aliased key carries its alias.
+    pub renames: Vec<(String, String)>,
+    /// `(Debug rendering, row name)` of each computed GROUP BY key. The row
+    /// carries the key's value, not the input columns it reads.
+    pub computed_keys: Vec<(String, String)>,
+}
+
+/// `expr` read from a finalized group row.
 ///
-/// A finalized group row keys its columns by bare name, and an aliased GROUP
-/// BY key by its alias: `renames` maps each aliased key's bare name to it.
-pub(super) fn group_row_columns(expr: SqlExpr, renames: &[(String, String)]) -> SqlExpr {
-    let go = |e: SqlExpr| group_row_columns(e, renames);
-    let go_box = |e: Box<SqlExpr>| Box::new(group_row_columns(*e, renames));
+/// A sub-expression equal to a computed GROUP BY key becomes a reference to
+/// the key's row column. `SqlExpr` has no `PartialEq` (it can carry a subquery
+/// plan), so the match compares the `Debug` rendering. Both sides pass through
+/// `convert_expr`, so equal expressions render identically. Every other column
+/// reference is stripped of its table qualifier and renamed to the name the
+/// row carries it under.
+pub(super) fn group_row_columns(expr: SqlExpr, names: &GroupRowNames) -> SqlExpr {
+    if !names.computed_keys.is_empty() && !matches!(expr, SqlExpr::Column { .. }) {
+        let rendered = format!("{expr:?}");
+        if let Some((_, name)) = names.computed_keys.iter().find(|(key, _)| *key == rendered) {
+            return SqlExpr::Column {
+                table: None,
+                name: name.clone(),
+            };
+        }
+    }
+    let go = |e: SqlExpr| group_row_columns(e, names);
+    let go_box = |e: Box<SqlExpr>| Box::new(group_row_columns(*e, names));
     match expr {
         SqlExpr::Column { name, .. } => {
-            let name = renames
+            let name = names
+                .renames
                 .iter()
                 .find(|(from, _)| *from == name)
                 .map_or(name, |(_, to)| to.clone());

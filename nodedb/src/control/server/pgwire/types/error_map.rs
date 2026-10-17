@@ -118,6 +118,9 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
             sqlstate::AMBIGUOUS_COLUMN,
             format!("column reference \"{column}\" is ambiguous"),
         ),
+        crate::Error::UngroupedColumn { .. } => {
+            ("ERROR", sqlstate::GROUPING_ERROR, err.to_string())
+        }
         crate::Error::UnknownStrictField { .. } => {
             ("ERROR", sqlstate::UNDEFINED_COLUMN, err.to_string())
         }
