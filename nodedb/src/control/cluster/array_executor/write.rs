@@ -11,7 +11,6 @@ use nodedb_cluster::distributed_array::ArrayShardWriteOutcome;
 use nodedb_cluster::distributed_array::wire::{ArrayShardDeleteReq, ArrayShardPutReq};
 use nodedb_cluster::error::{ClusterError, Result};
 
-use super::cells::flatten_blob_vec;
 use super::executor::DataPlaneArrayExecutor;
 use super::refusal::execution_error;
 use crate::control::server::shared::sql::staging_predicates::require_affected_count;
@@ -29,19 +28,11 @@ impl DataPlaneArrayExecutor {
                 detail: format!("array_id decode in exec_put: {e}"),
             })?;
 
-        // The coordinator sends a bucket of separately-encoded `ArrayPutCell`s;
-        // the Data Plane decodes one flat msgpack array.
-        let cells_msgpack = flatten_blob_vec::<crate::engine::array::wal::ArrayPutCell>(
-            &req.cells_msgpack,
-            "exec_put",
-        )
-        .map_err(|e| ClusterError::Codec {
-            detail: e.to_string(),
-        })?;
-
+        // The coordinator's bucket is the flat `Vec<ArrayPutCell>` encoding
+        // the Data Plane decodes, so it passes through as it is.
         let plan = PhysicalPlan::Array(ArrayOp::Put {
             array_id: array_id.clone(),
-            cells_msgpack,
+            cells_msgpack: req.cells_msgpack.clone(),
             wal_lsn: req.wal_lsn,
             provenance: None,
             vshard_id: local_vshard_id,
@@ -61,19 +52,11 @@ impl DataPlaneArrayExecutor {
                 detail: format!("array_id decode in exec_delete: {e}"),
             })?;
 
-        // Same bucket-to-flat reshape the put path performs: the Data Plane
-        // decodes `coords_msgpack` as one `Vec<ArrayDeleteCell>`.
-        let coords_msgpack = flatten_blob_vec::<crate::engine::array::wal::ArrayDeleteCell>(
-            &req.coords_msgpack,
-            "exec_delete",
-        )
-        .map_err(|e| ClusterError::Codec {
-            detail: e.to_string(),
-        })?;
-
+        // The bucket is the flat `Vec<ArrayDeleteCell>` encoding the Data
+        // Plane decodes, as on the put path.
         let plan = PhysicalPlan::Array(ArrayOp::Delete {
             array_id: array_id.clone(),
-            coords_msgpack,
+            coords_msgpack: req.coords_msgpack.clone(),
             wal_lsn: req.wal_lsn,
             provenance: None,
             vshard_id: local_vshard_id,

@@ -20,20 +20,28 @@ pub(super) fn bind(binder: &IdentityBinder<'_>, op: &mut ArrayOp) -> crate::Resu
                     format: "msgpack".into(),
                     detail: format!("array cell put decode: {e}"),
                 })?;
-            let pks = cells
-                .iter()
-                .map(|cell| {
-                    zerompk::to_msgpack_vec(&cell.coord).map_err(|e| crate::Error::Serialization {
+            // Every cell's key goes into one buffer: one allocation per put.
+            let mut pk_buf: Vec<u8> = Vec::new();
+            let mut pk_ends: Vec<usize> = Vec::with_capacity(cells.len());
+            for cell in &cells {
+                zerompk::write_msgpack(&mut pk_buf, &cell.coord).map_err(|e| {
+                    crate::Error::Serialization {
                         format: "msgpack".into(),
                         detail: format!("array coord pk encode: {e}"),
-                    })
-                })
-                .collect::<crate::Result<Vec<Vec<u8>>>>()?;
+                    }
+                })?;
+                pk_ends.push(pk_buf.len());
+            }
             let key = binder.bare_key(&array_id.name);
-            let identities: Vec<_> = pks
+            let mut start = 0;
+            let identities: Vec<_> = pk_ends
                 .iter()
                 .zip(&cells)
-                .map(|(pk_bytes, cell)| (key, pk_bytes.as_slice(), cell.surrogate))
+                .map(|(&end, cell)| {
+                    let pk_bytes = &pk_buf[start..end];
+                    start = end;
+                    (key, pk_bytes, cell.surrogate)
+                })
                 .collect();
             // Every cell binds in one catalog transaction.
             let bound = binder.resolve_many(&identities)?;

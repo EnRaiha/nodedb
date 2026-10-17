@@ -3,7 +3,7 @@
 //! `INSERT INTO ARRAY` / `DELETE FROM ARRAY` lowering to `PhysicalTask`.
 
 use nodedb_array::schema::ArraySchema;
-use nodedb_array::tile::cell_tile_prefix;
+use nodedb_array::tile::TilePrefixMemo;
 use nodedb_array::types::ArrayId;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_sql::types_array::{ArrayCoordLiteral, ArrayInsertRow};
@@ -13,6 +13,7 @@ use crate::control::array_catalog::ArrayCatalogEntry;
 use crate::engine::array::wal::{ArrayDeleteCell, ArrayPutCell};
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
+use nodedb_types::Surrogate;
 
 use super::super::convert::ConvertContext;
 use super::helpers::{coerce_attrs, coerce_coords};
@@ -56,6 +57,9 @@ pub(in super::super) struct ArrayCellKeys {
     pub coords: Vec<Vec<CoordValue>>,
     /// Each coordinate, msgpack-encoded: the cell's surrogate key.
     pub pks: Vec<Vec<u8>>,
+    /// Each cell's bound surrogate, in row order, when the bind step bound
+    /// the batch. Empty otherwise: conversion then resolves each key.
+    pub surrogates: Vec<Surrogate>,
 }
 
 /// The [`ArrayCellKeys`] of the rows an `INSERT INTO ARRAY` writes.
@@ -73,25 +77,35 @@ pub(in super::super) fn insert_array_cell_keys(
         pks.push(coord_pk(&coord)?);
         coords.push(coord);
     }
-    Ok(ArrayCellKeys { coords, pks })
+    Ok(ArrayCellKeys {
+        coords,
+        pks,
+        surrogates: Vec::new(),
+    })
 }
 
-/// Row `index`'s coerced coordinate and identity key: the bind step's when
-/// it kept them, else coerced and encoded here.
-fn cell_key<'k>(
-    kept: Option<&'k ArrayCellKeys>,
+/// Row `index`'s coerced coordinate and surrogate: the bind step's when it
+/// kept them, else coerced here and resolved through `ctx`.
+fn cell_identity(
+    kept: Option<&ArrayCellKeys>,
     index: usize,
     row: &ArrayInsertRow,
     schema: &ArraySchema,
-) -> crate::Result<(Vec<CoordValue>, std::borrow::Cow<'k, [u8]>)> {
+    key: nodedb_types::CollectionKey<'_>,
+    ctx: &ConvertContext,
+) -> crate::Result<(Vec<CoordValue>, Surrogate)> {
     if let Some(keys) = kept
         && let (Some(coord), Some(pk)) = (keys.coords.get(index), keys.pks.get(index))
     {
-        return Ok((coord.clone(), std::borrow::Cow::Borrowed(pk.as_slice())));
+        let surrogate = match keys.surrogates.get(index) {
+            Some(&bound) => bound,
+            None => ctx.surrogate_for_pk(key, pk)?,
+        };
+        return Ok((coord.clone(), surrogate));
     }
     let coord = coerce_coords(&row.coords, schema)?;
-    let pk = coord_pk(&coord)?;
-    Ok((coord, std::borrow::Cow::Owned(pk)))
+    let surrogate = ctx.surrogate_for_pk(key, &coord_pk(&coord)?)?;
+    Ok((coord, surrogate))
 }
 
 pub(in super::super) fn convert_insert_array(
@@ -110,16 +124,18 @@ pub(in super::super) fn convert_insert_array(
 
     if ctx.cluster_enabled {
         let mut partitioned: Vec<(u64, Vec<u8>)> = Vec::with_capacity(rows.len());
+        let mut tiles = TilePrefixMemo::new();
         for (index, row) in rows.iter().enumerate() {
-            let (coord, pk_bytes) = cell_key(kept, index, row, &schema)?;
+            let (coord, surrogate) = cell_identity(kept, index, row, &schema, key, ctx)?;
             let attrs = coerce_attrs(&row.attrs, &schema)?;
-            let surrogate = ctx.surrogate_for_pk(key, &pk_bytes)?;
             // A cell routes by its tile's key, the key a slice's shard
             // fan-out and each shard's tile filter use.
             let tile_key =
-                cell_tile_prefix(&schema, &coord).map_err(|e| crate::Error::PlanError {
-                    detail: format!("INSERT INTO ARRAY {name}: tile key: {e}"),
-                })?;
+                tiles
+                    .cell_prefix(&schema, &coord)
+                    .map_err(|e| crate::Error::PlanError {
+                        detail: format!("INSERT INTO ARRAY {name}: tile key: {e}"),
+                    })?;
             let cell = ArrayPutCell {
                 coord,
                 attrs,
@@ -162,9 +178,8 @@ pub(in super::super) fn convert_insert_array(
     // Single-node path: bundle all cells into one msgpack blob.
     let mut cells: Vec<ArrayPutCell> = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        let (coord, pk_bytes) = cell_key(kept, index, row, &schema)?;
+        let (coord, surrogate) = cell_identity(kept, index, row, &schema, key, ctx)?;
         let attrs = coerce_attrs(&row.attrs, &schema)?;
-        let surrogate = ctx.surrogate_for_pk(key, &pk_bytes)?;
         cells.push(ArrayPutCell {
             coord,
             attrs,
@@ -235,12 +250,15 @@ pub(in super::super) fn convert_delete_array(
 
     if ctx.cluster_enabled {
         let mut partitioned: Vec<(u64, Vec<u8>)> = Vec::with_capacity(coords.len());
+        let mut tiles = TilePrefixMemo::new();
         for row in coords {
             let typed = coerce_coords(row, &schema)?;
             let tile_key =
-                cell_tile_prefix(&schema, &typed).map_err(|e| crate::Error::PlanError {
-                    detail: format!("DELETE FROM ARRAY {name}: tile key: {e}"),
-                })?;
+                tiles
+                    .cell_prefix(&schema, &typed)
+                    .map_err(|e| crate::Error::PlanError {
+                        detail: format!("DELETE FROM ARRAY {name}: tile key: {e}"),
+                    })?;
             let cell = ArrayDeleteCell {
                 coord: typed,
                 system_from_ms: system_now_ms,

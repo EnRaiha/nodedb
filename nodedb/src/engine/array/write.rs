@@ -108,9 +108,11 @@ pub(crate) fn stamp_put_cells(
     // Every attr value has its attr's declared type, so a stored column
     // holds one type plus NULL. One refused cell refuses the whole batch.
     schema.check_cells(cells.iter().map(|c| c.attrs.as_slice()))?;
+    let mut tiles = nodedb_array::tile::TilePrefixMemo::new();
     for c in cells {
-        store.memtable.put_cell(
+        store.memtable.put_cell_keyed(
             &schema,
+            &mut tiles,
             super::memtable::PutCell {
                 coord: c.coord,
                 attrs: c.attrs,

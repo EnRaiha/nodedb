@@ -57,18 +57,19 @@ pub(crate) struct ArrayLoader {
     text: Option<TextStream>,
 }
 
-/// The array a load writes and how its rows route.
+/// The array a load writes.
 struct LoadTarget {
     array: String,
     view: ArrayCatalogView,
-    router: CellRouter,
     /// Whether the load runs inside a transaction block.
     in_txn: bool,
     label: &'static str,
 }
 
-/// The rows a load has read, chunked and dispatched.
+/// The rows a load has read, routed, chunked and dispatched.
 struct LoadProgress {
+    /// How each row routes. It keeps the last tile key across rows.
+    router: CellRouter,
     chunker: ArrayChunker,
     /// Rows read and checked.
     rows: u64,
@@ -138,11 +139,11 @@ impl ArrayLoader {
             target: LoadTarget {
                 array: array.to_string(),
                 view,
-                router,
                 in_txn: in_block(ctx.txn_ctx),
                 label,
             },
             progress: LoadProgress {
+                router,
                 chunker: ArrayChunker::new(ARRAY_COPY_CHUNK_BYTES),
                 rows: 0,
                 committed: 0,
@@ -319,7 +320,7 @@ impl LoadProgress {
         row_no: usize,
         row: ArrayInsertRow,
     ) -> Result<(), DdlError> {
-        let vshard = target.router.vshard(&row.coords).map_err(|e| {
+        let vshard = self.router.vshard(&row.coords).map_err(|e| {
             refuse(
                 DdlError::from_error(&e),
                 row_no,

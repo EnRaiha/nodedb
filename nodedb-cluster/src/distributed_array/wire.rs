@@ -230,7 +230,8 @@ pub struct ArrayShardPutResp {
 
 /// Scatter request: coordinator asks a shard to delete cells by exact coords.
 ///
-/// `coords_msgpack` is a zerompk encoding of `Vec<Vec<CoordValue>>`.
+/// `coords_msgpack` is a zerompk encoding of
+/// `Vec<nodedb::engine::array::wal::ArrayDeleteCell>`.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct ArrayShardDeleteReq {
     pub array_id_msgpack: Vec<u8>,

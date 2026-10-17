@@ -8,7 +8,7 @@
 //! same tile share a [`TileId::hilbert_prefix`].
 
 use crate::coord::encode::encode_tile_prefix_with_order;
-use crate::coord::normalize::{bits_per_dim, normalize_coord};
+use crate::coord::normalize::{MAX_DIMS, bits_per_dim, check_coord_domain};
 use crate::error::{ArrayError, ArrayResult};
 use crate::schema::ArraySchema;
 use crate::schema::dim_spec::{DimSpec, DimType};
@@ -25,46 +25,47 @@ pub fn tile_indices_for_cell(schema: &ArraySchema, coord: &[CoordValue]) -> Arra
             got: coord.len(),
         });
     }
-    let mut out = Vec::with_capacity(schema.arity());
-    for (i, dim) in schema.dims.iter().enumerate() {
-        let extent = schema.tile_extents[i];
-        let cell = &coord[i];
-        let lo = &dim.domain.lo;
-        let off = match (dim.dtype, cell, lo) {
-            (DimType::Int64, CoordValue::Int64(v), DomainBound::Int64(lo))
-            | (DimType::TimestampMs, CoordValue::TimestampMs(v), DomainBound::TimestampMs(lo)) => {
-                if v < lo {
-                    return out_of_domain(schema, dim.name.as_str(), "below domain_lo");
-                }
-                let delta = (*v as i128) - (*lo as i128);
-                (delta as u128 / u128::from(extent)) as u64
+    coord
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| tile_index(schema, i, cell))
+        .collect()
+}
+
+/// The tile index of `cell` along dim `i` of `schema`.
+pub(crate) fn tile_index(schema: &ArraySchema, i: usize, cell: &CoordValue) -> ArrayResult<u64> {
+    let dim = &schema.dims[i];
+    let extent = schema.tile_extents[i];
+    let lo = &dim.domain.lo;
+    match (dim.dtype, cell, lo) {
+        (DimType::Int64, CoordValue::Int64(v), DomainBound::Int64(lo))
+        | (DimType::TimestampMs, CoordValue::TimestampMs(v), DomainBound::TimestampMs(lo)) => {
+            if v < lo {
+                return out_of_domain(schema, dim.name.as_str(), "below domain_lo");
             }
-            (DimType::Float64, CoordValue::Float64(v), DomainBound::Float64(lo)) => {
-                if !v.is_finite() || v < lo {
-                    return out_of_domain(
-                        schema,
-                        dim.name.as_str(),
-                        "below domain_lo or non-finite",
-                    );
-                }
-                ((v - lo) as u64) / extent
+            let delta = (*v as i128) - (*lo as i128);
+            Ok((delta as u128 / u128::from(extent)) as u64)
+        }
+        (DimType::Float64, CoordValue::Float64(v), DomainBound::Float64(lo)) => {
+            if !v.is_finite() || v < lo {
+                return out_of_domain(schema, dim.name.as_str(), "below domain_lo or non-finite");
             }
-            (DimType::String, CoordValue::String(s), DomainBound::String(_)) => {
-                // Strings have no natural tile-extent semantics — bucket
-                // by hash modulo extent for stable grouping.
-                crate::coord::string_hash::hash_string_modulo(s, extent.max(1))
-            }
-            _ => {
-                return Err(ArrayError::CoordOutOfDomain {
-                    array: schema.name.clone(),
-                    dim: dim.name.clone(),
-                    detail: "coord variant does not match dim dtype".to_string(),
-                });
-            }
-        };
-        out.push(off);
+            Ok(((v - lo) as u64) / extent)
+        }
+        (DimType::String, CoordValue::String(s), DomainBound::String(_)) => {
+            // Strings have no natural tile-extent semantics — bucket
+            // by hash modulo extent for stable grouping.
+            Ok(crate::coord::string_hash::hash_string_modulo(
+                s,
+                extent.max(1),
+            ))
+        }
+        _ => Err(ArrayError::CoordOutOfDomain {
+            array: schema.name.clone(),
+            dim: dim.name.clone(),
+            detail: "coord variant does not match dim dtype".to_string(),
+        }),
     }
-    Ok(out)
 }
 
 /// Compute the [`TileId`] for one cell coordinate at a given system
@@ -107,19 +108,27 @@ pub fn tile_prefix(schema: &ArraySchema, tile_indices: &[u64]) -> ArrayResult<u6
         });
     }
     let bits = bits_per_dim(schema.arity());
-    let scaled: Vec<u64> = tile_indices
-        .iter()
-        .zip(schema.dims.iter().zip(schema.tile_extents.iter()))
-        .map(|(index, (dim, extent))| scale_tile_index(*index, tiles_per_dim(dim, *extent), bits))
-        .collect();
-    encode_tile_prefix_with_order(schema, &scaled, bits)
+    let n = tile_indices.len();
+    let mut buf = [0u64; MAX_DIMS];
+    let scaled = buf.get_mut(..n).ok_or_else(|| ArrayError::InvalidSchema {
+        array: schema.name.clone(),
+        detail: format!("tile prefix: arity {n} exceeds MAX_DIMS={MAX_DIMS}"),
+    })?;
+    for (slot, (index, (dim, extent))) in scaled.iter_mut().zip(
+        tile_indices
+            .iter()
+            .zip(schema.dims.iter().zip(schema.tile_extents.iter())),
+    ) {
+        *slot = scale_tile_index(*index, tiles_per_dim(dim, *extent), bits);
+    }
+    encode_tile_prefix_with_order(schema, scaled, bits)
 }
 
 /// The key of the tile that holds the cell at `coord`: the key every
 /// cluster path routes the cell by. Fails when `coord` lies outside the
 /// schema's domain.
 pub fn cell_tile_prefix(schema: &ArraySchema, coord: &[CoordValue]) -> ArrayResult<u64> {
-    normalize_coord(schema, coord, bits_per_dim(schema.arity()))?;
+    check_coord_domain(schema, coord, bits_per_dim(schema.arity()))?;
     tile_prefix(schema, &tile_indices_for_cell(schema, coord)?)
 }
 
