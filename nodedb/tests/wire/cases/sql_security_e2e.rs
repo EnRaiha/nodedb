@@ -112,6 +112,90 @@ async fn audit_readers_see_action_immediately() {
     );
 }
 
+/// `SHOW AUDIT IN DATABASE` applies the `event_type` filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_audit_in_database_applies_event_type_filter() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE DATABASE audit_db_filter")
+        .await
+        .unwrap();
+
+    let all = server
+        .query_named_rows("SHOW AUDIT IN DATABASE audit_db_filter LIMIT 1000")
+        .await
+        .expect("SHOW AUDIT IN DATABASE");
+    assert!(
+        all.iter()
+            .any(|r| r.get("event").map(String::as_str) == Some("database_created")),
+        "SHOW AUDIT IN DATABASE must list CREATE DATABASE: {all:?}"
+    );
+
+    let created = server
+        .query_named_rows(
+            "SHOW AUDIT IN DATABASE audit_db_filter \
+             WHERE event_type = 'database_created' LIMIT 1000",
+        )
+        .await
+        .expect("SHOW AUDIT IN DATABASE WHERE");
+    assert!(
+        !created.is_empty(),
+        "filter must keep database_created rows"
+    );
+    assert!(
+        created
+            .iter()
+            .all(|r| r.get("event").map(String::as_str) == Some("database_created")),
+        "filter must return only database_created rows: {created:?}"
+    );
+
+    let other = server
+        .query_named_rows(
+            "SHOW AUDIT IN DATABASE audit_db_filter WHERE event_type = 'auth_failure'",
+        )
+        .await
+        .expect("SHOW AUDIT IN DATABASE WHERE other event");
+    assert!(
+        other.is_empty(),
+        "filter must drop database_created rows: {other:?}"
+    );
+}
+
+/// Every SHOW AUDIT WHERE form other than `event_type = '...'` is refused with 42601.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_audit_refuses_unsupported_where() {
+    let server = TestServer::start().await;
+
+    server.exec("CREATE DATABASE audit_db_where").await.unwrap();
+
+    for sql in [
+        "SHOW AUDIT WHERE detail = 'x'",
+        "SHOW AUDIT WHERE event_type = 'auth_success' AND seq > 5",
+        "SHOW AUDIT IN DATABASE audit_db_where WHERE seq > 5",
+        "SHOW AUDIT IN DATABASE audit_db_where WHERE event_type = 'a' OR event_type = 'b'",
+    ] {
+        let err = server
+            .exec(sql)
+            .await
+            .expect_err(&format!("{sql} must be refused"));
+        assert!(
+            err.contains("SQLSTATE 42601"),
+            "{sql} must fail with 42601: {err}"
+        );
+        assert!(
+            err.contains("unsupported SHOW AUDIT WHERE clause"),
+            "{sql} must name the unsupported clause: {err}"
+        );
+    }
+
+    let err = server
+        .exec("SHOW AUDIT IN DATABASE audit_db_where ORDER BY seq")
+        .await
+        .expect_err("a stray clause must be refused");
+    assert!(err.contains("SQLSTATE 42601"), "stray clause: {err}");
+}
+
 // ── SHOW USERS ──
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

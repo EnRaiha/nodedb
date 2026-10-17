@@ -426,19 +426,15 @@ pub(super) async fn authenticate_otel(
         .filter(|token| !token.is_empty())
         .ok_or_else(|| "invalid authorization header".to_owned())?;
 
+    // A JWT goes through the shared bearer gate, which audits every refusal and login.
+    // An OTLP request carries no session, so the session id stays empty.
     if token.matches('.').count() == 2
-        && let Some(registry) = &shared.jwks_registry
-        && let Ok((identity, verified)) = registry.validate_with_claims(token).await
+        && let Some((identity, _claims)) =
+            session_auth::authenticate_bearer_jwt(shared, token, peer_addr, "").await
     {
-        crate::control::security::jwt_policy::enforce_stateful_jwt_policy(
-            shared,
-            verified.claims(),
-            &identity,
-        )
-        .map_err(|_| "invalid bearer token".to_owned())?;
         return admit_transport(shared, identity, peer_addr);
     }
-    let identity = session_auth::verify_api_key_identity(shared, token, "otlp", "OTLP")
+    let identity = session_auth::verify_api_key_identity(shared, token, peer_addr, "OTLP")
         .ok_or_else(|| "invalid bearer token".to_owned())?;
     admit_transport(shared, identity, peer_addr)
 }

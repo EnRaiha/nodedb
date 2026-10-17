@@ -29,8 +29,37 @@ impl SharedState {
         source: &str,
         detail: &str,
     ) {
-        let (durable, seq) =
-            self.audit_record_with_backpressure(event, tenant_id, database_id, source, detail);
+        self.audit_record_with_auth(
+            event,
+            tenant_id,
+            database_id,
+            source,
+            detail,
+            &crate::control::security::audit::AuditAuth::default(),
+        );
+    }
+
+    /// Record an audit event (best-effort) that carries the authenticated user and session.
+    ///
+    /// Writes to both the in-memory cache and the durable audit WAL (if available).
+    /// On audit WAL failure, logs an error but does not propagate it.
+    pub fn audit_record_with_auth(
+        &self,
+        event: crate::control::security::audit::AuditEvent,
+        tenant_id: Option<crate::types::TenantId>,
+        database_id: Option<nodedb_types::DatabaseId>,
+        source: &str,
+        detail: &str,
+        auth: &crate::control::security::audit::AuditAuth,
+    ) {
+        let (durable, seq) = self.audit_record_with_backpressure(
+            event,
+            tenant_id,
+            database_id,
+            source,
+            detail,
+            auth,
+        );
         if let Err(e) = durable {
             error!(error = %e, seq, "audit WAL write failed — entry recorded in-memory only");
             crate::diag::audit_wal_append_failed(&e, seq);
@@ -50,8 +79,15 @@ impl SharedState {
         source: &str,
         detail: &str,
     ) -> crate::Result<()> {
-        self.audit_record_with_backpressure(event, tenant_id, database_id, source, detail)
-            .0
+        self.audit_record_with_backpressure(
+            event,
+            tenant_id,
+            database_id,
+            source,
+            detail,
+            &crate::control::security::audit::AuditAuth::default(),
+        )
+        .0
     }
 
     /// Record an audit event, then wait for a flush when the buffer is past its backpressure point.
@@ -64,9 +100,16 @@ impl SharedState {
         database_id: Option<nodedb_types::DatabaseId>,
         source: &str,
         detail: &str,
+        auth: &crate::control::security::audit::AuditAuth,
     ) -> (crate::Result<()>, u64) {
-        let (durable, seq, backpressure) =
-            self.audit_record_buffered(event, tenant_id, database_id, source, detail);
+        let (durable, seq, backpressure) = self.audit_record_buffered_with_auth(
+            event,
+            tenant_id,
+            database_id,
+            source,
+            detail,
+            auth,
+        );
         if backpressure {
             self.await_audit_backpressure();
         }
@@ -85,16 +128,30 @@ impl SharedState {
         source: &str,
         detail: &str,
     ) -> (crate::Result<()>, u64, bool) {
-        // The guard exports the entry to SIEM after it unlocks.
-        let mut log = crate::control::security::audit::lock_audit_log(&self.audit);
-        let durable = log.record_with_auth_durable(
+        self.audit_record_buffered_with_auth(
             event,
             tenant_id,
             database_id,
             source,
             detail,
             &crate::control::security::audit::AuditAuth::default(),
-        );
+        )
+    }
+
+    /// [`Self::audit_record_buffered`] for an entry that carries the authenticated user and session.
+    fn audit_record_buffered_with_auth(
+        &self,
+        event: crate::control::security::audit::AuditEvent,
+        tenant_id: Option<crate::types::TenantId>,
+        database_id: Option<nodedb_types::DatabaseId>,
+        source: &str,
+        detail: &str,
+        auth: &crate::control::security::audit::AuditAuth,
+    ) -> (crate::Result<()>, u64, bool) {
+        // The guard exports the entry to SIEM after it unlocks.
+        let mut log = crate::control::security::audit::lock_audit_log(&self.audit);
+        let durable =
+            log.record_with_auth_durable(event, tenant_id, database_id, source, detail, auth);
         let (seq, backpressure) = (log.last_seq(), log.needs_backpressure());
         drop(log);
         (durable.map(|_| ()), seq, backpressure)

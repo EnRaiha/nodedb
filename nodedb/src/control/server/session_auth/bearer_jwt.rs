@@ -4,6 +4,7 @@
 
 use tracing::{debug, warn};
 
+use crate::control::security::bearer::{BearerAttempt, BearerMethod};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::jwks::registry::VerifiedJwtClaims;
 use crate::control::state::SharedState;
@@ -24,19 +25,30 @@ use crate::control::state::SharedState;
 /// assertion must be refused, never downgraded to an anonymous or trust
 /// identity. The reason stays server-side so a caller cannot probe which
 /// providers exist or why a token was refused.
+///
+/// Every refusal records one `AuthFailure` with the reason, and every login
+/// records one `AuthSuccess`, through [`BearerAttempt`]. `peer_addr` is the
+/// audit source. `session_id` is the id the caller's session or request scope
+/// carries, or empty for a sessionless route.
 pub async fn authenticate_bearer_jwt(
     state: &SharedState,
     token: &str,
+    peer_addr: &str,
+    session_id: &str,
 ) -> Option<(AuthenticatedIdentity, VerifiedJwtClaims)> {
+    let mut attempt = BearerAttempt::new(BearerMethod::JwtBearer, peer_addr, session_id);
     let Some(registry) = state.jwks_registry.as_ref() else {
         warn!("bearer token presented but no [auth.jwt] provider is configured; refusing");
+        attempt.refuse(state, "no [auth.jwt] provider is configured");
         return None;
     };
+    registry.label_unverified(token, &mut attempt);
 
     let (identity, verified) = match registry.validate_with_claims(token).await {
         Ok(verified) => verified,
         Err(error) => {
             debug!(%error, "bearer token rejected by the JWKS registry");
+            attempt.refuse(state, &error.to_string());
             return None;
         }
     };
@@ -47,8 +59,10 @@ pub async fn authenticate_bearer_jwt(
         &identity,
     ) {
         debug!(%error, "bearer token refused by auth.jwt policy");
+        attempt.refuse(state, &error.to_string());
         return None;
     }
 
+    attempt.accept(state, &identity, &verified.claims().sub);
     Some((identity, verified))
 }

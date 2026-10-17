@@ -12,11 +12,17 @@ use nodedb_test_support::pgwire_auth_helpers::{
     ddl_ok, make_state_with_catalog_configured, superuser,
 };
 
+/// The peer address every bearer attempt in the OIDC tests comes from.
+pub(super) const PEER: &str = "203.0.113.10:5000";
+
+/// The session id every accepted bearer login in the OIDC tests carries.
+pub(super) const SESSION: &str = "s_oidc_test";
+
 // ── Catalog-backed bearer verification ─────────────────────────────────────
 
 /// The JWKS policy every catalog-provider test runs under: plain HTTP to the
 /// loopback fixture server.
-fn loopback_jwks_config() -> JwtAuthConfig {
+pub(super) fn loopback_jwks_config() -> JwtAuthConfig {
     JwtAuthConfig {
         allow_http_jwks: true,
         allow_jwks_hosts: vec!["localhost".into()],
@@ -27,7 +33,7 @@ fn loopback_jwks_config() -> JwtAuthConfig {
 
 /// A catalog-backed state whose JWKS registry is built from `config`. The
 /// registry is set before the gateway install, as production boot sets it.
-async fn state_with_registry(
+pub(super) async fn state_with_registry(
     config: JwtAuthConfig,
 ) -> nodedb_test_support::pgwire_auth_helpers::BootedState {
     let registry = JwksRegistry::init(config)
@@ -36,7 +42,7 @@ async fn state_with_registry(
     make_state_with_catalog_configured(|state| state.jwks_registry = Some(Arc::new(registry)))
 }
 
-async fn spawn_static_jwks(body: String) -> String {
+pub(super) async fn spawn_static_jwks(body: String) -> String {
     let listener = tokio::net::TcpListener::bind("[::]:0")
         .await
         .expect("JWKS fixture must bind");
@@ -71,7 +77,7 @@ struct LegacyOidcProvider {
     created_at_lsn: u64,
 }
 
-fn forged_signature(token: &str) -> String {
+pub(super) fn forged_signature(token: &str) -> String {
     let (signing_input, signature) = token
         .rsplit_once('.')
         .expect("signed JWT fixture must have a signature");
@@ -102,7 +108,7 @@ fn assert_generic_oidc_authentication_failure(error: impl std::fmt::Display) -> 
     error
 }
 
-fn signed_jwt_fixture(issuer: &str, audience: &str, tenant_id: u64) -> (String, String) {
+pub(super) fn signed_jwt_fixture(issuer: &str, audience: &str, tenant_id: u64) -> (String, String) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("fixture clock must be after epoch")
@@ -110,7 +116,7 @@ fn signed_jwt_fixture(issuer: &str, audience: &str, tenant_id: u64) -> (String, 
     signed_jwt_fixture_with_expiry(issuer, audience, tenant_id, now + 3_600)
 }
 
-fn signed_jwt_fixture_with_expiry(
+pub(super) fn signed_jwt_fixture_with_expiry(
     issuer: &str,
     audience: &str,
     tenant_id: u64,
@@ -179,7 +185,7 @@ async fn catalog_provider_tenant_binding_overrides_signed_tenant_claim() {
     )
     .await;
 
-    let (identity, _claims) = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect("catalog-backed OIDC token must validate");
     assert_eq!(
@@ -226,7 +232,7 @@ async fn catalog_provider_does_not_reuse_static_provider_cache_entry() {
     )
     .await;
 
-    let err = verify_bearer_token(&state, &token)
+    let err = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect_err("catalog verification must not reuse the static provider key");
     assert_generic_oidc_authentication_failure(err);
@@ -277,17 +283,18 @@ async fn catalog_authentication_failures_are_client_indistinguishable() {
     )
     .await;
 
+    let forged_token = forged_signature(&valid_token);
     let errors = [
-        verify_bearer_token(&state, &unknown_issuer_token)
+        verify_bearer_token(&state, &unknown_issuer_token, PEER, SESSION)
             .await
             .expect_err("an unknown issuer must be rejected"),
-        verify_bearer_token(&state, &wrong_audience_token)
+        verify_bearer_token(&state, &wrong_audience_token, PEER, SESSION)
             .await
             .expect_err("a wrong audience must be rejected"),
-        verify_bearer_token(&state, &forged_signature(&valid_token))
+        verify_bearer_token(&state, &forged_token, PEER, SESSION)
             .await
             .expect_err("an invalid signature must be rejected"),
-        verify_bearer_token(&state, &expired_token)
+        verify_bearer_token(&state, &expired_token, PEER, SESSION)
             .await
             .expect_err("an expired token must be rejected"),
     ]
@@ -366,12 +373,12 @@ async fn authenticated_token_is_rejected_when_provider_tenant_was_dropped() {
     .await;
     ddl_ok(&state, &su, "DROP TENANT removed_tenant").await;
 
-    let err = verify_bearer_token(&state, &forged_signature(&token))
+    let err = verify_bearer_token(&state, &forged_signature(&token), PEER, SESSION)
         .await
         .expect_err("an unauthenticated token must fail before tenant-state validation");
     assert_generic_oidc_authentication_failure(err);
 
-    let err = verify_bearer_token(&state, &token)
+    let err = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect_err("a token bound to a dropped tenant must fail closed");
     assert!(matches!(
@@ -409,7 +416,7 @@ async fn catalog_providers_with_shared_issuer_route_by_audience() {
         .await;
     }
 
-    let (identity, _claims) = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect("issuer and audience must select the tenant-b provider");
     assert_eq!(identity.tenant_id.as_u64(), 43);
@@ -446,12 +453,12 @@ async fn catalog_provider_without_tenant_binding_is_rejected() {
         .put_oidc_provider(&provider)
         .expect("legacy provider fixture must persist");
 
-    let err = verify_bearer_token(&state, &forged_signature(&token))
+    let err = verify_bearer_token(&state, &forged_signature(&token), PEER, SESSION)
         .await
         .expect_err("an unauthenticated token must fail before tenant-binding validation");
     assert_generic_oidc_authentication_failure(err);
 
-    let err = verify_bearer_token(&state, &token)
+    let err = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect_err("an unbound persisted provider must fail closed");
     assert!(matches!(err, nodedb::Error::OidcProviderTenantUnbound));

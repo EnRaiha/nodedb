@@ -24,6 +24,8 @@ use nodedb::config::auth::JwtAuthConfig;
 use nodedb::control::security::jwks::registry::JwksRegistry;
 use nodedb::control::security::oidc::verify_bearer_token;
 use nodedb::control::security::request_scope::RequestAuthScope;
+
+use super::oidc_authentication::{PEER, SESSION};
 use nodedb_test_support::pgwire_auth_helpers::{
     ddl_ok, make_state_with_catalog_configured, superuser,
 };
@@ -137,7 +139,7 @@ async fn verify_via_catalog_provider(
     )
     .await;
 
-    let (identity, claims) = verify_bearer_token(&state, token)
+    let (identity, claims) = verify_bearer_token(&state, token, PEER, SESSION)
         .await
         .expect("catalog-backed OIDC token must validate");
     (state, identity, claims)

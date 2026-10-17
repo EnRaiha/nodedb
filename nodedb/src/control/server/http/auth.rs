@@ -16,6 +16,7 @@ use nodedb_types::error::sqlstate;
 use crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate;
 
 use crate::config::auth::AuthMode;
+use crate::control::security::bearer::VerifiedBearer;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::session_auth;
 use crate::control::state::SharedState;
@@ -50,17 +51,23 @@ pub struct AppState {
 /// provider's key set over the network, and the whole HTTP request path runs on
 /// Tokio worker threads, so blocking here will stall a worker at best and
 /// abort the request at worst.
+///
+/// The request's session id is minted before verification.
+/// The login's `AuthSuccess` entry and the request's `$auth.session_id` carry the same id.
 async fn try_validate_jwt(
     state: &AppState,
     token: &str,
-) -> Option<(
-    AuthenticatedIdentity,
-    crate::control::security::jwks::registry::VerifiedJwtClaims,
-)> {
+    peer_addr: &str,
+) -> Result<Option<(AuthenticatedIdentity, VerifiedBearer)>, ApiError> {
     if token.matches('.').count() != 2 {
-        return None;
+        return Ok(None);
     }
-    session_auth::authenticate_bearer_jwt(&state.shared, token).await
+    let session_id = crate::control::security::auth_context::generate_session_id()?;
+    Ok(
+        session_auth::authenticate_bearer_jwt(&state.shared, token, peer_addr, &session_id)
+            .await
+            .map(|(identity, claims)| (identity, VerifiedBearer { claims, session_id })),
+    )
 }
 
 /// Enforce the TLS policy for a resolved HTTP identity.
@@ -93,20 +100,23 @@ pub async fn resolve_identity(
     peer_addr: &str,
     transport: crate::control::security::tls_policy::TransportSecurity,
 ) -> Result<AuthenticatedIdentity, ApiError> {
-    let identity = resolve_identity_unchecked(headers, state, peer_addr).await?;
+    let (identity, _) = resolve_credentials_unchecked(headers, state, peer_addr).await?;
     enforce_transport_policy(state, &identity, transport, peer_addr)?;
     Ok(identity)
 }
 
 /// The credential half of [`resolve_identity`], without the transport check.
 ///
+/// Each credential kind is tried once, so one refused JWT leaves one `AuthFailure` entry.
+/// Returns the verified bearer token when the identity came from a JWT.
+///
 /// Private on purpose: an identity that has not been through
 /// [`enforce_transport_policy`] must not leave this module.
-async fn resolve_identity_unchecked(
+async fn resolve_credentials_unchecked(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
-) -> Result<AuthenticatedIdentity, ApiError> {
+) -> Result<(AuthenticatedIdentity, Option<VerifiedBearer>), ApiError> {
     if let Some(auth_header) = headers.get("authorization") {
         let auth_str = auth_header
             .to_str()
@@ -116,15 +126,15 @@ async fn resolve_identity_unchecked(
             let token = token.trim();
 
             // Try JWT first (token has 2 dots = JWT format).
-            if let Some((identity, _)) = try_validate_jwt(state, token).await {
-                return Ok(identity);
+            if let Some((identity, bearer)) = try_validate_jwt(state, token, peer_addr).await? {
+                return Ok((identity, Some(bearer)));
             }
 
             // Try API key.
             if let Some(identity) =
                 session_auth::verify_api_key_identity(&state.shared, token, peer_addr, "HTTP")
             {
-                return Ok(identity);
+                return Ok((identity, None));
             }
 
             return Err(ApiError::Unauthorized("invalid bearer token".into()));
@@ -132,9 +142,11 @@ async fn resolve_identity_unchecked(
     }
 
     if state.auth_mode == AuthMode::Trust {
-        return session_auth::configured_trust_identity(&state.shared).ok_or_else(|| {
-            ApiError::Unauthorized("configured trust identity is unavailable".into())
-        });
+        return session_auth::configured_trust_identity(&state.shared)
+            .map(|identity| (identity, None))
+            .ok_or_else(|| {
+                ApiError::Unauthorized("configured trust identity is unavailable".into())
+            });
     }
 
     Err(ApiError::Unauthorized(
@@ -184,11 +196,13 @@ pub async fn resolve_auth(
     ),
     ApiError,
 > {
-    use crate::control::security::auth_context::{AuthContext, generate_session_id};
+    use crate::control::security::auth_context::AuthContext;
 
     let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr, transport).await?;
-    let auth_ctx = match &verified_jwt {
-        Some(claims) => AuthContext::from_verified_jwt(claims, &identity, generate_session_id()?),
+    let auth_ctx = match verified_jwt {
+        Some(bearer) => {
+            AuthContext::from_verified_jwt(&bearer.claims, &identity, bearer.session_id)
+        }
         None => session_auth::build_auth_context(&identity)?,
     };
     let auth_ctx = apply_on_deny_header(headers, auth_ctx);
@@ -198,37 +212,19 @@ pub async fn resolve_auth(
 /// Resolve identity plus the raw ingredients a caller needs to build a
 /// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
 /// directly, instead of a pre-assembled `AuthContext`: the verified JWT
-/// claims when authentication went through a JWT bearer token (so
-/// `RequestAuthScope::builder().with_verified_jwt()` reproduces the exact
-/// claim-derived enrichment `resolve_auth` gives `AuthContext::from_verified_jwt`),
-/// or `None` for API key / trust / password auth.
+/// claims and the request's session id when authentication went through a JWT
+/// bearer token (so `RequestAuthScope::builder().with_verified_jwt()` reproduces
+/// the exact claim-derived enrichment `resolve_auth` gives
+/// `AuthContext::from_verified_jwt`), or `None` for API key / trust / password auth.
 pub(crate) async fn resolve_auth_parts(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
     transport: crate::control::security::tls_policy::TransportSecurity,
-) -> Result<
-    (
-        AuthenticatedIdentity,
-        Option<crate::control::security::jwks::registry::VerifiedJwtClaims>,
-    ),
-    ApiError,
-> {
-    if let Some(auth_header) = headers.get("authorization")
-        && let Ok(auth_str) = auth_header.to_str()
-        && let Some(token) = auth_str.strip_prefix("Bearer ")
-    {
-        let token = token.trim();
-        if let Some((identity, verified_claims)) = try_validate_jwt(state, token).await {
-            // The JWT path returns before `resolve_identity`, so it enforces
-            // the transport policy itself rather than inheriting it.
-            enforce_transport_policy(state, &identity, transport, peer_addr)?;
-            return Ok((identity, Some(verified_claims)));
-        }
-    }
-
-    let identity = resolve_identity(headers, state, peer_addr, transport).await?;
-    Ok((identity, None))
+) -> Result<(AuthenticatedIdentity, Option<VerifiedBearer>), ApiError> {
+    let (identity, bearer) = resolve_credentials_unchecked(headers, state, peer_addr).await?;
+    enforce_transport_policy(state, &identity, transport, peer_addr)?;
+    Ok((identity, bearer))
 }
 
 /// Parse the `X-On-Deny` header into a `DenyMode`, if present and valid.
@@ -276,20 +272,25 @@ pub(crate) fn on_deny_header_mode(
 /// different one.
 pub(crate) fn build_request_scope<'a, 'p>(
     identity: &'a AuthenticatedIdentity,
-    verified_jwt: Option<&'a crate::control::security::jwks::registry::VerifiedJwtClaims>,
+    verified_jwt: Option<&'a VerifiedBearer>,
     headers: &HeaderMap,
     state: &'a AppState,
     database_id: crate::types::DatabaseId,
     peer_addr: &'p str,
 ) -> crate::Result<crate::control::security::request_scope::ClientRequestScope<'a, 'p>> {
-    crate::control::security::request_scope::RequestAuthScope::builder(
+    let builder = crate::control::security::request_scope::RequestAuthScope::builder(
         identity,
         state.shared.auth_stores(),
     )
     .with_session_database(Some(database_id))
     .with_on_deny(on_deny_header_mode(headers))
-    .with_optional_verified_jwt(verified_jwt)
-    .build_for_client(peer_addr)
+    .with_optional_verified_jwt(verified_jwt.map(|bearer| &bearer.claims));
+    // A bearer request keeps the session id its `AuthSuccess` entry recorded.
+    let builder = match verified_jwt {
+        Some(bearer) => builder.with_session_id(bearer.session_id.clone()),
+        None => builder,
+    };
+    builder.build_for_client(peer_addr)
 }
 
 /// Apply [`on_deny_header_mode`] to an already-built `AuthContext`.

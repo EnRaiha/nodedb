@@ -140,6 +140,7 @@ mod memory_accounting_balance;
 mod mirror;
 mod native_handshake_e2e;
 mod oidc_authentication;
+mod oidc_bearer_audit;
 mod oidc_external_roles;
 mod oidc_native_claims;
 mod oidc_provider_ddl;

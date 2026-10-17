@@ -13,6 +13,7 @@
 use nodedb_types::id::DatabaseId;
 use tracing::debug;
 
+use crate::control::security::bearer::{BearerAttempt, BearerMethod, BearerRefusal};
 use crate::control::security::catalog::StoredOidcProvider;
 use crate::control::security::identity::database_set::DatabaseSet;
 use crate::control::security::identity::{
@@ -45,64 +46,104 @@ use super::claim_mapping::apply_claim_mapping;
 /// — mirroring what the HTTP bearer-token path already does. Authority
 /// (superuser, tenant, roles) always comes from the `AuthenticatedIdentity`
 /// built here, never from the claims themselves.
+///
+/// Every refusal records one `AuthFailure` and every login records one
+/// `AuthSuccess`, through [`BearerAttempt`]. `peer_addr` is the audit source.
+/// `session_id` is the id the accepted session's `AuthContext` carries.
 pub async fn verify_bearer_token(
     state: &SharedState,
     token: &str,
+    peer_addr: &str,
+    session_id: &str,
 ) -> crate::Result<(AuthenticatedIdentity, VerifiedJwtClaims)> {
+    let mut attempt = BearerAttempt::new(BearerMethod::OidcBearer, peer_addr, session_id);
+    match verify_catalog_token(state, token, &mut attempt).await {
+        Ok((identity, verified)) => {
+            attempt.accept(state, &identity, &verified.claims().sub);
+            Ok((identity, verified))
+        }
+        Err(refusal) => {
+            attempt.refuse(state, &refusal.reason);
+            Err(*refusal.error)
+        }
+    }
+}
+
+/// The verification steps of [`verify_bearer_token`].
+///
+/// Records the claimed `sub` and the selected provider into `attempt` as each one is learned.
+async fn verify_catalog_token(
+    state: &SharedState,
+    token: &str,
+    attempt: &mut BearerAttempt<'_>,
+) -> Result<(AuthenticatedIdentity, VerifiedJwtClaims), BearerRefusal> {
     // 1. Decode payload (no sig) to read `iss` and `aud`.
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
-        return Err(jwt_error_to_crate_error(JwtError::MalformedToken));
+        return Err(token_refusal(JwtError::MalformedToken));
     }
-    let payload_bytes = base64_url_decode(parts[1])
-        .ok_or_else(|| jwt_error_to_crate_error(JwtError::DecodingError))?;
+    let payload_bytes =
+        base64_url_decode(parts[1]).ok_or_else(|| token_refusal(JwtError::DecodingError))?;
     let claims: crate::control::security::jwt::JwtClaims =
         crate::util::bounded_json::from_slice(&payload_bytes)
-            .map_err(|_| jwt_error_to_crate_error(JwtError::InvalidClaims))?;
+            .map_err(|_| token_refusal(JwtError::InvalidClaims))?;
+    attempt.set_claimed_sub(&claims.sub);
 
     // 2. Route by both unverified issuer and audience. These values only select
     // the verification key; the same constraints are checked again after
     // signature and time validation.
     let catalog = state.credentials.catalog();
-    let provider = select_catalog_provider(
-        catalog
-            .list_oidc_providers()
-            .map_err(|_| jwt_error_to_crate_error(JwtError::InvalidIssuer))?,
-        &claims.iss,
-        &claims.aud,
-    )
-    .map_err(jwt_error_to_crate_error)?;
+    let providers = catalog.list_oidc_providers().map_err(|e| {
+        BearerRefusal::new(
+            format!("OIDC provider catalog read failed: {e}"),
+            client_refusal_error(),
+        )
+    })?;
+    let provider =
+        select_catalog_provider(providers, &claims.iss, &claims.aud).map_err(token_refusal)?;
+    attempt.set_provider(
+        &provider.provider_name,
+        provider.tenant_id.map(TenantId::new),
+    );
 
     // 3. Verify signature via JwksRegistry using the catalog-provided JWKS URI.
-    let jwks = state
-        .jwks_registry
-        .as_ref()
-        .ok_or_else(|| jwt_error_to_crate_error(JwtError::UnsupportedAlgorithm))?;
+    let jwks = state.jwks_registry.as_ref().ok_or_else(|| {
+        BearerRefusal::new(
+            "no JWKS registry is configured to verify the token",
+            client_refusal_error(),
+        )
+    })?;
     let verified = jwks
         .validate_with_catalog_provider(&provider.provider_name, &provider.jwks_uri, token)
         .await
-        .map_err(jwt_error_to_crate_error)?;
+        .map_err(token_refusal)?;
     let verified_claims = verified.claims();
 
     // 4. Re-check the verified claims against the provider selected above.
-    validate_selected_provider_claims(&provider, verified_claims)
-        .map_err(jwt_error_to_crate_error)?;
+    validate_selected_provider_claims(&provider, verified_claims).map_err(token_refusal)?;
 
     // Legacy records without a tenant binding must not reveal catalog metadata
     // until the token has passed signature, time, issuer, and audience checks.
     let tenant_id = provider
         .tenant_id
-        .ok_or(crate::Error::OidcProviderTenantUnbound)?;
+        .ok_or_else(|| BearerRefusal::from_error(crate::Error::OidcProviderTenantUnbound))?;
 
     // A provider can outlive its tenant after a tenant drop. Confirm the bound
     // tenant still exists before issuing an identity from an authenticated token.
     let tenant_exists = catalog
         .load_all_tenants()
-        .map_err(|_| crate::Error::OidcProviderTenantUnavailable { tenant_id })?
+        .map_err(|e| {
+            BearerRefusal::new(
+                format!("tenant catalog read failed: {e}"),
+                crate::Error::OidcProviderTenantUnavailable { tenant_id },
+            )
+        })?
         .into_iter()
         .any(|tenant| tenant.tenant_id == tenant_id);
     if !tenant_exists {
-        return Err(crate::Error::OidcProviderTenantUnavailable { tenant_id });
+        return Err(BearerRefusal::from_error(
+            crate::Error::OidcProviderTenantUnavailable { tenant_id },
+        ));
     }
 
     // 5. Apply claim mapping.
@@ -116,8 +157,10 @@ pub async fn verify_bearer_token(
     let default_db = mapping
         .default_database
         .map(DatabaseId::new)
-        .ok_or_else(|| crate::Error::OidcNoDefaultDatabase {
-            sub: verified_claims.sub.clone(),
+        .ok_or_else(|| {
+            BearerRefusal::from_error(crate::Error::OidcNoDefaultDatabase {
+                sub: verified_claims.sub.clone(),
+            })
         })?;
 
     let mut accessible: smallvec::SmallVec<[DatabaseId; 4]> = smallvec::smallvec![default_db];
@@ -133,7 +176,7 @@ pub async fn verify_bearer_token(
         sub = %verified_claims.sub,
         iss = %verified_claims.iss,
         default_db = %default_db.as_u64(),
-        "OIDC login succeeded"
+        "OIDC token verified"
     );
 
     let identity = identity_from_external_claims(
@@ -158,7 +201,8 @@ pub async fn verify_bearer_token(
         state,
         verified_claims,
         &identity,
-    )?;
+    )
+    .map_err(BearerRefusal::from_error)?;
 
     Ok((identity, verified))
 }
@@ -245,9 +289,14 @@ fn validate_selected_provider_claims(
     Ok(())
 }
 
-/// Collapse every pre-authentication JWT failure into one client-visible error.
+/// A token-stage refusal: the audit log records `error`, and the client sees one generic error.
+fn token_refusal(error: JwtError) -> BearerRefusal {
+    BearerRefusal::new(error.to_string(), client_refusal_error())
+}
+
+/// The one client-visible error of every token-stage refusal.
 /// Route, signature, algorithm, and token-state details remain non-observable.
-fn jwt_error_to_crate_error(_error: JwtError) -> crate::Error {
+fn client_refusal_error() -> crate::Error {
     crate::Error::BadRequest {
         detail: "OIDC authentication failed".into(),
     }

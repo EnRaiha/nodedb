@@ -47,11 +47,14 @@ impl SyncSession {
         // replacement credential cannot be checked, so the rotation is refused
         // and the session keeps the identity it already proved.
         let new_identity = match shared {
-            Some(state) => {
-                crate::control::server::session_auth::authenticate_bearer_jwt(state, &msg.new_token)
-                    .await
-                    .map(|(identity, _claims)| identity)
-            }
+            Some(state) => crate::control::server::session_auth::authenticate_bearer_jwt(
+                state,
+                &msg.new_token,
+                &self.device_metadata.remote_addr,
+                &self.session_id,
+            )
+            .await
+            .map(|(identity, _claims)| identity),
             None => None,
         };
 

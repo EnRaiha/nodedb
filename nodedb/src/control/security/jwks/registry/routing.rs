@@ -4,11 +4,37 @@
 //! configured static providers.
 
 use crate::config::auth::JwtProviderConfig;
-use crate::control::security::jwt::JwtError;
+use crate::control::security::bearer::BearerAttempt;
+use crate::control::security::jwt::{JwtClaims, JwtError};
+use crate::control::security::util::base64_url_decode;
+use crate::types::TenantId;
 
 use super::state::JwksRegistry;
 
 impl JwksRegistry {
+    /// Record into `attempt` the `sub` a token claims and the provider its `iss` and `aud` route to.
+    ///
+    /// Nothing here is verified, so the values only label the audit entry.
+    /// A token whose payload does not decode leaves `attempt` unchanged.
+    pub(crate) fn label_unverified(&self, token: &str, attempt: &mut BearerAttempt<'_>) {
+        let mut parts = token.split('.');
+        let (Some(_header), Some(payload), Some(_signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return;
+        };
+        let Some(payload_bytes) = base64_url_decode(payload) else {
+            return;
+        };
+        let Ok(claims) = crate::util::bounded_json::from_slice::<JwtClaims>(&payload_bytes) else {
+            return;
+        };
+        attempt.set_claimed_sub(&claims.sub);
+        if let Ok(provider) = self.find_provider(&claims.iss, &claims.aud) {
+            attempt.set_provider(&provider.name, Some(TenantId::new(provider.tenant_id)));
+        }
+    }
+
     /// Find the provider matching a token's issuer and audience.
     ///
     /// Static configuration validation ensures a route is unique. A provider

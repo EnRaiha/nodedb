@@ -10,6 +10,8 @@ use nodedb::control::security::identity::Role;
 use nodedb::control::security::jwks::registry::JwksRegistry;
 use nodedb::control::security::jwt::JwtError;
 use nodedb::control::security::oidc::verify_bearer_token;
+
+use super::oidc_authentication::{PEER, SESSION};
 use nodedb_test_support::pgwire_auth_helpers::{
     ddl_err, ddl_ok, make_state_with_catalog, make_state_with_catalog_configured, superuser,
 };
@@ -235,7 +237,7 @@ async fn legacy_oidc_mapping_cannot_grant_superuser() {
         .put_oidc_provider(&provider)
         .expect("legacy provider fixture must persist");
 
-    let (identity, _claims) = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect("legacy mapping must retain non-privileged authentication");
     assert_eq!(identity.tenant_id.as_u64(), 42);
@@ -269,7 +271,7 @@ async fn authenticate_catalog_token(
     )
     .await;
 
-    let (identity, _claims) = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token, PEER, SESSION)
         .await
         .expect("catalog-backed token must validate");
     identity
@@ -359,19 +361,21 @@ async fn catalog_oidc_rejects_algorithm_confusion_missing_expiration_and_none() 
         .await;
     assert_eq!(none_algorithm.err(), Some(JwtError::UnsupportedAlgorithm));
 
-    let missing_expiration = verify_bearer_token(&state, &fixture.missing_expiration).await;
+    let missing_expiration =
+        verify_bearer_token(&state, &fixture.missing_expiration, PEER, SESSION).await;
     assert!(matches!(
         missing_expiration,
         Err(nodedb::Error::BadRequest { .. })
     ));
 
-    let mismatched_algorithm = verify_bearer_token(&state, &fixture.mismatched_algorithm).await;
+    let mismatched_algorithm =
+        verify_bearer_token(&state, &fixture.mismatched_algorithm, PEER, SESSION).await;
     assert!(matches!(
         mismatched_algorithm,
         Err(nodedb::Error::BadRequest { .. })
     ));
 
-    let none_algorithm = verify_bearer_token(&state, &fixture.none_algorithm).await;
+    let none_algorithm = verify_bearer_token(&state, &fixture.none_algorithm, PEER, SESSION).await;
     assert!(matches!(
         none_algorithm,
         Err(nodedb::Error::BadRequest { .. })

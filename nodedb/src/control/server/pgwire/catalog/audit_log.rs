@@ -14,7 +14,8 @@
 //! Columns:
 //! - `seq`          — monotonic sequence number (int8).
 //! - `timestamp_us` — UTC microseconds since epoch (int8).
-//! - `event`        — event discriminant name (text, e.g. "AuthSuccess").
+//! - `event`        — snake_case event name (text, e.g. "auth_success").
+//!   It matches the `event` column of every `SHOW AUDIT` command.
 //! - `tenant_id`    — tenant identifier, 0 if not applicable (int8).
 //! - `source`       — source IP or node identifier (text).
 //! - `detail`       — human-readable event detail (text).
@@ -55,7 +56,10 @@ pub fn audit_log(
         let mut r: HashMap<String, Value> = HashMap::with_capacity(7);
         r.insert("seq".into(), Value::Integer(e.seq as i64));
         r.insert("timestamp_us".into(), Value::Integer(e.timestamp_us as i64));
-        r.insert("event".into(), Value::String(format!("{:?}", e.event)));
+        r.insert(
+            "event".into(),
+            Value::String(e.event.snake_name().to_string()),
+        );
         r.insert(
             "tenant_id".into(),
             Value::Integer(e.tenant_id.map_or(0i64, |t| t.as_u64() as i64)),

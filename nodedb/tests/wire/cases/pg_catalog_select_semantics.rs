@@ -90,7 +90,7 @@ async fn audit_log_where_prev_hash_is_not_null_filters_genesis() {
     );
 }
 
-/// `WHERE event = '<name>'` must filter rows by the event column.
+/// `WHERE event = '<name>'` must filter rows by the snake_case event column.
 #[tokio::test]
 async fn audit_log_where_event_equality_filters() {
     let srv = TestServer::start().await;
@@ -99,20 +99,59 @@ async fn audit_log_where_event_equality_filters() {
         .expect("create user e");
 
     let rows = srv
-        .query_rows("SELECT event FROM _system.audit_log WHERE event = 'PrivilegeChange'")
+        .query_rows("SELECT event FROM _system.audit_log WHERE event = 'privilege_change'")
         .await
         .expect("scan filtered by event");
     assert!(
         !rows.is_empty(),
-        "expected at least one PrivilegeChange row"
+        "expected at least one privilege_change row"
     );
     for r in &rows {
         assert_eq!(
             r.first().map(String::as_str),
-            Some("PrivilegeChange"),
-            "WHERE event = 'PrivilegeChange' returned a non-matching row: {r:?}"
+            Some("privilege_change"),
+            "WHERE event = 'privilege_change' returned a non-matching row: {r:?}"
         );
     }
+}
+
+/// `_system.audit_log` and `SHOW AUDIT LOG` print one event under one name.
+#[tokio::test]
+async fn audit_log_event_name_matches_show_audit() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE USER audit_sem_name WITH PASSWORD 'pw'")
+        .await
+        .expect("create user");
+
+    let table = srv
+        .query_rows("SELECT event FROM _system.audit_log")
+        .await
+        .expect("scan event column");
+    let table_events: Vec<&str> = table
+        .iter()
+        .filter_map(|r| r.first().map(String::as_str))
+        .collect();
+    assert!(
+        table_events.contains(&"privilege_change"),
+        "_system.audit_log must print the snake_case name: {table_events:?}"
+    );
+    assert!(
+        table_events
+            .iter()
+            .all(|e| !e.chars().any(|c| c.is_ascii_uppercase())),
+        "_system.audit_log must not print a PascalCase name: {table_events:?}"
+    );
+
+    let shown = srv
+        .query_named_rows("SHOW AUDIT LOG LIMIT 1000")
+        .await
+        .expect("SHOW AUDIT LOG");
+    assert!(
+        shown
+            .iter()
+            .any(|r| r.get("event").map(String::as_str) == Some("privilege_change")),
+        "SHOW AUDIT LOG must print the same name: {shown:?}"
+    );
 }
 
 /// A bare-column projection must return only the requested column,

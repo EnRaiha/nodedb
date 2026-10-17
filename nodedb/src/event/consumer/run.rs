@@ -876,8 +876,12 @@ mod tests {
         // they hold open, as they do when a real process exits. The array GC
         // task holds the array-sync op log until shutdown is signalled.
         node.shared.shutdown.signal();
+        // A task can hold the state for the rest of its current step, as the
+        // audit recorder does while it records a batch.
         tokio::time::timeout(Duration::from_secs(10), async {
-            while Arc::strong_count(&node.shared.array_sync_op_log) > 1 {
+            while Arc::strong_count(&node.shared.array_sync_op_log) > 1
+                || Arc::strong_count(&node.shared) > 1
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
