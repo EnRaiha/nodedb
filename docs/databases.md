@@ -309,7 +309,7 @@ This allows safe retry after network failures without duplicating the move.
 ### Per-Database Audit Filtering
 
 ```sql
-SHOW AUDIT IN DATABASE staging [WHERE event_type = 'database_quota_changed'];
+SHOW AUDIT IN DATABASE staging [WHERE event_type = 'database_quota_changed'] [LIMIT n];
 ```
 
 Events tagged with `database_id` include: `DatabaseCreated`, `DatabaseDropped`, `DatabaseRenamed`, `DatabaseQuotaChanged`, `DatabaseCloned`, `DatabaseMirrored`, `DatabasePromoted`, `TenantMoved`, etc.

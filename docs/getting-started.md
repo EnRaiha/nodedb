@@ -726,8 +726,10 @@ An env override still wins over an expanded value for the same field.
 ### With the `ndb` CLI
 
 ```bash
-./target/release/ndb
+./target/release/ndb -w
 ```
+
+`ndb` connects to `127.0.0.1:6433` as user `nodedb`. The server runs in password mode by default, and `ndb` sends no password unless given `-w`, which prompts for it. Set `NDB_PASSWORD` to skip the prompt. `NDB_USER` and `NDB_DATABASE` set the user and database.
 
 You get a full TUI with syntax highlighting, tab completion, and history search. See the [CLI guide](cli.md) for details.
 

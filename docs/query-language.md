@@ -72,6 +72,10 @@ SELECT UPPER(label), SUM(score) FROM events GROUP BY 1;
 
 GROUP BY keys follow PostgreSQL semantics: output columns appear in SELECT-list order, and a key projected as `SELECT k AS label` is emitted under its alias.
 
+A column in the SELECT list that is neither a GROUP BY key nor inside an aggregate is refused with SQLSTATE `42803` (`grouping_error`). The message reads `column "x" must appear in the GROUP BY clause or be used in an aggregate function`.
+
+A planning error reaches a driver at Parse (prepare) with its SQLSTATE when the statement has no `$N` placeholders. Class `42` errors and `0A000` report at Parse. These errors defer to Execute: `42501` (insufficient privilege), data errors of class `22`, and retryable errors of class `40`. With placeholders, Parse plans each `$N` as `NULL`. It reports only these errors: `42P01` (unknown table), `42703` (unknown column), `42702` (ambiguous column), `42883` (unknown function), and `42803`. Every other error defers to Execute, which plans with the bound values.
+
 A scalar aggregate (no GROUP BY) over zero input rows returns one identity row: `COUNT(*)` → `0`; `SUM`/`AVG`/`MIN`/`MAX` → `NULL`. A `GROUP BY` aggregate over zero rows returns zero rows.
 
 ### Joins
@@ -384,7 +388,7 @@ SHOW SESSIONS [IN DATABASE prod_us];
 KILL SESSION 'sid_abc123';
 
 -- Audit events tagged by database
-SHOW AUDIT IN DATABASE prod_us [WHERE event_type = 'database_quota_changed'];
+SHOW AUDIT IN DATABASE prod_us [WHERE event_type = 'database_quota_changed'] [LIMIT n];
 ```
 
 All database DDL is replicated via the metadata Raft group and is consistent across the cluster. For full examples and context, see [Databases](databases.md).
@@ -830,7 +834,7 @@ ORDER BY sparse_score(terms, '{3: 1.0, 7: 0.5}') DESC
 LIMIT 3;
 ```
 
-The inverted index is maintained automatically on document writes (insert, update, delete). Documents sharing no dimension with the query are never scanned. `sparse_score` is a standalone surface — it is not fused into `rrf_score` hybrid ranking.
+The inverted index is maintained automatically on document writes (insert, update, delete). Documents sharing no dimension with the query are never scanned. A `WHERE` clause filters the hits before the top-k cut. Projected columns read from the row. `sparse_score` is a standalone surface — it is not fused into `rrf_score` hybrid ranking.
 
 ### Full-Text Search
 

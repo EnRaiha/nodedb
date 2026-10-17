@@ -118,7 +118,7 @@ cargo install nodedb
 Requires Linux kernel >= 5.1 (io_uring). Connect:
 
 ```bash
-ndb                              # native CLI (connects to localhost:6433)
+ndb -w                           # native CLI as user nodedb on localhost:6433, prompts for the password (or set NDB_PASSWORD)
 psql -h localhost -p 6432 -U nodedb -d default   # password: <data_dir>/.superuser_password, or set NODEDB_SUPERUSER_PASSWORD
 ```
 

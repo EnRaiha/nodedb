@@ -97,7 +97,15 @@ INSERT INTO sparse_docs (id, terms) VALUES ('a', '{3: 1.0, 7: 1.0}');
 SELECT id FROM sparse_docs
 ORDER BY sparse_score(terms, '{3: 1.0, 7: 0.5}') DESC
 LIMIT 3;
+
+-- A WHERE clause filters the hits before the top-k cut
+SELECT id FROM sparse_docs
+WHERE id <> 'a'
+ORDER BY sparse_score(terms, '{3: 1.0, 7: 0.5}') DESC
+LIMIT 3;
 ```
+
+A `WHERE` clause filters the candidates before the top-k cut, so a matching row is never dropped by the cut. Projected columns read from the row.
 
 `SPARSEVECTOR` carries no fixed dimensionality — only non-zero `(dimension, weight)` pairs are stored and indexed. Documents sharing no dimension with the query are excluded by the inverted index rather than scored at zero. `sparse_score` ranks by descending dot product; it is a standalone surface, separate from the dense `vector_distance` path and the RRF hybrid fusion.
 

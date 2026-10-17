@@ -76,11 +76,11 @@ Use SQL for complex queries, ad-hoc exploration, and rapid prototyping. Use nati
 **Connection:**
 
 ```bash
-# ndb CLI connects automatically
-./target/release/ndb
+# ndb CLI: user nodedb, port 6433, -w prompts for the password (or set NDB_PASSWORD)
+./target/release/ndb -w
 
 # Or specify host
-./target/release/ndb --host localhost --port 6433
+./target/release/ndb --host localhost --port 6433 -w
 ```
 
 ## HTTP API

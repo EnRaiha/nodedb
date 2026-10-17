@@ -10,50 +10,68 @@ SHOW AUDIT LOG;
 SHOW AUDIT LOG LIMIT 50;
 ```
 
-**Columns:** `seq`, `timestamp`, `event`, `tenant_id`, `source`, `detail`
+**Columns:** `seq`, `timestamp_us`, `event`, `tenant_id`, `database_id`, `source`, `detail`
 
-Each entry also records `auth_user_id`, `auth_user_name`, and `session_id` for correlation.
+`SHOW AUDIT LOG`, `SHOW AUDIT WHERE` and `SHOW AUDIT IN DATABASE` return the newest entries first. Without `LIMIT`, each returns 100 rows. Only a superuser can run them.
+
+The `event` column prints the snake_case event name, for example `auth_success`. `WHERE event_type = '...'` takes the same snake_case name.
+
+A read sees every entry recorded before it starts. There is no flush delay.
+
+`_system.audit_log` has the columns `seq`, `timestamp_us`, `event`, `tenant_id`, `source`, `detail` and `prev_hash`. Its `event` column prints the snake_case name too. It has no `database_id` column. A superuser or a role with `monitor` can read it. It returns at most the newest 100,000 entries.
+
+Each stored entry also records `auth_user_id`, `auth_user_name`, and `session_id` for correlation.
 
 ## Audit Events
 
-| Event                        | Level    | Description                                    |
-| ---------------------------- | -------- | ---------------------------------------------- |
-| `AuthSuccess`                | Minimal  | Successful authentication                      |
-| `AuthFailure`                | Minimal  | Failed login attempt                           |
-| `PermissionDenied`           | Minimal  | Permission check failed                        |
-| `AuthzDenied`                | Minimal  | Legacy: permission denied                      |
-| `PrivilegeChange`            | Standard | GRANT, REVOKE, role changes                    |
-| `SessionConnect`             | Standard | New connection                                 |
-| `SessionDisconnect`          | Standard | Connection closed                              |
-| `SessionRevoked`             | Standard | Admin terminated session                       |
-| `LockoutTriggered`           | Standard | Account locked after failed logins             |
-| `LoginRateLimited`           | Standard | Too many login attempts                        |
-| `RlsRejected`                | Standard | RLS policy blocked row                         |
-| `AdminAction`                | Standard | DDL, config changes                            |
-| `TenantCreated`              | Standard | New tenant                                     |
-| `TenantDeleted`              | Standard | Tenant removed                                 |
-| `DatabaseCreated`            | Standard | New database                                   |
-| `DatabaseDropped`            | Standard | Database deleted                               |
-| `DatabaseRenamed`            | Standard | Database renamed                               |
-| `DatabaseQuotaChanged`       | Standard | Quota limit changed                            |
-| `DatabaseCloned`             | Standard | Database cloned                                |
-| `DatabaseMirrored`           | Standard | Database mirrored                              |
-| `DatabasePromoted`           | Standard | Replica promoted to primary                    |
-| `DatabaseMaterialized`       | Standard | Materialized view materialized                 |
-| `TenantMoved`                | Standard | Tenant reassigned to database                  |
-| `DatabaseBackedUp`           | Standard | Backup created                                 |
-| `DatabaseRestored`           | Standard | Backup restored                                |
-| `DatabaseAuditDmlChanged`    | Standard | DML audit setting changed                      |
-| `DatabaseIdleTimeoutChanged` | Standard | Idle timeout changed                           |
-| `OidcProviderChanged`        | Standard | OIDC provider created/altered/dropped          |
-| `DmlAudit`                   | Forensic | Individual DML operation (opt-in per database) |
-| `SnapshotBegin/End`          | Standard | Backup lifecycle                               |
-| `RestoreBegin/End`           | Standard | Restore lifecycle                              |
-| `CertRotation`               | Standard | TLS cert rotated                               |
-| `KeyRotation`                | Standard | Encryption key rotated                         |
-| `NodeJoined/Left`            | Standard | Cluster membership                             |
-| `QueryExec`                  | Full     | Every query executed                           |
-| `RowChange`                  | Forensic | Individual row mutations                       |
+| Event                                  | Level    | Description                                    |
+| -------------------------------------- | -------- | ---------------------------------------------- |
+| `auth_success`                         | Minimal  | Successful authentication                      |
+| `auth_failure`                         | Minimal  | Failed login attempt                           |
+| `permission_denied`                    | Minimal  | Permission check failed                        |
+| `authz_denied`                         | Minimal  | Authorization denied                           |
+| `rls_rejected`                         | Minimal  | RLS write policy rejected a write              |
+| `lockout_triggered`                    | Minimal  | Account locked after failed logins             |
+| `login_rate_limited`                   | Minimal  | Too many login attempts                        |
+| `session_revoked`                      | Minimal  | Open session revoked                           |
+| `audit_bus_lagged`                     | Minimal  | Audit bus dropped events, rows may be missing  |
+| `audit_checkpoint`                     | Minimal  | Retention prune checkpoint                     |
+| `privilege_change`                     | Standard | GRANT, REVOKE, role changes                    |
+| `session_connect`                      | Standard | New connection                                 |
+| `session_disconnect`                   | Standard | Connection closed                              |
+| `session_handle_fingerprint_mismatch`  | Standard | Session handle used from a different origin    |
+| `session_handle_resolve_miss_spike`    | Standard | Many failed session handle lookups             |
+| `admin_action`                         | Standard | Administrative actions                         |
+| `config_change`                        | Standard | Config change                                  |
+| `ddl_change`                           | Standard | DDL change committed to the metadata group     |
+| `tenant_created`                       | Standard | New tenant                                     |
+| `tenant_deleted`                       | Standard | Tenant removed                                 |
+| `tenant_moved`                         | Standard | Tenant reassigned to database                  |
+| `database_created`                     | Standard | New database                                   |
+| `database_dropped`                     | Standard | Database dropped                               |
+| `database_renamed`                     | Standard | Database renamed                               |
+| `database_quota_changed`               | Standard | Quota limit changed                            |
+| `database_cloned`                      | Standard | Database cloned                                |
+| `database_mirrored`                    | Standard | Database mirrored                              |
+| `database_promoted`                    | Standard | Mirror promoted to writable primary            |
+| `database_materialized`                | Standard | Cloned database materialized                   |
+| `database_backed_up`                   | Standard | Database backup started                        |
+| `database_restored`                    | Standard | Database restored from backup                  |
+| `database_audit_dml_changed`           | Standard | DML audit mode changed                         |
+| `database_idle_timeout_changed`        | Standard | Idle timeout changed                           |
+| `oidc_provider_changed`                | Standard | OIDC provider created, altered, or dropped     |
+| `snapshot_begin`, `snapshot_end`       | Standard | Snapshot lifecycle                             |
+| `restore_begin`, `restore_end`         | Standard | Restore lifecycle                              |
+| `cert_rotation`                        | Standard | TLS cert rotated                               |
+| `cert_rotation_failed`                 | Standard | TLS cert rotation failed                       |
+| `key_rotation`                         | Standard | Encryption key rotated                         |
+| `node_joined`, `node_left`             | Standard | Cluster membership                             |
+| `query_exec`                           | Full     | Every query executed                           |
+| `rls_denied`                           | Full     | RLS denial                                     |
+| `row_change`                           | Forensic | Individual row mutations                       |
+| `dml_audit`                            | Forensic | Individual DML operation (opt-in per database) |
+
+Events at the Minimal level are recorded at every audit level.
 
 ## Audit Levels
 
@@ -80,17 +98,39 @@ Filter audit events by database to reduce noise when operating a single database
 -- Show audit events for a specific database
 SHOW AUDIT IN DATABASE prod LIMIT 50;
 
--- Combine with event type filter
-SHOW AUDIT IN DATABASE prod WHERE event_type = 'DmlAudit' LIMIT 100;
+-- Combine with an event type filter
+SHOW AUDIT IN DATABASE prod WHERE event_type = 'dml_audit' LIMIT 100;
+
+-- Filter by event type across all databases
+SHOW AUDIT WHERE event_type = 'dml_audit' LIMIT 100;
 ```
+
+`SHOW AUDIT LOG`, `SHOW AUDIT WHERE` and `SHOW AUDIT IN DATABASE <db>` all take `[WHERE event_type = '<snake_case_name>'] [LIMIT n]`. `SHOW AUDIT WHERE` requires the `WHERE` clause. Any other `WHERE` form is refused with SQLSTATE `42601`, and the message names the clause. A bad `LIMIT` value or a stray token is also refused with `42601`. An unknown database name returns SQLSTATE `3D000`.
 
 Database-scoped DDL (CLONE, MIRROR, PROMOTE, etc.) include `database_id` in the audit entry, enabling per-database filtering and forensics.
 
 ## Hash Chain Integrity
 
-Every `AuditEntry` contains `prev_hash` — the SHA-256 of the previous entry. This creates a tamper-evident chain verified on startup. If an entry is modified or deleted, the chain breaks and is flagged.
+Every `AuditEntry` contains `prev_hash` — the SHA-256 of the previous entry. If an entry is modified or deleted, the chain breaks. The hash covers `database_id` when the entry has one.
 
-Hash chain is extended with `database_id` when present (new events include this field; legacy events without database scope are preserved for compatibility).
+Two commands check the chain. Only a superuser can run them.
+
+```sql
+VERIFY AUDIT CHAIN;
+SELECT VERIFY_AUDIT_CHAIN(1, 5000);
+```
+
+- Both read the whole log: catalog rows plus the in-memory buffer.
+- `VERIFY AUDIT CHAIN` checks the whole chain. It returns `status = VALID` and the entry count, or the error `XX001` `audit chain broken at sequence N`.
+- `VERIFY_AUDIT_CHAIN(from, to)` checks the entries in that sequence range. Entries before `from` still feed the first link. It returns `valid`, `entries_checked`, `from_seq`, `to_seq`, `broken_at_seq`, and `last_hash`.
+- `broken_at_seq` is the first sequence whose link fails. An altered entry is at that sequence or the one before it.
+- The newest entry is also compared with the live tail hash.
+
+## Retention Pruning
+
+`audit_retention_days` prunes entries older than that age. `audit_max_entries` prunes the oldest entries beyond that count. Age pruning runs first. Both default to 0, which keeps everything.
+
+Each prune that deletes entries first records an `audit_checkpoint` entry. The checkpoint holds `pruned_count`, `oldest_kept_seq`, and `anchor_hash`, the hash of the last deleted entry. The checkpoint is a normal chain link, so the chain still verifies after a prune. A prune that deletes nothing records no checkpoint.
 
 ## DML Audit (Opt-In)
 
@@ -107,7 +147,7 @@ ALTER DATABASE prod SET AUDIT_DML = 'all';
 ALTER DATABASE prod SET AUDIT_DML = 'none';
 
 -- View DML audit entries
-SHOW AUDIT IN DATABASE prod WHERE event_type = 'DmlAudit' LIMIT 100;
+SHOW AUDIT WHERE event_type = 'dml_audit' LIMIT 100;
 ```
 
 **DML audit entry includes:**

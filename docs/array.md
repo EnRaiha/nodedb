@@ -238,7 +238,7 @@ SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'SUM');
 SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'SUM', 'x');
 ```
 
-The result has a `result` column. A grouped call also has a `group` column that holds the dimension value. Reducers are case-insensitive: `'SUM'`, `'COUNT'`, `'MIN'`, `'MAX'`, and `'MEAN'` (or `'AVG'`).
+The result has a `result` column. A grouped call also has a `group` column that holds the dimension value. The `group` column takes the group dimension's declared type: `TIMESTAMP_MS` gives `timestamp`, `FLOAT64` gives `float8`, `INT64` gives `int8`, and `STRING` gives `text`. A temporal call (`AS OF`) appends one summary row with the `bool` column `truncated_before_horizon`. Reducers are case-insensitive: `'SUM'`, `'COUNT'`, `'MIN'`, `'MAX'`, and `'MEAN'` (or `'AVG'`).
 
 The `result` type follows the reducer and the attribute type:
 
@@ -248,6 +248,8 @@ The `result` type follows the reducer and the attribute type:
 | `SUM`         | `bigint`, exact                        | `double precision` |
 | `MIN` / `MAX` | the attribute's own column type, exact | the attribute's own column type |
 | `MEAN`        | `double precision`                     | `double precision` |
+
+`SUM`, `MEAN`, `MIN`, and `MAX` accept integer and float attributes only. `COUNT` accepts every attribute type. Another reducer over a `STRING` or `BYTES` attribute is refused at plan time with a type mismatch error.
 
 An integer `SUM` adds exactly, so `2^53 + 1` stays `9007199254740993`. A `SUM` past the `bigint` range is refused with SQLSTATE `22003`. `MIN` and `MAX` sort `NaN` above every other float, as PostgreSQL does.
 
