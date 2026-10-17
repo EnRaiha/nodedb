@@ -10,7 +10,7 @@ use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTile
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_cluster::distributed_array::{ArrayAggGroupKey, ArrayAggNumber};
-use nodedb_types::SurrogateBitmap;
+use nodedb_types::{InstantKind, NdbDateTime, SurrogateBitmap};
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
@@ -23,6 +23,9 @@ pub(super) enum AggCell {
     Int(i64),
     Str(String),
     Bool(bool),
+    /// A timestamp dim value in microseconds. It writes the naive-instant
+    /// ext a slice row writes for the same dim.
+    Timestamp(i64),
     Null,
 }
 
@@ -33,17 +36,28 @@ impl zerompk::ToMessagePack for AggCell {
             AggCell::Int(i) => writer.write_i64(*i),
             AggCell::Str(s) => writer.write_string(s),
             AggCell::Bool(b) => writer.write_boolean(*b),
+            AggCell::Timestamp(micros) => {
+                writer.write_ext(InstantKind::Naive.ext_type(), &micros.to_be_bytes())
+            }
             AggCell::Null => writer.write_nil(),
         }
     }
 }
 
-pub(super) fn coord_to_agg_cell(c: &CoordValue) -> AggCell {
-    match c {
-        CoordValue::Int64(v) | CoordValue::TimestampMs(v) => AggCell::Int(*v),
+/// The `group` cell of a grouped row, typed as its dim: a timestamp dim's
+/// milliseconds become a timestamp, as in a slice row.
+pub(super) fn coord_to_agg_cell(c: &CoordValue) -> Result<AggCell, ErrorCode> {
+    Ok(match c {
+        CoordValue::Int64(v) => AggCell::Int(*v),
+        CoordValue::TimestampMs(ms) => {
+            let dt = NdbDateTime::from_millis(*ms).map_err(|e| ErrorCode::Internal {
+                detail: format!("array aggregate: timestamp group {ms} ms: {e}"),
+            })?;
+            AggCell::Timestamp(dt.micros)
+        }
         CoordValue::Float64(v) => AggCell::Float(*v),
         CoordValue::String(v) => AggCell::Str(v.clone()),
-    }
+    })
 }
 
 /// The `result` cell of a finalized reducer. A SUM past `i64` is SQLSTATE
@@ -243,5 +257,39 @@ pub(super) fn encode_bitemporal_agg_partial(
                 detail: format!("bitemporal aggregate encode: {e}"),
             },
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `group` cell of each dim type decodes as the value a slice row
+    /// holds for that dim. A timestamp dim reads as a naive instant.
+    #[test]
+    fn a_group_cell_takes_its_dim_type() {
+        let decode = |c: &CoordValue| {
+            let cell = coord_to_agg_cell(c).expect("cell");
+            let bytes = zerompk::to_msgpack_vec(&cell).expect("encode");
+            nodedb_types::value_from_msgpack(&bytes).expect("decode")
+        };
+        let ms = 1_768_435_200_000;
+        let instant = NdbDateTime::from_millis(ms).expect("in range");
+        assert_eq!(
+            decode(&CoordValue::TimestampMs(ms)),
+            nodedb_types::Value::NaiveDateTime(instant)
+        );
+        assert_eq!(
+            decode(&CoordValue::Int64(7)),
+            nodedb_types::Value::Integer(7)
+        );
+        assert_eq!(
+            decode(&CoordValue::Float64(102.5)),
+            nodedb_types::Value::Float(102.5)
+        );
+        assert_eq!(
+            decode(&CoordValue::String("chrX".into())),
+            nodedb_types::Value::String("chrX".into())
+        );
     }
 }

@@ -22,6 +22,9 @@ pub(super) enum AggValue {
     Int(i64),
     Str(String),
     Bool(bool),
+    /// A timestamp dim value in microseconds, written as the naive-instant
+    /// ext a slice row writes for the same dim.
+    Timestamp(i64),
     Null,
 }
 
@@ -32,20 +35,31 @@ impl zerompk::ToMessagePack for AggValue {
             AggValue::Int(i) => writer.write_i64(*i),
             AggValue::Str(s) => writer.write_string(s),
             AggValue::Bool(b) => writer.write_boolean(*b),
+            AggValue::Timestamp(micros) => writer.write_ext(
+                nodedb_types::InstantKind::Naive.ext_type(),
+                &micros.to_be_bytes(),
+            ),
             AggValue::Null => writer.write_nil(),
         }
     }
 }
 
 /// The `group` cell of a grouped row: the dim value, typed as the single-node
-/// path writes it. A scalar partial carries no group, so it writes NULL.
-fn group_cell(key: &ArrayAggGroupKey) -> AggValue {
-    match key {
-        ArrayAggGroupKey::Int64(v) | ArrayAggGroupKey::TimestampMs(v) => AggValue::Int(*v),
+/// path writes it. A timestamp dim's milliseconds become a timestamp. A
+/// scalar partial carries no group, so it writes NULL.
+fn group_cell(key: &ArrayAggGroupKey) -> Result<AggValue, Error> {
+    Ok(match key {
+        ArrayAggGroupKey::Int64(v) => AggValue::Int(*v),
+        ArrayAggGroupKey::TimestampMs(ms) => {
+            let dt = nodedb_types::NdbDateTime::from_millis(*ms).map_err(|e| Error::Codec {
+                detail: format!("array aggregate: timestamp group {ms} ms: {e}"),
+            })?;
+            AggValue::Timestamp(dt.micros)
+        }
         ArrayAggGroupKey::Float64(v) => AggValue::Float(*v),
         ArrayAggGroupKey::String(s) => AggValue::Str(s.clone()),
         ArrayAggGroupKey::Scalar => AggValue::Null,
-    }
+    })
 }
 
 /// Finalize merged `ArrayAggPartial`s into the same msgpack-map structure
@@ -91,7 +105,7 @@ pub(super) fn finalize_agg_partials(
         .map(|p| {
             let mut row = std::collections::BTreeMap::new();
             if is_grouped {
-                row.insert("group".to_string(), group_cell(&p.group_key));
+                row.insert("group".to_string(), group_cell(&p.group_key)?);
             }
             row.insert("result".to_string(), finalize(p)?);
             Ok(row)
@@ -305,6 +319,33 @@ mod tests {
         assert_eq!(rows[1]["group"].as_str(), Some("chrX"));
         assert_eq!(rows[2]["group"].as_i64(), Some(7));
         assert_eq!(rows[2]["result"].as_f64(), Some(4.0));
+    }
+
+    /// A timestamp group writes the naive instant a slice row writes for the
+    /// same dim, never the raw milliseconds.
+    #[test]
+    fn a_timestamp_group_writes_a_naive_instant() {
+        use nodedb_physical::physical_plan::ArrayReducer;
+        let ms = 1_768_435_200_000;
+        let partials = vec![ArrayAggPartial::from_single(
+            ArrayAggGroupKey::TimestampMs(ms),
+            2.0,
+        )];
+        let rows = finalize_agg_partials(&partials, &ArrayReducer::Sum, 0, false, false)
+            .expect("finalize");
+        let bytes = zerompk::to_msgpack_vec(&rows).expect("encode rows");
+        let decoded = nodedb_types::json_msgpack::value_from_msgpack(&bytes).expect("decode");
+        let nodedb_types::Value::Array(rows) = decoded else {
+            panic!("rows are an array: {decoded:?}");
+        };
+        let nodedb_types::Value::Object(row) = &rows[0] else {
+            panic!("row is a map: {:?}", rows[0]);
+        };
+        let want = nodedb_types::NdbDateTime::from_millis(ms).expect("in range");
+        assert_eq!(
+            row.get("group"),
+            Some(&nodedb_types::Value::NaiveDateTime(want))
+        );
     }
 
     /// An integer SUM finalizes as an exact integer, and one past `i64`

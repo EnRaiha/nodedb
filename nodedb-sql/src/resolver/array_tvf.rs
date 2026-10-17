@@ -12,8 +12,8 @@ use crate::planner::array_fn::{ArrayTableFn, try_plan_array_table_fn};
 use crate::resolver::columns::ResolvedTable;
 use crate::temporal::TemporalScope;
 use crate::types::{
-    ArrayCatalogView, ArraySlicePlan, CollectionInfo, ColumnInfo, EngineType, SqlCatalog,
-    SqlDataType,
+    ArrayAggPlan, ArrayCatalogView, ArraySlicePlan, CollectionInfo, ColumnInfo, EngineType,
+    SqlCatalog, SqlDataType,
 };
 use crate::types_array::{ArrayAttrType, ArrayDimType, ArrayReducerAst};
 use nodedb_types::columnar::{FloatWidth, IntWidth};
@@ -21,6 +21,10 @@ use nodedb_types::columnar::{FloatWidth, IntWidth};
 /// The column an audit-log slice (`AS OF SYSTEM TIME NULL`) stamps on each
 /// row: the version's system time in milliseconds.
 pub const ARRAY_SYSTEM_TIME_COLUMN: &str = "_ts_system";
+
+/// The flag of the summary row a temporal aggregate or elementwise read
+/// appends: whether its system-time cutoff predates the retained history.
+pub const ARRAY_HORIZON_COLUMN: &str = "truncated_before_horizon";
 
 /// If `factor` is `ARRAY_*(name, ...)`, look up the array via the
 /// catalog and build a `ResolvedTable` whose columns are the ones the
@@ -129,6 +133,20 @@ pub fn array_slice_columns(view: &ArrayCatalogView, slice: &ArraySlicePlan) -> V
     cols
 }
 
+/// The columns an aggregate's rows carry: `group`, typed as the group dim,
+/// when it groups, then `result`, typed by the reducer.
+pub fn array_agg_columns(view: &ArrayCatalogView, agg: &ArrayAggPlan) -> Vec<ColumnInfo> {
+    let mut cols = Vec::with_capacity(2);
+    if let Some(dim) = &agg.group_by_dim
+        && let Some(d) = view.dims.iter().find(|d| &d.name == dim)
+    {
+        cols.push(column("group", dim_type_to_sql(d.dtype), false));
+    }
+    let attr = view.attrs.iter().find(|a| a.name == agg.attr);
+    cols.push(agg_result_column(agg.reducer, attr.map(|a| a.dtype)));
+    cols
+}
+
 /// The columns the rows of one array table-function call carry.
 ///
 /// - A slice or project row holds the array's dims and the requested attrs.
@@ -142,18 +160,7 @@ pub fn array_table_fn_columns(
         ArrayTableFn::Slice(slice) | ArrayTableFn::Project(slice) => {
             Ok(array_slice_columns(&view_of(catalog, &slice.name)?, slice))
         }
-        ArrayTableFn::Agg(agg) => {
-            let view = view_of(catalog, &agg.name)?;
-            let mut cols = Vec::with_capacity(2);
-            if let Some(dim) = &agg.group_by_dim
-                && let Some(d) = view.dims.iter().find(|d| &d.name == dim)
-            {
-                cols.push(column("group", dim_type_to_sql(d.dtype), false));
-            }
-            let attr = view.attrs.iter().find(|a| a.name == agg.attr);
-            cols.push(agg_result_column(agg.reducer, attr.map(|a| a.dtype)));
-            Ok(cols)
-        }
+        ArrayTableFn::Agg(agg) => Ok(array_agg_columns(&view_of(catalog, &agg.name)?, agg)),
         ArrayTableFn::Elementwise(_) => Ok(vec![
             column("coords", SqlDataType::Json, false),
             column("attrs", SqlDataType::Json, false),

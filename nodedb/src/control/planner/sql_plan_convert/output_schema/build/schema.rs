@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
+use nodedb_sql::resolver::array_tvf::ARRAY_HORIZON_COLUMN;
 use nodedb_sql::types::query::Projection;
 use nodedb_sql::types::{
     CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, InsertPlan,
@@ -301,13 +302,30 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         | SqlPlan::DropIndex { .. }
         | SqlPlan::ArrayFlush { .. }
         | SqlPlan::ArrayCompact { .. } => OutputSchema::default(),
-        // `ArrayAgg` / `ArrayElementwise` compile to `ArrayOp::Aggregate` /
-        // `ArrayOp::Elementwise`, which `describe_plan` classifies as
-        // `PlanKind::MultiRow`. `MultiRow` responses are shaped by
-        // `shape_generic_rows` -> `shape_decoded_rows`, which derives column
-        // names from the decoded JSON payload itself, not from
-        // `OutputSchema`. An empty schema here is therefore correct.
-        SqlPlan::ArrayAgg { .. } | SqlPlan::ArrayElementwise { .. } => OutputSchema::default(),
+        // An aggregate announces `group`, typed as its group dim the way a
+        // slice types that dim, then `result`, typed by the reducer. A
+        // temporal aggregate ends with a summary row, so it also announces
+        // the row's `truncated_before_horizon` flag.
+        SqlPlan::ArrayAgg(agg) => {
+            let view = array_view(catalog, &agg.name)?;
+            let mut schema = array_columns_schema(
+                &nodedb_sql::resolver::array_tvf::array_agg_columns(&view, agg),
+            );
+            if agg.temporal.is_temporal() {
+                schema.columns.push(OutputColumn {
+                    display_name: ARRAY_HORIZON_COLUMN.to_string(),
+                    lookup_key: ARRAY_HORIZON_COLUMN.to_string(),
+                    ty: DdlColType::Bool,
+                });
+            }
+            schema
+        }
+        // `ArrayElementwise` compiles to `ArrayOp::Elementwise`, which
+        // `describe_plan` classifies as `PlanKind::MultiRow`. `MultiRow`
+        // responses are shaped by `shape_generic_rows` ->
+        // `shape_decoded_rows`, which derives column names from the decoded
+        // payload when the schema is empty.
+        SqlPlan::ArrayElementwise { .. } => OutputSchema::default(),
     })
 }
 

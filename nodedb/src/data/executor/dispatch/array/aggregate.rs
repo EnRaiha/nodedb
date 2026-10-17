@@ -356,8 +356,12 @@ impl CoreLoop {
                 Ok(cell) => cell,
                 Err(code) => return self.response_error(task, code),
             };
+            let group = match coord_to_agg_cell(&key) {
+                Ok(cell) => cell,
+                Err(code) => return self.response_error(task, code),
+            };
             let mut row: BTreeMap<&'static str, AggCell> = BTreeMap::new();
-            row.insert("group", coord_to_agg_cell(&key));
+            row.insert("group", group);
             row.insert("result", result);
             rows.push(row);
         }

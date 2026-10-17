@@ -7,6 +7,7 @@ mod aggregate_integer_exactness;
 mod aggregate_non_finite_float;
 mod aggregate_over_join;
 mod aggregate_routing_multicore;
+mod array_agg_group_types;
 mod array_copy_from;
 mod array_dml_in_bodies;
 mod array_narrow_attrs;
