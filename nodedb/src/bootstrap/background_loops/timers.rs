@@ -44,6 +44,40 @@ pub fn spawn_tick_loop<F>(
     );
 }
 
+/// Spawn the audit log flush loop.
+///
+/// The loop flushes every `AUDIT_FLUSH_PERIOD` and also when the buffer requests an early flush.
+/// It is the flush executor: recorders past the backpressure point wait for its flushes.
+/// On shutdown it flushes once more, so a clean stop leaves no entry only in memory.
+fn spawn_audit_flush_loop(shared: &Arc<SharedState>) {
+    let state = Arc::clone(shared);
+    let control = match shared.audit.lock() {
+        Ok(log) => log.flush_control(),
+        Err(poisoned) => poisoned.into_inner().flush_control(),
+    };
+    spawn_loop(
+        &shared.loop_registry,
+        &shared.shutdown,
+        "audit_log_flush",
+        ShutdownPhase::DrainingControlPlane,
+        move |mut shutdown| async move {
+            control.attach_executor();
+            let mut tick = tokio::time::interval(AUDIT_FLUSH_PERIOD);
+            loop {
+                tokio::select! {
+                    _ = shutdown.wait_cancelled() => break,
+                    _ = tick.tick() => {}
+                    _ = control.flush_requested() => {}
+                }
+                control.take_flush_request();
+                state.flush_audit_log();
+            }
+            state.flush_audit_log();
+            control.detach_executor();
+        },
+    );
+}
+
 /// Spawn the tenant rate reset, audit log flush, and tenant memory
 /// estimate timers.
 pub fn spawn_tenant_timers(shared: &Arc<SharedState>) {
@@ -53,12 +87,7 @@ pub fn spawn_tenant_timers(shared: &Arc<SharedState>) {
         TENANT_RATE_RESET_PERIOD,
         SharedState::reset_tenant_rate_counters,
     );
-    spawn_tick_loop(
-        shared,
-        "audit_log_flush",
-        AUDIT_FLUSH_PERIOD,
-        SharedState::flush_audit_log,
-    );
+    spawn_audit_flush_loop(shared);
     spawn_tick_loop(
         shared,
         "tenant_memory_estimate",

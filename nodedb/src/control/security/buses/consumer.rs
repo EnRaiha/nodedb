@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::control::security::audit::event::AuditEvent;
+use crate::control::security::audit::guard::lock_audit_log;
 use crate::control::security::audit::log::AuditLog;
 use crate::control::security::sessions::SessionRegistry;
 
@@ -155,14 +156,12 @@ fn handle_session_invalidated(
     // Audit row written BEFORE closing any connection — durable even if
     // the close subsequently fails.
     let detail = format!("user_id={} reason={}", event.user_id, event.reason.as_str());
-    if let Ok(mut log) = audit.lock() {
-        log.record(
-            AuditEvent::SessionRevoked,
-            None,
-            "session_invalidation_bus",
-            &detail,
-        );
-    }
+    lock_audit_log(audit).record(
+        AuditEvent::SessionRevoked,
+        None,
+        "session_invalidation_bus",
+        &detail,
+    );
 
     // Hard revoke: signal every open session for this user to close.
     if event.reason.is_hard_revoke() {
@@ -177,20 +176,16 @@ fn handle_session_invalidated(
 
 fn handle_user_changed(audit: &Arc<Mutex<AuditLog>>, event: &UserChanged) {
     let detail = format!("user_id={} credential_mutation", event.user_id);
-    if let Ok(mut log) = audit.lock() {
-        log.record(
-            AuditEvent::PrivilegeChange,
-            None,
-            "user_change_bus",
-            &detail,
-        );
-    }
+    lock_audit_log(audit).record(
+        AuditEvent::PrivilegeChange,
+        None,
+        "user_change_bus",
+        &detail,
+    );
 }
 
 fn record_lagged(audit: &Arc<Mutex<AuditLog>>, detail: &str) {
-    if let Ok(mut log) = audit.lock() {
-        log.record(AuditEvent::AuditBusLagged, None, "bus_consumer", detail);
-    }
+    lock_audit_log(audit).record(AuditEvent::AuditBusLagged, None, "bus_consumer", detail);
 }
 
 #[cfg(test)]
@@ -342,5 +337,39 @@ mod tests {
         let log = audit.lock().unwrap();
         assert_eq!(log.query_by_event(&AuditEvent::SessionRevoked).len(), 1);
         assert_eq!(log.query_by_event(&AuditEvent::PrivilegeChange).len(), 1);
+    }
+
+    #[test]
+    fn bus_consumer_entries_survive_a_crash() {
+        use crate::control::security::audit::restore::{audit_with_test_wal, replay_after_crash};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (audit, wal) = audit_with_test_wal(dir.path());
+        handle_session_invalidated(
+            &audit,
+            &make_registry(),
+            &SessionInvalidated {
+                user_id: 41,
+                reason: SessionInvalidationReason::UserDropped,
+            },
+        );
+        handle_user_changed(&audit, &UserChanged { user_id: 42 });
+        record_lagged(&audit, "lagged by 3");
+        drop(audit);
+
+        let sources: Vec<String> = replay_after_crash(&wal)
+            .into_iter()
+            .map(|e| e.source)
+            .collect();
+        for source in [
+            "session_invalidation_bus",
+            "user_change_bus",
+            "bus_consumer",
+        ] {
+            assert!(
+                sources.iter().any(|s| s == source),
+                "the {source} entry must replay after a crash: {sources:?}"
+            );
+        }
     }
 }

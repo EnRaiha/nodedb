@@ -53,16 +53,14 @@ pub(super) fn apply_ca_trust_change(
         "removed_fingerprint": remove.map(nodedb_cluster::ca_fingerprint_hex),
     }))
     .unwrap_or_default();
-    if let Ok(mut log) = shared.audit.lock() {
-        log.record_with_auth(
-            AuditEvent::CertRotation,
-            None,
-            None,
-            "metadata_group",
-            &detail,
-            &AuditAuth::default(),
-        );
-    }
+    crate::control::security::audit::lock_audit_log(&shared.audit).record_with_auth(
+        AuditEvent::CertRotation,
+        None,
+        None,
+        "metadata_group",
+        &detail,
+        &AuditAuth::default(),
+    );
     Ok(())
 }
 
@@ -134,10 +132,7 @@ pub(super) fn emit_ddl_audit(
     // other audit writer.
     let audit = std::sync::Arc::clone(&shared.audit);
     let emit = move || {
-        let mut log = match audit.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut log = crate::control::security::audit::lock_audit_log(&audit);
         log.record_with_auth(
             AuditEvent::DdlChange,
             None,
@@ -158,5 +153,51 @@ pub(super) fn emit_ddl_audit(
         // No reactor (unit tests, non-Tokio callers): emit inline. There is no
         // apply loop to protect in that context.
         Err(_) => emit(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::super::test_fixture::applier_with_shared_at;
+    use super::*;
+    use crate::control::security::audit::AuditEvent;
+    use crate::control::security::audit::restore::replay_after_crash;
+    use crate::control::security::catalog::StoredCollection;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ddl_audit_entry_survives_a_crash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_applier, state) = applier_with_shared_at(dir.path(), "ddl-audit.wal");
+        let stamped = catalog_entry::CatalogEntry::PutCollection(Box::new(
+            StoredCollection::stamped_for_test(7, "crash_coll", "tester"),
+        ));
+        emit_ddl_audit(&state, 11, &stamped, None);
+
+        // The emit runs on a blocking task, so wait until it lands in the buffer.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let landed = state
+                .audit
+                .lock()
+                .expect("audit lock")
+                .all()
+                .iter()
+                .any(|e| e.source == "metadata_group");
+            if landed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the DDL audit emit never ran");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let replayed = replay_after_crash(&state.wal);
+        assert!(
+            replayed
+                .iter()
+                .any(|e| e.source == "metadata_group" && e.event == AuditEvent::DdlChange),
+            "the metadata-applier entry must replay after a crash: {replayed:?}"
+        );
     }
 }

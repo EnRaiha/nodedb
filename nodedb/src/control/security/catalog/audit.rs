@@ -1,64 +1,132 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Audit log operations for the system catalog.
+//!
+//! The `AUDIT_LOG` table stores each full [`AuditEntry`], keyed by big-endian seq.
+//! Every field that feeds the hash chain survives persistence, so persisted rows verify.
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
-use super::types::{AUDIT_LOG, StoredAuditEntry, SystemCatalog, catalog_err};
+use super::audit_dml_index::{DML_INDEX_KEY_LEN, dml_index_key};
+use super::types::{AUDIT_DML_POSITIONS, AUDIT_LOG, SystemCatalog, catalog_err};
+use crate::control::security::audit::AuditEntry;
+use crate::control::security::audit::entry::hash_entry;
+
+/// The oldest-first prefix of the audit table that one retention prune removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditPrunePlan {
+    /// Highest seq the prune removes. Every lower seq goes too.
+    pub through_seq: u64,
+    /// Number of rows the prune removes.
+    pub pruned_count: u64,
+    /// Hash of the row at `through_seq`, which the first survivor links to.
+    pub anchor_hash: String,
+}
+
+pub(super) fn decode_entry(bytes: &[u8]) -> crate::Result<AuditEntry> {
+    zerompk::from_msgpack(bytes).map_err(|e| catalog_err("deser audit", e))
+}
 
 impl SystemCatalog {
-    /// Delete audit entries older than `cutoff_us` (microseconds since epoch).
-    pub fn prune_audit_before(&self, cutoff_us: u64) -> crate::Result<u64> {
-        // Phase 1: Read to find keys to delete.
-        let to_delete = {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| catalog_err("read txn", e))?;
-            let table = read_txn
-                .open_table(AUDIT_LOG)
-                .map_err(|e| catalog_err("open audit", e))?;
-            let mut keys = Vec::new();
-            for entry in table.range(..).map_err(|e| catalog_err("range audit", e))? {
-                let (key, value) = entry.map_err(|e| catalog_err("read audit", e))?;
-                let stored: StoredAuditEntry = match zerompk::from_msgpack(value.value()) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if stored.timestamp_us < cutoff_us {
-                    keys.push(key.value().to_vec());
-                } else {
-                    break;
-                }
-            }
-            keys
-        };
+    /// Plan a prune of the rows older than `cutoff_us`, oldest first.
+    ///
+    /// The scan stops at the first row at or after the cutoff. Returns `None` when nothing is older.
+    pub fn plan_audit_prune_before(&self, cutoff_us: u64) -> crate::Result<Option<AuditPrunePlan>> {
+        self.plan_audit_prune(|_, entry| entry.timestamp_us < cutoff_us)
+    }
 
-        if to_delete.is_empty() {
-            return Ok(0);
+    /// Plan a prune that leaves at most `max_entries` rows once its checkpoint is added.
+    ///
+    /// The plan frees one extra row for the checkpoint the prune records.
+    /// So the next flush finds the table within the cap and records no new checkpoint.
+    /// Returns `None` when the table is already within the cap.
+    pub fn plan_audit_prune_to_count(
+        &self,
+        max_entries: u64,
+    ) -> crate::Result<Option<AuditPrunePlan>> {
+        let total = self.audit_entry_count()?;
+        if total <= max_entries {
+            return Ok(None);
         }
+        let to_remove = (total - max_entries).saturating_add(1);
+        self.plan_audit_prune(|index, _| index < to_remove)
+    }
 
-        // Phase 2: Write to delete the keys.
+    /// Walk rows oldest first while `remove(index, entry)` holds, and plan their removal.
+    fn plan_audit_prune(
+        &self,
+        remove: impl Fn(u64, &AuditEntry) -> bool,
+    ) -> crate::Result<Option<AuditPrunePlan>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(AUDIT_LOG)
+            .map_err(|e| catalog_err("open audit", e))?;
+        let mut last_removed: Option<AuditEntry> = None;
+        let mut pruned_count = 0u64;
+        for row in table.range(..).map_err(|e| catalog_err("range audit", e))? {
+            let (_, value) = row.map_err(|e| catalog_err("read audit", e))?;
+            let entry = decode_entry(value.value())?;
+            if !remove(pruned_count, &entry) {
+                break;
+            }
+            pruned_count += 1;
+            last_removed = Some(entry);
+        }
+        Ok(last_removed.map(|entry| AuditPrunePlan {
+            through_seq: entry.seq,
+            pruned_count,
+            anchor_hash: hash_entry(&entry),
+        }))
+    }
+
+    /// Remove every row with `seq <= through_seq`. Returns the number removed.
+    pub fn delete_audit_through(&self, through_seq: u64) -> crate::Result<u64> {
+        let end_key = through_seq.to_be_bytes();
         let write_txn = self
             .db
             .begin_write()
             .map_err(|e| catalog_err("write txn", e))?;
-        {
+        let removed = {
             let mut table = write_txn
                 .open_table(AUDIT_LOG)
                 .map_err(|e| catalog_err("open audit", e))?;
-            for key in &to_delete {
+            let mut index = write_txn
+                .open_table(AUDIT_DML_POSITIONS)
+                .map_err(|e| catalog_err("open audit dml index", e))?;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            let mut index_keys: Vec<[u8; DML_INDEX_KEY_LEN]> = Vec::new();
+            for row in table
+                .range(..=end_key.as_slice())
+                .map_err(|e| catalog_err("range audit", e))?
+            {
+                let (key, value) = row.map_err(|e| catalog_err("read audit", e))?;
+                keys.push(key.value().to_vec());
+                index_keys.extend(dml_index_key(&decode_entry(value.value())?));
+            }
+            for key in &keys {
                 table
                     .remove(key.as_slice())
                     .map_err(|e| catalog_err("prune audit", e))?;
             }
-        }
+            for key in &index_keys {
+                index
+                    .remove(key.as_slice())
+                    .map_err(|e| catalog_err("prune audit dml index", e))?;
+            }
+            keys.len() as u64
+        };
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
-        Ok(to_delete.len() as u64)
+        Ok(removed)
     }
 
-    /// Append a batch of audit entries. Used by the periodic flush.
-    pub fn append_audit_entries(&self, entries: &[StoredAuditEntry]) -> crate::Result<()> {
+    /// Append a batch of audit entries. Used by the periodic flush and boot recovery.
+    ///
+    /// A row keyed by an existing seq is overwritten with the same entry.
+    /// A DML audit row also gets its position index row in the same transaction.
+    pub fn append_audit_entries(&self, entries: &[AuditEntry]) -> crate::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -71,6 +139,9 @@ impl SystemCatalog {
             let mut table = write_txn
                 .open_table(AUDIT_LOG)
                 .map_err(|e| catalog_err("open audit_log", e))?;
+            let mut index = write_txn
+                .open_table(AUDIT_DML_POSITIONS)
+                .map_err(|e| catalog_err("open audit dml index", e))?;
             for entry in entries {
                 let key = entry.seq.to_be_bytes();
                 let value = zerompk::to_msgpack_vec(entry)
@@ -78,6 +149,11 @@ impl SystemCatalog {
                 table
                     .insert(key.as_slice(), value.as_slice())
                     .map_err(|e| catalog_err("insert audit", e))?;
+                if let Some(index_key) = dml_index_key(entry) {
+                    index
+                        .insert(index_key.as_slice(), b"".as_slice())
+                        .map_err(|e| catalog_err("insert audit dml index", e))?;
+                }
             }
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
@@ -85,152 +161,25 @@ impl SystemCatalog {
         Ok(())
     }
 
-    /// Load the highest sequence number from the audit log.
-    /// Used on startup to resume the sequence counter.
+    /// Load the highest sequence number from the audit log, or 0 when it is empty.
     pub fn load_audit_max_seq(&self) -> crate::Result<u64> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(AUDIT_LOG)
-            .map_err(|e| catalog_err("open audit_log", e))?;
-
-        // Scan all keys to find the maximum sequence number.
-        // Audit log keys are u64 big-endian, so the last entry in
-        // iteration order is the highest.
-        let mut max_seq = 0u64;
-        let range = table.range(..).map_err(|e| catalog_err("range audit", e))?;
-        for entry in range {
-            let (key, _) = entry.map_err(|e| catalog_err("read audit key", e))?;
-            let key_bytes: &[u8] = key.value();
-            if key_bytes.len() == 8 {
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(key_bytes);
-                let seq = u64::from_be_bytes(arr);
-                if seq > max_seq {
-                    max_seq = seq;
-                }
-            }
-        }
-        Ok(max_seq)
+        Ok(self.load_audit_newest()?.map_or(0, |entry| entry.seq))
     }
 
-    /// Load audit entries, most recent first, up to `limit`.
-    pub fn load_recent_audit_entries(&self, limit: usize) -> crate::Result<Vec<StoredAuditEntry>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(AUDIT_LOG)
-            .map_err(|e| catalog_err("open audit_log", e))?;
-
-        // Read all entries, then take the last `limit` (since redb iterates in key order = seq order).
-        let mut all = Vec::new();
-        for entry in table.range(..).map_err(|e| catalog_err("range audit", e))? {
-            let (_, value) = entry.map_err(|e| catalog_err("read audit", e))?;
-            let stored: StoredAuditEntry =
-                zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser audit", e))?;
-            all.push(stored);
-        }
-
-        // Return most recent entries (last N).
-        if all.len() > limit {
-            Ok(all.split_off(all.len() - limit))
-        } else {
-            Ok(all)
-        }
+    /// Load the persisted entry with the highest seq.
+    pub fn load_audit_newest(&self) -> crate::Result<Option<AuditEntry>> {
+        Ok(self.load_recent_audit_entries(1, |_| true)?.pop())
     }
 
-    /// Delete the oldest audit entries until the total count is at or below
-    /// `max_entries`. Returns the number of deleted entries plus the hash
-    /// of the last deleted entry (for the `AuditCheckpoint` prev_hash) and
-    /// the seq of the oldest surviving entry. Returns `(0, "", 0)` when no
-    /// pruning was needed.
-    pub fn prune_audit_to_count(&self, max_entries: u64) -> crate::Result<(u64, String, u64)> {
-        let total = self.audit_entry_count()?;
-        if total <= max_entries {
-            return Ok((0, String::new(), 0));
-        }
-        let to_remove = total - max_entries;
-
-        // Phase 1: collect keys and the hash of the last entry to be deleted.
-        let (to_delete, last_deleted_hash, oldest_kept_seq) = {
-            let read_txn = self
-                .db
-                .begin_read()
-                .map_err(|e| catalog_err("read txn", e))?;
-            let table = read_txn
-                .open_table(AUDIT_LOG)
-                .map_err(|e| catalog_err("open audit", e))?;
-            let mut keys: Vec<Vec<u8>> = Vec::new();
-            let mut last_hash = String::new();
-            let mut first_kept_seq = 0u64;
-            for (idx, entry) in table
-                .range(..)
-                .map_err(|e| catalog_err("range audit", e))?
-                .enumerate()
-            {
-                let (key, value) = entry.map_err(|e| catalog_err("read audit", e))?;
-                if (idx as u64) < to_remove {
-                    keys.push(key.value().to_vec());
-                } else {
-                    // This is the first surviving entry.
-                    // Its prev_hash = hash of the last deleted entry — that
-                    // is exactly what the AuditCheckpoint needs as its own
-                    // prev_hash so the surviving chain verifies correctly.
-                    let stored: StoredAuditEntry = match zerompk::from_msgpack(value.value()) {
-                        Ok(s) => s,
-                        Err(_) => break,
-                    };
-                    first_kept_seq = stored.seq;
-                    last_hash = stored.prev_hash.clone();
-                    break;
-                }
-            }
-            (keys, last_hash, first_kept_seq)
-        };
-
-        if to_delete.is_empty() {
-            return Ok((0, String::new(), 0));
-        }
-
-        // Phase 2: delete.
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| catalog_err("write txn", e))?;
-        {
-            let mut table = write_txn
-                .open_table(AUDIT_LOG)
-                .map_err(|e| catalog_err("open audit", e))?;
-            for key in &to_delete {
-                table
-                    .remove(key.as_slice())
-                    .map_err(|e| catalog_err("prune audit count", e))?;
-            }
-        }
-        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
-        Ok((to_delete.len() as u64, last_deleted_hash, oldest_kept_seq))
-    }
-
-    /// Load audit entries filtered by seq and/or timestamp range, up to `limit`.
+    /// Load the newest `limit` persisted entries that pass `filter`.
     ///
-    /// `from_seq`/`to_seq` are inclusive bounds (pass 0/u64::MAX for no bound).
-    /// `from_ts_us`/`to_ts_us` are inclusive timestamp bounds in microseconds.
-    /// Since the table is seq-ordered (big-endian key), seq range pushdown is
-    /// cheap: we seek to `from_seq` and stop at `to_seq`.
-    /// Timestamp filtering applies on top of the seq scan.
-    /// Returns entries in ascending seq order (oldest first).
-    pub fn load_audit_entries_ranged(
+    /// The scan walks keys from the highest seq down and stops at `limit` matches.
+    /// The result is in ascending seq order.
+    pub fn load_recent_audit_entries(
         &self,
-        from_seq: u64,
-        to_seq: u64,
-        from_ts_us: u64,
-        to_ts_us: u64,
         limit: usize,
-    ) -> crate::Result<Vec<StoredAuditEntry>> {
+        filter: impl Fn(&AuditEntry) -> bool,
+    ) -> crate::Result<Vec<AuditEntry>> {
         let read_txn = self
             .db
             .begin_read()
@@ -239,25 +188,23 @@ impl SystemCatalog {
             .open_table(AUDIT_LOG)
             .map_err(|e| catalog_err("open audit_log", e))?;
 
-        let start_key = from_seq.to_be_bytes();
-        let end_key = to_seq.to_be_bytes();
-
-        let mut results = Vec::new();
-        for entry in table
-            .range(start_key.as_slice()..=end_key.as_slice())
+        let mut newest_first = Vec::new();
+        for row in table
+            .range(..)
             .map_err(|e| catalog_err("range audit", e))?
+            .rev()
         {
-            if results.len() >= limit {
+            if newest_first.len() >= limit {
                 break;
             }
-            let (_, value) = entry.map_err(|e| catalog_err("read audit", e))?;
-            let stored: StoredAuditEntry =
-                zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser audit", e))?;
-            if stored.timestamp_us >= from_ts_us && stored.timestamp_us <= to_ts_us {
-                results.push(stored);
+            let (_, value) = row.map_err(|e| catalog_err("read audit", e))?;
+            let entry = decode_entry(value.value())?;
+            if filter(&entry) {
+                newest_first.push(entry);
             }
         }
-        Ok(results)
+        newest_first.reverse();
+        Ok(newest_first)
     }
 
     /// Count total audit entries (for diagnostics).

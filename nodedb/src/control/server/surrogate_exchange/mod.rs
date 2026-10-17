@@ -9,6 +9,7 @@ pub mod authority;
 pub mod home_bridge;
 pub mod hook;
 pub mod resolve;
+pub mod unbound;
 
 pub use home_bridge::RoutedHomeAuthority;
 pub use hook::RegistryAssignRemoteSurrogate;

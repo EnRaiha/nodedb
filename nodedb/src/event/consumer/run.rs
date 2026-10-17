@@ -795,15 +795,14 @@ mod tests {
     }
 
     /// DML audit rows in the durable audit log.
-    fn durable_audit_rows(wal: &crate::wal::WalManager) -> usize {
-        wal.recover_audit_entries()
-            .expect("recover audit entries")
-            .iter()
-            .filter(|(_, bytes)| {
-                zerompk::from_msgpack::<crate::control::security::audit::AuditEntry>(bytes)
-                    .is_ok_and(|entry| entry.event == AuditEvent::DmlAudit)
-            })
-            .count()
+    ///
+    /// The durable audit log is the catalog plus the buffer. The audit WAL holds
+    /// only the unflushed tail: boot commits it to the catalog and truncates it.
+    fn durable_audit_rows(shared: &SharedState) -> usize {
+        shared
+            .recent_audit_entries(usize::MAX, |entry| entry.event == AuditEvent::DmlAudit)
+            .expect("read the audit log")
+            .len()
     }
 
     /// The row of every event the change stream retains, in stream order.
@@ -907,7 +906,7 @@ mod tests {
         );
         assert_eq!(seen.mv_sum, (1..=WRITES).sum::<u64>() as i64);
         assert_eq!(
-            durable_audit_rows(&node.wal),
+            durable_audit_rows(&node.shared),
             WRITES as usize,
             "an event was audited twice or not at all"
         );

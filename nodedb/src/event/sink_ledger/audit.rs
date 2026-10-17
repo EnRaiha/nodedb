@@ -3,9 +3,10 @@
 //! Which DML audit rows the durable audit log already holds.
 //!
 //! A DML audit row carries the key of the event it records, in its detail
-//! text. The durable audit WAL is the audit sink's ledger: each row is
-//! written there with its key in one append. At startup the Event Plane
-//! reads the keys above each core's watermark back out of it. A replayed
+//! text. The durable audit log is the audit sink's ledger: each row reaches
+//! the audit WAL with its key in one append, and a flush moves it to the
+//! system catalog. The WAL is truncated through what the catalog holds, so
+//! startup reads the keys above each core's watermark from both. A replayed
 //! event whose key is present was audited before the restart and is not
 //! audited again.
 
@@ -30,6 +31,13 @@ fn key_of(detail: &str) -> Option<SinkEventKey> {
     SinkEventKey::from_token(detail.get(at + KEY_MARKER.len()..)?)
 }
 
+/// The `(core, lsn)` of the event a DML audit row's detail names, if any.
+///
+/// The catalog indexes DML audit rows by this position, so boot reads only rows above each core's floor.
+pub fn dml_event_position(detail: &str) -> Option<(u32, u64)> {
+    key_of(detail).map(|key| (key.core, key.lsn))
+}
+
 /// Keys of DML audit rows written above each core's watermark.
 #[derive(Debug, Default)]
 pub struct AuditedKeys {
@@ -37,19 +45,29 @@ pub struct AuditedKeys {
 }
 
 impl AuditedKeys {
-    /// Collect the keys of the recovered durable audit entries that lie above
-    /// `watermark(core)`.
-    pub fn from_recovered(
-        entries: &[(u64, Vec<u8>)],
-        watermark: impl Fn(u32) -> u64,
-    ) -> crate::Result<Self> {
-        let mut keys = HashSet::new();
-        for (_, bytes) in entries {
-            let entry: AuditEntry =
+    /// Decode the recovered audit WAL records.
+    pub fn decode_recovered(records: &[(u64, Vec<u8>)]) -> crate::Result<Vec<AuditEntry>> {
+        records
+            .iter()
+            .map(|(_, bytes)| {
                 zerompk::from_msgpack(bytes).map_err(|e| crate::Error::Serialization {
                     format: "msgpack".into(),
                     detail: format!("recovered audit entry: {e}"),
-                })?;
+                })
+            })
+            .collect()
+    }
+
+    /// Collect the keys of the durable audit entries that lie above `watermark(core)`.
+    ///
+    /// `entries` is the catalog's DML audit rows together with the audit WAL's records.
+    /// A key both hold counts once.
+    pub fn from_entries<'a>(
+        entries: impl IntoIterator<Item = &'a AuditEntry>,
+        watermark: impl Fn(u32) -> u64,
+    ) -> Self {
+        let mut keys = HashSet::new();
+        for entry in entries {
             if entry.event != AuditEvent::DmlAudit {
                 continue;
             }
@@ -59,9 +77,9 @@ impl AuditedKeys {
                 keys.insert(key);
             }
         }
-        Ok(Self {
+        Self {
             keys: Mutex::new(keys),
-        })
+        }
     }
 
     /// Whether the durable audit log already records `key`.

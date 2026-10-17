@@ -35,6 +35,83 @@ async fn show_audit_log_with_limit() {
     }
 }
 
+/// Every audit reader returns an action right after it runs, with no wait for a flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_readers_see_action_immediately() {
+    let server = TestServer::start().await;
+
+    server
+        .exec("CREATE USER audit_ryw WITH PASSWORD 'pw'")
+        .await
+        .unwrap();
+    server
+        .exec("CREATE COLLECTION audit_ryw_coll")
+        .await
+        .unwrap();
+    server
+        .exec("GRANT READ ON audit_ryw_coll TO audit_ryw")
+        .await
+        .unwrap();
+
+    let is_create = |d: &str| d.contains("created user 'audit_ryw'");
+    let is_grant = |d: &str| d.contains("granted") && d.contains("'audit_ryw'");
+
+    let log = server
+        .query_named_rows("SHOW AUDIT LOG LIMIT 1000")
+        .await
+        .expect("SHOW AUDIT LOG");
+    let details: Vec<&str> = log
+        .iter()
+        .filter_map(|r| r.get("detail").map(String::as_str))
+        .collect();
+    assert!(
+        details.iter().any(|d| is_create(d)),
+        "SHOW AUDIT LOG must list CREATE USER at once: {details:?}"
+    );
+    assert!(
+        details.iter().any(|d| is_grant(d)),
+        "SHOW AUDIT LOG must list GRANT at once: {details:?}"
+    );
+    let seqs: Vec<i64> = log
+        .iter()
+        .filter_map(|r| r.get("seq").and_then(|s| s.parse().ok()))
+        .collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] > w[1]),
+        "SHOW AUDIT LOG rows must be unique and most-recent-first: {seqs:?}"
+    );
+
+    let filtered = server
+        .query_named_rows("SHOW AUDIT WHERE event_type = 'privilege_change' LIMIT 1000")
+        .await
+        .expect("SHOW AUDIT WHERE");
+    assert!(
+        filtered
+            .iter()
+            .all(|r| r.get("event").map(String::as_str) == Some("privilege_change")),
+        "SHOW AUDIT WHERE must return only the filtered event: {filtered:?}"
+    );
+    assert!(
+        filtered
+            .iter()
+            .filter_map(|r| r.get("detail"))
+            .any(|d| is_create(d)),
+        "SHOW AUDIT WHERE must list CREATE USER at once: {filtered:?}"
+    );
+
+    let table = server
+        .query_named_rows("SELECT detail FROM _system.audit_log")
+        .await
+        .expect("SELECT FROM _system.audit_log");
+    assert!(
+        table
+            .iter()
+            .filter_map(|r| r.get("detail"))
+            .any(|d| is_grant(d)),
+        "_system.audit_log must list GRANT at once: {table:?}"
+    );
+}
+
 // ── SHOW USERS ──
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

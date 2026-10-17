@@ -242,6 +242,30 @@ mod tests {
     }
 
     #[test]
+    fn silent_rejection_entry_survives_a_crash() {
+        use crate::control::security::audit::restore::{audit_with_test_wal, replay_after_crash};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (audit, wal) = audit_with_test_wal(dir.path());
+        let identity = test_identity(1, "carol");
+        let delta = make_delta("orders", "o2", &serde_json::json!({"x": 2}));
+        let reason = SyncRejectionReason::RateLimited { retry_after_ms: 10 };
+        {
+            let mut log = audit.lock().expect("audit lock");
+            log_silent_rejection(&mut log, "sess-crash", &identity, &delta, &reason);
+        }
+        drop(audit);
+
+        let replayed = replay_after_crash(&wal);
+        assert!(
+            replayed
+                .iter()
+                .any(|e| e.source == "sess-crash" && e.event == AuditEvent::AuthzDenied),
+            "the sync rejection entry must replay after a crash: {replayed:?}"
+        );
+    }
+
+    #[test]
     fn upgrade_rejects_bad_token() {
         let config = JwtConfig::default();
         let result = validate_upgrade_token("bad.token.here", &config);

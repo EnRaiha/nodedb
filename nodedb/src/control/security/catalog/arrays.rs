@@ -11,7 +11,10 @@ use redb::{ReadableDatabase, ReadableTable};
 
 use crate::control::array_catalog::ArrayCatalogEntry;
 
-use super::types::{ARRAYS, SURROGATE_PK_REV_V3, SURROGATE_PK_V3, SystemCatalog, catalog_err};
+use super::surrogate_scope::{
+    assign_scope, drain_scope, fwd_key, rev_key, take_scope, write_scope,
+};
+use super::types::{ARRAYS, SURROGATE_PK, SURROGATE_PK_REV, SystemCatalog, catalog_err};
 
 /// Version-two catalog key.  It includes both tenant and database because a
 /// database id is only meaningful inside a tenant.
@@ -142,8 +145,6 @@ impl SystemCatalog {
             .db
             .begin_write()
             .map_err(|e| catalog_err("array/surrogate delete txn", e))?;
-        let db_id = database_id.as_u64();
-        let tid = tenant_id.as_u64();
         let existed;
         {
             let mut arrays = write_txn
@@ -154,43 +155,39 @@ impl SystemCatalog {
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("remove array", e))?
                 .is_some();
-
-            let mut forward = write_txn
-                .open_table(SURROGATE_PK_V3)
-                .map_err(|e| catalog_err("open surrogate_pk", e))?;
-            let bindings: Vec<(Vec<u8>, u32)> = forward
-                .range((db_id, tid, name, [].as_slice())..)
-                .map_err(|e| catalog_err("range surrogate_pk", e))?
-                .take_while(|row| match row {
-                    Ok((key, _)) => {
-                        let (row_db, row_tenant, collection, _) = key.value();
-                        row_db == db_id && row_tenant == tid && collection == name
+        }
+        let source = nodedb_types::CollectionKey::from_bare(database_id, name);
+        if let Some(scope) = take_scope(&write_txn, source, tenant_id)? {
+            match move_to {
+                None => {
+                    drain_scope(&write_txn, scope)?;
+                }
+                Some(to) => {
+                    let target = nodedb_types::CollectionKey::from_bare(to, name);
+                    match write_scope(&write_txn, target, tenant_id)? {
+                        // The rows keep their scope id: naming it under the
+                        // target moves every binding at once.
+                        None => assign_scope(&write_txn, target, tenant_id, scope)?,
+                        // The target already holds bindings: the moved rows
+                        // overwrite it key by key.
+                        Some(existing) => {
+                            let moved = drain_scope(&write_txn, scope)?;
+                            let mut forward = write_txn
+                                .open_table(SURROGATE_PK)
+                                .map_err(|e| catalog_err("open surrogate_pk", e))?;
+                            let mut reverse = write_txn
+                                .open_table(SURROGATE_PK_REV)
+                                .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
+                            for (pk, surrogate) in moved {
+                                forward
+                                    .insert(fwd_key(existing, &pk).as_slice(), surrogate)
+                                    .map_err(|e| catalog_err("move surrogate_pk", e))?;
+                                reverse
+                                    .insert(rev_key(existing, surrogate), pk.as_slice())
+                                    .map_err(|e| catalog_err("move surrogate_pk_rev", e))?;
+                            }
+                        }
                     }
-                    Err(_) => true,
-                })
-                .map(|row| {
-                    let (key, value) = row.map_err(|e| catalog_err("iter surrogate_pk", e))?;
-                    Ok((key.value().3.to_vec(), value.value()))
-                })
-                .collect::<crate::Result<_>>()?;
-            let mut reverse = write_txn
-                .open_table(SURROGATE_PK_REV_V3)
-                .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
-            for (pk, surrogate) in bindings {
-                forward
-                    .remove((db_id, tid, name, pk.as_slice()))
-                    .map_err(|e| catalog_err("remove surrogate_pk", e))?;
-                reverse
-                    .remove((db_id, tid, name, surrogate))
-                    .map_err(|e| catalog_err("remove surrogate_pk_rev", e))?;
-                if let Some(to) = move_to {
-                    let to = to.as_u64();
-                    forward
-                        .insert((to, tid, name, pk.as_slice()), surrogate)
-                        .map_err(|e| catalog_err("move surrogate_pk", e))?;
-                    reverse
-                        .insert((to, tid, name, surrogate), pk.as_slice())
-                        .map_err(|e| catalog_err("move surrogate_pk_rev", e))?;
                 }
             }
         }
@@ -396,6 +393,49 @@ mod tests {
                 .get_surrogate_for_pk(key(to), TenantId::new(1), b"coord:1")
                 .unwrap(),
             Some(nodedb_types::Surrogate::new(9))
+        );
+        assert_eq!(
+            catalog
+                .get_pk_for_surrogate(key(to), TenantId::new(1), nodedb_types::Surrogate::new(9))
+                .unwrap(),
+            Some(b"coord:1".to_vec())
+        );
+    }
+
+    /// A move into a database that already binds keys of the same name merges
+    /// the moved bindings into it, both directions.
+    #[test]
+    fn move_into_a_bound_target_merges_both_directions() {
+        let catalog = catalog();
+        let (from, to) = (DatabaseId::new(3), DatabaseId::new(4));
+        let t1 = TenantId::new(1);
+        catalog.put_array(&entry(1, from, "cells", 1)).unwrap();
+        let key = |db| nodedb_types::CollectionKey::from_bare(db, "cells");
+        let s = nodedb_types::Surrogate::new;
+        catalog
+            .put_surrogate(key(from), t1, b"moved", s(9))
+            .unwrap();
+        catalog.put_surrogate(key(to), t1, b"kept", s(4)).unwrap();
+
+        catalog
+            .move_array_surrogates_in_database(t1, from, to, "cells")
+            .unwrap();
+
+        let mut got = catalog.scan_surrogates_for_collection(key(to), t1).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(b"kept".to_vec(), s(4)), (b"moved".to_vec(), s(9))]
+        );
+        assert_eq!(
+            catalog.get_pk_for_surrogate(key(to), t1, s(9)).unwrap(),
+            Some(b"moved".to_vec())
+        );
+        assert!(
+            catalog
+                .scan_surrogates_for_collection(key(from), t1)
+                .unwrap()
+                .is_empty()
         );
     }
 }

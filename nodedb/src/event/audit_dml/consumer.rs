@@ -15,20 +15,19 @@
 //! The control plane `AuditDmlCache` and `CollectionToDatabase` reverse map
 //! are consulted from the `SharedState` (both are `Send + Sync`).
 //!
-//! The function is synchronous: it records an in-memory audit entry (and
-//! best-effort WAL flush via `audit_record_with_db`). There is no disk I/O
-//! on the Event Plane hot path — the flush is handled by the Control Plane's
-//! periodic `flush_audit_log` timer.
+//! The function is synchronous and does no storage I/O.
+//! It returns the record to write, and the pipeline hands the batch to the Control Plane recorder.
+//! See [`super::hold::hold_audits`].
 
 use std::sync::Arc;
 
 use nodedb_types::AuditDmlMode;
 
+use crate::control::security::audit::PendingAudit;
 use crate::control::state::SharedState;
 use crate::event::types::{EventSource, WriteEvent, WriteOp};
 
-/// Attempt to record a DML audit entry for `event` if the database's
-/// `AuditDmlMode` requires it.
+/// The DML audit record `event` needs, if the database's `AuditDmlMode` requires one.
 ///
 /// Silently skips on any miss (unknown collection → unknown database →
 /// mode is `None`) — the fail-open default keeps DML unblocked when the
@@ -41,7 +40,7 @@ pub fn audit_dml_event(
     event: &WriteEvent,
     state: &Arc<SharedState>,
     key: Option<&crate::event::sink_ledger::SinkEventKey>,
-) {
+) -> Option<PendingAudit> {
     // Only User-sourced writes are subject to DML auditing.
     match event.source {
         EventSource::User | EventSource::ImplicitClient => {}
@@ -51,7 +50,7 @@ pub fn audit_dml_event(
         | EventSource::RaftFollower
         | EventSource::CrdtSync
         | EventSource::Deferred
-        | EventSource::Restore => return,
+        | EventSource::Restore => return None,
     }
 
     // Only data-modifying ops (not Heartbeat or Publish).
@@ -61,7 +60,7 @@ pub fn audit_dml_event(
         | WriteOp::Delete
         | WriteOp::BulkInsert { .. }
         | WriteOp::BulkDelete { .. } => {}
-        WriteOp::Heartbeat | WriteOp::Publish => return,
+        WriteOp::Heartbeat | WriteOp::Publish => return None,
     }
 
     // The Data Plane propagates the request database with every write; do not
@@ -72,7 +71,7 @@ pub fn audit_dml_event(
     // Check the per-database audit mode.
     let mode = state.audit_dml_cache.get(db_id);
     match mode {
-        AuditDmlMode::None => return,
+        AuditDmlMode::None => return None,
         AuditDmlMode::Writes | AuditDmlMode::All => {}
     }
 
@@ -82,7 +81,7 @@ pub fn audit_dml_event(
             .get()
             .is_some_and(|ledgers| ledgers.audited.contains(key))
     {
-        return;
+        return None;
     }
 
     // Build a compact detail string: op collection:row_id, then the key.
@@ -99,13 +98,13 @@ pub fn audit_dml_event(
 
     let source = event.user_id.as_deref().unwrap_or("unknown").to_string();
 
-    state.audit_record_with_db(
-        crate::control::security::audit::AuditEvent::DmlAudit,
-        Some(event.tenant_id),
-        Some(db_id),
-        &source,
-        &detail,
-    );
+    Some(PendingAudit {
+        event: crate::control::security::audit::AuditEvent::DmlAudit,
+        tenant_id: Some(event.tenant_id),
+        database_id: Some(db_id),
+        source,
+        detail,
+    })
 }
 
 #[cfg(test)]

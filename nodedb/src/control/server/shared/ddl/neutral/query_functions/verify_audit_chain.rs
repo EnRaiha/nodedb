@@ -3,17 +3,15 @@
 //! `SELECT VERIFY_AUDIT_CHAIN(from_seq, to_seq)`
 //!
 //! Validates the SHA-256 hash chain integrity of audit entries over a sequence range.
-//! Reads from the durable audit WAL (or in-memory cache as fallback).
-//!
-//! **Note:** For complete chain verification, pass `from_seq=1`. Partial ranges
-//! validate chain integrity *within* the range but do not verify continuity from genesis.
+//! Reads the whole audit log: persisted catalog rows plus the in-memory buffer, merged by seq.
+//! Entries before `from_seq` still feed the link of the first entry in the range.
 //!
 //! Superuser only, for the same reason `SHOW AUDIT LOG` is: the audit log is a
 //! single node-wide record covering every tenant on the node.
 
 use nodedb_sql::parser::query_function::VerifyAuditChainArgs;
 
-use crate::control::security::audit::entry::hash_entry;
+use crate::control::security::audit::verify_chain;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -23,16 +21,15 @@ use super::helpers::{err, single_result};
 
 /// `SELECT VERIFY_AUDIT_CHAIN(from_seq, to_seq)`
 ///
-/// Reads audit entries from the durable audit WAL (or in-memory cache),
-/// verifies the hash chain over the specified sequence range, and returns
-/// `{valid: true/false, entries: N, broken_at_seq: N}`.
+/// Verifies the hash chain over the specified sequence range and returns
+/// `{valid: true/false, entries_checked: N, broken_at_seq: N}`.
 ///
 /// **Superuser only.** `AuditEntry` does carry a `tenant_id`, but the chain
 /// itself cannot be narrowed by it: entries from every tenant share one
 /// monotonic `seq` and one `last_hash`, so each entry's `prev_hash` links to
 /// whichever entry preceded it globally — commonly another tenant's. Dropping
-/// the other tenants' entries would break the very links being checked and
-/// report a false `valid: false` for any interleaved log. Since the answer is
+/// the other tenants' entries breaks the very links being checked and
+/// reports a false `valid: false` for any interleaved log. Since the answer is
 /// unavoidably node-wide, it is gated the way the other node-wide audit
 /// readers are (`SHOW AUDIT LOG`, `SHOW AUDIT WHERE`, `EXPORT AUDIT`): to a
 /// superuser, whose remit already spans every tenant.
@@ -67,83 +64,24 @@ pub async fn verify_audit_chain(
         .map_err(|_| err("22023", "to_seq must be an integer"))?
         .unwrap_or(u64::MAX);
 
-    // Try the durable audit WAL first.
-    let audit_entries = state
-        .wal
-        .recover_audit_entries()
-        .map_err(|e| DdlError::from_error_in_context("audit WAL recovery failed", &e))?;
-
-    let mut valid = true;
-    let mut checked = 0u64;
-    let mut broken_at: Option<u64> = None;
-    let mut prev_hash = String::new();
-
-    if !audit_entries.is_empty() {
-        // Verify from durable WAL entries.
-        for (_data_lsn, audit_bytes) in &audit_entries {
-            let entry: crate::control::security::audit::AuditEntry =
-                match zerompk::from_msgpack(audit_bytes) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "skipping malformed audit WAL entry");
-                        continue;
-                    }
-                };
-
-            if entry.seq < from_seq {
-                prev_hash = hash_entry(&entry);
-                continue;
-            }
-            if entry.seq > to_seq {
-                break;
-            }
-
-            if entry.prev_hash != prev_hash {
-                valid = false;
-                broken_at = Some(entry.seq);
-                break;
-            }
-
-            prev_hash = hash_entry(&entry);
-            checked += 1;
-        }
-    } else {
-        // Fall back to in-memory audit log.
-        // Recover from poisoned mutex — audit log corruption doesn't justify panic.
-        let log = match state.audit.lock() {
-            Ok(l) => l,
-            Err(poisoned) => {
-                tracing::warn!("audit log mutex poisoned, recovering");
-                poisoned.into_inner()
-            }
-        };
-        for entry in log.all() {
-            if entry.seq < from_seq {
-                prev_hash = hash_entry(entry);
-                continue;
-            }
-            if entry.seq > to_seq {
-                break;
-            }
-
-            if entry.prev_hash != prev_hash {
-                valid = false;
-                broken_at = Some(entry.seq);
-                break;
-            }
-
-            prev_hash = hash_entry(entry);
-            checked += 1;
-        }
-    }
+    let (entries, tail_hash) = state
+        .audit_chain_snapshot()
+        .map_err(|e| DdlError::from_error_in_context("audit log read failed", &e))?;
+    let report = verify_chain(&entries, from_seq, to_seq, &tail_hash);
+    let last_checked_seq = entries
+        .iter()
+        .map(|e| e.seq)
+        .filter(|seq| (from_seq..=to_seq).contains(seq))
+        .max()
+        .unwrap_or(from_seq.saturating_sub(1));
 
     let result = serde_json::json!({
-        "valid": valid,
-        "entries_checked": checked,
+        "valid": report.broken_at.is_none(),
+        "entries_checked": report.checked,
         "from_seq": from_seq,
-        "to_seq": if to_seq == u64::MAX { checked + from_seq - 1 } else { to_seq },
-        "broken_at_seq": broken_at,
-        "last_hash": prev_hash,
+        "to_seq": if to_seq == u64::MAX { last_checked_seq } else { to_seq },
+        "broken_at_seq": report.broken_at,
+        "last_hash": report.last_hash,
     });
 
     Ok(single_result(&result.to_string()))

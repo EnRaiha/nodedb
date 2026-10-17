@@ -30,6 +30,8 @@ pub struct SharedState {
     pub credentials: Arc<CredentialStore>,
     /// Audit log — Control Plane only; emitters must be `Send + Sync`.
     pub audit: Arc<Mutex<AuditLog>>,
+    /// Control Plane recorder for Event Plane audit records, spawned on first use.
+    pub(super) audit_recorder: OnceLock<crate::control::security::audit::AuditRecorder>,
     pub api_keys: ApiKeyStore,
     pub roles: RoleStore,
     pub permissions: PermissionStore,
@@ -82,7 +84,7 @@ pub struct SharedState {
     /// TLS enforcement policy.
     pub tls_policy: crate::control::security::tls_policy::TlsPolicy,
     /// SIEM export adapter.
-    pub siem: crate::control::security::siem::SiemExporter,
+    pub siem: Arc<crate::control::security::siem::SiemExporter>,
     /// JWKS registry for multi-provider JWT validation (None = JWT disabled).
     pub jwks_registry: Option<Arc<crate::control::security::jwks::registry::JwksRegistry>>,
     /// Dead-Letter Queue for sync-rejected deltas.

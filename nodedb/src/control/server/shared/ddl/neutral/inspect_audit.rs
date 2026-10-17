@@ -3,23 +3,41 @@
 //! Protocol-neutral audit-log SHOW commands: `SHOW AUDIT LOG`,
 //! `SHOW AUDIT WHERE`, `SHOW AUDIT IN DATABASE`, and `EXPORT AUDIT`.
 //!
-//! The catalog / in-memory audit-log reads, ordering (most-recent-first), and
-//! the catalog fall-through scan run here. The result is the protocol-neutral
+//! Every SHOW command reads through [`SharedState::recent_audit_entries`].
+//! That reader merges the in-memory buffer with the catalog.
+//! A SHOW therefore returns every entry recorded before it started.
+//! Rows are most-recent-first. The result is the protocol-neutral
 //! `DdlResult` over `ShapedRows`.
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::security::audit::AuditEntry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
+/// Default row count when a SHOW AUDIT command has no `LIMIT`.
+const DEFAULT_LIMIT: usize = 100;
+
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 ///
 /// The SQLSTATE and message reach the client unchanged.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
+}
+
+/// Reject a caller that is not a superuser.
+fn require_superuser(identity: &AuthenticatedIdentity) -> Result<(), DdlError> {
+    if identity.is_superuser {
+        Ok(())
+    } else {
+        Err(ddl_err(
+            "42501",
+            "permission denied: only superuser can view audit log",
+        ))
+    }
 }
 
 /// Shared column names + types for all audit SHOW commands.
@@ -46,67 +64,51 @@ fn audit_columns() -> (Vec<String>, Vec<DdlColType>) {
     )
 }
 
-/// SHOW AUDIT LOG [LIMIT <n>]
-///
-/// Shows recent persisted audit entries. Superuser only.
-pub fn show_audit_log(
+/// One SHOW AUDIT row. The `event` column is the snake_case event name.
+fn audit_row(entry: &AuditEntry) -> Map<String, JsonValue> {
+    let mut row = Map::new();
+    row.insert(
+        "seq".to_string(),
+        JsonValue::String((entry.seq as i64).to_string()),
+    );
+    row.insert(
+        "timestamp_us".to_string(),
+        JsonValue::String((entry.timestamp_us as i64).to_string()),
+    );
+    row.insert(
+        "event".to_string(),
+        JsonValue::String(entry.event.snake_name().to_string()),
+    );
+    row.insert(
+        "tenant_id".to_string(),
+        JsonValue::String((entry.tenant_id.map_or(0i64, |t| t.as_u64() as i64)).to_string()),
+    );
+    row.insert(
+        "database_id".to_string(),
+        JsonValue::String((entry.database_id.map_or(0i64, |d| d.as_u64() as i64)).to_string()),
+    );
+    row.insert(
+        "source".to_string(),
+        JsonValue::String(entry.source.clone()),
+    );
+    row.insert(
+        "detail".to_string(),
+        JsonValue::String(entry.detail.clone()),
+    );
+    row
+}
+
+/// Read the newest `limit` entries that pass `filter` and shape them most-recent-first.
+fn audit_rows(
     state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    parts: &[&str],
+    limit: usize,
+    filter: impl Fn(&AuditEntry) -> bool,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    if !identity.is_superuser {
-        return Err(ddl_err(
-            "42501",
-            "permission denied: only superuser can view audit log",
-        ));
-    }
-
-    let limit = if parts.len() >= 5 && parts[3].eq_ignore_ascii_case("LIMIT") {
-        parts[4].parse::<usize>().unwrap_or(100)
-    } else {
-        100
-    };
-
-    let catalog = state.credentials.catalog();
-
-    let entries = catalog
-        .load_recent_audit_entries(limit)
+    let entries = state
+        .recent_audit_entries(limit, filter)
         .map_err(|e| DdlError::from_error(&e))?;
-
+    let rows = entries.iter().rev().map(audit_row).collect();
     let (columns, column_types) = audit_columns();
-    let mut rows = Vec::with_capacity(entries.len());
-
-    for entry in entries.iter().rev() {
-        // Most recent first.
-        let mut row = Map::new();
-        row.insert(
-            "seq".to_string(),
-            JsonValue::String((entry.seq as i64).to_string()),
-        );
-        row.insert(
-            "timestamp_us".to_string(),
-            JsonValue::String((entry.timestamp_us as i64).to_string()),
-        );
-        row.insert("event".to_string(), JsonValue::String(entry.event.clone()));
-        row.insert(
-            "tenant_id".to_string(),
-            JsonValue::String((entry.tenant_id.unwrap_or(0) as i64).to_string()),
-        );
-        row.insert(
-            "database_id".to_string(),
-            JsonValue::String((entry.database_id.unwrap_or(0) as i64).to_string()),
-        );
-        row.insert(
-            "source".to_string(),
-            JsonValue::String(entry.source.clone()),
-        );
-        row.insert(
-            "detail".to_string(),
-            JsonValue::String(entry.detail.clone()),
-        );
-        rows.push(row);
-    }
-
     Ok(vec![DdlResult::Rows(ShapedRows::from_json_rows(
         columns,
         column_types,
@@ -114,9 +116,28 @@ pub fn show_audit_log(
     ))])
 }
 
+/// SHOW AUDIT LOG [LIMIT <n>]
+///
+/// Shows the most recent audit entries. Superuser only.
+pub fn show_audit_log(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    parts: &[&str],
+) -> Result<Vec<DdlResult>, DdlError> {
+    require_superuser(identity)?;
+
+    let limit = if parts.len() >= 5 && parts[3].eq_ignore_ascii_case("LIMIT") {
+        parts[4].parse::<usize>().unwrap_or(DEFAULT_LIMIT)
+    } else {
+        DEFAULT_LIMIT
+    };
+
+    audit_rows(state, limit, |_| true)
+}
+
 /// SHOW AUDIT WHERE event_type = '<snake_name>'
 ///
-/// Filters in-memory audit entries by event type.
+/// Filters audit entries by event type.
 /// The filter value must be the snake_case event name, e.g.
 /// `'permission_denied'`, `'rls_rejected'`, `'lockout_triggered'`.
 pub fn show_audit_where(
@@ -124,12 +145,7 @@ pub fn show_audit_where(
     identity: &AuthenticatedIdentity,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
-    if !identity.is_superuser {
-        return Err(ddl_err(
-            "42501",
-            "permission denied: only superuser can view audit log",
-        ));
-    }
+    require_superuser(identity)?;
 
     // Parse: SHOW AUDIT WHERE event_type = '<value>' [LIMIT <n>]
     // parts: ["SHOW", "AUDIT", "WHERE", "event_type", "=", "'permission_denied'", ...]
@@ -150,184 +166,34 @@ pub fn show_audit_where(
             )
         })?
     } else {
-        100
+        DEFAULT_LIMIT
     };
 
-    let log = match state.audit.lock() {
-        Ok(l) => l,
-        Err(p) => p.into_inner(),
-    };
-
-    let (columns, column_types) = audit_columns();
-    let all = log.all();
-    let mut rows = Vec::new();
-
-    for entry in all.iter().rev() {
-        if rows.len() >= limit {
-            break;
-        }
-        if entry.event.snake_name() != event_filter {
-            continue;
-        }
-        let mut row = Map::new();
-        row.insert(
-            "seq".to_string(),
-            JsonValue::String((entry.seq as i64).to_string()),
-        );
-        row.insert(
-            "timestamp_us".to_string(),
-            JsonValue::String((entry.timestamp_us as i64).to_string()),
-        );
-        row.insert(
-            "event".to_string(),
-            JsonValue::String(entry.event.snake_name().to_string()),
-        );
-        row.insert(
-            "tenant_id".to_string(),
-            JsonValue::String((entry.tenant_id.map_or(0i64, |t| t.as_u64() as i64)).to_string()),
-        );
-        row.insert(
-            "database_id".to_string(),
-            JsonValue::String((entry.database_id.map_or(0i64, |d| d.as_u64() as i64)).to_string()),
-        );
-        row.insert(
-            "source".to_string(),
-            JsonValue::String(entry.source.clone()),
-        );
-        row.insert(
-            "detail".to_string(),
-            JsonValue::String(entry.detail.clone()),
-        );
-        rows.push(row);
-    }
-
-    Ok(vec![DdlResult::Rows(ShapedRows::from_json_rows(
-        columns,
-        column_types,
-        rows,
-    ))])
+    audit_rows(state, limit, |entry| {
+        entry.event.snake_name() == event_filter
+    })
 }
 
 /// `SHOW AUDIT IN DATABASE <name> [LIMIT <n>]`
 ///
-/// Returns all in-memory audit entries whose `database_id` matches the
-/// named database. Falls back to a full-scan of the catalog when the
-/// in-memory window is exhausted and a persistent catalog is available.
-///
-/// Superuser only.
+/// Returns the most recent audit entries whose `database_id` matches the
+/// named database. Superuser only.
 pub fn show_audit_in_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     db_name: &str,
     limit: usize,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    if !identity.is_superuser {
-        return Err(ddl_err(
-            "42501",
-            "permission denied: only superuser can view audit log",
-        ));
-    }
+    require_superuser(identity)?;
 
-    let catalog = state.credentials.catalog();
-
-    let db_id = catalog
+    let db_id = state
+        .credentials
+        .catalog()
         .get_database_id_by_name(db_name)
         .map_err(|e| DdlError::from_error_in_context("catalog lookup failed", &e))?
         .ok_or_else(|| ddl_err("3D000", format!("database '{db_name}' does not exist")))?;
 
-    let (columns, column_types) = audit_columns();
-    let mut rows = Vec::new();
-
-    // Scan the in-memory log first.
-    let log = match state.audit.lock() {
-        Ok(l) => l,
-        Err(p) => p.into_inner(),
-    };
-    for entry in log.query_by_database(db_id).into_iter().rev() {
-        if rows.len() >= limit {
-            break;
-        }
-        let mut row = Map::new();
-        row.insert(
-            "seq".to_string(),
-            JsonValue::String((entry.seq as i64).to_string()),
-        );
-        row.insert(
-            "timestamp_us".to_string(),
-            JsonValue::String((entry.timestamp_us as i64).to_string()),
-        );
-        row.insert(
-            "event".to_string(),
-            JsonValue::String(entry.event.snake_name().to_string()),
-        );
-        row.insert(
-            "tenant_id".to_string(),
-            JsonValue::String((entry.tenant_id.map_or(0i64, |t| t.as_u64() as i64)).to_string()),
-        );
-        row.insert(
-            "database_id".to_string(),
-            JsonValue::String((entry.database_id.map_or(0i64, |d| d.as_u64() as i64)).to_string()),
-        );
-        row.insert(
-            "source".to_string(),
-            JsonValue::String(entry.source.clone()),
-        );
-        row.insert(
-            "detail".to_string(),
-            JsonValue::String(entry.detail.clone()),
-        );
-        rows.push(row);
-    }
-    drop(log);
-
-    // If the in-memory log didn't fill the limit, scan the catalog.
-    if rows.len() < limit {
-        let remaining = limit - rows.len();
-        let all_entries = catalog
-            .load_recent_audit_entries(remaining * 10)
-            .map_err(|e| DdlError::from_error(&e))?;
-        for entry in all_entries.iter().rev() {
-            if rows.len() >= limit {
-                break;
-            }
-            if entry.database_id != Some(db_id.as_u64()) {
-                continue;
-            }
-            let mut row = Map::new();
-            row.insert(
-                "seq".to_string(),
-                JsonValue::String((entry.seq as i64).to_string()),
-            );
-            row.insert(
-                "timestamp_us".to_string(),
-                JsonValue::String((entry.timestamp_us as i64).to_string()),
-            );
-            row.insert("event".to_string(), JsonValue::String(entry.event.clone()));
-            row.insert(
-                "tenant_id".to_string(),
-                JsonValue::String((entry.tenant_id.unwrap_or(0) as i64).to_string()),
-            );
-            row.insert(
-                "database_id".to_string(),
-                JsonValue::String((entry.database_id.unwrap_or(0) as i64).to_string()),
-            );
-            row.insert(
-                "source".to_string(),
-                JsonValue::String(entry.source.clone()),
-            );
-            row.insert(
-                "detail".to_string(),
-                JsonValue::String(entry.detail.clone()),
-            );
-            rows.push(row);
-        }
-    }
-
-    Ok(vec![DdlResult::Rows(ShapedRows::from_json_rows(
-        columns,
-        column_types,
-        rows,
-    ))])
+    audit_rows(state, limit, |entry| entry.database_id == Some(db_id))
 }
 
 /// Audit entries are read with a regular `SELECT` query against

@@ -84,7 +84,7 @@ impl SharedState {
             auth_users,
             scope_grants,
             quota_manager,
-        } = super::auth_parts::build(auth_config, &credentials)?;
+        } = super::auth_parts::build(auth_config, &credentials, &shared_audit)?;
 
         let super::stores::DiskStores {
             data_dir,
@@ -131,6 +131,7 @@ impl SharedState {
             http_client,
             credentials: Arc::clone(&credentials),
             audit: shared_audit,
+            audit_recorder: std::sync::OnceLock::new(),
             api_keys,
             roles,
             permissions,

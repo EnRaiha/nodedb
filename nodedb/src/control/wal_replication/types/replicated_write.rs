@@ -6,7 +6,7 @@ use super::aliases::{
     default_ivf_nprobe, default_pq_m,
 };
 use super::redo_chunk_wire::RedoBody;
-use super::transaction_redo_wire::{ReplicatedEventSource, ReplicatedIdentity};
+use super::transaction_redo_wire::ReplicatedEventSource;
 use super::wire_shapes::{
     ColumnarResolvedRow, ConstraintChangeOp, DocumentResolvedMutationWire, KvResolvedMutationWire,
     ReplicatedBatchEdge, ReplicatedSumTarget,
@@ -1069,7 +1069,10 @@ pub enum ReplicatedWrite {
     /// bind and a write that carries the same key resolve alike on every
     /// replica, and the binding survives a change of leader.
     SurrogateBind {
-        identities: Vec<ReplicatedIdentity>,
+        /// The bare catalog name of the collection every key belongs to.
+        collection: String,
+        /// Each key's pk bytes and candidate surrogate, in mint order.
+        binds: Vec<(Vec<u8>, u32)>,
     },
     /// One chunk of a chunked redo's content. Every replica appends it to its
     /// WAL and holds it until the stream's final `TransactionRedo` entry.

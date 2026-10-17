@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use nodedb_sql::types::SqlPlan;
-use nodedb_types::CollectionKey;
+use nodedb_types::{CollectionKey, Surrogate};
 
 use super::super::array_convert::ArrayCellKeys;
 use super::super::convert::ConvertContext;
@@ -42,7 +42,14 @@ pub async fn prefetch_plan_surrogates(
             array_rows,
         } = batch;
         let key = ctx.collection_key(collection);
-        {
+        // An array batch keeps its answers by row, so conversion reads each
+        // cell's surrogate by index and no answer enters the key map.
+        let keep = if array_rows.is_some() {
+            Keep::ByPosition
+        } else {
+            Keep::ByKey
+        };
+        let surrogates = {
             let refs: Vec<&[u8]> = pks.iter().map(Vec::as_slice).collect();
             let (binds, lookups) = if binding {
                 (refs, Vec::new())
@@ -55,12 +62,20 @@ pub async fn prefetch_plan_surrogates(
                 lookups: &lookups,
                 fresh,
             };
-            resolver.resolve(request, &mut prefetched).await?;
-        }
+            resolver.resolve(request, keep, &mut prefetched).await?
+        };
         // An array batch's coordinates and keys stay for conversion, which
         // then neither coerces nor encodes a coordinate again.
         if let Some(ArrayBatchRows { rows, coords }) = array_rows {
-            prefetched.keep_array_keys(key, rows, ArrayCellKeys { coords, pks });
+            prefetched.keep_array_keys(
+                key,
+                rows,
+                ArrayCellKeys {
+                    coords,
+                    pks,
+                    surrogates,
+                },
+            );
         }
     }
     Ok(prefetched)
@@ -81,9 +96,20 @@ pub(super) async fn resolve_misses(
             lookups: &lookups,
             fresh: recorded.fresh,
         };
-        resolver.resolve(request, &mut ctx.prefetched).await?;
+        resolver
+            .resolve(request, Keep::ByKey, &mut ctx.prefetched)
+            .await?;
     }
     Ok(())
+}
+
+/// Where a resolve keeps the surrogates its bound keys answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// In the answer map, for conversion to look up by key.
+    ByKey,
+    /// Returned in key order, for the caller to keep by row.
+    ByPosition,
 }
 
 /// The keys of one collection to resolve.
@@ -120,11 +146,15 @@ impl Resolver {
         })
     }
 
+    /// Resolve `request` into `into`. With [`Keep::ByPosition`] the bound
+    /// keys' surrogates return in `binds` order and enter no map; otherwise
+    /// the return is empty.
     async fn resolve(
         &self,
         request: KeyRequest<'_>,
+        keep: Keep,
         into: &mut PrefetchedSurrogates,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Vec<Surrogate>> {
         let KeyRequest {
             key,
             binds,
@@ -134,7 +164,8 @@ impl Resolver {
         if self.metadata {
             // A metadata plan binds nothing: its binding keys are lookups.
             self.look_up(key, binds, into).await?;
-            return self.look_up(key, lookups, into).await;
+            self.look_up(key, lookups, into).await?;
+            return Ok(Vec::new());
         }
         if fresh > 0 {
             let drawn = self
@@ -145,16 +176,23 @@ impl Resolver {
                 into.push_fresh(key, identity);
             }
         }
+        let mut kept = Vec::new();
         if !binds.is_empty() {
             let bound = self
                 .assigner
                 .assign_many(key, self.tenant_id, binds)
                 .await?;
-            for (pk, surrogate) in binds.iter().zip(bound) {
-                into.insert(key, pk, Some(surrogate));
+            match keep {
+                Keep::ByPosition => kept = bound,
+                Keep::ByKey => {
+                    for (pk, surrogate) in binds.iter().zip(bound) {
+                        into.insert(key, pk, Some(surrogate));
+                    }
+                }
             }
         }
-        self.look_up(key, lookups, into).await
+        self.look_up(key, lookups, into).await?;
+        Ok(kept)
     }
 
     async fn look_up(

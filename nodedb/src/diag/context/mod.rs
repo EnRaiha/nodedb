@@ -7,6 +7,7 @@
 //! report with a rising count instead of one per attempt.
 
 mod array_sync;
+mod audit;
 mod catalog;
 mod columnar;
 mod continuous_agg;
@@ -30,6 +31,7 @@ mod vector_build;
 mod write_path;
 
 pub(in crate::diag) use array_sync::ArraySnapshotBufferPoisoned;
+pub(in crate::diag) use audit::{AuditFlushNotPersisted, AuditWalAppendFailed};
 pub(in crate::diag) use catalog::{
     CatalogApplyOrphanRow, CollectionPurgeRowMissing, ConsumerGroupOffsetsRetained,
     MetadataApplyWedged, SynonymGroupNotApplied,

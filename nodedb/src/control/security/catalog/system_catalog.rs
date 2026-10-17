@@ -41,6 +41,9 @@ pub struct SystemCatalog {
     pub(super) fail_next_surrogate_write: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     pub(super) fail_next_redo_snapshot_owed_write: Arc<std::sync::atomic::AtomicBool>,
+    /// Audit rows the DML position read decoded, so a test can tell a range read from a full scan.
+    #[cfg(test)]
+    pub(super) dml_audit_rows_read: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl crate::storage::RedbBacked for SystemCatalog {
@@ -83,6 +86,8 @@ impl SystemCatalog {
             fail_next_surrogate_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_redo_snapshot_owed_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            dml_audit_rows_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         catalog.bootstrap_default_database()?;
         catalog.reload_event_definitions()?;
@@ -116,6 +121,8 @@ impl SystemCatalog {
             fail_next_surrogate_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_redo_snapshot_owed_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            dml_audit_rows_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         catalog.bootstrap_default_database()?;
         catalog.reload_event_definitions()?;

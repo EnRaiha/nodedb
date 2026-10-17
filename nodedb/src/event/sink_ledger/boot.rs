@@ -20,7 +20,7 @@ pub fn load_sink_state(
     num_cores: usize,
 ) -> crate::Result<()> {
     shared.mv_persistence.restore_all(&shared.mv_registry)?;
-    let ledgers = SinkLedgers::open(wal, watermarks, num_cores)?;
+    let ledgers = SinkLedgers::open(wal, shared, watermarks, num_cores)?;
     ledgers.cdc.restore_into(&shared.cdc_router)?;
     // A snapshot install before the ledger opened raised its floors in
     // memory only.

@@ -40,26 +40,39 @@ pub async fn deliver_events(
 ) -> u64 {
     let mut delivered = 0u64;
     let mut held = Vec::new();
+    let mut audits = Vec::new();
     for event in events {
         if !guard.admit(event) {
             continue;
         }
-        deliver_event(core_id, event, shared_state, cdc_router, &mut held).await;
+        deliver_event(
+            core_id,
+            event,
+            shared_state,
+            cdc_router,
+            &mut held,
+            &mut audits,
+        )
+        .await;
         delivered += 1;
     }
-    // The batch's events are durable in the lane before the consumer's safe
-    // LSN, and so its persisted watermark, passes them.
+    // The batch's audit records are durable before its actions are held, as a
+    // statement's audit precedes its triggers. Both are durable before the
+    // consumer's safe LSN, and so its persisted watermark, passes them.
+    crate::event::audit_dml::hold_audits(shared_state, audits).await;
     crate::event::trigger::lane::hold_rows(shared_state, &held).await;
     delivered
 }
 
-/// Deliver one admitted event. Its trigger action row joins `held`.
+/// Deliver one admitted event. Its trigger action row joins `held`, and its
+/// audit record joins `audits`.
 async fn deliver_event(
     core_id: usize,
     event: &WriteEvent,
     shared_state: &Arc<SharedState>,
     cdc_router: &Arc<CdcRouter>,
     held: &mut Vec<crate::event::trigger::lane::HeldRow>,
+    audits: &mut Vec<crate::control::security::audit::PendingAudit>,
 ) {
     // A committed transaction's message is held for delivery to its topic.
     // It is no row, so no other side effect sees it.
@@ -73,7 +86,7 @@ async fn deliver_event(
         return;
     }
     if let Some(fault) = event.image_fault {
-        dead_letter_unrendered_image(event, fault, shared_state);
+        audits.push(dead_letter_unrendered_image(event, fault));
         shared_state
             .watermark_tracker
             .advance_lsn_only(event.vshard_id.as_u32(), event.lsn.as_u64());
@@ -84,7 +97,11 @@ async fn deliver_event(
     let key = SinkEventKey::of(core_id, event);
     // Recorded before the actions run, as the statement's audit precedes its
     // triggers.
-    crate::event::audit_dml::audit_dml_event(event, shared_state, key.as_ref());
+    audits.extend(crate::event::audit_dml::audit_dml_event(
+        event,
+        shared_state,
+        key.as_ref(),
+    ));
     // Every replica positions the event in apply order and holds it.
     if event_actions_required(event)
         && let Some(row) = crate::event::trigger::lane::action_row(event, shared_state, cdc_router)
@@ -99,13 +116,12 @@ async fn deliver_event(
 /// The stored row is corrupt, so no side effect can act on the write: a
 /// trigger would bind a missing NEW or OLD row, a change stream would carry
 /// a row without its image, and a view or CRDT peer would apply it as one.
-/// The event runs none of them. A durable audit entry names the collection,
+/// The event runs none of them. The returned audit record names the collection,
 /// row, LSN and image, and the Data Plane already filed the recorder report.
 fn dead_letter_unrendered_image(
     event: &WriteEvent,
     fault: crate::event::image_fault::ImageFault,
-    shared_state: &SharedState,
-) {
+) -> crate::control::security::audit::PendingAudit {
     let detail = format!(
         "event dead-lettered: the {} image of row '{}' in '{}' at LSN {} did not render; \
          no trigger, change stream, view or CRDT peer received the write",
@@ -121,13 +137,13 @@ fn dead_letter_unrendered_image(
         image = fault.as_str(),
         "{detail}"
     );
-    shared_state.audit_record_with_db(
-        crate::control::security::audit::AuditEvent::AdminAction,
-        Some(event.tenant_id),
-        Some(event.database_id),
-        "event_plane",
-        &detail,
-    );
+    crate::control::security::audit::PendingAudit {
+        event: crate::control::security::audit::AuditEvent::AdminAction,
+        tenant_id: Some(event.tenant_id),
+        database_id: Some(event.database_id),
+        source: "event_plane".to_string(),
+        detail,
+    }
 }
 
 /// Whether `event` is a row write that triggers and event actions act on.

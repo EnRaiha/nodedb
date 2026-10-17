@@ -105,6 +105,54 @@ mod tests {
         assert_eq!(reg.read().unwrap().current_hwm(), 3);
     }
 
+    /// Two first-wins chunks, the second rewriting half the first's keys,
+    /// log only the rows they inserted. Replaying those records into an
+    /// empty catalog rebuilds the same map in both directions.
+    #[test]
+    fn replaying_logged_binds_rebuilds_the_first_wins_map() {
+        let (_live_dir, live, _) = open_test();
+        let (_replay_dir, replayed, reg) = open_test();
+        let t0 = TenantId::new(0);
+        let pks: Vec<Vec<u8>> = (0..150u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let chunk = |range: std::ops::Range<usize>, base: u32| {
+            range
+                .map(|i| (pks[i].as_slice(), Surrogate::new(base + i as u32)))
+                .collect::<Vec<_>>()
+        };
+        let mut records = Vec::new();
+        for rows in [chunk(0..100, 1), chunk(50..150, 1_000)] {
+            let bound = live.put_surrogates(users(), t0, &rows).unwrap();
+            // The assigner logs exactly the rows its commit inserted.
+            let inserted: Vec<(u32, Vec<u8>)> = rows
+                .iter()
+                .zip(&bound)
+                .filter(|(_, binding)| binding.inserted)
+                .map(|(&(pk, _), binding)| (binding.surrogate.as_u32(), pk.to_vec()))
+                .collect();
+            records.push(SurrogateBindBatchPayload::new("users", inserted));
+        }
+        for batch in &records {
+            apply_surrogate_bind_batch(batch, DatabaseId::DEFAULT, t0, &replayed, &reg).unwrap();
+        }
+        let live_map = live.scan_surrogates_for_collection(users(), t0).unwrap();
+        assert_eq!(live_map.len(), 150);
+        assert_eq!(
+            replayed
+                .scan_surrogates_for_collection(users(), t0)
+                .unwrap(),
+            live_map
+        );
+        for (pk, surrogate) in &live_map {
+            assert_eq!(
+                replayed
+                    .get_pk_for_surrogate(users(), t0, *surrogate)
+                    .unwrap(),
+                Some(pk.clone())
+            );
+        }
+        assert_eq!(reg.read().unwrap().current_hwm(), 1_149);
+    }
+
     #[test]
     fn empty_batch_changes_nothing() {
         let (_dir, cat, reg) = open_test();

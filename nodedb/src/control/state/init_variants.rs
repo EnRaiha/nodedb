@@ -158,16 +158,70 @@ impl SharedState {
     pub(super) fn wire_session_handle_audit(state: &Arc<Self>) {
         let audit = Arc::clone(&state.audit);
         state.session_handles.set_audit_hook(move |event| {
-            // A poisoned log still records, as `audit_record_with_db_strict`
-            // does: dropping a security event is worse than a warning.
-            let mut log = audit.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!(
-                    ?event,
-                    "audit log mutex poisoned; recording session-handle event after recovery"
-                );
-                poisoned.into_inner()
-            });
-            log.record(event, None, "session_handle", "");
+            // A poisoned log still records: dropping a security event is worse than a warning.
+            crate::control::security::audit::lock_audit_log(&audit).record(
+                event,
+                None,
+                "session_handle",
+                "",
+            );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+    use crate::control::security::audit::AuditEvent;
+    use crate::control::security::audit::restore::replay_after_crash;
+    use crate::control::security::auth_context::{AuthContext, generate_session_id};
+    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
+    use crate::control::security::session_handle::ClientFingerprint;
+    use crate::types::TenantId;
+
+    fn fingerprint(tenant: u64, last_octet: u8) -> ClientFingerprint {
+        ClientFingerprint::new(
+            TenantId::new(tenant),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)),
+        )
+    }
+
+    #[tokio::test]
+    async fn session_handle_audit_entry_survives_a_crash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("session-handle.wal")).expect("open WAL"),
+        );
+        let (dispatcher, _sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, Arc::clone(&wal)).expect("shared state");
+
+        let identity = AuthenticatedIdentity::new_regular(
+            1,
+            "dave",
+            TenantId::new(1),
+            AuthMethod::ApiKey,
+            vec![Role::ReadWrite],
+            None,
+            AuthenticatedIdentity::default_database_set(false),
+        );
+        let context =
+            AuthContext::from_identity(&identity, generate_session_id().expect("session id"));
+        let handle = state
+            .session_handles
+            .create(context, fingerprint(1, 5))
+            .expect("create handle");
+        // A different tenant fails every fingerprint mode, so the hook fires.
+        let _ = state
+            .session_handles
+            .resolve(&handle, "conn-crash", &fingerprint(2, 5));
+
+        let replayed = replay_after_crash(&wal);
+        assert!(
+            replayed.iter().any(|e| e.source == "session_handle"
+                && e.event == AuditEvent::SessionHandleFingerprintMismatch),
+            "the session-handle entry must replay after a crash: {replayed:?}"
+        );
     }
 }

@@ -235,15 +235,19 @@ fn prepare_replicated<'a>(
         ReplicatedWrite::RedoChunk { .. } | ReplicatedWrite::RedoAbandon { .. } => {
             super::redo_chunk::prepare_stream_entry(ctx, pos, log_term, replicated)
         }
-        ReplicatedWrite::SurrogateBind { ref identities } => {
-            Prepared::Concluded(super::surrogate_bind::apply_surrogate_bind(
-                ctx,
-                pos,
+        ReplicatedWrite::SurrogateBind {
+            ref collection,
+            ref binds,
+        } => Prepared::Concluded(super::surrogate_bind::apply_surrogate_bind(
+            ctx,
+            pos,
+            super::surrogate_bind::BindKeys {
                 tenant_id,
-                entry_database,
-                identities,
-            ))
-        }
+                database_id: entry_database,
+                collection,
+                binds,
+            },
+        )),
         ReplicatedWrite::TopicPublish {
             topic,
             payload,

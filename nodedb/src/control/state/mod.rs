@@ -16,6 +16,7 @@ mod init_variants;
 mod metadata_ddl;
 mod methods;
 mod methods_audit;
+mod methods_audit_store;
 mod methods_lease;
 mod proposer_pair;
 pub mod tenant_marks;

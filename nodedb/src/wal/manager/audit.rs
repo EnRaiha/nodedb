@@ -7,13 +7,12 @@ impl WalManager {
     ///
     /// `data_lsn` is the data WAL LSN this audit entry corresponds to.
     /// The audit entry is serialized, appended, and fsynced before returning.
-    /// If the audit WAL is not available, the entry is silently dropped
-    /// (logged at warn level).
-    pub fn append_audit_durable(&self, audit_bytes: &[u8], data_lsn: u64) -> crate::Result<()> {
-        if let Some(ref audit_wal) = self.audit_wal {
-            audit_wal.append_durable(audit_bytes, data_lsn)?;
+    /// Returns the audit WAL LSN of the record, or 0 when no audit WAL is open.
+    pub fn append_audit_durable(&self, audit_bytes: &[u8], data_lsn: u64) -> crate::Result<u64> {
+        match self.audit_wal {
+            Some(ref audit_wal) => audit_wal.append_durable(audit_bytes, data_lsn),
+            None => Ok(0),
         }
-        Ok(())
     }
 
     /// Recover all audit WAL entries for crash recovery.
@@ -24,6 +23,24 @@ impl WalManager {
             audit_wal.recover()
         } else {
             Ok(Vec::new())
+        }
+    }
+
+    /// Drop every audit WAL record at or below `audit_lsn`.
+    ///
+    /// The caller must pass only an LSN whose record, and every earlier one, the catalog has committed.
+    pub fn truncate_audit_through(&self, audit_lsn: u64) -> crate::Result<()> {
+        match self.audit_wal {
+            Some(ref audit_wal) => audit_wal.truncate_through(audit_lsn),
+            None => Ok(()),
+        }
+    }
+
+    /// The highest audit WAL LSN written, or 0 when none is.
+    pub fn audit_last_lsn(&self) -> crate::Result<u64> {
+        match self.audit_wal {
+            Some(ref audit_wal) => audit_wal.last_lsn(),
+            None => Ok(0),
         }
     }
 

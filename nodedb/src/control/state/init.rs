@@ -68,7 +68,17 @@ impl SharedState {
                 permission_cache.sources(),
             ),
         );
-        let shared_audit = Arc::new(Mutex::new(AuditLog::new(10_000)));
+        let siem = Arc::new(crate::control::security::siem::SiemExporter::default());
+        let shared_audit = {
+            let mut log = AuditLog::new(crate::control::security::audit::DEFAULT_FLUSH_BOUND);
+            log.set_wal_sink(
+                Arc::clone(&wal) as Arc<dyn crate::control::security::audit::AuditWalSink>
+            );
+            log.set_export_sink(
+                Arc::clone(&siem) as Arc<dyn crate::control::security::audit::AuditExportSink>
+            );
+            Arc::new(Mutex::new(log))
+        };
         let test_session_registry =
             Arc::new(crate::control::security::sessions::SessionRegistry::new());
         let (si_bus, uc_bus, bus_consumer_task) = super::buses_init::init_security_buses(
@@ -126,6 +136,7 @@ impl SharedState {
             http_client: Arc::new(reqwest::Client::new()),
             credentials: Arc::clone(&test_credentials),
             audit: shared_audit,
+            audit_recorder: std::sync::OnceLock::new(),
             api_keys: ApiKeyStore::new(),
             roles: RoleStore::new(),
             permissions: PermissionStore::new(),
@@ -195,7 +206,7 @@ impl SharedState {
             redaction: crate::control::security::redaction::RedactionStore::new(),
             risk_scorer: crate::control::security::risk::RiskScorer::default(),
             tls_policy: crate::control::security::tls_policy::TlsPolicy::default(),
-            siem: crate::control::security::siem::SiemExporter::default(),
+            siem,
             jwks_registry: None,
             sync_dlq: Mutex::new(SyncDlq::new(DlqConfig::default())),
             audit_retention_days: 0,

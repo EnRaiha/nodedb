@@ -81,12 +81,6 @@ pub(super) fn run(
         .catalog()
         .configure_crdt_signing_root(wal.crdt_signing_root()?)?;
 
-    // Bring the surrogate PK catalog up to the current key layout before
-    // any allocation path reads it: v1 (bare) → v2 (database-scoped) →
-    // v3 (database + tenant scoped). Both steps are idempotent and ordered.
-    credentials.catalog().migrate_surrogate_pk()?;
-    credentials.catalog().migrate_surrogate_pk_v3()?;
-
     // Share the credential store's already-open catalog (one redb file
     // handle). Opening a second `SystemCatalog` on the same path is rejected
     // by redb. The registry holds replicated state the metadata applier
@@ -122,8 +116,7 @@ pub(super) fn run(
     let sequence_registry = Arc::new(crate::control::sequence::SequenceRegistry::new());
     let rls_store = RlsPolicyStore::new();
     let redaction_store = RedactionStore::new();
-    let mut audit_start_seq = 1u64;
-    {
+    let audit_log = {
         let catalog = credentials.catalog();
         super::catalog_registries::CatalogRegistries {
             api_keys: &api_keys,
@@ -145,14 +138,8 @@ pub(super) fn run(
             redaction_store: &redaction_store,
         }
         .load(catalog)?;
-        let max_seq = catalog.load_audit_max_seq()?;
-        if max_seq > 0 {
-            audit_start_seq = max_seq + 1;
-        }
-    }
-
-    let mut audit_log = AuditLog::new(10_000);
-    audit_log.set_next_seq(audit_start_seq);
+        crate::control::security::audit::restore_audit_log(catalog, wal)?
+    };
 
     // Seed the database-id registry from the persisted hwm and the
     // applied-reservation cursor. Every issued id was persisted before it

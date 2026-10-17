@@ -2,6 +2,8 @@
 
 //! Audit recording and memory-estimate update methods for `SharedState`.
 
+use std::sync::Arc;
+
 use tracing::{error, warn};
 
 use super::SharedState;
@@ -27,16 +29,19 @@ impl SharedState {
         source: &str,
         detail: &str,
     ) {
-        if let Err(e) =
-            self.audit_record_with_db_strict(event, tenant_id, database_id, source, detail)
-        {
-            error!(error = %e, "audit WAL write failed — entry recorded in-memory only");
+        let (durable, seq) =
+            self.audit_record_with_backpressure(event, tenant_id, database_id, source, detail);
+        if let Err(e) = durable {
+            error!(error = %e, seq, "audit WAL write failed — entry recorded in-memory only");
+            crate::diag::audit_wal_append_failed(&e, seq);
         }
     }
 
     /// Record an audit event with strict durability and full database context.
     ///
     /// Returns an error if the durable audit WAL write fails.
+    /// A buffer past its backpressure point makes this wait for a flush, with a time bound.
+    /// The wait holds no lock, and this call never runs a flush itself.
     pub fn audit_record_with_db_strict(
         &self,
         event: crate::control::security::audit::AuditEvent,
@@ -45,43 +50,123 @@ impl SharedState {
         source: &str,
         detail: &str,
     ) -> crate::Result<()> {
-        let entry = match self.audit.lock() {
-            Ok(mut log) => {
-                log.record_with_database(event, tenant_id, database_id, source, detail);
-                log.all().back().cloned()
-            }
-            Err(poisoned) => {
-                warn!("audit log mutex poisoned, recovering");
-                let mut log = poisoned.into_inner();
-                log.record_with_database(event, tenant_id, database_id, source, detail);
-                log.all().back().cloned()
-            }
-        };
+        self.audit_record_with_backpressure(event, tenant_id, database_id, source, detail)
+            .0
+    }
 
-        // Write to durable audit WAL — failure is a hard error.
-        if let Some(ref entry) = entry {
-            // SIEM export. This is the single choke point every audit event
-            // passes through, so it is the only place the exporter has to be
-            // fed. `is_configured()` is checked first so an unconfigured
-            // exporter — the default — costs one atomic-free bool read and
-            // never clones the entry.
-            if self.siem.is_configured() {
-                if entry.event.is_auth_event() {
-                    self.siem.push_auth(entry.clone());
-                } else {
-                    self.siem.push_audit(entry.clone());
-                }
-            }
-
-            let bytes =
-                zerompk::to_msgpack_vec(entry).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("audit entry serialization failed: {e}"),
-                })?;
-            let data_lsn = self.wal.next_lsn().as_u64();
-            self.wal.append_audit_durable(&bytes, data_lsn)?;
+    /// Record an audit event, then wait for a flush when the buffer is past its backpressure point.
+    ///
+    /// Returns the WAL result and the entry's seq.
+    fn audit_record_with_backpressure(
+        &self,
+        event: crate::control::security::audit::AuditEvent,
+        tenant_id: Option<crate::types::TenantId>,
+        database_id: Option<nodedb_types::DatabaseId>,
+        source: &str,
+        detail: &str,
+    ) -> (crate::Result<()>, u64) {
+        let (durable, seq, backpressure) =
+            self.audit_record_buffered(event, tenant_id, database_id, source, detail);
+        if backpressure {
+            self.await_audit_backpressure();
         }
-        Ok(())
+        (durable, seq)
+    }
+
+    /// Record an audit event into the buffer and the audit WAL, with no backpressure wait.
+    ///
+    /// Returns the WAL result, the entry's seq, and whether the buffer is past its backpressure point.
+    /// The flush path uses this directly, because a flush must never wait for a flush.
+    pub(super) fn audit_record_buffered(
+        &self,
+        event: crate::control::security::audit::AuditEvent,
+        tenant_id: Option<crate::types::TenantId>,
+        database_id: Option<nodedb_types::DatabaseId>,
+        source: &str,
+        detail: &str,
+    ) -> (crate::Result<()>, u64, bool) {
+        // The guard exports the entry to SIEM after it unlocks.
+        let mut log = crate::control::security::audit::lock_audit_log(&self.audit);
+        let durable = log.record_with_auth_durable(
+            event,
+            tenant_id,
+            database_id,
+            source,
+            detail,
+            &crate::control::security::audit::AuditAuth::default(),
+        );
+        let (seq, backpressure) = (log.last_seq(), log.needs_backpressure());
+        drop(log);
+        (durable.map(|_| ()), seq, backpressure)
+    }
+
+    /// Record one Event Plane audit record handed over by the recorder channel, with no backpressure wait.
+    ///
+    /// Runs on the recorder's blocking task, never on the Event Plane.
+    pub fn record_pending_audit(&self, record: &crate::control::security::audit::PendingAudit) {
+        let (durable, seq, _) = self.audit_record_buffered(
+            record.event.clone(),
+            record.tenant_id,
+            record.database_id,
+            &record.source,
+            &record.detail,
+        );
+        if let Err(e) = durable {
+            error!(error = %e, seq, "audit WAL write failed — entry recorded in-memory only");
+            crate::diag::audit_wal_append_failed(&e, seq);
+        }
+    }
+
+    /// Record Event Plane audit records in order, then apply the backpressure wait once.
+    pub fn record_pending_audits(&self, records: &[crate::control::security::audit::PendingAudit]) {
+        for record in records {
+            self.record_pending_audit(record);
+        }
+        self.await_audit_backpressure();
+    }
+
+    /// Wait for a flush when the buffer is past its backpressure point, with a time bound.
+    ///
+    /// The wait holds no lock. With no flush executor running it returns at once.
+    fn await_audit_backpressure(&self) {
+        let control = {
+            let log = crate::control::security::audit::lock_audit_log(&self.audit);
+            if !log.needs_backpressure() {
+                return;
+            }
+            log.flush_control()
+        };
+        if control.executor_attached() && !control.await_flush() {
+            warn!("audit flush did not finish within the backpressure wait, entries stay buffered");
+        }
+    }
+
+    /// The Control Plane recorder for Event Plane audit records. The first call spawns it.
+    ///
+    /// The task holds weak references, so it never keeps this state alive.
+    /// It records one entry at a time, so a failure partway returns only the unrecorded tail.
+    pub fn audit_recorder(self: &Arc<Self>) -> &crate::control::security::audit::AuditRecorder {
+        use crate::control::security::audit::PendingAudit;
+
+        self.audit_recorder.get_or_init(|| {
+            let for_record = Arc::downgrade(self);
+            let for_wait = Arc::downgrade(self);
+            crate::control::security::audit::AuditRecorder::spawn(
+                crate::control::security::audit::recorder::RECORDER_CHANNEL_CAPACITY,
+                Arc::new(move |record: &PendingAudit| match for_record.upgrade() {
+                    Some(state) => {
+                        state.record_pending_audit(record);
+                        true
+                    }
+                    None => false,
+                }),
+                Arc::new(move || {
+                    if let Some(state) = for_wait.upgrade() {
+                        state.await_audit_backpressure();
+                    }
+                }),
+            )
+        })
     }
 
     /// Record an audit event (best-effort).
@@ -149,114 +234,6 @@ impl SharedState {
             let proportion = *reqs as f64 / total_reqs as f64;
             let estimated_bytes = (total_allocated as f64 * proportion) as u64;
             tenants.update_memory(*tid, estimated_bytes);
-        }
-    }
-
-    /// Flush in-memory audit entries to the persistent catalog.
-    pub fn flush_audit_log(&self) {
-        let entries = match self.audit.lock() {
-            Ok(mut log) => log.drain_for_persistence(),
-            Err(poisoned) => {
-                warn!("audit log mutex poisoned during flush, recovering");
-                poisoned.into_inner().drain_for_persistence()
-            }
-        };
-
-        if entries.is_empty() {
-            return;
-        }
-
-        {
-            let catalog = self.credentials.catalog();
-            let stored: Vec<crate::control::security::catalog::StoredAuditEntry> = entries
-                .iter()
-                .map(|e| crate::control::security::catalog::StoredAuditEntry {
-                    seq: e.seq,
-                    timestamp_us: e.timestamp_us,
-                    event: format!("{:?}", e.event),
-                    tenant_id: e.tenant_id.map(|t| t.as_u64()),
-                    database_id: e.database_id.map(|d| d.as_u64()),
-                    source: e.source.clone(),
-                    detail: e.detail.clone(),
-                    prev_hash: e.prev_hash.clone(),
-                })
-                .collect();
-
-            if let Err(e) = catalog.append_audit_entries(&stored) {
-                warn!(error = %e, count = stored.len(), "failed to persist audit entries");
-                if let Ok(mut log) = self.audit.lock() {
-                    for entry in entries {
-                        log.record_with_database(
-                            entry.event,
-                            entry.tenant_id,
-                            entry.database_id,
-                            &entry.source,
-                            &entry.detail,
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(count = stored.len(), "flushed audit entries to catalog");
-
-                // Age-based pruning: remove entries older than retention window.
-                if self.audit_retention_days > 0 {
-                    let retention_us = self.audit_retention_days as u64 * 86400 * 1_000_000;
-                    let now_us = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as u64;
-                    let cutoff = now_us.saturating_sub(retention_us);
-                    match catalog.prune_audit_before(cutoff) {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            tracing::info!(
-                                pruned = n,
-                                days = self.audit_retention_days,
-                                "pruned old audit entries"
-                            );
-                        }
-                        Err(e) => warn!(error = %e, "failed to prune old audit entries"),
-                    }
-                }
-
-                // Count-based pruning: trim to audit_max_entries ceiling.
-                if self.audit_max_entries > 0 {
-                    match catalog.prune_audit_to_count(self.audit_max_entries) {
-                        Ok((0, _, _)) => {}
-                        Ok((pruned_count, last_deleted_hash, oldest_kept_seq)) => {
-                            tracing::info!(
-                                pruned = pruned_count,
-                                oldest_kept_seq,
-                                "pruned audit entries by count cap"
-                            );
-                            // Emit checkpoint so the surviving chain stays
-                            // verifiable.
-                            if let Ok(mut log) = self.audit.lock() {
-                                let seq = log.allocate_seq();
-                                let detail = format!(
-                                    "pruned_count={pruned_count} oldest_kept_seq={oldest_kept_seq}"
-                                );
-                                let entry = crate::control::security::audit::AuditEntry {
-                                    seq,
-                                    timestamp_us: crate::control::security::audit::entry::now_us(),
-                                    event:
-                                        crate::control::security::audit::AuditEvent::AuditCheckpoint,
-                                    tenant_id: None,
-                                    database_id: None,
-                                    auth_user_id: String::new(),
-                                    auth_user_name: String::new(),
-                                    session_id: String::new(),
-                                    source: "retention".to_string(),
-                                    detail,
-                                    prev_hash: last_deleted_hash,
-                                };
-                                log.push_checkpoint(entry);
-                            }
-                        }
-                        Err(e) => warn!(error = %e, "failed to prune audit entries by count"),
-                    }
-                }
-            }
         }
     }
 }

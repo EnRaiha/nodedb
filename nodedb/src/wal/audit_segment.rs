@@ -4,7 +4,8 @@
 //!
 //! Provides a separate, append-only WAL for audit entries with the same
 //! O_DIRECT + fsync guarantees as the data WAL. The audit WAL is:
-//! - Append-only (never compacted, never truncated)
+//! - Append-only between truncations
+//! - Truncated only through a record the system catalog has committed
 //! - Durable (fsync on every commit batch)
 //!
 //! Audit entries are hash-chain linked at the application layer (see `audit.rs`).
@@ -96,6 +97,35 @@ impl AuditWalSegment {
         wal.sync().map_err(crate::Error::Wal)?;
 
         Ok(lsn)
+    }
+
+    /// Drop every record at or below `lsn`.
+    ///
+    /// The segmented WAL deletes whole sealed segments only.
+    /// So the active segment is sealed first when it holds a record at or below `lsn`.
+    /// A sealed segment that also holds a record above `lsn` survives whole.
+    /// The caller must pass only an LSN the system catalog has committed through.
+    pub fn truncate_through(&self, lsn: u64) -> crate::Result<()> {
+        let mut wal = self.wal.lock().map_err(|_| crate::Error::Internal {
+            detail: "audit WAL lock poisoned".into(),
+        })?;
+        if lsn == 0 {
+            return Ok(());
+        }
+        if wal.active_segment_first_lsn() <= lsn {
+            wal.seal_active_segment().map_err(crate::Error::Wal)?;
+        }
+        wal.truncate_before(lsn.saturating_add(1))
+            .map_err(crate::Error::Wal)?;
+        Ok(())
+    }
+
+    /// The highest LSN written, or 0 when none is.
+    pub fn last_lsn(&self) -> crate::Result<u64> {
+        let wal = self.wal.lock().map_err(|_| crate::Error::Internal {
+            detail: "audit WAL lock poisoned".into(),
+        })?;
+        Ok(wal.next_lsn().saturating_sub(1))
     }
 
     /// Replay all audit WAL entries for crash recovery.

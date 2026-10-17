@@ -3,6 +3,7 @@
 pub mod alert;
 pub mod arrays;
 pub mod audit;
+pub mod audit_dml_index;
 pub mod auth_types;
 pub mod auth_users;
 pub mod backup_schedule_marks;
@@ -77,6 +78,8 @@ pub mod streaming_mvs;
 pub mod surrogate_hwm;
 pub mod surrogate_pk;
 pub mod surrogate_pk_batch;
+pub mod surrogate_scope;
+pub mod surrogate_sorted;
 pub mod sync_producer;
 pub mod synonym_groups;
 pub mod system_catalog;
@@ -97,8 +100,8 @@ pub mod vector_model;
 pub mod wal_tombstones;
 
 pub use auth_types::{
-    StoredApiKey, StoredAuditEntry, StoredAuthUser, StoredBlacklistEntry, StoredOwner,
-    StoredPermission, StoredRole, StoredTenant, StoredUser,
+    StoredApiKey, StoredAuthUser, StoredBlacklistEntry, StoredOwner, StoredPermission, StoredRole,
+    StoredTenant, StoredUser,
 };
 pub use collection_constraints::{
     BalancedConstraintDef, CheckConstraintDef, EventDefinition, FieldDefinition, LegalHold,

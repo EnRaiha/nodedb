@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use nodedb_types::{CollectionKey, DatabaseId, Surrogate};
+use rustc_hash::FxHashMap;
 
 use super::super::array_convert::ArrayCellKeys;
 
@@ -29,7 +30,7 @@ type ArrayRowsSlot = (CollectionSlot, usize, usize);
 
 /// One collection's bind answers: primary key to its bound surrogate, or
 /// `None` when the key's home binds none.
-type KeyAnswers = HashMap<Vec<u8>, Option<Surrogate>>;
+type KeyAnswers = FxHashMap<Vec<u8>, Option<Surrogate>>;
 
 /// The bind step's answer for each `(collection, primary key)`: the bound
 /// surrogate, or `None` when the key's home binds none. Also the fresh
@@ -39,7 +40,7 @@ type KeyAnswers = HashMap<Vec<u8>, Option<Surrogate>>;
 pub struct PrefetchedSurrogates {
     /// Keyed database, then collection, then key, so a lookup borrows its
     /// key and allocates nothing.
-    answers: HashMap<DatabaseId, HashMap<String, KeyAnswers>>,
+    answers: FxHashMap<DatabaseId, FxHashMap<String, KeyAnswers>>,
     /// The coerced coordinates and identity keys of each `INSERT INTO ARRAY`
     /// row batch the bind step read, so conversion encodes neither again.
     array_keys: HashMap<ArrayRowsSlot, ArrayCellKeys>,
@@ -135,7 +136,7 @@ impl PrefetchedSurrogates {
             }
             return;
         }
-        let mut keys = HashMap::new();
+        let mut keys = KeyAnswers::default();
         keys.insert(pk.to_vec(), answer);
         by_name.insert(key.name().to_string(), keys);
     }
@@ -347,11 +348,13 @@ mod tests {
             ArrayCellKeys {
                 coords: vec![vec![CoordValue::Int64(1)], vec![CoordValue::Int64(2)]],
                 pks: vec![b"a".to_vec(), b"b".to_vec()],
+                surrogates: vec![Surrogate::new(4), Surrogate::new(5)],
             },
         );
 
         let kept = prefetched.array_keys(scene, &rows).expect("kept");
         assert_eq!(kept.pks[1], b"b".to_vec());
+        assert_eq!(kept.surrogates[1], Surrogate::new(5));
         assert!(prefetched.array_keys(scene, &other_rows).is_none());
         assert!(prefetched.array_keys(scene, &rows[..1]).is_none());
 

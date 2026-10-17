@@ -61,10 +61,7 @@ impl AuditEmitter for ArcAuditEmitter {
             user_name: ctx.auth_user_name.to_string(),
             session_id: String::new(),
         };
-        let mut log = match self.0.lock() {
-            Ok(l) => l,
-            Err(p) => p.into_inner(),
-        };
+        let mut log = super::guard::lock_audit_log(&self.0);
         log.record_with_auth(event, ctx.tenant_id, ctx.database_id, source, detail, &auth);
     }
 }

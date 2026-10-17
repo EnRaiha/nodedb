@@ -8,9 +8,8 @@
 //! commits durably once, so N keys cost one durable sync. The WAL bind records
 //! follow the commit under the same lock.
 
-use std::collections::{HashMap, HashSet};
-
 use nodedb_types::{CollectionKey, Surrogate, TenantId};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::types::SurrogateAssigner;
 use crate::control::security::catalog::surrogate_pk_batch::BatchBinding;
@@ -65,7 +64,8 @@ impl SurrogateAssigner {
         let registry = self.registry_write()?;
         let missing: Vec<usize> = (0..out.len()).filter(|&i| out[i].is_none()).collect();
         // Each distinct unbound key once, in first-seen order.
-        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(missing.len());
+        let mut seen: FxHashSet<&[u8]> =
+            FxHashSet::with_capacity_and_hasher(missing.len(), Default::default());
         let unbound: Vec<&[u8]> = missing
             .iter()
             .map(|&i| pks[i])
@@ -96,7 +96,7 @@ impl SurrogateAssigner {
         if hwm.is_some() {
             self.finish_committed_flush(&registry)?;
         }
-        let winners: HashMap<&[u8], Surrogate> = rows
+        let winners: FxHashMap<&[u8], Surrogate> = rows
             .iter()
             .zip(&bound)
             .map(|(&(pk, _), binding)| (pk, binding.surrogate))
@@ -287,6 +287,41 @@ mod tests {
             .expect("assign");
         assert_eq!(first, again);
         assert_eq!(assigner.current_hwm(), hwm, "bound keys draw nothing");
+    }
+
+    /// A load chunk that rewrites half of an earlier chunk's coordinates keeps
+    /// their surrogates, draws a range for the rest, and leaves every reverse
+    /// row pointing at its key.
+    #[tokio::test]
+    async fn a_later_overlapping_chunk_keeps_every_earlier_surrogate() {
+        let (_dir, assigner) = open();
+        let pks: Vec<Vec<u8>> = (0..450u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = pks.iter().map(Vec::as_slice).collect();
+        let first = assigner
+            .assign_bound_many(users(), T0, &refs[..300])
+            .await
+            .expect("first chunk");
+        let hwm = assigner.current_hwm();
+        let second = assigner
+            .assign_bound_many(users(), T0, &refs[150..])
+            .await
+            .expect("second chunk");
+        assert_eq!(
+            &second[..150],
+            &first[150..],
+            "overwritten cells keep identity"
+        );
+        let drawn: Vec<u32> = second[150..].iter().map(|s| s.as_u32()).collect();
+        assert_eq!(drawn, (hwm + 1..=hwm + 150).collect::<Vec<_>>());
+        let catalog = assigner.credential_store.catalog();
+        for (pk, surrogate) in refs[150..].iter().zip(&second) {
+            assert_eq!(
+                catalog
+                    .get_pk_for_surrogate(users(), T0, *surrogate)
+                    .expect("rev"),
+                Some(pk.to_vec())
+            );
+        }
     }
 
     #[tokio::test]
