@@ -187,6 +187,7 @@ pub(super) async fn resolve_exchange(
             sub_aggregates,
             grouping_sets,
             sort_keys,
+            group_key_aliases,
         }) => {
             aggregate_input_arm::resolve_aggregate_input(
                 state,
@@ -204,6 +205,7 @@ pub(super) async fn resolve_exchange(
                     sub_aggregates,
                     grouping_sets,
                     sort_keys,
+                    group_key_aliases,
                 },
             )
             .await

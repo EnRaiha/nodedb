@@ -16,7 +16,9 @@ use crate::control::server::exchange::gather_outcome::GatherOutcome;
 use crate::control::server::exchange::owning_core::gather_single_owning_core;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::server::response_translate::hit_key::parse_surrogate_hex;
-use crate::control::server::response_translate::vector::resolve_surrogate_pk;
+use crate::control::server::response_translate::vector::{
+    filter_vector_hits, resolve_surrogate_pk,
+};
 use crate::control::server::shared::authorization::gathered_sources;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{
@@ -78,6 +80,33 @@ fn classify_hit_shape(plan: &PhysicalPlan) -> HitShape {
         }
         _ => HitShape::None,
     }
+}
+
+/// The residual filter and `top_k` bound a vector search's hits are cut to
+/// on the Control Plane, for a body that carries them.
+///
+/// The Data Plane ranks a wider window while a residual filter applies and
+/// leaves the filter and the cut to the Control Plane. A body read under a
+/// tail reaches the gather path, not the response translator, so the cut
+/// runs here.
+fn vector_hit_cut(plan: &PhysicalPlan) -> Option<(Vec<u8>, usize)> {
+    if let PhysicalPlan::Vector(
+        VectorOp::Search {
+            rls_filters, top_k, ..
+        }
+        | VectorOp::MultiSearch {
+            rls_filters, top_k, ..
+        }
+        | VectorOp::SparseSearch {
+            filters: rls_filters,
+            top_k,
+            ..
+        },
+    ) = plan
+    {
+        return Some((rls_filters.clone(), *top_k));
+    }
+    None
 }
 
 /// Collection a `PostProcess` child reads, for the surrogate→PK resolver.
@@ -198,6 +227,7 @@ pub(super) async fn materialize_child_rows(
     // `collection` and `hit_kind` are captured before the gather
     // consumes `child`.
     let hit_kind = classify_hit_shape(&child);
+    let hit_cut = vector_hit_cut(&child);
     // Extract the collection from the hit op directly: `collection()`
     // has no arm for sparse / multi-vector search, so it will yield
     // `None` and the PK resolver will be handed an empty collection.
@@ -256,6 +286,10 @@ pub(super) async fn materialize_child_rows(
     let rows = match hit_kind {
         HitShape::Vector => {
             let merged = outcome.merged_rows(as_aggregate)?;
+            let merged = match &hit_cut {
+                Some((rls_filters, top_k)) => filter_vector_hits(&merged, rls_filters, *top_k)?,
+                None => merged,
+            };
             flatten_vector_hits_to_relational_rows(&merged, |surrogate| {
                 resolve_surrogate_pk(
                     state,

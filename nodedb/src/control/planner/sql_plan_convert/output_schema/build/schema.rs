@@ -55,27 +55,16 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
     };
 
     Ok(match plan {
-        // A grouped or aggregating timeseries scan announces the columns its
-        // aggregate encoder emits, in that encoder's order: each GROUP BY key,
-        // then each aggregate. An ungrouped aggregate takes this arm too: the
-        // raw-scan arm below announces no column for it, and its cells then
-        // lose the SELECT-list order. A GROUP BY key carries its own catalog
-        // type, so one stored instant renders the same grouped as it does
-        // through a plain `SELECT`. An aggregate result stays `Text`: the timeseries plan
-        // carries no SELECT-list alias for it, so its type cannot be resolved
-        // with certainty.
-        //
-        // A `time_bucket` query is excluded: its encoder prepends a `bucket`
-        // boundary column that the plan's GROUP BY list does not name, so the
-        // announced shape would not be the emitted one.
-        SqlPlan::TimeseriesScan(TimeseriesScanPlan {
-            collection,
-            group_by,
-            aggregates,
-            bucket_interval_ms,
-            ..
-        }) if (!group_by.is_empty() || !aggregates.is_empty()) && *bucket_interval_ms == 0 => {
-            timeseries_group_schema(catalog, database_id, collection, group_by, aggregates)?
+        // A grouped, bucketed, or aggregating timeseries scan announces its
+        // SELECT-list columns in SELECT-list order, under their aliases, typed
+        // as the generic aggregate types them. An ungrouped aggregate takes
+        // this arm too: the raw-scan arm below announces no column for it.
+        SqlPlan::TimeseriesScan(scan)
+            if !scan.group_by.is_empty()
+                || !scan.aggregates.is_empty()
+                || scan.bucket_interval_ms > 0 =>
+        {
+            timeseries_group_schema(catalog, database_id, scan)?
         }
         SqlPlan::Scan {
             collection,
@@ -220,12 +209,15 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         SqlPlan::Cte(CtePlan { definitions, outer }) => {
             let stored = CatalogRef(catalog);
             let overlay = CteTypesCatalog::build(&stored, definitions, database_id)?;
-            build_output_schema(
+            let schema = build_output_schema(
                 std::slice::from_ref(outer.as_ref()),
                 &overlay,
                 database_id,
                 returning,
-            )?
+            )?;
+            // An outer query that runs as a body unchanged reads each column
+            // under the key the body's rows carry it.
+            overlay.read_through(outer, schema)
         }
         // A post-processor's projected shape is its outer projection over the
         // body's announced columns. An empty projection (SELECT *) inherits

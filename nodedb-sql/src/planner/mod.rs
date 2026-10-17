@@ -16,6 +16,7 @@ pub mod catalog_fold;
 pub mod catalog_plan_shapes;
 pub mod catalog_plan_validate;
 pub mod collection_predicate;
+pub mod computed_tail;
 pub mod const_fold;
 pub mod cp_projection;
 pub mod cte;
@@ -35,6 +36,7 @@ pub mod merge;
 pub mod predicate_coerce;
 pub mod returning;
 pub mod search_scope;
+pub mod search_tail;
 pub mod select;
 
 pub use returning::resolve_returning_items;

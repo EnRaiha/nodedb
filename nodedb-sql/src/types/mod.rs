@@ -17,14 +17,14 @@ pub use plan::{
     CreateIndexPlan, CtePlan, DeleteArrayPlan, DocumentIndexLookupPlan, DropIndexPlan,
     HybridSearchPlan, HybridSearchTriplePlan, InsertArrayPlan, InsertPlan, KvInsertPlan,
     LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan, RecursiveScanPlan,
-    RecursiveValuePlan, TextScoreColumn, TextSearchPlan, TextSearchShape, TimeseriesIngestPlan,
-    TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan,
-    VectorPrimaryTruncatePlan, VectorPrimaryUpdatePlan,
+    RecursiveValuePlan, TextScoreColumn, TextSearchPlan, TextSearchShape, TimeseriesAggOutput,
+    TimeseriesIngestPlan, TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan,
+    VectorPrimaryInsertPlan, VectorPrimaryTruncatePlan, VectorPrimaryUpdatePlan,
 };
 pub use plan::{
     ArrayPrefilter, DistanceMetric, KvInsertIntent, MergeClauseKind, MergePlanAction,
-    MergePlanClause, PlanCacheEligibility, SqlPlan, VectorAnnOptions, VectorPrimaryInsertIntent,
-    VectorPrimaryRow, VectorQuantization, WriteRoute,
+    MergePlanClause, PlanCacheEligibility, SqlPlan, TIMESERIES_BUCKET_KEY, VectorAnnOptions,
+    VectorPrimaryInsertIntent, VectorPrimaryRow, VectorQuantization, WriteRoute,
 };
 pub use query::{
     AggOutputSlot, AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate,

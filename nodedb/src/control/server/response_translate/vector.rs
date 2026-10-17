@@ -42,16 +42,41 @@ struct Hit {
     body: Option<Vec<u8>>,
 }
 
-/// Apply RLS post-filter at the Control-Plane security boundary, then
-/// truncate to `top_k` and strip the body bytes that the Data Plane
-/// attached purely for the predicate evaluation. A no-op when
-/// `rls_filters` is empty.
-fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
-    // When filters are empty the Data Plane never attaches a body, so there
-    // is nothing to evaluate or strip — return immediately.
+/// The residual filter and row bound a vector search's hits are cut to.
+pub struct VectorHitCut<'a> {
+    /// Serialized `Vec<ScanFilter>`: the statement's `WHERE` conjuncts and
+    /// any read policy. Empty when none applies.
+    pub rls_filters: &'a [u8],
+    pub top_k: usize,
+    /// Drop each body after the filter. `true` when the Data Plane attached
+    /// the body only for the predicate, as the pure-vector fast path does.
+    pub strip_bodies: bool,
+}
+
+/// Apply the residual filter, then truncate to `top_k`. With
+/// `strip_bodies`, drop the body bytes the Data Plane attached only for the
+/// predicate. A no-op when `rls_filters` is empty.
+fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize, strip_bodies: bool) {
+    // When filters are empty the Data Plane ranks exactly `top_k` and
+    // attaches a body only for projection, so there is nothing to do.
     if rls_filters.is_empty() {
         return;
     }
+    admit_hits(hits, rls_filters, top_k);
+    if strip_bodies {
+        for h in hits.iter_mut() {
+            h.body = None;
+        }
+    }
+}
+
+/// Keep the hits whose body passes `rls_filters`, nearest first, cut to
+/// `top_k`.
+///
+/// The Data Plane ranks a wider window when a residual filter applies: the
+/// statement's `WHERE` conjuncts and any read policy. The filter and the cut
+/// run here, on the Control Plane.
+fn admit_hits(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
     let filters: Vec<ScanFilter> = match zerompk::from_msgpack(rls_filters) {
         Ok(f) => f,
         Err(_) => {
@@ -76,9 +101,33 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
     if hits.len() > top_k {
         hits.truncate(top_k);
     }
-    for h in hits.iter_mut() {
-        h.body = None;
+}
+
+/// Apply a vector search's residual filter and `top_k` cut to its raw hit
+/// payload, keeping each body for the rows built from it.
+///
+/// A search read as the body of a post-processing tail reaches the gather
+/// path, not the response translator. The gather path calls this so the
+/// tail sees the rows a root search returns. A payload that does not decode
+/// fails the statement while a filter applies: no hit can be vouched for.
+pub(crate) fn filter_vector_hits(
+    payload: &[u8],
+    rls_filters: &[u8],
+    top_k: usize,
+) -> crate::Result<Vec<u8>> {
+    if rls_filters.is_empty() {
+        return Ok(payload.to_vec());
     }
+    let mut hits: Vec<Hit> =
+        zerompk::from_msgpack(payload).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("vector search hits do not decode: {e}"),
+        })?;
+    admit_hits(&mut hits, rls_filters, top_k);
+    zerompk::to_msgpack_vec(&hits).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("vector search hits do not encode: {e}"),
+    })
 }
 
 /// Resolve one surrogate to its user-facing primary key via the catalog.
@@ -115,8 +164,7 @@ pub fn translate_vector_search_payload(
     database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
-    rls_filters: &[u8],
-    top_k: usize,
+    cut: VectorHitCut<'_>,
 ) -> Vec<u8> {
     if payload.is_empty() {
         return payload.to_vec();
@@ -131,7 +179,7 @@ pub fn translate_vector_search_payload(
         Err(_) => return payload.to_vec(),
     };
 
-    apply_rls_filter(&mut hits, rls_filters, top_k);
+    apply_rls_filter(&mut hits, cut.rls_filters, cut.top_k, cut.strip_bodies);
 
     for hit in &mut hits {
         if hit.doc_id.is_some() {

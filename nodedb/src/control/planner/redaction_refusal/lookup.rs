@@ -3,6 +3,16 @@
 //! Identity-scoped rule lookups shared by the aggregate and graph refusals.
 
 use crate::control::security::redaction::RedactionStore;
+use crate::types::TenantId;
+
+/// The error every redaction refusal raises: `42501`, with `detail` naming
+/// the redacted column or collection and the clause that reads it.
+pub(super) fn redaction_refusal(tenant_id: u64, detail: String) -> crate::Error {
+    crate::Error::RejectedAuthz {
+        tenant_id: TenantId::new(tenant_id),
+        resource: detail,
+    }
+}
 
 /// The inputs every refusal check keys on: the policy registry plus the
 /// requester's tenant and roles.
@@ -22,6 +32,11 @@ pub(super) struct RefusalCtx<'a> {
 }
 
 impl RefusalCtx<'_> {
+    /// [`redaction_refusal`] for this requester's tenant.
+    pub(super) fn refusal(&self, detail: String) -> crate::Error {
+        redaction_refusal(self.tenant_id, detail)
+    }
+
     /// True when one of the requester's roles has a redaction rule covering
     /// `collection`.`field`.
     ///
@@ -39,6 +54,37 @@ impl RefusalCtx<'_> {
             self.store
                 .has_rule_for_field(self.tenant_id, collection, self.roles, column)
         })
+    }
+
+    /// The collection of `sources` whose redacted column `field` names, if
+    /// any.
+    ///
+    /// A field qualified with a source's qualifier (`o.ssn`) is checked
+    /// against the sources that carry that qualifier. Any other field,
+    /// unqualified or with a qualifier no source carries (a derived table's
+    /// alias, a nested field path), is checked against every source, so an
+    /// ambiguous name cannot slip past. [`Self::field_is_redacted`] matches
+    /// the field as written and by its column part.
+    pub(super) fn redacted_source<'s>(
+        &self,
+        sources: &'s [(String, String)],
+        field: &str,
+    ) -> Option<&'s str> {
+        let qualifier = field.split_once('.').map(|(qualifier, _)| qualifier);
+        let names_a_source = qualifier.is_some_and(|qualifier| {
+            sources
+                .iter()
+                .any(|(source_qualifier, _)| source_qualifier == qualifier)
+        });
+        sources
+            .iter()
+            .filter(|(source_qualifier, _)| {
+                !names_a_source || qualifier == Some(source_qualifier.as_str())
+            })
+            .find(|(_, collection)| {
+                !collection.is_empty() && self.field_is_redacted(collection, field)
+            })
+            .map(|(_, collection)| collection.as_str())
     }
 
     /// True when one of the requester's roles has any redaction rule on

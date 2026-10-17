@@ -47,7 +47,11 @@ pub(super) fn native_shape(p: &AggregateParams) -> Option<NativeShape> {
             | SqlExpr::Literal(_)
             | SqlExpr::Subquery(_)
             | SqlExpr::Wildcard => match p.time_bucket {
-                Some(tb) if tb.group_index == index && tb.interval_ms > 0 => {
+                Some(tb)
+                    if tb.group_index == index
+                        && tb.interval_ms > 0
+                        && buckets_time_key(key, p.time_key.as_deref()) =>
+                {
                     bucket_interval_ms = tb.interval_ms;
                 }
                 _ => return None,
@@ -66,6 +70,29 @@ pub(super) fn native_shape(p: &AggregateParams) -> Option<NativeShape> {
             group_columns,
             bucket_interval_ms,
         })
+}
+
+/// Whether the `time_bucket` call `key` buckets the collection's time key.
+///
+/// The grouped scan buckets by the time key only. A call over any other
+/// column, an expression, or a collection whose time key is unknown needs
+/// the generic aggregate, which buckets by the column the call names.
+fn buckets_time_key(key: &SqlExpr, time_key: Option<&str>) -> bool {
+    let (SqlExpr::Function { args, .. }, Some(time_key)) = (key, time_key) else {
+        return false;
+    };
+    let mut columns = args.iter().filter_map(|arg| match arg {
+        SqlExpr::Column { name, .. } => Some(name.as_str()),
+        _ => None,
+    });
+    let bucketed = columns.next();
+    let only_column = columns.next().is_none();
+    let other_args_literal = args
+        .iter()
+        .all(|arg| matches!(arg, SqlExpr::Column { .. } | SqlExpr::Literal(_)));
+    only_column
+        && other_args_literal
+        && bucketed.is_some_and(|name| name.eq_ignore_ascii_case(time_key))
 }
 
 /// Whether the grouped scan accumulates `a` exactly.
@@ -92,5 +119,33 @@ fn native_aggregate(a: &AggregateExpr, columns: &[ColumnInfo]) -> bool {
             })
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SqlValue;
+
+    fn bucket(column: &str) -> SqlExpr {
+        SqlExpr::Function {
+            name: "time_bucket".into(),
+            args: vec![
+                SqlExpr::Literal(SqlValue::String("1 hour".into())),
+                SqlExpr::Column {
+                    table: None,
+                    name: column.into(),
+                },
+            ],
+            distinct: false,
+        }
+    }
+
+    /// Only a bucket of the time key takes the grouped scan.
+    #[test]
+    fn only_the_time_key_buckets_natively() {
+        assert!(buckets_time_key(&bucket("ts"), Some("ts")));
+        assert!(!buckets_time_key(&bucket("recorded_at"), Some("ts")));
+        assert!(!buckets_time_key(&bucket("ts"), None));
     }
 }

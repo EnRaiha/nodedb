@@ -209,6 +209,11 @@ pub(super) fn plan_select(
         let input_joins = subquery_joins
             .iter()
             .any(|sq| sq.join_type != JoinType::Cross);
+        let time_key = if matches!(table.info.engine, EngineType::Timeseries) {
+            catalog.timeseries_time_key(nodedb_types::DatabaseId::DEFAULT, &table.name)?
+        } else {
+            None
+        };
         let mut plan = crate::planner::aggregate::plan_aggregate(
             crate::planner::aggregate::AggregateQuery {
                 select,
@@ -218,6 +223,7 @@ pub(super) fn plan_select(
                 scope: &scope,
                 temporal: &temporal,
                 input_joins,
+                time_key,
             },
             functions,
         )?;

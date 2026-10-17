@@ -160,13 +160,15 @@ pub trait PlanVisitor {
         ef_search: usize,
     ) -> Result<Self::Output, Self::Error>;
 
-    /// Handle [`SqlPlan::SparseSearch`].
+    /// Handle [`SqlPlan::SparseSearch`]. `filters` is the statement's
+    /// residual `WHERE`, applied before the `top_k` cut.
     fn sparse_search(
         &mut self,
         collection: &str,
         field: &str,
         query_entries: &[(u32, f32)],
         top_k: usize,
+        filters: &[Filter],
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::TextSearch`].

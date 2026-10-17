@@ -372,6 +372,8 @@ pub(in crate::control::planner::sql_plan_convert) struct InputSourcedTaskParams<
     /// ROLLUP / CUBE / GROUPING SETS, as indices into `group_by`.
     pub grouping_sets: Vec<Vec<u32>>,
     pub sort_keys: Vec<SortKeySpec>,
+    /// SELECT-list output alias of each GROUP BY key, parallel to `group_by`.
+    pub group_by_aliases: &'a [Option<String>],
     /// How `child`'s rows key their fields.
     pub names: InputFieldNames,
 }
@@ -390,6 +392,7 @@ pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggrega
         limit,
         grouping_sets,
         sort_keys,
+        group_by_aliases,
         names,
     } = p;
     let group_specs = group_by_to_specs(group_by, names);
@@ -417,6 +420,7 @@ pub(in crate::control::planner::sql_plan_convert) fn build_input_sourced_aggrega
             sub_aggregates: Vec::new(),
             grouping_sets,
             sort_keys,
+            group_key_aliases: group_by_aliases.to_vec(),
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

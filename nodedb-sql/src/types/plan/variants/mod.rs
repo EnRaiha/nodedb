@@ -29,7 +29,9 @@ pub use merge::MergePlan;
 pub use plan::{DistanceMetric, SqlPlan};
 pub use recursive::{RecursiveScanPlan, RecursiveValuePlan};
 pub use text::{TextScoreColumn, TextSearchPlan, TextSearchShape};
-pub use timeseries::{TimeseriesIngestPlan, TimeseriesScanPlan};
+pub use timeseries::{
+    TIMESERIES_BUCKET_KEY, TimeseriesAggOutput, TimeseriesIngestPlan, TimeseriesScanPlan,
+};
 pub use vector_primary::{
     VectorPrimaryDeletePlan, VectorPrimaryInsertPlan, VectorPrimaryTruncatePlan,
     VectorPrimaryUpdatePlan,

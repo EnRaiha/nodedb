@@ -279,6 +279,9 @@ pub enum SqlPlan {
         field: String,
         query_entries: Vec<(u32, f32)>,
         top_k: usize,
+        /// The statement's residual `WHERE`. It narrows the candidates
+        /// before the `top_k` cut.
+        filters: Vec<Filter>,
         /// Resolved SELECT target list, for output-schema derivation.
         projection: Vec<Projection>,
     },

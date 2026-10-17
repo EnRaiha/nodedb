@@ -246,6 +246,7 @@ pub fn columnar_count(collection: &str) -> PhysicalPlan {
         sub_aggregates: Vec::new(),
         grouping_sets: Vec::new(),
         sort_keys: Vec::new(),
+        group_key_aliases: Vec::new(),
     })
 }
 
@@ -282,6 +283,7 @@ pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
         computed_columns: Vec::new(),
         having: Vec::new(),
         tiering: None,
+        output_columns: Vec::new(),
     })
 }
 

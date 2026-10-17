@@ -168,6 +168,7 @@ mod tests {
             valid_at_ms: None,
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         });
         assert!(apply(&mut plan, &cache).is_ok());
         match &plan {

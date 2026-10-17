@@ -102,6 +102,7 @@ fn limit_honoured_when_groups_span_multiple_aggregate_chunks() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );
@@ -165,6 +166,7 @@ fn no_limit_returns_all_groups_with_small_chunk_size() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );

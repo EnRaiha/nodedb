@@ -245,6 +245,7 @@ fn purge_removes_all_tenant_data() {
             computed_columns: vec![],
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(ts_resp.status, Status::Ok);

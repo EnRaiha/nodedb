@@ -176,6 +176,7 @@ impl TestStack {
                     computed_columns: Vec::new(),
                     having: Vec::new(),
                     tiering: None,
+                    output_columns: Vec::new(),
                 }),
                 collection,
             )

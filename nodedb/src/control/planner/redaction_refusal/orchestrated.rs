@@ -74,12 +74,10 @@ pub(super) fn refuse_redacted_source(
         .iter()
         .find(|collection| !collection.is_empty() && ctx.collection_is_redacted(collection))
     {
-        Some(collection) => Err(crate::Error::PlanError {
-            detail: format!(
-                "redaction policies on '{collection}' are not supported as the source of \
-                 {statement}: the copied values bypass column redaction"
-            ),
-        }),
+        Some(collection) => Err(ctx.refusal(format!(
+            "redaction policies on '{collection}' are not supported as the source of \
+             {statement}: the copied values bypass column redaction"
+        ))),
         None => Ok(()),
     }
 }
@@ -144,8 +142,8 @@ mod tests {
             "users",
         )));
         match check(&store, &op) {
-            Err(crate::Error::PlanError { detail }) => {
-                assert!(detail.contains("'users'") && detail.contains("INSERT ... SELECT"));
+            Err(crate::Error::RejectedAuthz { resource, .. }) => {
+                assert!(resource.contains("'users'") && resource.contains("INSERT ... SELECT"));
             }
             other => panic!("expected a redaction refusal, got {other:?}"),
         }
@@ -165,7 +163,7 @@ mod tests {
         }));
         assert!(matches!(
             check(&store, &op),
-            Err(crate::Error::PlanError { .. })
+            Err(crate::Error::RejectedAuthz { .. })
         ));
     }
 
@@ -194,7 +192,7 @@ mod tests {
         }));
         assert!(matches!(
             check(&store, &op),
-            Err(crate::Error::PlanError { .. })
+            Err(crate::Error::RejectedAuthz { .. })
         ));
     }
 

@@ -114,6 +114,19 @@ impl QueryContext {
             .map(|c| c.tenant_version(tenant_id.as_u64()))
             .unwrap_or(0);
         let rls_version = sec.rls_store.tenant_version(tenant_id.as_u64());
+        let redaction_version = sec.redaction_store.version();
+
+        // Refuse a read of a redacted column outside the projection before
+        // row-level security adds its own predicates: a read policy's
+        // predicate is the administrator's, not the requester's.
+        crate::control::planner::redaction_refusal::refuse_redacted_expression_reads_in_tasks(
+            tasks,
+            &crate::control::planner::redaction_refusal::RedactionReadCheck {
+                auth: sec.auth,
+                store: sec.redaction_store,
+                catalog: self.catalog_inputs.credentials.catalog(),
+            },
+        )?;
 
         crate::control::planner::rls_injection::inject_rls(
             tasks,
@@ -137,6 +150,7 @@ impl QueryContext {
 
         version_set.set_permission_tree_version(permission_tree_version);
         version_set.set_rls_version(rls_version);
+        version_set.set_redaction_version(redaction_version);
         Ok(())
     }
 }

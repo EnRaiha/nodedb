@@ -96,7 +96,12 @@ pub(in crate::planner::select) fn apply_order_by(
     // finalized, so each call is bound to the column it lands in and any
     // aggregate the sort alone introduces joins the computed list.
     let mut bound_aggregates: Option<Vec<AggregateExpr>> = None;
-    let sort_keys: Vec<SortKey> = if let SqlPlan::Aggregate { aggregates, .. } = plan {
+    let sort_keys: Vec<SortKey> = if let SqlPlan::Aggregate {
+        aggregates,
+        group_by,
+        ..
+    } = plan
+    {
         let mut extended = aggregates.clone();
         // A sort-only aggregate reads the aggregate's input rows. Over a
         // join those are the merged rows, keyed `qualifier.column`, while the
@@ -132,8 +137,9 @@ pub(in crate::planner::select) fn apply_order_by(
             .iter()
             .zip(&bound)
             .map(|(o, expr)| {
+                let converted = convert_expr(expr, &ColumnScope::Relations(&sort_scope))?;
                 Ok(SortKey {
-                    expr: convert_expr(expr, &ColumnScope::Relations(&sort_scope))?,
+                    expr: computed_group_key_ref(converted, group_by),
                     ascending: sort_ascending(&o.options)?,
                     nulls_first: sort_nulls_first(&o.options)?,
                 })
@@ -239,6 +245,7 @@ pub(in crate::planner::select) fn apply_order_by(
             limit,
             tiered,
             temporal,
+            output,
             ..
         }) => Ok(SqlPlan::TimeseriesScan(TimeseriesScanPlan {
             collection: collection.clone(),
@@ -254,6 +261,7 @@ pub(in crate::planner::select) fn apply_order_by(
             sort_keys,
             tiered: *tiered,
             temporal: *temporal,
+            output: output.clone(),
         })),
         // Cte wraps an inner outer plan; push ORDER BY into that outer
         // so derived-table queries (`SELECT … FROM (…) AS t ORDER BY …`)
@@ -275,5 +283,31 @@ pub(in crate::planner::select) fn apply_order_by(
         // the engine happened to produce. Sort its rows in a post-processing
         // tail instead.
         other => post_process(other.clone(), sort_keys, None, 0),
+    }
+}
+
+/// `expr` as a reference to the group-row column of the computed GROUP BY key
+/// it equals, else unchanged.
+///
+/// A finalized group row carries a computed key (`time_bucket('1 hour', ts)`)
+/// under its `group_{index}` row name, and none of the input columns the
+/// expression reads. Evaluating the expression over the group row reads
+/// NULL, so the sort key reads the key's column instead. `SqlExpr` has no
+/// `PartialEq`, so the match compares the `Debug` rendering. Both sides pass
+/// through `convert_expr`, so equal expressions render identically.
+fn computed_group_key_ref(expr: SqlExpr, group_by: &[SqlExpr]) -> SqlExpr {
+    if matches!(expr, SqlExpr::Column { .. }) {
+        return expr;
+    }
+    let rendered = format!("{expr:?}");
+    match group_by
+        .iter()
+        .position(|key| format!("{key:?}") == rendered)
+    {
+        Some(index) => SqlExpr::Column {
+            table: None,
+            name: crate::planner::agg_naming::computed_group_key_name(index),
+        },
+        None => expr,
     }
 }

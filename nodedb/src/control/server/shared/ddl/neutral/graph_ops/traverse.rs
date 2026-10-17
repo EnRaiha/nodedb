@@ -104,7 +104,7 @@ fn authorize_traversal(
         gate.auth(),
         &state.redaction,
     )
-    .map_err(|error| ddl_err("0A000", error.to_string()))?;
+    .map_err(|error| ddl_err("42501", error.to_string()))?;
 
     Ok(())
 }

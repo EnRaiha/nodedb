@@ -896,6 +896,7 @@ mod tests {
                 field_name: String::new(),
                 query_entries: Vec::new(),
                 top_k: 0,
+                filters: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1571,6 +1572,7 @@ mod tests {
                 valid_at_ms: None,
                 having: Vec::new(),
                 tiering: None,
+                output_columns: Vec::new(),
             }),
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1735,6 +1737,7 @@ mod tests {
                 sub_aggregates: Vec::new(),
                 grouping_sets: Vec::new(),
                 sort_keys: Vec::new(),
+                group_key_aliases: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::PartialAggregate {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),

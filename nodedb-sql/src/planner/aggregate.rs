@@ -29,6 +29,8 @@ pub struct AggregateQuery<'a> {
     /// the aggregate. The engine then plans an aggregate over an input plan
     /// the caller can wrap.
     pub input_joins: bool,
+    /// The designated time-key column of a timeseries collection.
+    pub time_key: Option<String>,
 }
 
 /// The aggregate's row limit without a `LIMIT` clause: every group. An
@@ -45,9 +47,11 @@ pub fn plan_aggregate(query: AggregateQuery<'_>, functions: &FunctionRegistry) -
         scope,
         temporal,
         input_joins,
+        time_key,
     } = query;
     let clauses = plan_aggregate_clauses(select, order_by, &table.info.columns, scope, functions)?;
     let time_bucket = time_bucket_key(&clauses.group_by, functions);
+    let group_keys = clauses.group_by.clone();
 
     let rules = engine_rules::resolve_engine_rules(table.info.engine);
     let mut plan = rules.plan_aggregate(AggregateParams {
@@ -66,6 +70,7 @@ pub fn plan_aggregate(query: AggregateQuery<'_>, functions: &FunctionRegistry) -
         temporal: *temporal,
         hidden_aggregates: clauses.hidden_aggregates,
         input_joins,
+        time_key,
     })?;
 
     // The engine rules build the Aggregate node without a projection in scope,
@@ -80,8 +85,59 @@ pub fn plan_aggregate(query: AggregateQuery<'_>, functions: &FunctionRegistry) -
     {
         *group_by_aliases = clauses.group_by_aliases;
         *output_order = clauses.output_order;
+    } else if let SqlPlan::TimeseriesScan(scan) = &mut plan {
+        // A native grouped timeseries scan emits its group rows under fixed
+        // keys. The SELECT-list order and aliases are recorded here, so the
+        // response shaper reads each key under the name the client asked for.
+        scan.output = timeseries_agg_output(
+            &group_keys,
+            &clauses.group_by_aliases,
+            &clauses.output_order,
+        );
     }
     Ok(plan)
+}
+
+/// The SELECT-list output columns of a native grouped timeseries scan.
+///
+/// `group_by` holds the GROUP BY keys the slots in `output_order` index.
+/// The native scan accepts only column keys and one `time_bucket` key, so a
+/// non-column key is its time bucket.
+fn timeseries_agg_output(
+    group_by: &[SqlExpr],
+    group_by_aliases: &[Option<String>],
+    output_order: &[AggOutputSlot],
+) -> Vec<TimeseriesAggOutput> {
+    output_order
+        .iter()
+        .filter_map(|slot| match slot {
+            AggOutputSlot::GroupKey(index) => {
+                let alias = group_by_aliases.get(*index).cloned().flatten();
+                group_by.get(*index).map(|key| match key {
+                    SqlExpr::Column { name, .. } => TimeseriesAggOutput::GroupColumn {
+                        name: name.clone(),
+                        alias,
+                    },
+                    other => TimeseriesAggOutput::Bucket {
+                        alias,
+                        source: bucket_source_column(other),
+                    },
+                })
+            }
+            AggOutputSlot::Aggregate(index) => Some(TimeseriesAggOutput::Aggregate(*index)),
+        })
+        .collect()
+}
+
+/// The column a `time_bucket(...)` call buckets: its one column argument.
+fn bucket_source_column(key: &SqlExpr) -> Option<String> {
+    match key {
+        SqlExpr::Function { args, .. } => args.iter().find_map(|arg| match arg {
+            SqlExpr::Column { name, .. } => Some(name.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
 }
 
 /// The `time_bucket(...)` key among the GROUP BY keys, with its interval.
@@ -315,6 +371,39 @@ mod tests {
     fn time_bucket_key_is_absent_for_plain_columns() {
         let functions = FunctionRegistry::new();
         assert_eq!(time_bucket_key(&[column("qtype")], &functions), None);
+    }
+
+    /// The native scan's output follows the SELECT list: an aggregate, the
+    /// bucket under its alias with the column it buckets, then a tag column.
+    #[test]
+    fn timeseries_output_follows_the_select_list() {
+        let keys = vec![
+            column("host"),
+            time_bucket(SqlValue::String("1 hour".into())),
+        ];
+        let output = timeseries_agg_output(
+            &keys,
+            &[None, Some("b".into())],
+            &[
+                AggOutputSlot::Aggregate(0),
+                AggOutputSlot::GroupKey(1),
+                AggOutputSlot::GroupKey(0),
+            ],
+        );
+        assert_eq!(
+            output,
+            vec![
+                TimeseriesAggOutput::Aggregate(0),
+                TimeseriesAggOutput::Bucket {
+                    alias: Some("b".into()),
+                    source: Some("ts".into()),
+                },
+                TimeseriesAggOutput::GroupColumn {
+                    name: "host".into(),
+                    alias: None,
+                },
+            ]
+        );
     }
 
     #[test]

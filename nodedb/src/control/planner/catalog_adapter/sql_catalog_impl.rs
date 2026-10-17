@@ -181,6 +181,33 @@ impl SqlCatalog for OriginCatalog {
         }))
     }
 
+    /// The time key the collection stores, as `CREATE COLLECTION` designated
+    /// it. A later `ALTER ADD COLUMN` cannot change it.
+    fn timeseries_time_key(
+        &self,
+        _database_id: nodedb_types::DatabaseId,
+        name: &str,
+    ) -> std::result::Result<Option<String>, SqlCatalogError> {
+        let stored = self
+            .credentials
+            .catalog()
+            .get_collection(self.database_id, self.tenant_id, name)
+            .map_err(|e| SqlCatalogError::Unreadable {
+                relation: name.to_string(),
+                detail: e.to_string(),
+            })?;
+        Ok(stored.and_then(|stored| {
+            if let nodedb_types::CollectionType::Columnar(
+                nodedb_types::columnar::ColumnarProfile::Timeseries { time_key, .. },
+            ) = stored.collection_type
+            {
+                Some(time_key)
+            } else {
+                None
+            }
+        }))
+    }
+
     fn resolve_regclass(
         &self,
         _database_id: nodedb_types::DatabaseId,

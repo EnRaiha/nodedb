@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::apply::redacted_value;
 use super::types::{RedactionPolicy, RedactionRule, policy_key};
@@ -13,6 +14,9 @@ use super::types::{RedactionPolicy, RedactionRule, policy_key};
 pub struct RedactionStore {
     /// `"{tenant_id}:{collection}:{for_role}"` → redaction policy.
     policies: RwLock<HashMap<String, RedactionPolicy>>,
+    /// Bumped on every policy change. A cached plan records the value it was
+    /// checked against, and a changed value forces a fresh check.
+    version: AtomicU64,
 }
 
 impl Default for RedactionStore {
@@ -25,7 +29,20 @@ impl RedactionStore {
     pub fn new() -> Self {
         Self {
             policies: RwLock::new(HashMap::new()),
+            version: AtomicU64::new(0),
         }
+    }
+
+    /// The policy version. It changes whenever a policy is created, dropped,
+    /// or reloaded.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// Record a policy change. Callers hold the write lock, so a reader that
+    /// sees the new version also sees the new policies.
+    pub(super) fn bump_version(&self) {
+        self.version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Acquire a read lock, recovering from `RwLock` poisoning.
@@ -55,13 +72,16 @@ impl RedactionStore {
             "redaction policy created"
         );
         policies.insert(key, policy);
+        self.bump_version();
     }
 
     /// Drop a redaction policy.
     pub fn drop_policy(&self, tenant_id: u64, collection: &str, for_role: &str) -> bool {
         let key = policy_key(tenant_id, collection, for_role);
         let mut policies = self.lock_write();
-        policies.remove(&key).is_some()
+        let removed = policies.remove(&key).is_some();
+        self.bump_version();
+        removed
     }
 
     /// Get redaction rules for a tenant+collection+role combination.
@@ -213,6 +233,7 @@ impl RedactionStore {
                 }
             }
         }
+        self.bump_version();
         Ok(())
     }
 

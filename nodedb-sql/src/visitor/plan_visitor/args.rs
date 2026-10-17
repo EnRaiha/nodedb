@@ -10,8 +10,8 @@ use crate::temporal::TemporalScope;
 use crate::types::SqlPlan;
 use crate::types::filter::Filter;
 use crate::types::plan::{
-    ArrayPrefilter, MergePlanClause, TextScoreColumn, TextSearchShape, VectorAnnOptions,
-    VectorPrimaryInsertIntent, VectorPrimaryRow, WriteRoute,
+    ArrayPrefilter, MergePlanClause, TextScoreColumn, TextSearchShape, TimeseriesAggOutput,
+    VectorAnnOptions, VectorPrimaryInsertIntent, VectorPrimaryRow, WriteRoute,
 };
 use crate::types::query::{
     AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate, WindowSpec,
@@ -126,6 +126,9 @@ pub struct AggregateVisitArgs<'a> {
     pub limit: usize,
     pub grouping_sets: Option<&'a [Vec<usize>]>,
     pub sort_keys: &'a [SortKey],
+    /// SELECT-list output alias of each GROUP BY key, parallel to `group_by`.
+    /// Empty, or a `None` entry, keeps the key's own row name.
+    pub group_by_aliases: &'a [Option<String>],
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::timeseries_scan`].
@@ -144,6 +147,8 @@ pub struct TimeseriesScanVisitArgs<'a> {
     pub sort_keys: &'a [SortKey],
     pub tiered: bool,
     pub temporal: &'a TemporalScope,
+    /// SELECT-list output columns of an aggregating scan. Empty on a raw scan.
+    pub output: &'a [TimeseriesAggOutput],
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::vector_search`].

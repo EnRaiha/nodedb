@@ -49,6 +49,9 @@ pub(in crate::data::executor) struct TimeseriesScanParams<'a> {
     pub having: &'a [u8],
     /// AUTO_TIER layout of the collection's retention policy, if any.
     pub tiering: Option<&'a nodedb_physical::physical_plan::TieringPlan>,
+    /// `(encoded key, output name)` of each output column of the aggregate
+    /// branch, in SELECT-list order. Empty keeps the encoded keys.
+    pub output_columns: &'a [(String, String)],
 }
 
 impl CoreLoop {
@@ -80,6 +83,7 @@ impl CoreLoop {
             valid_at_ms,
             having,
             tiering,
+            output_columns,
         } = params;
 
         let all_versions = system_time.is_all_versions();
@@ -272,7 +276,7 @@ impl CoreLoop {
             && aggregates[0].0 == "count"
             && aggregates[0].1 == "*"
         {
-            return self.execute_ts_count_star(task, tid, collection, time_range);
+            return self.execute_ts_count_star(task, tid, collection, time_range, output_columns);
         }
 
         // Determine needed columns (projection pushdown).
@@ -329,6 +333,7 @@ impl CoreLoop {
                 staged,
                 raw_range,
                 tier_partials,
+                output_columns,
             })
         } else {
             self.execute_ts_raw_scan(raw_scan::RawScanParams {
@@ -349,12 +354,16 @@ impl CoreLoop {
     }
 
     /// COUNT(*) metadata fast path — zero I/O.
+    ///
+    /// The one row carries the count under each name `output_columns` gives
+    /// it, as the grouped scan's rows do.
     fn execute_ts_count_star(
         &self,
         task: &ExecutionTask,
         tid: crate::types::TenantId,
         collection: &str,
         time_range: (i64, i64),
+        output_columns: &[(String, String)],
     ) -> Response {
         let key = (task.request.database_id, tid, collection.to_string());
         let mut total: u64 = 0;
@@ -372,9 +381,17 @@ impl CoreLoop {
             rmpv::Value::String(count_key.into()),
             rmpv::Value::Integer((total as i64).into()),
         )]);
+        let row = super::encode::select_output_columns(row, output_columns);
         let array = rmpv::Value::Array(vec![row]);
         let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &array).unwrap_or(());
+        if let Err(e) = rmpv::encode::write_value(&mut buf, &array) {
+            return self.response_error(
+                task,
+                crate::Error::Codec {
+                    detail: format!("timeseries COUNT(*) result encode: {e}"),
+                },
+            );
+        }
         Response {
             request_id: task.request.request_id,
             status: Status::Ok,

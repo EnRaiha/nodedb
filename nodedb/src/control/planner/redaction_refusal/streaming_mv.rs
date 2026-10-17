@@ -39,8 +39,8 @@ use crate::event::streaming_mv::types::AggDef;
 /// in the tenant, so the column is matched tenant-wide rather than passing
 /// unchecked.
 ///
-/// Returns `Err(crate::Error::PlanError)` — the same typed refusal the planner
-/// raises for an aggregate over a redacted column.
+/// Returns `Err(crate::Error::RejectedAuthz)`, the refusal every redaction
+/// check raises, which clients see as `42501`.
 pub fn refuse_redacted_streaming_mv(
     store: &RedactionStore,
     tenant_id: u64,
@@ -56,7 +56,7 @@ pub fn refuse_redacted_streaming_mv(
     // a protected column is not to persist it.
     for column in group_by_columns {
         if store.has_rule_for_field_any_role(tenant_id, source_collection, column) {
-            return Err(refusal(source_collection, column, "grouping by"));
+            return Err(refusal(tenant_id, source_collection, column, "grouping by"));
         }
     }
 
@@ -68,25 +68,26 @@ pub fn refuse_redacted_streaming_mv(
             continue;
         };
         if store.has_rule_for_field_any_role(tenant_id, source_collection, column) {
-            return Err(refusal(source_collection, column, "aggregating"));
+            return Err(refusal(tenant_id, source_collection, column, "aggregating"));
         }
     }
 
     Ok(())
 }
 
-fn refusal(collection: Option<&str>, column: &str, action: &str) -> crate::Error {
+fn refusal(tenant_id: u64, collection: Option<&str>, column: &str, action: &str) -> crate::Error {
     let scope = match collection {
         Some(name) => format!("on '{name}'"),
         None => "on a collection of this tenant (the source stream is a wildcard)".to_string(),
     };
-    crate::Error::PlanError {
-        detail: format!(
+    super::lookup::redaction_refusal(
+        tenant_id,
+        format!(
             "column '{column}' {scope} is redacted: {action} it in a streaming materialized view \
              is not permitted — the view persists what it derives from each event, so the \
              protected value would be stored in the clear in the view's own state"
         ),
-    }
+    )
 }
 
 #[cfg(test)]
@@ -134,8 +135,8 @@ mod tests {
 
     fn assert_refused(result: crate::Result<()>) {
         match result {
-            Err(crate::Error::PlanError { .. }) => {}
-            other => panic!("expected PlanError refusal, got {other:?}"),
+            Err(crate::Error::RejectedAuthz { .. }) => {}
+            other => panic!("expected RejectedAuthz refusal, got {other:?}"),
         }
     }
 

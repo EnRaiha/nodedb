@@ -4,40 +4,63 @@
 
 use super::super::columns::{column_types_for, group_by_key_column};
 use crate::control::planner::sql_plan_convert::lateral::collection_name_from_plan;
-use crate::control::planner::sql_plan_convert::output_schema_types::infer_aggregate_type;
+use crate::control::planner::sql_plan_convert::output_schema_types::{
+    infer_aggregate_type, time_bucket_type,
+};
 use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
 use crate::control::server::response_shape::types::DdlColType;
 use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
-use nodedb_sql::types::SqlPlan;
 use nodedb_sql::types::query::{AggOutputSlot, AggregateExpr};
+use nodedb_sql::types::{SqlPlan, TimeseriesAggOutput, TimeseriesScanPlan};
 use nodedb_sql::types_expr::SqlExpr;
 use std::collections::HashMap;
 
-/// The aggregating (non-`time_bucket`) timeseries scan schema, grouped or
-/// not: GROUP BY keys typed from the catalog, then aggregates as `Text`.
+/// The schema of an aggregating timeseries scan, grouped, bucketed, or not.
+///
+/// Columns follow the plan's recorded SELECT-list order, under their
+/// SELECT-list names. The scan writes each group row under those names, so
+/// each column reads its own name. Each column is typed exactly as
+/// [`aggregate_schema`] types the generic aggregate.
+///
+/// A plan with no recorded order falls back to the encoder's own order and
+/// keys: `bucket`, each GROUP BY column, then each aggregate's canonical key.
 pub(super) fn timeseries_group_schema<C: SqlCatalog + ?Sized>(
     catalog: &C,
     database_id: nodedb_types::DatabaseId,
-    collection: &str,
-    group_by: &[String],
-    aggregates: &[AggregateExpr],
+    scan: &TimeseriesScanPlan,
 ) -> Result<OutputSchema, SqlError> {
-    let types = column_types_for(catalog, database_id, collection)?;
-    let mut columns = Vec::with_capacity(group_by.len() + aggregates.len());
-    for key in group_by {
+    let types = column_types_for(catalog, database_id, &scan.collection)?;
+    let renamed = !scan.output.is_empty();
+    let fallback;
+    let output: &[TimeseriesAggOutput] = if renamed {
+        &scan.output
+    } else {
+        fallback = encoder_order(scan);
+        &fallback
+    };
+    let mut columns = Vec::with_capacity(output.len());
+    for slot in output {
+        let Some((key, name)) = slot.key_and_name(&scan.aggregates) else {
+            continue;
+        };
+        let ty = match slot {
+            // The bucket renders in the kind of the column it buckets.
+            TimeseriesAggOutput::Bucket { source, .. } => {
+                time_bucket_type(source.as_deref().and_then(|s| types.get(s).copied()))
+            }
+            TimeseriesAggOutput::GroupColumn { name, .. } => {
+                types.get(name).copied().unwrap_or(DdlColType::Text)
+            }
+            TimeseriesAggOutput::Aggregate(index) => scan
+                .aggregates
+                .get(*index)
+                .map_or(DdlColType::Text, |agg| infer_aggregate_type(agg, &types)),
+        };
         columns.push(OutputColumn {
-            display_name: key.clone(),
-            lookup_key: key.clone(),
-            ty: types.get(key).copied().unwrap_or(DdlColType::Text),
-        });
-    }
-    for agg in aggregates {
-        let key = nodedb_sql::planner::agg_naming::aggregate_output_key(agg);
-        columns.push(OutputColumn {
-            display_name: key.clone(),
-            lookup_key: key,
-            ty: DdlColType::Text,
+            lookup_key: if renamed { name.clone() } else { key },
+            display_name: name,
+            ty,
         });
     }
     Ok(OutputSchema {
@@ -46,6 +69,35 @@ pub(super) fn timeseries_group_schema<C: SqlCatalog + ?Sized>(
         cp_computed: Vec::new(),
         declared_key: None,
     })
+}
+
+/// The columns a native grouped timeseries scan encodes, in its own order:
+/// the bucket, each GROUP BY column, then each aggregate.
+fn encoder_order(scan: &TimeseriesScanPlan) -> Vec<TimeseriesAggOutput> {
+    let bucket = (scan.bucket_interval_ms > 0).then_some(TimeseriesAggOutput::Bucket {
+        alias: None,
+        source: None,
+    });
+    let groups = scan
+        .group_by
+        .iter()
+        .map(|name| TimeseriesAggOutput::GroupColumn {
+            name: name.clone(),
+            alias: None,
+        });
+    let aggregates = (0..scan.aggregates.len()).map(TimeseriesAggOutput::Aggregate);
+    bucket.into_iter().chain(groups).chain(aggregates).collect()
+}
+
+/// The collection whose catalog types the aggregate's input columns.
+///
+/// A timeseries scan feeds the generic aggregate whenever the native grouped
+/// scan cannot compute the query, and its rows carry the collection's types.
+fn aggregate_input_collection(input: &SqlPlan) -> Option<String> {
+    match input {
+        SqlPlan::TimeseriesScan(TimeseriesScanPlan { collection, .. }) => Some(collection.clone()),
+        other => collection_name_from_plan(other),
+    }
 }
 
 /// The fields of an `SqlPlan::Aggregate` that shape its output.
@@ -72,9 +124,10 @@ pub(super) fn aggregate_schema<C: SqlCatalog + ?Sized>(
     } = shape;
     // Catalog types of the aggregate's underlying columns, resolved from
     // the input plan's single source collection when it has one (Scan /
-    // point-get style). GROUP BY bare keys and MIN/MAX/SUM/AVG argument
-    // columns are typed against this; anything unresolvable stays Text.
-    let types = match collection_name_from_plan(input) {
+    // point-get / timeseries-scan style). GROUP BY bare keys and
+    // MIN/MAX/SUM/AVG argument columns are typed against this; anything
+    // unresolvable stays Text.
+    let types = match aggregate_input_collection(input) {
         Some(collection) => column_types_for(catalog, database_id, &collection)?,
         None => HashMap::new(),
     };
@@ -148,8 +201,7 @@ mod tests {
                 name: "status".to_string(),
             }],
             // `SELECT status AS state ...` — the group-key output name is the
-            // SELECT-list alias, while the value lookup key stays the raw
-            // grouped column name.
+            // SELECT-list alias.
             group_by_aliases: vec![Some("state".to_string())],
             // Empty output_order exercises the group-keys-first fallback.
             output_order: Vec::new(),
@@ -186,10 +238,10 @@ mod tests {
             build_output_schema(&plans, &NoCatalog, nodedb_types::DatabaseId::DEFAULT, None)
                 .expect("schema derives");
         assert_eq!(schema.columns.len(), 3);
-        // Group-key display_name is the SELECT-list alias; lookup_key stays
-        // the raw grouped column name (the executor's emitted value key).
+        // An aliased group key shows and reads its alias: the aggregate
+        // renames the key to it in every result row.
         assert_eq!(schema.columns[0].display_name, "state");
-        assert_eq!(schema.columns[0].lookup_key, "status");
+        assert_eq!(schema.columns[0].lookup_key, "state");
         assert_eq!(schema.columns[1].display_name, "total");
         assert_eq!(schema.columns[1].lookup_key, "total");
         // sum(x) stays TEXT here because this test has no catalog, so the
@@ -245,6 +297,112 @@ mod tests {
         // SUM(int_col) stays Text (numeric promotion, no regression).
         assert_eq!(schema.columns[4].display_name, "sum_n");
         assert_eq!(schema.columns[4].ty, DdlColType::Text);
+    }
+
+    fn timeseries_scan(
+        output: Vec<nodedb_sql::types::TimeseriesAggOutput>,
+    ) -> nodedb_sql::types::TimeseriesScanPlan {
+        nodedb_sql::types::TimeseriesScanPlan {
+            collection: "metrics".to_string(),
+            time_range: (i64::MIN, i64::MAX),
+            bucket_interval_ms: 3_600_000,
+            group_by: vec!["region".to_string()],
+            aggregates: vec![agg_expr("avg", vec![metrics_column("amount")], "mean")],
+            filters: Vec::new(),
+            having: Vec::new(),
+            projection: Vec::new(),
+            gap_fill: String::new(),
+            limit: usize::MAX,
+            sort_keys: Vec::new(),
+            tiered: false,
+            temporal: nodedb_sql::temporal::TemporalScope::default(),
+            output,
+        }
+    }
+
+    /// A native grouped timeseries scan announces SELECT-list order and
+    /// aliases. Each column reads its own name, which the encoder writes, and
+    /// takes the generic aggregate's type.
+    #[test]
+    fn timeseries_scan_follows_select_list_order_and_aliases() {
+        use nodedb_sql::types::TimeseriesAggOutput;
+        let plans = vec![SqlPlan::TimeseriesScan(timeseries_scan(vec![
+            TimeseriesAggOutput::Aggregate(0),
+            TimeseriesAggOutput::Bucket {
+                alias: Some("b".to_string()),
+                source: Some("n".to_string()),
+            },
+            TimeseriesAggOutput::GroupColumn {
+                name: "region".to_string(),
+                alias: Some("r".to_string()),
+            },
+        ]))];
+        let schema = build_output_schema(
+            &plans,
+            &TypedCatalog,
+            nodedb_types::DatabaseId::DEFAULT,
+            None,
+        )
+        .expect("schema derives");
+        let shape: Vec<(&str, &str, DdlColType)> = schema
+            .columns
+            .iter()
+            .map(|c| (c.display_name.as_str(), c.lookup_key.as_str(), c.ty))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("mean", "mean", DdlColType::Float8),
+                ("b", "b", DdlColType::Int8),
+                ("r", "r", DdlColType::Text),
+            ]
+        );
+    }
+
+    /// With no recorded order the scan announces its encoder's order: the
+    /// bucket, each GROUP BY column, then each aggregate.
+    #[test]
+    fn timeseries_scan_without_select_list_uses_encoder_order() {
+        let plans = vec![SqlPlan::TimeseriesScan(timeseries_scan(Vec::new()))];
+        let schema = build_output_schema(
+            &plans,
+            &TypedCatalog,
+            nodedb_types::DatabaseId::DEFAULT,
+            None,
+        )
+        .expect("schema derives");
+        let names: Vec<&str> = schema
+            .columns
+            .iter()
+            .map(|c| c.display_name.as_str())
+            .collect();
+        assert_eq!(names, ["bucket", "region", "mean"]);
+    }
+
+    /// The generic aggregate over a timeseries scan types its columns from
+    /// the scanned collection.
+    #[test]
+    fn aggregate_over_a_timeseries_scan_takes_catalog_types() {
+        let plans = vec![SqlPlan::Aggregate {
+            input: Box::new(SqlPlan::TimeseriesScan(timeseries_scan(Vec::new()))),
+            group_by: vec![metrics_column("region")],
+            group_by_aliases: vec![None],
+            output_order: Vec::new(),
+            aggregates: vec![agg_expr("avg", vec![metrics_column("amount")], "mean")],
+            having: Vec::new(),
+            limit: 0,
+            grouping_sets: None,
+            sort_keys: Vec::new(),
+        }];
+        let schema = build_output_schema(
+            &plans,
+            &TypedCatalog,
+            nodedb_types::DatabaseId::DEFAULT,
+            None,
+        )
+        .expect("schema derives");
+        assert_eq!(schema.columns[1].display_name, "mean");
+        assert_eq!(schema.columns[1].ty, DdlColType::Float8);
     }
 
     /// A computed GROUP BY key (`UPPER(region)`) is not a bare column, so it

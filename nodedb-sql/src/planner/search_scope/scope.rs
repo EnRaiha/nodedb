@@ -150,6 +150,7 @@ impl Scope<'_> {
             // A search plan serves its own score call as a column; only its
             // residual filters run on the row evaluator.
             SqlPlan::VectorSearch { filters, .. }
+            | SqlPlan::SparseSearch { filters, .. }
             | SqlPlan::TextSearch(TextSearchPlan { filters, .. })
             | SqlPlan::HybridSearch(HybridSearchPlan { filters, .. })
             | SqlPlan::HybridSearchTriple(HybridSearchTriplePlan { filters, .. }) => {
@@ -244,7 +245,6 @@ impl Scope<'_> {
             | SqlPlan::Truncate { .. }
             | SqlPlan::TimeseriesIngest { .. }
             | SqlPlan::MultiVectorSearch { .. }
-            | SqlPlan::SparseSearch { .. }
             | SqlPlan::RecursiveValue { .. }
             | SqlPlan::CreateArray { .. }
             | SqlPlan::DropArray { .. }

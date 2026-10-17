@@ -162,55 +162,52 @@ pub(super) fn column_types_for<C: SqlCatalog + ?Sized>(
 ///
 /// The `display_name` is the SELECT-list output name: the explicit alias when
 /// the projection aliased the key (`SELECT k AS label ... GROUP BY k` yields
-/// output column `label`, matching Postgres), otherwise the key's own column
-/// name. The `lookup_key` always stays the raw grouped column name (the key
-/// the aggregate executor emits the value under), so `project_row` still finds
-/// the value.
+/// output column `label`, matching Postgres), otherwise the key's own name.
+///
+/// The aggregate renames an aliased key to its alias in every result row, so
+/// an aliased key reads its alias. An unaliased key reads its row name: the
+/// raw grouped column name, qualified when the key is, or for a computed key
+/// the shared index-based `computed_group_key_name` (`group_0`), the exact
+/// name the aggregate spec emits the evaluated value under.
 ///
 /// The output type is the grouped column's catalog type when the key is a bare
 /// column (resolved from `types`, default `Text`); a computed-expression key is
 /// typed conservatively via [`infer_computed_expr_type`], defaulting to `Text`.
-///
-/// A non-`Column` GROUP BY key (a computed expression) derives its `lookup_key`
-/// from the shared index-based `computed_group_key_name` rule — the exact name
-/// the aggregate spec emits the evaluated value under, so the two can never
-/// diverge. Its `display_name` is the SELECT-list alias when present
-/// (`UPPER(label) AS u` shows column `u`), else the same placeholder.
 pub(super) fn group_by_key_column(
     expr: &SqlExpr,
     index: usize,
     alias: Option<&str>,
     types: &HashMap<String, DdlColType>,
 ) -> OutputColumn {
-    match expr {
-        SqlExpr::Column { table, name } => {
-            let lookup_key = match table {
+    let (row_name, display_name, ty) = match expr {
+        SqlExpr::Column { table, name } => (
+            match table {
                 Some(t) => format!("{t}.{name}"),
                 None => name.clone(),
-            };
-            let display_name = alias.map(str::to_string).unwrap_or_else(|| name.clone());
-            let ty = types.get(name).copied().unwrap_or(DdlColType::Text);
-            OutputColumn {
-                display_name,
-                lookup_key,
-                ty,
-            }
-        }
+            },
+            name.clone(),
+            types.get(name).copied().unwrap_or(DdlColType::Text),
+        ),
         _ => {
-            // The executor emits the evaluated value under the shared
-            // index-based name (see `group_by_to_specs`), so `lookup_key` MUST
-            // equal it. `display_name` is the SELECT-list alias when present
-            // (`UPPER(label) AS u` shows column `u`), else the same placeholder.
-            let lookup_key = computed_group_key_name(index);
-            let display_name = alias
-                .map(str::to_string)
-                .unwrap_or_else(|| lookup_key.clone());
-            OutputColumn {
-                display_name,
-                lookup_key,
-                ty: infer_computed_expr_type(expr, types),
-            }
+            let row_name = computed_group_key_name(index);
+            (
+                row_name.clone(),
+                row_name,
+                infer_computed_expr_type(expr, types),
+            )
         }
+    };
+    match alias {
+        Some(alias) => OutputColumn {
+            display_name: alias.to_string(),
+            lookup_key: alias.to_string(),
+            ty,
+        },
+        None => OutputColumn {
+            display_name,
+            lookup_key: row_name,
+            ty,
+        },
     }
 }
 

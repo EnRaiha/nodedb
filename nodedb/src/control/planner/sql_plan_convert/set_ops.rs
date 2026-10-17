@@ -365,7 +365,10 @@ fn is_merged_doc_body(plan: &PhysicalPlan) -> bool {
 /// A Control-Plane-computed item keeps the base columns its expression reads,
 /// not its alias: the Control Plane evaluates it once the tail returns, then
 /// drops those columns.
-fn lower_subquery_projection(
+///
+/// A `ProviderScan` runs the same tail over its materialized rows, so it
+/// prunes its columns by this list too.
+pub(super) fn lower_subquery_projection(
     projection: &[Projection],
     window_functions: &[WindowSpec],
 ) -> crate::Result<Vec<String>> {

@@ -62,6 +62,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             computed_columns: vec![],
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(resp_baseline.status, Status::Ok);
@@ -125,6 +126,7 @@ fn timeseries_cross_tenant_ingest_does_not_contaminate_scan() {
             computed_columns: vec![],
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(resp_after.status, Status::Ok);

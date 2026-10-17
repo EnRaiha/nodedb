@@ -188,6 +188,7 @@ pub fn full_scan_plan_for_collection(
                 valid_at_ms: None,
                 having: Vec::new(),
                 tiering: None,
+                output_columns: Vec::new(),
             })
         }
     };

@@ -183,8 +183,7 @@ impl SessionStore {
         id: impl Into<SessionId>,
         sql: &str,
         current_version: F,
-        current_permission_tree_version: u64,
-        current_rls_version: u64,
+        policies: crate::control::planner::descriptor_set::PolicyVersions,
     ) -> Option<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
         crate::control::planner::descriptor_set::DescriptorVersionSet,
@@ -194,14 +193,9 @@ impl SessionStore {
         F: Fn(&nodedb_cluster::DescriptorId) -> Option<u64>,
     {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        sessions.get_mut(&id.into()).and_then(|entry| {
-            entry.session.plan_cache.get(
-                sql,
-                current_version,
-                current_permission_tree_version,
-                current_rls_version,
-            )
-        })
+        sessions
+            .get_mut(&id.into())
+            .and_then(|entry| entry.session.plan_cache.get(sql, current_version, policies))
     }
 
     pub fn put_cached_plan(

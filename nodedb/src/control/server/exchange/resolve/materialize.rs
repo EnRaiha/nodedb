@@ -106,6 +106,7 @@ pub(super) async fn materialize_providers(
             sub_aggregates,
             grouping_sets,
             sort_keys,
+            group_key_aliases,
         }) => {
             let input =
                 Box::pin(materialize_providers(state, identity, database_id, *input)).await?;
@@ -121,6 +122,7 @@ pub(super) async fn materialize_providers(
                 sub_aggregates,
                 grouping_sets,
                 sort_keys,
+                group_key_aliases,
             }))
         }
 

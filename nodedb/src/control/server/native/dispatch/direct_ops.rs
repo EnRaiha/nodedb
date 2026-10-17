@@ -96,6 +96,21 @@ pub(crate) async fn handle_direct_op(
     };
     let vshard_id = ctx.task_vshard(&plan, fields.document_id.as_deref(), &collection);
 
+    // Refuse a read of a redacted column outside the projection, before RLS
+    // adds the read policy's own predicates.
+    if let Err(e) = crate::control::planner::redaction_refusal::refuse_redacted_expression_reads(
+        &plan,
+        tenant_id,
+        ctx.database_id(),
+        &crate::control::planner::redaction_refusal::RedactionReadCheck {
+            auth: ctx.auth_context(),
+            store: &ctx.state.redaction,
+            catalog: ctx.state.credentials.catalog(),
+        },
+    ) {
+        return error_to_native_with_sqlstate(seq, "42501", &e);
+    }
+
     // Apply RLS before any special Control-Plane orchestration can observe the plan.
     if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
@@ -116,7 +131,7 @@ pub(crate) async fn handle_direct_op(
         ctx.auth_context(),
         &ctx.state.redaction,
     ) {
-        return error_to_native_with_sqlstate(seq, "0A000", &e);
+        return error_to_native_with_sqlstate(seq, "42501", &e);
     }
 
     // Extracted before `plan` moves; a no-op when metering is disabled (the default).

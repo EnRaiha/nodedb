@@ -226,6 +226,19 @@ fn authorize_resp_task(
     //
     // Operations that cannot carry a filter (`BatchGet`, `FieldGet`) fail
     // closed here with a typed error rather than executing unfiltered.
+    //
+    // A read of a redacted column outside the projection is refused first,
+    // before RLS adds the read policy's own predicates.
+    crate::control::planner::redaction_refusal::refuse_redacted_expression_reads(
+        &plan,
+        session.tenant_id,
+        database_id,
+        &crate::control::planner::redaction_refusal::RedactionReadCheck {
+            auth: scope.auth(),
+            store: &state.redaction,
+            catalog: state.credentials.catalog(),
+        },
+    )?;
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         session.tenant_id.as_u64(),
         database_id,

@@ -114,6 +114,7 @@ mod vector_search_exec;
 mod vector_search_window;
 pub mod vector_settle;
 pub mod vector_sparse;
+mod vector_sparse_window;
 pub mod vector_upsert;
 pub mod vector_write;
 pub mod verify_hash_chain;

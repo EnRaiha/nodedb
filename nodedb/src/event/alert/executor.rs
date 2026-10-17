@@ -198,6 +198,8 @@ async fn execute_aggregate_scan(
         valid_at_ms: None,
         having: Vec::new(),
         tiering: None,
+        // The evaluator reads each group's value under its canonical key.
+        output_columns: Vec::new(),
     });
 
     let payload = sync_dispatch::dispatch_system(

@@ -114,6 +114,9 @@ pub(super) fn plan_select_query(
         pre_order_by_collection.as_deref(),
     )?;
     let plan = apply_limit(plan, &tail)?;
+    // A search plan evaluates no expression. Its computed items move to a
+    // tail now that the search holds its own ORDER BY and LIMIT bound.
+    let plan = crate::planner::search_tail::lift_search_computed(plan, functions);
     // ORDER BY and LIMIT sit on the aggregate by now, so the wrap
     // only restates the output columns around it.
     wrap_aggregate_cp_items(
@@ -793,5 +796,85 @@ mod tests {
             let detail = invalid_function_detail(&sql);
             assert!(detail.contains("bm25_score"), "{sql}: {detail}");
         }
+    }
+
+    /// The vector search's filter and top-k bound, from a top-level plan.
+    fn vector_filters_and_k(plan: &SqlPlan) -> (usize, usize) {
+        let SqlPlan::VectorSearch { filters, top_k, .. } = plan else {
+            panic!("expected VectorSearch, got {plan:?}");
+        };
+        (filters.len(), *top_k)
+    }
+
+    /// The remote client's `vector_search(k, filter)` shape: the distance
+    /// under its own row key needs no tail, so the search stays the root
+    /// and keeps its filter and top-k bound.
+    #[test]
+    fn a_filtered_vector_search_without_computed_items_stays_whole() {
+        for select in [
+            "SELECT id",
+            "SELECT id, vector_distance(embedding, ARRAY[0.0, 0.0]) AS distance",
+        ] {
+            let plan = plan_select_sql(&format!(
+                "{select} FROM embeddings WHERE category = 'keep' \
+                 ORDER BY vector_distance(embedding, ARRAY[0.0, 0.0]) LIMIT 2"
+            ));
+            assert_eq!(vector_filters_and_k(&plan), (1, 2), "{select}");
+        }
+    }
+
+    /// A WHERE predicate beside a sparse search rides on the search, so the
+    /// search can filter before its top-k cut.
+    #[test]
+    fn a_where_predicate_with_a_sparse_search_rides_on_the_search() {
+        let plan = plan_select_sql(
+            "SELECT id FROM embeddings WHERE category = 'keep' \
+             ORDER BY sparse_score(terms, '{3: 1.0}') DESC LIMIT 2",
+        );
+        let SqlPlan::SparseSearch { filters, top_k, .. } = &plan else {
+            panic!("expected SparseSearch, got {plan:?}");
+        };
+        assert_eq!((filters.len(), *top_k), (1, 2));
+
+        let plan = plan_select_sql(
+            "SELECT id FROM embeddings ORDER BY sparse_score(terms, '{3: 1.0}') DESC LIMIT 2",
+        );
+        let SqlPlan::SparseSearch { filters, .. } = &plan else {
+            panic!("expected SparseSearch, got {plan:?}");
+        };
+        assert!(filters.is_empty());
+    }
+
+    /// A computed item moves to a tail. The search below it keeps its filter
+    /// and top-k bound, and the tail reads the distance by its row key.
+    #[test]
+    fn a_filtered_vector_search_with_a_computed_item_keeps_filter_and_k() {
+        let plan = plan_select_sql(
+            "SELECT id, upper(category) AS c, \
+                    vector_distance(embedding, ARRAY[0.0, 0.0]) AS d \
+             FROM embeddings WHERE category = 'keep' \
+             ORDER BY vector_distance(embedding, ARRAY[0.0, 0.0]) LIMIT 2",
+        );
+        let SqlPlan::Subquery {
+            input,
+            projection,
+            limit,
+            ..
+        } = &plan
+        else {
+            panic!("expected a tail, got {plan:?}");
+        };
+        assert_eq!(*limit, None, "the bound stays on the search");
+        assert_eq!(vector_filters_and_k(input), (1, 2));
+        assert!(
+            projection.iter().any(|p| matches!(
+                p,
+                Projection::Computed {
+                    expr: SqlExpr::Column { name, .. },
+                    alias,
+                } if name == "distance" && alias == "d"
+            )),
+            "the tail reads the distance by its row key: {projection:?}"
+        );
     }
 }

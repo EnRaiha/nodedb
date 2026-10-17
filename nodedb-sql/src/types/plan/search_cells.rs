@@ -75,6 +75,7 @@ mod tests {
                 field: "t".into(),
                 query_entries: vec![(3, 1.0)],
                 top_k: 1,
+                filters: Vec::new(),
                 projection: Vec::new(),
             }
             .carries_search_cells()

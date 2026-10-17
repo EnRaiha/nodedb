@@ -115,10 +115,10 @@ fn relation_columns(
     for expr in &def.aggregates {
         let input = source_column(&expr.source_column);
         let column = match &expr.function {
-            AggFunction::Count | AggFunction::TopK(_) => {
+            AggFunction::Count | AggFunction::CountDistinct | AggFunction::TopK(_) => {
                 derived(&expr.output_column, SqlDataType::Int64)
             }
-            AggFunction::Avg | AggFunction::CountDistinct | AggFunction::Percentile(_) => {
+            AggFunction::Avg | AggFunction::Percentile(_) => {
                 derived(&expr.output_column, SqlDataType::Float64)
             }
             // An integer total can pass the 64-bit range and turns exact

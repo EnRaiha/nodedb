@@ -76,21 +76,17 @@ fn refuse_text_field(
         return Ok(());
     }
     match field {
-        Some(field) if ctx.field_is_redacted(collection, field) => Err(crate::Error::PlanError {
-            detail: format!(
-                "column '{field}' on '{collection}' is redacted for this role: {reader} over a \
-                 redacted column is not permitted — the match and score are computed over the \
-                 stored text, so masking the result would not protect it"
-            ),
-        }),
+        Some(field) if ctx.field_is_redacted(collection, field) => Err(ctx.refusal(format!(
+            "column '{field}' on '{collection}' is redacted for this role: {reader} over a \
+             redacted column is not permitted — the match and score are computed over the \
+             stored text, so masking the result would not protect it"
+        ))),
         Some(_) => Ok(()),
-        None if ctx.collection_is_redacted(collection) => Err(crate::Error::PlanError {
-            detail: format!(
-                "'{collection}' has redacted columns for this role: {reader} over the whole \
-                 document is not permitted — it reads every text column, including the \
-                 redacted ones"
-            ),
-        }),
+        None if ctx.collection_is_redacted(collection) => Err(ctx.refusal(format!(
+            "'{collection}' has redacted columns for this role: {reader} over the whole \
+             document is not permitted — it reads every text column, including the \
+             redacted ones"
+        ))),
         None => Ok(()),
     }
 }
@@ -184,8 +180,8 @@ mod tests {
 
     fn assert_refused(result: crate::Result<()>) {
         assert!(
-            matches!(result, Err(crate::Error::PlanError { .. })),
-            "expected a PlanError refusal, got {result:?}"
+            matches!(result, Err(crate::Error::RejectedAuthz { .. })),
+            "expected a RejectedAuthz refusal, got {result:?}"
         );
     }
 

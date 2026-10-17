@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nodedb_cluster::DescriptorId;
 
-use crate::control::planner::descriptor_set::DescriptorVersionSet;
+use crate::control::planner::descriptor_set::{DescriptorVersionSet, PolicyVersions};
 use crate::control::server::response_shape::schema::OutputSchema;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -98,25 +98,20 @@ impl PlanCache {
     ///
     /// Returns `None` if not cached, if any recorded descriptor
     /// version has bumped / been dropped, or if the tenant's
-    /// permission-tree / RLS version has moved since the plan
-    /// was built. Stale entries are evicted automatically.
+    /// permission-tree / RLS / redaction version has moved since
+    /// the plan was built. Stale entries are evicted automatically.
     pub fn get<F>(
         &mut self,
         sql: &str,
         current_version: F,
-        current_permission_tree_version: u64,
-        current_rls_version: u64,
+        policies: PolicyVersions,
     ) -> Option<(Vec<PhysicalTask>, DescriptorVersionSet, OutputSchema)>
     where
         F: Fn(&DescriptorId) -> Option<u64>,
     {
         let key = hash_sql(sql);
         let entry = self.entries.get(&key)?;
-        if entry.versions.all_fresh(
-            &current_version,
-            current_permission_tree_version,
-            current_rls_version,
-        ) {
+        if entry.versions.all_fresh(&current_version, policies) {
             return Some((
                 entry.tasks.clone(),
                 entry.versions.clone(),
@@ -213,6 +208,20 @@ mod tests {
         move |_| Some(expected)
     }
 
+    fn policies(permission_tree: u64, rls: u64, redaction: u64) -> PolicyVersions {
+        PolicyVersions {
+            permission_tree,
+            rls,
+            redaction,
+        }
+    }
+
+    const NO_POLICY: PolicyVersions = PolicyVersions {
+        permission_tree: 0,
+        rls: 0,
+        redaction: 0,
+    };
+
     fn version_map(map: Vec<(&'static str, u64)>) -> impl Fn(&DescriptorId) -> Option<u64> {
         move |id: &DescriptorId| {
             map.iter()
@@ -230,7 +239,7 @@ mod tests {
             versions_for(&[("foo", 1)]),
             OutputSchema::default(),
         );
-        assert!(cache.get("SELECT 1", always_v(1), 0, 0).is_some());
+        assert!(cache.get("SELECT 1", always_v(1), NO_POLICY).is_some());
     }
 
     #[test]
@@ -242,9 +251,9 @@ mod tests {
             versions_for(&[("foo", 1)]),
             OutputSchema::default(),
         );
-        assert!(cache.get("SELECT 1", always_v(2), 0, 0).is_none());
+        assert!(cache.get("SELECT 1", always_v(2), NO_POLICY).is_none());
         // Re-lookup returns None — the stale entry was evicted.
-        assert!(cache.get("SELECT 1", always_v(1), 0, 0).is_none());
+        assert!(cache.get("SELECT 1", always_v(1), NO_POLICY).is_none());
     }
 
     #[test]
@@ -258,7 +267,7 @@ mod tests {
         );
         assert!(
             cache
-                .get("SELECT 1", |_: &DescriptorId| None, 0, 0)
+                .get("SELECT 1", |_: &DescriptorId| None, NO_POLICY)
                 .is_none()
         );
     }
@@ -274,7 +283,7 @@ mod tests {
         );
         // bar bumps but we only track foo → cache hit still.
         let lookup = version_map(vec![("foo", 1), ("bar", 99)]);
-        assert!(cache.get("SELECT FROM foo", lookup, 0, 0).is_some());
+        assert!(cache.get("SELECT FROM foo", lookup, NO_POLICY).is_some());
     }
 
     #[test]
@@ -298,9 +307,9 @@ mod tests {
             versions_for(&[("c", 1)]),
             OutputSchema::default(),
         );
-        assert!(cache.get("SELECT 1", always_v(1), 0, 0).is_none());
-        assert!(cache.get("SELECT 2", always_v(1), 0, 0).is_some());
-        assert!(cache.get("SELECT 3", always_v(1), 0, 0).is_some());
+        assert!(cache.get("SELECT 1", always_v(1), NO_POLICY).is_none());
+        assert!(cache.get("SELECT 2", always_v(1), NO_POLICY).is_some());
+        assert!(cache.get("SELECT 3", always_v(1), NO_POLICY).is_some());
     }
 
     #[test]
@@ -313,7 +322,7 @@ mod tests {
             OutputSchema::default(),
         );
         cache.clear();
-        assert!(cache.get("SELECT 1", always_v(1), 0, 0).is_none());
+        assert!(cache.get("SELECT 1", always_v(1), NO_POLICY).is_none());
     }
 
     /// A revoked permission-tree grant bumps the tenant's permission
@@ -327,15 +336,27 @@ mod tests {
         cache.put("SELECT 1", dummy_tasks(), versions, OutputSchema::default());
 
         // Same permission version — hit.
-        assert!(cache.get("SELECT 1", always_v(1), 1, 0).is_some());
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(1, 0, 0))
+                .is_some()
+        );
 
         // Re-populate, then simulate a REVOKE bumping the tenant version.
         let mut versions = versions_for(&[("foo", 1)]);
         versions.set_permission_tree_version(1);
         cache.put("SELECT 1", dummy_tasks(), versions, OutputSchema::default());
-        assert!(cache.get("SELECT 1", always_v(1), 2, 0).is_none());
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(2, 0, 0))
+                .is_none()
+        );
         // The stale entry was evicted, not just skipped.
-        assert!(cache.get("SELECT 1", always_v(1), 1, 0).is_none());
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(1, 0, 0))
+                .is_none()
+        );
     }
 
     /// Same freshness gate for the RLS policy version.
@@ -346,8 +367,36 @@ mod tests {
         versions.set_rls_version(1);
         cache.put("SELECT 1", dummy_tasks(), versions, OutputSchema::default());
 
-        assert!(cache.get("SELECT 1", always_v(1), 0, 1).is_some());
-        assert!(cache.get("SELECT 1", always_v(1), 0, 2).is_none());
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(0, 1, 0))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(0, 2, 0))
+                .is_none()
+        );
+    }
+
+    /// Same freshness gate for the redaction policy version.
+    #[test]
+    fn cache_miss_on_redaction_version_bump() {
+        let mut cache = PlanCache::new(10);
+        let mut versions = versions_for(&[("foo", 1)]);
+        versions.set_redaction_version(4);
+        cache.put("SELECT 1", dummy_tasks(), versions, OutputSchema::default());
+
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(0, 0, 4))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get("SELECT 1", always_v(1), policies(0, 0, 5))
+                .is_none()
+        );
     }
 
     #[test]

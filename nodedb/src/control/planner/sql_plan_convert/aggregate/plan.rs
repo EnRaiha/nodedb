@@ -34,6 +34,8 @@ pub(in crate::control::planner::sql_plan_convert) struct ConvertAggregateParams<
     pub limit: usize,
     pub grouping_sets: Option<&'a [Vec<usize>]>,
     pub sort_keys: &'a [SortKey],
+    /// SELECT-list output alias of each GROUP BY key, parallel to `group_by`.
+    pub group_by_aliases: &'a [Option<String>],
     pub tenant_id: TenantId,
     pub ctx: &'a ConvertContext,
 }
@@ -49,6 +51,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
         limit,
         grouping_sets,
         sort_keys,
+        group_by_aliases,
         tenant_id,
         ctx,
     } = p;
@@ -81,6 +84,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                     limit,
                     grouping_sets,
                     sort_keys: bridge_sort_keys,
+                    group_by_aliases,
                     tenant_id,
                     ctx,
                 },
@@ -132,6 +136,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 limit,
                 grouping_sets: bridge_grouping_sets,
                 sort_keys: bridge_sort_keys,
+                group_by_aliases,
                 names: InputFieldNames::Bare,
             },
         )?]);
@@ -201,6 +206,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
         sub_aggregates: Vec::new(),
         grouping_sets: bridge_grouping_sets,
         sort_keys: bridge_sort_keys,
+        group_key_aliases: group_by_aliases.to_vec(),
     });
 
     let plan = if shuffle_agg_eligible {

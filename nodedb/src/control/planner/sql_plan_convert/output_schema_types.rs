@@ -90,6 +90,14 @@ pub fn infer_computed_expr_type(expr: &SqlExpr, types: &HashMap<String, DdlColTy
         | SqlExpr::InList { .. }
         | SqlExpr::Between { .. }
         | SqlExpr::Like { .. } => DdlColType::Bool,
+        // `time_bucket` keeps the type of the column it buckets.
+        SqlExpr::Function { name, args, .. } if name.eq_ignore_ascii_case("time_bucket") => {
+            let mut columns = args.iter().filter(|a| matches!(a, SqlExpr::Column { .. }));
+            match (columns.next(), columns.next()) {
+                (Some(column), None) => time_bucket_type(bare_column_type(column, types)),
+                _ => DdlColType::Text,
+            }
+        }
         // String functions, casts, subqueries, wildcards, array literals and
         // any other function call are not certainly non-TEXT — stay Text.
         SqlExpr::Function { .. }
@@ -98,6 +106,17 @@ pub fn infer_computed_expr_type(expr: &SqlExpr, types: &HashMap<String, DdlColTy
         | SqlExpr::Subquery(_)
         | SqlExpr::Wildcard
         | SqlExpr::ArrayLiteral(_) => DdlColType::Text,
+    }
+}
+
+/// The result type of a `time_bucket` call over a column of type `source`.
+///
+/// A bucket of an instant is an instant of the same kind, and a bucket of a
+/// `BIGINT` is a `BIGINT`. Any other source, or none, is `Text`.
+pub fn time_bucket_type(source: Option<DdlColType>) -> DdlColType {
+    match source {
+        Some(ty @ (DdlColType::Timestamp | DdlColType::Timestamptz | DdlColType::Int8)) => ty,
+        Some(_) | None => DdlColType::Text,
     }
 }
 
@@ -115,7 +134,15 @@ pub fn infer_aggregate_type(
 ) -> DdlColType {
     let arg_bare_type = || agg.args.first().and_then(|a| bare_column_type(a, types));
     match agg.function.as_str() {
-        "count" => DdlColType::Int8,
+        // A HyperLogLog estimate finalizes to a rounded integer.
+        "count" | "approx_count_distinct" => DdlColType::Int8,
+        // A t-digest quantile, an interpolated percentile, and every
+        // Welford dispersion finalize to a float, or NULL.
+        "approx_percentile" | "percentile_cont" | "stddev" | "stddev_pop" | "stddev_samp"
+        | "variance" | "var_pop" | "var_samp" | "ts_stddev" => DdlColType::Float8,
+        // The space-saving top-k finalizes to an array of
+        // `{item, count, error}` objects.
+        "approx_topk" => DdlColType::Json,
         "min" | "max" => arg_bare_type().unwrap_or(DdlColType::Text),
         "sum" | "avg" => match arg_bare_type() {
             Some(DdlColType::Float8) | Some(DdlColType::Float4) => DdlColType::Float8,
@@ -155,6 +182,32 @@ mod tests {
         // Unknown column falls back to Text.
         assert_eq!(
             infer_computed_expr_type(&column("missing"), &t),
+            DdlColType::Text
+        );
+    }
+
+    /// `time_bucket` takes the type of the column it buckets when that is an
+    /// instant or a `BIGINT`, in either argument order. Otherwise it is Text.
+    #[test]
+    fn time_bucket_keeps_its_column_type() {
+        let mut t = types_map();
+        t.insert("ts".to_string(), DdlColType::Timestamptz);
+        let bucket = |args: Vec<SqlExpr>| SqlExpr::Function {
+            name: "time_bucket".to_string(),
+            args,
+            distinct: false,
+        };
+        let interval = || SqlExpr::Literal(SqlValue::String("1 hour".into()));
+        assert_eq!(
+            infer_computed_expr_type(&bucket(vec![interval(), column("ts")]), &t),
+            DdlColType::Timestamptz
+        );
+        assert_eq!(
+            infer_computed_expr_type(&bucket(vec![column("n"), interval()]), &t),
+            DdlColType::Int8
+        );
+        assert_eq!(
+            infer_computed_expr_type(&bucket(vec![interval(), column("amount")]), &t),
             DdlColType::Text
         );
     }

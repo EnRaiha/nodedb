@@ -2,7 +2,7 @@
 
 //! Grouped output projection and sequence-accessor checks.
 
-use super::expression::unqualify_columns;
+use super::expression::group_row_columns;
 use crate::aggregate_walk::contains_aggregate;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
@@ -26,12 +26,13 @@ pub(super) fn aggregate_cp_projection(
     functions: &FunctionRegistry,
     scope: &TableScope,
 ) -> Result<Vec<Projection>> {
-    let (group_by, aggregates) = match plan {
+    let (group_by, group_by_aliases, aggregates) = match plan {
         SqlPlan::Aggregate {
             group_by,
+            group_by_aliases,
             aggregates,
             ..
-        } => (group_by, aggregates),
+        } => (group_by, group_by_aliases, aggregates),
         other => {
             return Err(SqlError::Unsupported {
                 detail: format!("aggregate wrap over a {} plan", other.variant_name()),
@@ -42,6 +43,22 @@ pub(super) fn aggregate_cp_projection(
         .iter()
         .enumerate()
         .map(|(index, key)| group_key_row_name(key, index))
+        .collect();
+    // The aggregate renames each aliased key to its alias in the finalized
+    // group row, so the restated columns read that name.
+    let renames: Vec<(String, String)> = key_names
+        .iter()
+        .zip(group_by_aliases)
+        .filter_map(|(name, alias)| alias.as_ref().map(|alias| (name.clone(), alias.clone())))
+        .collect();
+    let row_names: Vec<String> = key_names
+        .iter()
+        .map(|name| {
+            renames
+                .iter()
+                .find(|(from, _)| from == name)
+                .map_or_else(|| name.clone(), |(_, to)| to.clone())
+        })
         .collect();
     let by_item = compute_output_order_by_item(items, group_by, functions, scope)?;
     // The item resolves against the input relations, so an unknown column is
@@ -67,18 +84,38 @@ pub(super) fn aggregate_cp_projection(
             if let Some(name) = first_sequence_accessor(&converted) {
                 let name = name.to_string();
                 projection.push(cp_item(
-                    converted, name, alias, expr, &key_names, functions,
+                    converted,
+                    CpItemNames {
+                        accessor: name,
+                        alias,
+                        key_names: &key_names,
+                        renames: &renames,
+                    },
+                    expr,
+                    functions,
                 )?);
                 continue;
             }
         }
         for slot in slots {
             projection.push(Projection::Column(slot_row_name(
-                slot, &key_names, aggregates,
+                slot, &row_names, aggregates,
             )?));
         }
     }
     Ok(projection)
+}
+
+/// The names one accessor item over a grouped result is checked and keyed by.
+struct CpItemNames<'a> {
+    /// The sequence accessor the item calls.
+    accessor: String,
+    /// The item's output name.
+    alias: String,
+    /// The row name of each GROUP BY key.
+    key_names: &'a [String],
+    /// `(row name, alias)` of each aliased GROUP BY key.
+    renames: &'a [(String, String)],
 }
 
 /// The Control-Plane entry for one accessor item over a grouped result.
@@ -86,15 +123,20 @@ pub(super) fn aggregate_cp_projection(
 /// The item holds no aggregate: the Control Plane evaluates it over the
 /// finalized group row, which carries aggregate values under their output
 /// names but no per-row aggregate state. Every column it references is a
-/// group key, unqualified so the reference matches the row's bare key.
+/// group key, unqualified and renamed so the reference matches the key the
+/// row carries it under.
 fn cp_item(
     converted: SqlExpr,
-    accessor: String,
-    alias: String,
+    names: CpItemNames<'_>,
     raw: &ast::Expr,
-    key_names: &[String],
     functions: &FunctionRegistry,
 ) -> Result<Projection> {
+    let CpItemNames {
+        accessor,
+        alias,
+        key_names,
+        renames,
+    } = names;
     if contains_aggregate(raw, functions) {
         return Err(SqlError::SequencePerRowUnsupported { name: accessor });
     }
@@ -110,7 +152,7 @@ fn cp_item(
         }
     }
     Ok(Projection::CpComputed {
-        expr: unqualify_columns(converted),
+        expr: group_row_columns(converted, renames),
         alias,
     })
 }

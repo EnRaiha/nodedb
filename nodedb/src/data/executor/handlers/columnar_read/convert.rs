@@ -22,6 +22,14 @@ use nodedb_types::value::Value;
 /// `_ts_valid_from`, `_ts_valid_until` columns are declared `Int64` and stay
 /// integers: they hold epoch milliseconds with `i64::MIN` / `i64::MAX` as
 /// the unbounded sentinels, which no instant can carry.
+///
+/// A computed column evaluates over the whole stored row. Its expression can
+/// read a column the projection leaves out, as `ST_AsText(loc)` does beside a
+/// projected `name`. The output then keeps the projected columns and the
+/// computed aliases only. A computed alias that is also projected keeps the
+/// projected value, as the document projection does. Any other computed
+/// alias carries the evaluated value, even when a stored column shares its
+/// name.
 pub(in crate::data::executor) fn row_to_projected_value(
     row: &[Value],
     schema: &nodedb_types::columnar::ColumnarSchema,
@@ -29,14 +37,12 @@ pub(in crate::data::executor) fn row_to_projected_value(
     computed_cols: &[crate::bridge::expr_eval::ComputedColumn],
     all_versions: bool,
 ) -> crate::Result<Value> {
+    let keep_every_column = projection.is_empty() || !computed_cols.is_empty();
     let mut obj: HashMap<String, Value> = HashMap::with_capacity(schema.columns.len());
     for (i, col_def) in schema.columns.iter().enumerate() {
         let force_system_col =
             all_versions && col_def.name == nodedb_types::columnar::schema::TS_SYSTEM;
-        if !projection.is_empty()
-            && !force_system_col
-            && !projection.iter().any(|p| p == &col_def.name)
-            && !computed_cols.iter().any(|cc| cc.alias == col_def.name)
+        if !keep_every_column && !force_system_col && !projection.iter().any(|p| p == &col_def.name)
         {
             continue;
         }
@@ -47,7 +53,7 @@ pub(in crate::data::executor) fn row_to_projected_value(
     if !computed_cols.is_empty() {
         let doc_val = Value::Object(obj.clone());
         for cc in computed_cols {
-            if matches!(obj.get(&cc.alias), Some(v) if !matches!(v, Value::Null)) {
+            if projection.iter().any(|p| p == &cc.alias) {
                 continue;
             }
             // A computed column is projection-shaped: a division/modulo-by-
@@ -242,6 +248,71 @@ mod tests {
             "an all-versions read forces the system-time column into the projection"
         );
         assert!(!audit.contains_key("id"));
+    }
+
+    /// An `(id, name, city)` schema and one row, for the computed-column
+    /// projection tests.
+    fn name_city_row() -> (nodedb_types::columnar::ColumnarSchema, [Value; 3]) {
+        use nodedb_types::columnar::{ColumnDef, ColumnType};
+        let schema = nodedb_types::columnar::ColumnarSchema::new(vec![
+            ColumnDef::required("id", ColumnType::Int64).with_primary_key(),
+            ColumnDef::required("name", ColumnType::String),
+            ColumnDef::required("city", ColumnType::String),
+        ])
+        .expect("valid schema");
+        let row = [
+            Value::Integer(1),
+            Value::String("ali".into()),
+            Value::String("temerloh".into()),
+        ];
+        (schema, row)
+    }
+
+    fn upper(alias: &str, column: &str) -> crate::bridge::expr_eval::ComputedColumn {
+        use crate::bridge::expr_eval::{ComputedColumn, SqlExpr};
+        ComputedColumn {
+            alias: alias.into(),
+            expr: SqlExpr::Function {
+                name: "upper".into(),
+                args: vec![SqlExpr::Column(column.into())],
+            },
+        }
+    }
+
+    /// A computed column reads a stored column the projection leaves out.
+    /// The output carries the projected column and the computed alias only.
+    #[test]
+    fn a_computed_column_reads_a_column_outside_the_projection() {
+        let (schema, row) = name_city_row();
+        let projection = ["name".to_string()];
+        let computed = [upper("upper(city)", "city")];
+        let Value::Object(obj) =
+            row_to_projected_value(&row, &schema, &projection, &computed, false).expect("project")
+        else {
+            panic!("a projected row is an object");
+        };
+        assert_eq!(obj.get("name"), Some(&Value::String("ali".into())));
+        assert_eq!(
+            obj.get("upper(city)"),
+            Some(&Value::String("TEMERLOH".into())),
+            "the computed column must see `city` although only `name` is projected"
+        );
+        assert!(!obj.contains_key("city"), "an unprojected column stays out");
+        assert!(!obj.contains_key("id"), "an unprojected column stays out");
+    }
+
+    /// A computed alias that names a stored column carries the evaluated
+    /// value, never the stored one.
+    #[test]
+    fn a_computed_alias_shadowing_a_stored_column_carries_the_computed_value() {
+        let (schema, row) = name_city_row();
+        let computed = [upper("name", "name")];
+        let Value::Object(obj) =
+            row_to_projected_value(&row, &schema, &[], &computed, false).expect("project")
+        else {
+            panic!("a projected row is an object");
+        };
+        assert_eq!(obj.get("name"), Some(&Value::String("ALI".into())));
     }
 
     #[test]

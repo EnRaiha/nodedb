@@ -71,6 +71,13 @@ pub enum TimeseriesOp {
         /// raw rows or to a downsample tier's buckets.
         #[serde(default)]
         tiering: Option<crate::physical_plan::TieringPlan>,
+        /// The output columns of an aggregating scan, in SELECT-list order.
+        /// Each pair is `(encoded key, output name)`: the encoded key is
+        /// `bucket`, a GROUP BY column, or an aggregate's canonical key. Each
+        /// group row carries exactly these columns, renamed after HAVING,
+        /// sort, and limit. Empty keeps every encoded key under its own name.
+        #[serde(default)]
+        output_columns: Vec<(String, String)>,
     },
 
     /// Write a batch of samples to the columnar memtable.

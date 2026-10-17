@@ -38,7 +38,7 @@ fn refuse_specs(
     for spec in specs {
         for field in read_fields(spec) {
             if ctx.field_is_redacted(collection, field) {
-                return Err(refusal(collection, field));
+                return Err(refusal(ctx, collection, field));
             }
         }
     }
@@ -67,34 +67,17 @@ pub(super) fn refuse_input_aggregates(
     Ok(())
 }
 
-/// Refuse when `field` is a redacted column of one of `sources`.
-///
-/// A field qualified with a source's qualifier (`o.ssn`) is checked against
-/// the sources that carry that qualifier. Any other field, unqualified or
-/// with a qualifier no source carries (a derived table's alias, a nested
-/// field path), is checked against every source, so an ambiguous name
-/// cannot slip past. [`RefusalCtx::field_is_redacted`] matches the field as
-/// written and by its column part.
+/// Refuse when `field` is a redacted column of one of `sources`, per
+/// [`RefusalCtx::redacted_source`].
 fn refuse_source_field(
     ctx: &RefusalCtx<'_>,
     sources: &[(String, String)],
     field: &str,
 ) -> crate::Result<()> {
-    let qualifier = field.split_once('.').map(|(qualifier, _)| qualifier);
-    let names_a_source = qualifier.is_some_and(|qualifier| {
-        sources
-            .iter()
-            .any(|(source_qualifier, _)| source_qualifier == qualifier)
-    });
-    for (source_qualifier, collection) in sources {
-        if names_a_source && qualifier != Some(source_qualifier.as_str()) {
-            continue;
-        }
-        if !collection.is_empty() && ctx.field_is_redacted(collection, field) {
-            return Err(refusal(collection, field));
-        }
+    match ctx.redacted_source(sources, field) {
+        Some(collection) => Err(refusal(ctx, collection, field)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuse when a grouped timeseries scan aggregates a redacted column.
@@ -109,7 +92,7 @@ pub(super) fn refuse_timeseries_aggregates(
     }
     for (_function, field) in aggregates {
         if !is_count_star(field) && ctx.field_is_redacted(collection, field) {
-            return Err(refusal(collection, field));
+            return Err(refusal(ctx, collection, field));
         }
     }
     Ok(())
@@ -130,26 +113,22 @@ pub(super) fn refuse_facet_fields(
     }
     for field in fields {
         if ctx.field_is_redacted(collection, field) {
-            return Err(crate::Error::PlanError {
-                detail: format!(
-                    "column '{field}' on '{collection}' is redacted for this role: faceting a \
-                     redacted column is not permitted — facet counts enumerate the stored values \
-                     the policy protects"
-                ),
-            });
+            return Err(ctx.refusal(format!(
+                "column '{field}' on '{collection}' is redacted for this role: faceting a \
+                 redacted column is not permitted — facet counts enumerate the stored values \
+                 the policy protects"
+            )));
         }
     }
     Ok(())
 }
 
-fn refusal(collection: &str, field: &str) -> crate::Error {
-    crate::Error::PlanError {
-        detail: format!(
-            "column '{field}' on '{collection}' is redacted for this role: aggregating a redacted \
-             column is not permitted — the aggregate is computed over the stored values, so \
-             masking its result would not protect them"
-        ),
-    }
+fn refusal(ctx: &RefusalCtx<'_>, collection: &str, field: &str) -> crate::Error {
+    ctx.refusal(format!(
+        "column '{field}' on '{collection}' is redacted for this role: aggregating a redacted \
+         column is not permitted — the aggregate is computed over the stored values, so \
+         masking its result would not protect them"
+    ))
 }
 
 /// Every stored column one aggregate spec reads.
@@ -179,7 +158,7 @@ fn is_count_star(field: &str) -> bool {
 }
 
 /// Collect every column reference in `expr`.
-fn collect_columns<'e>(expr: &'e SqlExpr, out: &mut Vec<&'e str>) {
+pub(super) fn collect_columns<'e>(expr: &'e SqlExpr, out: &mut Vec<&'e str>) {
     match expr {
         SqlExpr::Column(name) | SqlExpr::OldColumn(name) | SqlExpr::ExcludedColumn(name) => {
             out.push(name.as_str());

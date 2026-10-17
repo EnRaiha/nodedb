@@ -102,7 +102,7 @@ impl CoreLoop {
 
 /// Hits the Control Plane keeps under `residual`. A filter that fails to
 /// evaluate against a body drops that hit there, so it does not count here.
-fn passing(hits: &[VectorSearchHit], residual: &[ScanFilter]) -> usize {
+pub(super) fn passing(hits: &[VectorSearchHit], residual: &[ScanFilter]) -> usize {
     hits.iter()
         .filter(|hit| {
             hit.body

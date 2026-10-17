@@ -91,6 +91,7 @@ fn startup_replay_recovers_all_wal_data() {
         computed_columns: Vec::new(),
         having: Vec::new(),
         tiering: None,
+        output_columns: Vec::new(),
     });
 
     use nodedb::bridge::dispatch::BridgeRequest;

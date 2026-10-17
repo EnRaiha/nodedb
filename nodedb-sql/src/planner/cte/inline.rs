@@ -266,6 +266,38 @@ impl ScanRef<'_> {
     }
 }
 
+/// Whether [`inline_cte`] replaces `plan` with the body of `cte_name`
+/// unchanged.
+///
+/// That is an unconstrained `Scan` of `cte_name`. Its columns then read the
+/// body's own rows, so each one resolves through the body's output schema.
+pub fn reads_cte_body_unchanged(plan: &SqlPlan, cte_name: &str) -> bool {
+    match plan {
+        SqlPlan::Scan {
+            collection,
+            filters,
+            projection,
+            sort_keys,
+            limit,
+            offset,
+            distinct,
+            window_functions,
+            ..
+        } if collection == cte_name => ScanRef {
+            filters,
+            projection,
+            sort_keys,
+            limit: *limit,
+            offset: *offset,
+            distinct: *distinct,
+            window_functions,
+            has_computed: has_computed_projection(projection),
+        }
+        .is_unconstrained(),
+        _ => false,
+    }
+}
+
 /// Wrap `input` in a `Subquery` post-processor carrying the outer
 /// constraints that `input` has no slot for.
 fn wrap_in_subquery(input: SqlPlan, filters: Vec<Filter>, outer: ScanRef<'_>) -> SqlPlan {

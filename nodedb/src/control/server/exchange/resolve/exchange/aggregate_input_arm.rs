@@ -30,6 +30,7 @@ pub(super) struct AggregateFields {
     pub sub_aggregates: Vec<AggregateSpec>,
     pub grouping_sets: Vec<Vec<u32>>,
     pub sort_keys: Vec<SortKeySpec>,
+    pub group_key_aliases: Vec<Option<String>>,
 }
 
 /// Resolve an input-sourced `QueryOp::Aggregate`.
@@ -59,6 +60,7 @@ pub(super) async fn resolve_aggregate_input(
         sub_aggregates,
         grouping_sets,
         sort_keys,
+        group_key_aliases,
     } = fields;
 
     let rebuild = |input: Box<PhysicalPlan>| {
@@ -74,6 +76,7 @@ pub(super) async fn resolve_aggregate_input(
             sub_aggregates,
             grouping_sets,
             sort_keys,
+            group_key_aliases,
         })))
     };
 

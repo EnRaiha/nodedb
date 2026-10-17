@@ -58,6 +58,8 @@ impl<C: SqlCatalog + ?Sized> SqlCatalog for CatalogRef<'_, C> {
 pub(super) struct CteTypesCatalog<'a> {
     inner: &'a dyn SqlCatalog,
     relations: Vec<(String, CollectionInfo)>,
+    /// Each definition's body output schema, by definition name.
+    bodies: Vec<(String, OutputSchema)>,
 }
 
 impl<'a> CteTypesCatalog<'a> {
@@ -74,15 +76,48 @@ impl<'a> CteTypesCatalog<'a> {
         let mut overlay = Self {
             inner,
             relations: Vec::with_capacity(definitions.len()),
+            bodies: Vec::with_capacity(definitions.len()),
         };
         for (name, body) in definitions {
             let schema =
                 build_output_schema(std::slice::from_ref(body), &overlay, database_id, None)?;
+            let schema = overlay.read_through(body, schema);
             overlay
                 .relations
                 .push((name.clone(), relation_from_schema(name, &schema)));
+            overlay.bodies.push((name.clone(), schema));
         }
         Ok(overlay)
+    }
+
+    /// `schema`, the schema of `plan`, with each column reading the key the
+    /// rows carry.
+    ///
+    /// A plan that reads a definition body unchanged runs as that body, so
+    /// its rows are the body's rows. A body column can be announced under its
+    /// display name but carried under another lookup key: a join body
+    /// carries `o.id` under the qualified `o.id` and announces it as `id`.
+    /// Each column that names a body column by display name reads that body
+    /// column's lookup key. Any other plan returns `schema` unchanged.
+    pub(super) fn read_through(&self, plan: &SqlPlan, mut schema: OutputSchema) -> OutputSchema {
+        let Some((_, body)) = self
+            .bodies
+            .iter()
+            .find(|(name, _)| nodedb_sql::planner::cte::reads_cte_body_unchanged(plan, name))
+        else {
+            return schema;
+        };
+        for column in &mut schema.columns {
+            let bare = column
+                .lookup_key
+                .rsplit('.')
+                .next()
+                .unwrap_or(column.lookup_key.as_str());
+            if let Some(source) = body.columns.iter().find(|c| c.display_name == bare) {
+                column.lookup_key = source.lookup_key.clone();
+            }
+        }
+        schema
     }
 }
 

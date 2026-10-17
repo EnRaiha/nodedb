@@ -67,6 +67,7 @@ impl EngineRules for TimeseriesRules {
             sort_keys: p.sort_keys,
             tiered: p.has_auto_tier,
             temporal: p.temporal,
+            output: Vec::new(),
         }))
     }
 
@@ -154,6 +155,7 @@ impl EngineRules for TimeseriesRules {
                 sort_keys: Vec::new(),
                 tiered: p.has_auto_tier,
                 temporal: p.temporal,
+                output: Vec::new(),
             });
             return Ok(SqlPlan::Aggregate {
                 input: Box::new(input),
@@ -183,6 +185,9 @@ impl EngineRules for TimeseriesRules {
             sort_keys: Vec::new(),
             tiered: p.has_auto_tier,
             temporal: p.temporal,
+            // The SELECT-list order and aliases are attached by the caller,
+            // which holds the projection.
+            output: Vec::new(),
         }))
     }
 

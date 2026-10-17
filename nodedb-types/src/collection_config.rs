@@ -183,6 +183,15 @@ pub enum PayloadAtom {
     },
 }
 
+impl PayloadAtom {
+    /// The payload field this atom filters on.
+    pub fn field(&self) -> &str {
+        match self {
+            Self::Eq(field, _) | Self::In(field, _) | Self::Range { field, .. } => field,
+        }
+    }
+}
+
 /// Names WHAT a key-partitioned collection hashes to derive its vShard.
 ///
 /// Defined as substrate for future routing and array layers; not yet populated

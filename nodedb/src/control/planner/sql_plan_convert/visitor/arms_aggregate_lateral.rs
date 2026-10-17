@@ -16,6 +16,7 @@ macro_rules! impl_aggregate_lateral_arms_for_convert_visitor {
                 limit,
                 grouping_sets,
                 sort_keys,
+                group_by_aliases,
             } = args;
             super::super::aggregate::convert_aggregate(
                 super::super::aggregate::ConvertAggregateParams {
@@ -26,6 +27,7 @@ macro_rules! impl_aggregate_lateral_arms_for_convert_visitor {
                     limit,
                     grouping_sets,
                     sort_keys,
+                    group_by_aliases,
                     tenant_id: self.tenant_id,
                     ctx: self.ctx,
                 },

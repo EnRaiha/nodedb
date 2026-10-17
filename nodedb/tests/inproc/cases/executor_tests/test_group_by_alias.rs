@@ -225,11 +225,11 @@ fn e2e_group_by_full_expression() {
         .map(|r| r["count(*)"].as_u64().unwrap_or(0))
         .sum();
     assert_eq!(total, 5, "bucket counts should sum to ingested rows");
-    // Each result must have the bucket column.
+    // Each row carries the bucket under its SELECT-list alias `b`.
     for row in &results {
         assert!(
-            row.get("bucket").is_some(),
-            "each row should have 'bucket' column, got: {row}"
+            row.get("b").is_some(),
+            "each row should have the 'b' column, got: {row}"
         );
     }
 }
@@ -254,10 +254,11 @@ fn e2e_group_by_alias() {
         .map(|r| r["count(*)"].as_u64().unwrap_or(0))
         .sum();
     assert_eq!(total, 5, "bucket counts should sum to ingested rows");
+    // Each row carries the bucket under its SELECT-list alias `b`.
     for row in &results {
         assert!(
-            row.get("bucket").is_some(),
-            "each row should have 'bucket' column, got: {row}"
+            row.get("b").is_some(),
+            "each row should have the 'b' column, got: {row}"
         );
     }
 }
@@ -282,10 +283,11 @@ fn e2e_group_by_positional() {
         .map(|r| r["count(*)"].as_u64().unwrap_or(0))
         .sum();
     assert_eq!(total, 5, "bucket counts should sum to ingested rows");
+    // Each row carries the bucket under its SELECT-list alias `b`.
     for row in &results {
         assert!(
-            row.get("bucket").is_some(),
-            "each row should have 'bucket' column, got: {row}"
+            row.get("b").is_some(),
+            "each row should have the 'b' column, got: {row}"
         );
     }
 }

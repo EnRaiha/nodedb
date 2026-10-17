@@ -230,6 +230,11 @@ pub(super) fn try_extract_sort_search(
                 field,
                 query_entries,
                 top_k,
+                // The scan's WHERE narrows the candidates before the cut.
+                filters: match plan {
+                    SqlPlan::Scan { filters, .. } => filters.clone(),
+                    _ => Vec::new(),
+                },
                 projection: source_projection(plan),
             })))
         }

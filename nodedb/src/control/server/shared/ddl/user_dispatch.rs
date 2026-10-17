@@ -202,6 +202,17 @@ async fn authorize_for_identity(
         }
     };
 
+    // Column reads are checked before RLS adds the read policy's predicates.
+    crate::control::planner::redaction_refusal::refuse_redacted_expression_reads(
+        &plan,
+        identity.tenant_id,
+        scope.database_id(),
+        &crate::control::planner::redaction_refusal::RedactionReadCheck {
+            auth: scope.auth(),
+            store: &state.redaction,
+            catalog: state.credentials.catalog(),
+        },
+    )?;
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         identity.tenant_id.as_u64(),
         scope.database_id(),

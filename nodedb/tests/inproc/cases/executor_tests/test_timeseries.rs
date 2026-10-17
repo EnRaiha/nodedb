@@ -94,6 +94,7 @@ fn ts_scan(
             computed_columns: Vec::new(),
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     // Payload may be MessagePack (grouped aggregates) or JSON — decode both.
@@ -138,6 +139,7 @@ fn ts_scan_filtered(
             computed_columns: Vec::new(),
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     let json_str = nodedb::data::executor::response_codec::decode_payload_to_json(&raw);
@@ -777,6 +779,7 @@ fn large_group_by_returns_single_valid_json() {
             computed_columns: Vec::new(),
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
 

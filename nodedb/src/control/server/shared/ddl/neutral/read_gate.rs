@@ -154,7 +154,26 @@ impl<'a> CollectionReadGate<'a> {
     /// Delegates to the same [`inject_rls_for_single_plan`] the planner-driven
     /// read path uses, so a hand-built `Scan` / `PointGet` receives byte-identical
     /// filters to the ones a `SELECT` against the same collection would get.
+    ///
+    /// A read of a redacted column outside the projection is refused first,
+    /// before the read policy's own predicates join the plan.
     pub fn inject_rls(&self, plan: &mut PhysicalPlan) -> Result<(), DdlError> {
+        crate::control::planner::redaction_refusal::refuse_redacted_expression_reads(
+            plan,
+            self.tenant_id(),
+            self.scope.database_id(),
+            &crate::control::planner::redaction_refusal::RedactionReadCheck {
+                auth: self.scope.auth(),
+                store: &self.state.redaction,
+                catalog: self.state.credentials.catalog(),
+            },
+        )
+        .map_err(|error| match &error {
+            crate::Error::RejectedAuthz { .. } => {
+                gate_err(INSUFFICIENT_PRIVILEGE, error.to_string())
+            }
+            other => DdlError::from_error(other),
+        })?;
         inject_rls_for_single_plan(
             self.tenant_id().as_u64(),
             self.scope.database_id(),

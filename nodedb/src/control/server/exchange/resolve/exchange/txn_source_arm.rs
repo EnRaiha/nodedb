@@ -54,6 +54,7 @@ pub(super) async fn txn_aggregate(
         sub_aggregates,
         grouping_sets,
         sort_keys,
+        group_key_aliases,
     }) = plan
     else {
         return Ok(TxnRewrite::Unchanged(Box::new(plan)));
@@ -79,6 +80,7 @@ pub(super) async fn txn_aggregate(
                 sub_aggregates,
                 grouping_sets,
                 sort_keys,
+                group_key_aliases,
             },
         ))));
     };
@@ -99,6 +101,7 @@ pub(super) async fn txn_aggregate(
             sub_aggregates,
             grouping_sets,
             sort_keys,
+            group_key_aliases,
         },
     )
     .await?;

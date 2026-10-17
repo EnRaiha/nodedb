@@ -96,6 +96,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_sparse_search(
             field_name: p.field.to_string(),
             query_entries: p.query_entries.to_vec(),
             top_k: *p.top_k,
+            filters: serialize_filters(p.filters)?,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

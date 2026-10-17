@@ -32,23 +32,41 @@ impl CoreLoop {
                 sub_aggregates,
                 grouping_sets,
                 sort_keys,
-            } => self.execute_aggregate(
-                crate::data::executor::handlers::aggregate::exec::AggregateExecInputs {
-                    task,
-                    tid,
-                    collection: collection.as_str(),
-                    input: input.as_deref(),
-                    group_by,
-                    aggregates,
-                    filters,
-                    having,
-                    limit: *limit,
-                    sub_group_by,
-                    sub_aggregates,
-                    grouping_sets,
-                    sort_keys,
-                },
-            ),
+                group_key_aliases,
+            } => {
+                let response = self.execute_aggregate(
+                    crate::data::executor::handlers::aggregate::exec::AggregateExecInputs {
+                        task,
+                        tid,
+                        collection: collection.as_str(),
+                        input: input.as_deref(),
+                        group_by,
+                        aggregates,
+                        filters,
+                        having,
+                        limit: *limit,
+                        sub_group_by,
+                        sub_aggregates,
+                        grouping_sets,
+                        sort_keys,
+                    },
+                );
+                // Every aggregate path finalizes, filters, sorts, and cuts
+                // under the keys' row names. The aliases apply to the final
+                // rows, so a derived table or an outer query reads them.
+                let renames = crate::util::row_rename::group_key_renames(group_by, group_key_aliases);
+                if renames.is_empty() || response.status != crate::bridge::envelope::Status::Ok {
+                    return response;
+                }
+                match crate::util::row_rename::rename_row_keys(response.payload.as_bytes(), &renames)
+                {
+                    Ok(payload) => crate::bridge::envelope::Response {
+                        payload: crate::bridge::envelope::Payload::from_vec(payload),
+                        ..response
+                    },
+                    Err(e) => self.response_error(task, e),
+                }
+            }
 
             QueryOp::Exchange(_) => self.response_error(
                 task,

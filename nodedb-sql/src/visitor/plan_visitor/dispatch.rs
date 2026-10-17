@@ -216,7 +216,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
         SqlPlan::Aggregate {
             input,
             group_by,
-            group_by_aliases: _,
+            group_by_aliases,
             output_order: _,
             aggregates,
             having,
@@ -231,6 +231,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             limit: *limit,
             grouping_sets: grouping_sets.as_deref(),
             sort_keys,
+            group_by_aliases,
         }),
         SqlPlan::TimeseriesScan(TimeseriesScanPlan {
             collection,
@@ -246,6 +247,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             sort_keys,
             tiered,
             temporal,
+            output,
         }) => visitor.timeseries_scan(TimeseriesScanVisitArgs {
             collection,
             time_range: *time_range,
@@ -260,6 +262,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             sort_keys,
             tiered: *tiered,
             temporal,
+            output,
         }),
         SqlPlan::TimeseriesIngest(TimeseriesIngestPlan {
             collection,
@@ -306,8 +309,9 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             field,
             query_entries,
             top_k,
+            filters,
             projection: _,
-        } => visitor.sparse_search(collection, field, query_entries, *top_k),
+        } => visitor.sparse_search(collection, field, query_entries, *top_k, filters),
         SqlPlan::TextSearch(TextSearchPlan {
             collection,
             shape,

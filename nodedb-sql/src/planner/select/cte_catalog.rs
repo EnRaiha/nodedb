@@ -65,6 +65,18 @@ impl SqlCatalog for CteCatalog<'_> {
         }
     }
 
+    /// A synthesized relation is never a timeseries collection.
+    fn timeseries_time_key(
+        &self,
+        database_id: DatabaseId,
+        name: &str,
+    ) -> std::result::Result<Option<String>, SqlCatalogError> {
+        match self.relation(name) {
+            Some(_) => Ok(None),
+            None => self.inner.timeseries_time_key(database_id, name),
+        }
+    }
+
     fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
         self.inner.lookup_array(name)
     }
