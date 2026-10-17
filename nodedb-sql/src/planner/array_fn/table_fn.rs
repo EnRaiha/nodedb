@@ -12,6 +12,7 @@ use super::helpers::{
 };
 use super::zone::parse_zone_args;
 use crate::error::{Result, SqlError};
+use crate::resolver::array_tvf::check_agg_reducer;
 use crate::temporal::TemporalScope;
 use crate::types::{SqlCatalog, SqlPlan};
 use crate::types_array::{ArrayBinaryOpAst, ArrayReducerAst, ArraySliceAst};
@@ -233,16 +234,20 @@ fn plan_agg(
         })?;
 
     let attr = expect_string_literal(&args[1], "ARRAY_AGG attr")?;
-    if !view.attrs.iter().any(|a| a.name == attr) {
-        return Err(SqlError::Unsupported {
+    let attr_type = view
+        .attrs
+        .iter()
+        .find(|a| a.name == attr)
+        .map(|a| a.dtype)
+        .ok_or_else(|| SqlError::Unsupported {
             detail: format!("ARRAY_AGG: array '{name}' has no attr '{attr}'"),
-        });
-    }
+        })?;
 
     let reducer_str = expect_string_literal(&args[2], "ARRAY_AGG reducer")?;
     let reducer = ArrayReducerAst::parse(&reducer_str).ok_or_else(|| SqlError::Unsupported {
         detail: format!("ARRAY_AGG: unknown reducer '{reducer_str}' (want sum/count/min/max/mean)"),
     })?;
+    check_agg_reducer(reducer, &attr, attr_type)?;
 
     let group_by_dim = match args.get(3) {
         Some(arg) if !is_null_literal(arg) => {
@@ -332,7 +337,7 @@ fn plan_elementwise(
 #[cfg(test)]
 mod tests {
     use crate::catalog::{ArrayCatalogView, SqlCatalogError};
-    use crate::error::Result;
+    use crate::error::{Result, SqlError};
     use crate::functions::registry::FunctionRegistry;
     use crate::parser::statement::parse_sql;
     use crate::types::{ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan};
@@ -604,6 +609,21 @@ mod tests {
 
     fn agg_error(sql: &str) -> String {
         format!("{}", plan_one(sql).expect_err("refused"))
+    }
+
+    #[test]
+    fn agg_numeric_reducer_over_string_attr_is_refused() {
+        for reducer in ["sum", "mean", "min", "max"] {
+            let sql = format!("SELECT * FROM ARRAY_AGG('g', 'variant', '{reducer}')");
+            match plan_one(&sql) {
+                Err(SqlError::TypeMismatch { detail }) => {
+                    assert!(detail.contains("STRING attr 'variant'"), "{detail}");
+                }
+                other => panic!("{sql} must be refused at plan time: {other:?}"),
+            }
+        }
+        plan_one("SELECT * FROM ARRAY_AGG('g', 'variant', 'count')")
+            .expect("COUNT over a STRING attr plans");
     }
 
     #[test]

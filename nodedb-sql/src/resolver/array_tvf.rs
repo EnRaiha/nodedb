@@ -135,16 +135,57 @@ pub fn array_slice_columns(view: &ArrayCatalogView, slice: &ArraySlicePlan) -> V
 
 /// The columns an aggregate's rows carry: `group`, typed as the group dim,
 /// when it groups, then `result`, typed by the reducer.
-pub fn array_agg_columns(view: &ArrayCatalogView, agg: &ArrayAggPlan) -> Vec<ColumnInfo> {
+///
+/// Refuses an attr the array does not hold, or a reducer the attr type cannot answer.
+pub fn array_agg_columns(view: &ArrayCatalogView, agg: &ArrayAggPlan) -> Result<Vec<ColumnInfo>> {
     let mut cols = Vec::with_capacity(2);
     if let Some(dim) = &agg.group_by_dim
         && let Some(d) = view.dims.iter().find(|d| &d.name == dim)
     {
         cols.push(column("group", dim_type_to_sql(d.dtype), false));
     }
-    let attr = view.attrs.iter().find(|a| a.name == agg.attr);
-    cols.push(agg_result_column(agg.reducer, attr.map(|a| a.dtype)));
-    cols
+    let attr = view
+        .attrs
+        .iter()
+        .find(|a| a.name == agg.attr)
+        .ok_or_else(|| SqlError::UnknownColumn {
+            table: view.name.clone(),
+            column: agg.attr.clone(),
+        })?;
+    cols.push(agg_result_column(agg.reducer, &attr.name, attr.dtype)?);
+    Ok(cols)
+}
+
+/// Refuse a reducer that an attr of type `attr` cannot answer.
+///
+/// The engine folds only numeric cells and skips every other cell.
+/// `SUM`, `MEAN`, `MIN`, and `MAX` over a `STRING` or `BYTES` attr see no cell.
+/// Their rows can only carry NULL, so the planner refuses them.
+/// `COUNT` counts the non-null cells of every attr type.
+pub fn check_agg_reducer(
+    reducer: ArrayReducerAst,
+    attr_name: &str,
+    attr: ArrayAttrType,
+) -> Result<()> {
+    let answers = match reducer {
+        ArrayReducerAst::Count => true,
+        ArrayReducerAst::Sum
+        | ArrayReducerAst::Min
+        | ArrayReducerAst::Max
+        | ArrayReducerAst::Mean => attr.is_integer() || attr.is_float(),
+    };
+    if answers {
+        Ok(())
+    } else {
+        Err(SqlError::TypeMismatch {
+            detail: format!(
+                "ARRAY_AGG: {} cannot reduce {} attr '{attr_name}'; \
+                 only COUNT accepts a non-numeric attr",
+                reducer.sql_name(),
+                attr.sql_name()
+            ),
+        })
+    }
 }
 
 /// The columns the rows of one array table-function call carry.
@@ -160,7 +201,7 @@ pub fn array_table_fn_columns(
         ArrayTableFn::Slice(slice) | ArrayTableFn::Project(slice) => {
             Ok(array_slice_columns(&view_of(catalog, &slice.name)?, slice))
         }
-        ArrayTableFn::Agg(agg) => Ok(array_agg_columns(&view_of(catalog, &agg.name)?, agg)),
+        ArrayTableFn::Agg(agg) => array_agg_columns(&view_of(catalog, &agg.name)?, agg),
         ArrayTableFn::Elementwise(_) => Ok(vec![
             column("coords", SqlDataType::Json, false),
             column("attrs", SqlDataType::Json, false),
@@ -231,21 +272,22 @@ fn attr_wire_type(t: ArrayAttrType) -> (SqlDataType, Option<IntWidth>, Option<Fl
 /// The `result` column of an aggregate. `COUNT` and the `SUM` of an integer
 /// attr are `int8`. `MIN` / `MAX` take the attr's own wire type. `MEAN`
 /// and the `SUM` of a float attr are `float8`.
-fn agg_result_column(reducer: ArrayReducerAst, attr: Option<ArrayAttrType>) -> ColumnInfo {
+/// A reducer the attr type cannot answer is refused, see [`check_agg_reducer`].
+fn agg_result_column(
+    reducer: ArrayReducerAst,
+    attr_name: &str,
+    attr: ArrayAttrType,
+) -> Result<ColumnInfo> {
+    check_agg_reducer(reducer, attr_name, attr)?;
     let float8 = || column("result", SqlDataType::Float64, true);
     let int8 = || column("result", SqlDataType::Int64, true);
-    match (reducer, attr) {
-        (ArrayReducerAst::Count, _) => int8(),
-        (ArrayReducerAst::Mean, _) => float8(),
-        (ArrayReducerAst::Sum, Some(t)) if t.is_integer() => int8(),
-        (ArrayReducerAst::Sum, _) => float8(),
-        (ArrayReducerAst::Min | ArrayReducerAst::Max, Some(t))
-            if t.is_integer() || t.is_float() =>
-        {
-            attr_column("result", t, true)
-        }
-        (ArrayReducerAst::Min | ArrayReducerAst::Max, _) => float8(),
-    }
+    Ok(match reducer {
+        ArrayReducerAst::Count => int8(),
+        ArrayReducerAst::Mean => float8(),
+        ArrayReducerAst::Sum if attr.is_integer() => int8(),
+        ArrayReducerAst::Sum => float8(),
+        ArrayReducerAst::Min | ArrayReducerAst::Max => attr_column("result", attr, true),
+    })
 }
 
 fn extract_string_literal_arg(arg: &sqlparser::ast::FunctionArg) -> Option<String> {
@@ -295,15 +337,39 @@ mod tests {
 
     #[test]
     fn aggregate_results_take_the_reducer_type() {
-        let sum = agg_result_column(ArrayReducerAst::Sum, Some(ArrayAttrType::UInt16));
+        let result = |reducer, attr| agg_result_column(reducer, "v", attr).expect("answerable");
+        let sum = result(ArrayReducerAst::Sum, ArrayAttrType::UInt16);
         assert_eq!(sum.data_type, SqlDataType::Int64);
-        let count = agg_result_column(ArrayReducerAst::Count, Some(ArrayAttrType::String));
+        let count = result(ArrayReducerAst::Count, ArrayAttrType::String);
         assert_eq!(count.data_type, SqlDataType::Int64);
-        let mean = agg_result_column(ArrayReducerAst::Mean, Some(ArrayAttrType::Int16));
+        let count_bytes = result(ArrayReducerAst::Count, ArrayAttrType::Bytes);
+        assert_eq!(count_bytes.data_type, SqlDataType::Int64);
+        let mean = result(ArrayReducerAst::Mean, ArrayAttrType::Int16);
         assert_eq!(mean.data_type, SqlDataType::Float64);
-        let max = agg_result_column(ArrayReducerAst::Max, Some(ArrayAttrType::Float32));
+        let max = result(ArrayReducerAst::Max, ArrayAttrType::Float32);
         assert_eq!(max.float_width, Some(FloatWidth::F32));
-        let min = agg_result_column(ArrayReducerAst::Min, Some(ArrayAttrType::Int16));
+        let min = result(ArrayReducerAst::Min, ArrayAttrType::Int16);
         assert_eq!(min.int_width, Some(IntWidth::I16));
+    }
+
+    #[test]
+    fn non_numeric_attrs_refuse_numeric_reducers() {
+        for attr in [ArrayAttrType::String, ArrayAttrType::Bytes] {
+            for reducer in [
+                ArrayReducerAst::Sum,
+                ArrayReducerAst::Mean,
+                ArrayReducerAst::Min,
+                ArrayReducerAst::Max,
+            ] {
+                match agg_result_column(reducer, "label", attr) {
+                    Err(SqlError::TypeMismatch { detail }) => {
+                        assert!(detail.contains(reducer.sql_name()), "{detail}");
+                        assert!(detail.contains(attr.sql_name()), "{detail}");
+                        assert!(detail.contains("'label'"), "{detail}");
+                    }
+                    other => panic!("{reducer:?} over {attr:?} must be refused: {other:?}"),
+                }
+            }
+        }
     }
 }

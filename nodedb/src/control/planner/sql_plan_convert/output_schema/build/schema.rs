@@ -309,7 +309,7 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         SqlPlan::ArrayAgg(agg) => {
             let view = array_view(catalog, &agg.name)?;
             let mut schema = array_columns_schema(
-                &nodedb_sql::resolver::array_tvf::array_agg_columns(&view, agg),
+                &nodedb_sql::resolver::array_tvf::array_agg_columns(&view, agg)?,
             );
             if agg.temporal.is_temporal() {
                 schema.columns.push(OutputColumn {

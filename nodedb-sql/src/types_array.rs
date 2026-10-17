@@ -211,6 +211,17 @@ impl ArrayReducerAst {
             _ => None,
         }
     }
+
+    /// The uppercase SQL name of the reducer.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ArrayReducerAst::Sum => "SUM",
+            ArrayReducerAst::Count => "COUNT",
+            ArrayReducerAst::Min => "MIN",
+            ArrayReducerAst::Max => "MAX",
+            ArrayReducerAst::Mean => "MEAN",
+        }
+    }
 }
 
 /// Pairwise op carried on `SqlPlan::ArrayElementwise`. Mirrors
