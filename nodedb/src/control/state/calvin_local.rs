@@ -12,7 +12,7 @@ use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnI
 use crate::control::cluster::calvin::scheduler::{
     CalvinAppliedLedgers, CalvinInboxes, CalvinReadResults, CaughtUpRegistry, SequencerProposer,
 };
-use crate::control::server::shared::write_admission::AdmissionHolds;
+use crate::control::server::shared::write_admission::{AdmissionHolds, AdmissionTickets};
 
 use super::calvin_apply_sidecar::CalvinApplySidecar;
 use super::calvin_bases::CalvinBases;
@@ -77,8 +77,13 @@ pub struct CalvinLocalState {
     /// collide with a real Calvin `(epoch, position)` schedule position.
     pub autocommit_lock_seq: AtomicU32,
     /// The lock keys replicated writes hold on this data-group leader, from
-    /// their propose until the apply loop starts their entries.
-    pub admission_holds: AdmissionHolds,
+    /// their propose until the apply loop starts their entries. The propose
+    /// tracker shares it: no proposer learns its entry's result while the
+    /// entry's keys are held.
+    pub admission_holds: Arc<AdmissionHolds>,
+    /// The tickets of the writes the gate admitted. A starting scheduler
+    /// stages nothing before every earlier one reached its core.
+    pub admission_tickets: Arc<AdmissionTickets>,
     /// The backup cut markers each local scheduler passed.
     pub cuts: CalvinCuts,
     /// Each ordered cut's barrier per data group: where this node proposed
@@ -125,7 +130,8 @@ impl CalvinLocalState {
             hot_key_table: Arc::new(Mutex::new(HotKeyTable::new())),
             promotion_senders: Arc::new(Mutex::new(BTreeMap::new())),
             autocommit_lock_seq: AtomicU32::new(0),
-            admission_holds: AdmissionHolds::new(),
+            admission_holds: Arc::new(AdmissionHolds::new()),
+            admission_tickets: Arc::new(AdmissionTickets::new()),
             cuts: CalvinCuts::default(),
             cut_barriers: crate::control::backup::cut_order::CutBarriers::new(),
             bases: CalvinBases::default(),

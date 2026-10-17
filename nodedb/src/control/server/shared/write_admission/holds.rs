@@ -9,6 +9,11 @@
 //! Calvin transaction granted a key after the release therefore stages on
 //! the core after the write, and reads the write's effects.
 //!
+//! The keys also release before the propose tracker answers the entry's
+//! proposer. An entry that concludes inside its own apply answers there, before
+//! the apply loop sees it start. Its proposer's next write must not find its
+//! keys held.
+//!
 //! The keys are never held across a Data-Plane apply. A write that holds keys
 //! waits only for the apply loop to start its entry, which never waits for a
 //! lock. So no held key waits for a Calvin transaction to finish.
@@ -102,6 +107,10 @@ impl AdmissionHolds {
 
     /// The scheduler of `vshard` stopped on this node, and its lock table
     /// with it. Drop every hold on that table.
+    ///
+    /// The entries of the dropped holds can still be unstarted. Each one's
+    /// admission ticket recorded its landing index, so the vShard's next
+    /// scheduler stages nothing before it applied.
     pub fn release_vshard(&self, vshard: VShardId) {
         let _released: Vec<Held> = {
             let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());

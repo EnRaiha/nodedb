@@ -8,7 +8,9 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::bridge::dispatch::JournalGroup;
 use crate::bridge::envelope::{Admission, PhysicalPlan, Priority, Request};
-use crate::control::server::shared::write_admission::{WriteAdmissionGuard, WriteOrder};
+use crate::control::server::shared::write_admission::{
+    AdmissionTicket, WriteAdmissionGuard, WriteOrder,
+};
 use crate::control::state::SharedState;
 use crate::types::{
     DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, TxnId, VShardId,
@@ -19,6 +21,8 @@ use crate::types::{
 pub(super) struct HeldGuards {
     pub _admission: Option<WriteAdmissionGuard>,
     pub _order: Option<OwnedMutexGuard<()>>,
+    /// The ticket of a write to a vShard with no scheduler.
+    pub _unscheduled: Option<AdmissionTicket>,
     /// The document write order (see `write_order_fence`).
     pub _write_order: WriteOrder,
 }

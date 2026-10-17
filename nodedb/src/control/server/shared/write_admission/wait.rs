@@ -19,6 +19,7 @@ use crate::control::cluster::calvin::scheduler::lock_manager::{
 use crate::types::RequestId;
 
 use super::gate::WriteAdmissionGuard;
+use super::tickets::AdmissionTicket;
 
 /// The keys of a contended write, and the lock table it waits on.
 pub struct AdmissionWait {
@@ -26,6 +27,8 @@ pub struct AdmissionWait {
     txn: TxnId,
     keys: BTreeMap<LockKey, LockMode>,
     promotion_sender: Option<UnboundedSender<Vec<TxnId>>>,
+    /// The waiting write's admission ticket. The guard carries it on.
+    ticket: Option<AdmissionTicket>,
 }
 
 impl AdmissionWait {
@@ -40,7 +43,13 @@ impl AdmissionWait {
             txn,
             keys,
             promotion_sender,
+            ticket: None,
         }
+    }
+
+    /// Carry `ticket` until the wait ends, then on in its guard.
+    pub(super) fn carry_ticket(&mut self, ticket: AdmissionTicket) {
+        self.ticket = Some(ticket);
     }
 
     /// Wait until every key is free, take them all, and return the guard
@@ -68,11 +77,12 @@ impl AdmissionWait {
                 lock_manager.try_acquire(self.txn, self.keys.clone())
             };
             if acquired {
-                return Ok(WriteAdmissionGuard::new(
-                    self.lock_manager,
-                    self.txn,
-                    self.promotion_sender,
-                ));
+                let mut guard =
+                    WriteAdmissionGuard::new(self.lock_manager, self.txn, self.promotion_sender);
+                if let Some(ticket) = self.ticket {
+                    guard.carry_ticket(ticket);
+                }
+                return Ok(guard);
             }
             if tokio::time::timeout_at(deadline, released).await.is_err() {
                 let contention = self

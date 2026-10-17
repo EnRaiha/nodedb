@@ -196,7 +196,9 @@ async fn single_node_point_write_uses_global_keyed_order_lock() {
     let plan = kv_put(coll, b"K");
 
     let lock = match admit(&shared, &target(vshard, &plan)).expect("admit") {
-        WriteAdmission::FastPathBlocking { key, keyed_lock } => {
+        WriteAdmission::FastPathBlocking {
+            key, keyed_lock, ..
+        } => {
             assert_eq!(
                 key,
                 kv_lock_key(coll, b"K"),
@@ -223,7 +225,9 @@ async fn single_node_same_key_serializes_fifo() {
     let plan = kv_put(coll, b"K");
 
     let (key, lock) = match admit(&shared, &target(vshard, &plan)).expect("admit") {
-        WriteAdmission::FastPathBlocking { key, keyed_lock } => (key, keyed_lock),
+        WriteAdmission::FastPathBlocking {
+            key, keyed_lock, ..
+        } => (key, keyed_lock),
         _ => panic!("single-node point write must return FastPathBlocking"),
     };
 

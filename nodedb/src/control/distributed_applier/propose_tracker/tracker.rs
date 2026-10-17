@@ -18,6 +18,7 @@ use super::committed_keys::{CarriedKeys, CommittedKeys};
 use super::cut::GroupCuts;
 use super::slots::WaiterSlots;
 use crate::control::distributed_applier::apply_window::ApplyWindow;
+use crate::control::server::shared::write_admission::AdmissionHolds;
 
 /// How long a propose waiter can exist: the default statement deadline.
 /// `start_raft` sets the configured deadline through
@@ -57,6 +58,10 @@ pub struct ProposeTracker {
     window: Arc<ApplyWindow>,
     /// Per group, the indexes a data-group snapshot is cut at.
     cuts: Mutex<GroupCuts>,
+    /// The lock keys this node's write gate holds for proposed entries.
+    /// [`Self::complete`] releases an entry's keys before it answers the
+    /// proposer. `None` only in tests that run no write gate.
+    admission_holds: Option<Arc<AdmissionHolds>>,
 }
 
 /// The keys one install carried, and the lowest index they are complete from.
@@ -83,7 +88,15 @@ impl ProposeTracker {
             applying: Mutex::new(HashMap::new()),
             window: Arc::new(ApplyWindow::default()),
             cuts: Mutex::new(GroupCuts::default()),
+            admission_holds: None,
         }
+    }
+
+    /// Wire the write gate's held keys. Called by `start_raft` with the
+    /// holds of `SharedState`.
+    pub fn with_admission_holds(mut self, holds: Arc<AdmissionHolds>) -> Self {
+        self.admission_holds = Some(holds);
+        self
     }
 
     /// Wire the per-group apply watermark registry. Called by
@@ -182,6 +195,11 @@ impl ProposeTracker {
     /// change overwrote the proposal, and the waiter gets
     /// `RetryableLeaderChange` instead of another proposal's result.
     ///
+    /// The write gate's keys for every entry of the group through
+    /// `log_index` release first. An entry completes only after it and every
+    /// entry below it started. A proposer that writes again after this answer
+    /// never finds its own entry's keys held.
+    ///
     /// Returns true if a live waiter was found and notified, false otherwise.
     pub fn complete(
         &self,
@@ -190,6 +208,9 @@ impl ProposeTracker {
         applied_key: u64,
         result: ProposeResult,
     ) -> bool {
+        if let Some(holds) = &self.admission_holds {
+            holds.release_through(group_id, log_index);
+        }
         self.slots()
             .complete(group_id, log_index, applied_key, result, Instant::now())
     }
