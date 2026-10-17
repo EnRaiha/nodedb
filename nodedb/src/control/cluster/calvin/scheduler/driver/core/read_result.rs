@@ -585,7 +585,7 @@ mod tests {
         let txn_id = TxnId::new(57, 0);
         registry.note_verdict(
             nodedb_cluster::calvin::TxnId::new(57, 0),
-            VerdictOutcome::Abort(AbortReason::ParticipantError),
+            VerdictOutcome::Abort(AbortReason::ParticipantError.into()),
         );
 
         scheduler.resume_on_verdict(txn_id, false);

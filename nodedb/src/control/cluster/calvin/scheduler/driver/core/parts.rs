@@ -593,6 +593,7 @@ mod tests {
             position: txn_id.position,
             vshard: test_coll_vshard(),
             reason: AbortReason::PlanRejected,
+            refusal: None,
         }));
         assert!(!scheduler.applied.is_applied(txn_id.epoch, txn_id.position));
 
@@ -605,7 +606,7 @@ mod tests {
 
         scheduler.registry.note_verdict(
             nodedb_cluster::calvin::TxnId::new(txn_id.epoch, txn_id.position),
-            nodedb_cluster::calvin::VerdictOutcome::Abort(AbortReason::PlanRejected),
+            nodedb_cluster::calvin::VerdictOutcome::Abort(AbortReason::PlanRejected.into()),
         );
         scheduler.resume_on_verdict(txn_id, false);
         assert_eq!(

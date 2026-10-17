@@ -160,12 +160,14 @@ impl Scheduler {
         &mut self,
         txn_id: TxnId,
     ) {
+        // The locks free before the ack: the ack answers the coordinator, and
+        // its client's next write must not find this txn's keys held.
+        self.metrics.record_completed();
+        self.on_txn_complete(txn_id, LedgerMark::Terminal);
         self.propose_sequencer_entry(
             txn_id,
             SchedulerProposal::CompletionAck { result: Vec::new() },
         );
-        self.metrics.record_completed();
-        self.on_txn_complete(txn_id, LedgerMark::Terminal);
     }
 
     /// Handle a pushed [`VerdictSignal`] from this node's completion registry.
@@ -178,7 +180,7 @@ impl Scheduler {
         signal: VerdictSignal,
     ) {
         let txn_id = TxnId::new(signal.epoch, signal.position);
-        self.resume_on_verdict(txn_id, signal.verdict.is_commit());
+        self.resume_on_verdict(txn_id, signal.commit);
     }
 
     /// Sweep parked `AwaitingVerdict` txns whose stall deadline has passed.
@@ -499,18 +501,18 @@ mod tests {
         registry.note_vote(
             txn,
             9,
-            ParticipantVote::Abort(AbortReason::SerializationConflict),
+            ParticipantVote::Abort(AbortReason::SerializationConflict.into()),
         );
         assert_eq!(
             registry.drain_unproposed_verdicts(),
             vec![(
                 txn,
-                VerdictOutcome::Abort(AbortReason::SerializationConflict)
+                VerdictOutcome::Abort(AbortReason::SerializationConflict.into())
             )]
         );
         registry.note_verdict(
             txn,
-            VerdictOutcome::Abort(AbortReason::SerializationConflict),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict.into()),
         );
         assert_eq!(registry.verdict(txn), Some(false));
 

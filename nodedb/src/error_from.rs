@@ -256,7 +256,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
             // A routed Calvin abort, rebuilt as the error a local submit
             // returns for the same verdict.
             TypedClusterError::CalvinAborted { reason } => {
-                crate::control::planner::calvin::calvin_abort_error(reason)
+                crate::control::planner::calvin::calvin_abort_error(reason.into())
             }
             TypedClusterError::Internal { code, message } => {
                 // Legacy or unknown codes retain their message without panicking.

@@ -56,6 +56,7 @@ mod calvin_executor_ollp;
 mod calvin_executor_ollp_property;
 mod calvin_executor_panic_recovery;
 mod calvin_executor_static_multishard;
+mod calvin_routed_refusal;
 mod calvin_scheduler_restart;
 mod calvin_two_phase_apply;
 mod catalog_integrity_apply;

@@ -58,9 +58,8 @@ impl Scheduler {
                     let reason = match error {
                         StageVoteError::CoreFailStopped { .. } => HaltReason::CoreFailStopped,
                         StageVoteError::Missing { .. }
-                        | StageVoteError::CommitWithoutSuccess { .. } => {
-                            HaltReason::StageVoteInvalid
-                        }
+                        | StageVoteError::CommitWithoutSuccess { .. }
+                        | StageVoteError::RefusalUnencodable { .. } => HaltReason::StageVoteInvalid,
                     };
                     self.halt_apply(
                         txn_id,
@@ -77,14 +76,14 @@ impl Scheduler {
         // group. Only the leader stages, so its vote is the vShard's. The
         // sequencer aggregates every participant's vote into the single
         // global verdict this txn parks on below. An abort travels as
-        // `AbortVote` so its cause survives to the coordinator. The vote stays
-        // owed until the tally holds it, so a refused or dropped proposal is
+        // `AbortVote` so its cause and refusal survive to the coordinator.
+        // The vote stays owed until the tally holds it, so a refused or dropped proposal is
         // proposed again rather than lost. A promoted leader's vote for a
         // txn whose vote applied already changes nothing: the first counts.
         self.propose_sequencer_entry(
             txn_id,
             SchedulerProposal::Vote {
-                abort: vote.abort_reason(),
+                abort: vote.abort_cause(),
             },
         );
 
@@ -113,7 +112,7 @@ impl Scheduler {
                 pending.commit_state = CommitState::AwaitingVerdict;
                 // A superseded slice cannot commit here: its collection is gone.
                 pending.stage_error = match vote {
-                    StagedVote::ParticipantError | StagedVote::PredictionDrift => {
+                    StagedVote::ParticipantError { .. } | StagedVote::PredictionDrift => {
                         Some(error_response_text("stage", staged_response))
                     }
                     StagedVote::CollectionSuperseded => Some(
@@ -216,6 +215,7 @@ mod tests {
                     position: 1,
                     vshard: VSHARD,
                     reason,
+                    refusal: None,
                 },
             };
             assert_eq!(proposer.accepted(), vec![expected], "{vote:?}");
@@ -226,6 +226,35 @@ mod tests {
             );
             assert!(scheduler.apply_halt().is_none(), "{vote:?}");
         }
+    }
+
+    /// A stage refused with a typed code: the abort vote carries the code.
+    #[tokio::test]
+    async fn a_refused_stage_proposes_its_refusal_with_the_vote() {
+        let txn_id = TxnId::new(30, 2);
+        let (mut scheduler, _dir, proposer) = staged_leader(txn_id);
+        let code = ErrorCode::RejectedConstraint {
+            constraint: "not_null".into(),
+            detail: "column 'v' is NOT NULL".into(),
+        };
+        let mut response = staged_response(Status::Error, Some(StageVote::ParticipantError));
+        response.error_code = Some(Box::new(code.clone()));
+
+        scheduler.resolve_staged_commit(txn_id, &response);
+
+        let refusal = crate::control::cluster::calvin::refusal::encode_refusal(&code)
+            .expect("the refusal encodes");
+        assert_eq!(
+            proposer.accepted(),
+            vec![SequencerEntry::AbortVote {
+                epoch: 30,
+                position: 2,
+                vshard: VSHARD,
+                reason: AbortReason::ParticipantError,
+                refusal: Some(refusal),
+            }]
+        );
+        assert!(scheduler.apply_halt().is_none());
     }
 
     #[tokio::test]

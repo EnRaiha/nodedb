@@ -21,17 +21,16 @@ impl CalvinCompletionRegistry {
     /// Idempotent. A later ack of `txn` lands on the terminal entry, which
     /// the waiterless sweep removes.
     pub fn note_parts_abandoned(&self, txn: TxnId) {
-        let verdict = VerdictOutcome::Abort(AbortReason::PartsLost);
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         {
             let entry = inner.entry_mut(txn);
             entry.abandoned = true;
-            entry.verdict = Some(verdict);
+            entry.verdict = Some(VerdictOutcome::Abort(AbortReason::PartsLost.into()));
         }
         let signal = VerdictSignal {
             epoch: txn.epoch,
             position: txn.position,
-            verdict,
+            commit: false,
         };
         for tx in inner.verdict_signal_senders.values() {
             let _ = tx.try_send(signal);
@@ -55,9 +54,7 @@ mod tests {
         reg.note_parts_abandoned(txn);
         assert_eq!(
             rx.await.expect("outcome"),
-            AttemptOutcome::Aborted {
-                reason: AbortReason::PartsLost
-            }
+            AttemptOutcome::Aborted(AbortReason::PartsLost.into())
         );
         assert_eq!(reg.verdict(txn), Some(false));
     }
@@ -70,9 +67,7 @@ mod tests {
         let rx = reg.register_completion(txn, 3);
         assert_eq!(
             rx.await.expect("outcome"),
-            AttemptOutcome::Aborted {
-                reason: AbortReason::PartsLost
-            }
+            AttemptOutcome::Aborted(AbortReason::PartsLost.into())
         );
     }
 }

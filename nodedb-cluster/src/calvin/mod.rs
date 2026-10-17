@@ -12,8 +12,8 @@ pub mod types;
 
 pub use applied_acks::{AppliedAckLog, AppliedCompletionAck};
 pub use completion::{
-    Assignment, AssignmentReceiver, AttemptOutcome, CalvinCompletionRegistry, ParticipantProgress,
-    ParticipantVote, TxnId, VerdictOutcome,
+    AbortCause, Assignment, AssignmentReceiver, AttemptOutcome, CalvinCompletionRegistry,
+    ParticipantProgress, ParticipantVote, TxnId, VerdictOutcome,
 };
 pub use completion_verdict::VerdictSignal;
 pub use completion_waiter::CompletionReport;

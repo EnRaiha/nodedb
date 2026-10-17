@@ -161,17 +161,19 @@ where
             // Terminal, NON-retryable: the global cross-shard verdict was ABORT
             // for a reason a fresh reconnaissance cannot change, so surface it
             // to the client immediately instead of burning retries. The
-            // verdict's reason picks the error: a stale read-set is SQLSTATE
-            // 40001, a participant error is not, and rejected plans are an
-            // internal error. `PredictionDrift` and `PartsLost` retry, in the
+            // verdict's cause picks the error: a stale read-set is SQLSTATE
+            // 40001, a refused stage is its own refusal, a participant error
+            // is not a conflict, and rejected plans are an internal error.
+            // `PredictionDrift` and `PartsLost` retry, in the
             // arm below: a multi-part transaction whose parts a leader change
             // lost staged nothing anywhere.
-            AttemptOutcome::Aborted { reason }
-                if reason != AbortReason::PredictionDrift && reason != AbortReason::PartsLost =>
+            AttemptOutcome::Aborted(cause)
+                if cause.reason != AbortReason::PredictionDrift
+                    && cause.reason != AbortReason::PartsLost =>
             {
-                return Err(calvin_abort_error(reason));
+                return Err(calvin_abort_error(cause));
             }
-            AttemptOutcome::Aborted { .. } => {
+            AttemptOutcome::Aborted(_) => {
                 // A participant found state other than the reconnaissance
                 // predicted and wrote nothing, or the parts were lost. Every
                 // participant released the attempt's locks before it acked,
@@ -257,7 +259,7 @@ mod tests {
             let mut seen: u32 = 0;
             while let Some(txn) = rx.recv().await {
                 let verdict = if seen < drift_count {
-                    VerdictOutcome::Abort(AbortReason::PredictionDrift)
+                    VerdictOutcome::Abort(AbortReason::PredictionDrift.into())
                 } else {
                     VerdictOutcome::Commit
                 };
@@ -657,7 +659,7 @@ mod tests {
                     let mut first = true;
                     while let Some(txn) = rx.recv().await {
                         let verdict = if first {
-                            VerdictOutcome::Abort(reason)
+                            VerdictOutcome::Abort(reason.into())
                         } else {
                             VerdictOutcome::Commit
                         };

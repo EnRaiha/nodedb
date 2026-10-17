@@ -126,9 +126,11 @@ impl Scheduler {
         lock_owner: TxnId,
         applied: AppliedRedo,
     ) {
-        self.owe_applied_ack(txn_id, &applied);
+        // The locks free before the ack: the ack answers the coordinator, and
+        // its client's next write must not find this txn's keys held.
         self.metrics.record_completed();
         self.release_and_mark_applied(txn_id, lock_owner, LedgerMark::ByApply);
+        self.owe_applied_ack(txn_id, &applied);
     }
 
     /// Deposit a primary slice's reply, then owe the ack that carries it.

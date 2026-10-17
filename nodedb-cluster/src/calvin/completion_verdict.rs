@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 use super::TxnId;
-use super::completion::{CalvinCompletionRegistry, ParticipantVote, VerdictOutcome};
+use super::completion::{AbortCause, CalvinCompletionRegistry, ParticipantVote, VerdictOutcome};
 use super::sequencer::AbortReason;
 
 /// Push notification that a staged cross-shard txn's authoritative global
@@ -28,8 +28,10 @@ use super::sequencer::AbortReason;
 pub struct VerdictSignal {
     pub epoch: u64,
     pub position: u32,
-    /// The decision, carrying the abort reason when it aborts.
-    pub verdict: VerdictOutcome,
+    /// `true` for a commit decision. A participant needs only this bit to
+    /// flush or drop. The abort cause reaches the coordinator through
+    /// `AttemptOutcome`.
+    pub commit: bool,
 }
 
 impl CalvinCompletionRegistry {
@@ -155,22 +157,27 @@ impl CalvinCompletionRegistry {
     /// channel) is a non-fatal drop — the scheduler's stall re-probe backstops
     /// it — never a block or panic, mirroring the apply fan-out drop discipline.
     pub fn note_verdict(&self, txn: TxnId, verdict: VerdictOutcome) {
+        let commit = verdict.is_commit();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         {
             let entry = inner.entry_mut(txn);
-            match entry.verdict {
-                Some(existing) if existing.is_commit() != verdict.is_commit() => {
+            let differs = entry
+                .verdict
+                .as_ref()
+                .map(|existing| existing.is_commit() != commit);
+            match differs {
+                Some(true) => {
                     tracing::warn!(
                         epoch = txn.epoch,
                         position = txn.position,
-                        existing = ?existing,
+                        existing = ?entry.verdict,
                         proposed = ?verdict,
                         "calvin verdict differs from a previously applied one; \
                          determinism bug — overwriting with the latest"
                     );
                     entry.verdict = Some(verdict);
                 }
-                Some(_) => {}
+                Some(false) => {}
                 None => entry.verdict = Some(verdict),
             }
         }
@@ -181,7 +188,7 @@ impl CalvinCompletionRegistry {
         let signal = VerdictSignal {
             epoch: txn.epoch,
             position: txn.position,
-            verdict,
+            commit,
         };
         for tx in inner.verdict_signal_senders.values() {
             let _ = tx.try_send(signal);
@@ -192,7 +199,7 @@ impl CalvinCompletionRegistry {
 
     /// The parked scheduler's flush/drop gate: `Some(true)` commit, `Some(false)`
     /// abort, `None` if no verdict has been applied yet. Deliberately drops the
-    /// abort reason — the reason reaches the coordinator via `AttemptOutcome`,
+    /// abort cause — the cause reaches the coordinator via `AttemptOutcome`,
     /// and a participant only needs to know whether to flush.
     pub fn verdict(&self, txn_id: TxnId) -> Option<bool> {
         self.inner
@@ -200,7 +207,7 @@ impl CalvinCompletionRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .completions
             .get(&txn_id)
-            .and_then(|entry| entry.verdict)
+            .and_then(|entry| entry.verdict.as_ref())
             .map(VerdictOutcome::is_commit)
     }
 
@@ -217,37 +224,45 @@ impl CalvinCompletionRegistry {
 }
 
 /// Aggregate a complete vote tally: commit only when every participant voted
-/// commit, otherwise abort with the highest-precedence reason.
+/// commit, otherwise abort with the highest-precedence cause.
 ///
-/// Precedence: `PartsLost` outranks everything, since no participant holds
-/// the whole transaction. `PlanRejected` outranks `ParticipantError`, which
-/// outranks `CollectionSuperseded`, which outranks `PredictionDrift`, which
-/// outranks `SerializationConflict`. Rejected plans fail the same way on every
-/// resubmit, a peer that never staged makes every other verdict unverifiable,
-/// a superseded collection makes a retry against the same read-set pointless,
-/// and a drifted prediction retries with a fresh reconnaissance. The tally is
-/// order-independent.
+/// Precedence, highest first:
+///
+/// - `PartsLost`: no participant holds the whole transaction.
+/// - `PlanRejected`: the plans fail the same way on every resubmit.
+/// - `ParticipantError` with a refusal: the stage refused the slice, and a
+///   resubmit refuses it the same way. The client sees that refusal.
+/// - `ParticipantError` without a refusal: a peer that never staged makes
+///   every other verdict unverifiable.
+/// - `CollectionSuperseded`: a retry against the same read-set is pointless.
+/// - `PredictionDrift`: the coordinator retries with a fresh reconnaissance.
+/// - `SerializationConflict`.
+///
+/// Among causes of equal rank the lowest vShard wins. The votes iterate in
+/// vShard order, so every replica picks the same cause, whatever the order
+/// the votes applied in.
 fn tally_verdict(votes: &BTreeMap<u32, ParticipantVote>) -> VerdictOutcome {
-    fn rank(reason: AbortReason) -> u8 {
-        match reason {
-            AbortReason::PartsLost => 5,
-            AbortReason::PlanRejected => 4,
+    fn rank(cause: &AbortCause) -> u8 {
+        match cause.reason {
+            AbortReason::PartsLost => 6,
+            AbortReason::PlanRejected => 5,
+            AbortReason::ParticipantError if cause.refusal.is_some() => 4,
             AbortReason::ParticipantError => 3,
             AbortReason::CollectionSuperseded => 2,
             AbortReason::PredictionDrift => 1,
             AbortReason::SerializationConflict => 0,
         }
     }
-    let mut reason: Option<AbortReason> = None;
+    let mut held: Option<&AbortCause> = None;
     for vote in votes.values() {
-        if let ParticipantVote::Abort(vote_reason) = *vote
-            && reason.is_none_or(|held| rank(vote_reason) > rank(held))
+        if let ParticipantVote::Abort(cause) = vote
+            && held.is_none_or(|held| rank(cause) > rank(held))
         {
-            reason = Some(vote_reason);
+            held = Some(cause);
         }
     }
-    match reason {
-        Some(reason) => VerdictOutcome::Abort(reason),
+    match held {
+        Some(cause) => VerdictOutcome::Abort(cause.clone()),
         None => VerdictOutcome::Commit,
     }
 }
@@ -264,14 +279,16 @@ mod tests {
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(AbortReason::SerializationConflict),
+            ParticipantVote::Abort(AbortReason::SerializationConflict.into()),
         );
         let tally = reg.vote_tally(txn).expect("entry created by note_vote");
         assert_eq!(tally.len(), 2);
         assert_eq!(tally.get(&1), Some(&ParticipantVote::Commit));
         assert_eq!(
             tally.get(&2),
-            Some(&ParticipantVote::Abort(AbortReason::SerializationConflict))
+            Some(&ParticipantVote::Abort(
+                AbortReason::SerializationConflict.into()
+            ))
         );
     }
 
@@ -313,14 +330,14 @@ mod tests {
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(AbortReason::SerializationConflict),
+            ParticipantVote::Abort(AbortReason::SerializationConflict.into()),
         );
         // Any abort vote makes the aggregated verdict an abort.
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
             (
                 txn,
-                VerdictOutcome::Abort(AbortReason::SerializationConflict)
+                VerdictOutcome::Abort(AbortReason::SerializationConflict.into())
             )
         );
         assert!(rx.try_recv().is_err());
@@ -337,16 +354,19 @@ mod tests {
         reg.note_vote(
             txn,
             1,
-            ParticipantVote::Abort(AbortReason::SerializationConflict),
+            ParticipantVote::Abort(AbortReason::SerializationConflict.into()),
         );
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(AbortReason::ParticipantError),
+            ParticipantVote::Abort(AbortReason::ParticipantError.into()),
         );
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
-            (txn, VerdictOutcome::Abort(AbortReason::ParticipantError)),
+            (
+                txn,
+                VerdictOutcome::Abort(AbortReason::ParticipantError.into())
+            ),
             "a peer that never staged makes the stale read-set unverifiable"
         );
     }
@@ -362,17 +382,30 @@ mod tests {
         reg.note_vote(
             txn,
             1,
-            ParticipantVote::Abort(AbortReason::ParticipantError),
+            ParticipantVote::Abort(AbortReason::ParticipantError.into()),
         );
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(AbortReason::SerializationConflict),
+            ParticipantVote::Abort(AbortReason::SerializationConflict.into()),
         );
         assert_eq!(
             rx.try_recv().expect("verdict emitted"),
-            (txn, VerdictOutcome::Abort(AbortReason::ParticipantError))
+            (
+                txn,
+                VerdictOutcome::Abort(AbortReason::ParticipantError.into())
+            )
         );
+    }
+
+    /// Tally `votes`, the vote of vShard `1`, `2`, ... in turn.
+    fn tally<const N: usize>(votes: [&ParticipantVote; N]) -> VerdictOutcome {
+        let votes: BTreeMap<u32, ParticipantVote> = (1..).zip(votes.into_iter().cloned()).collect();
+        tally_verdict(&votes)
+    }
+
+    fn aborted(reason: AbortReason) -> VerdictOutcome {
+        VerdictOutcome::Abort(reason.into())
     }
 
     /// A superseded collection aborts a transaction other slices voted to
@@ -380,15 +413,9 @@ mod tests {
     /// vote order.
     #[test]
     fn a_superseded_collection_aborts_the_whole_transaction() {
-        let superseded = ParticipantVote::Abort(AbortReason::CollectionSuperseded);
-        let conflict = ParticipantVote::Abort(AbortReason::SerializationConflict);
-        let errored = ParticipantVote::Abort(AbortReason::ParticipantError);
-        let tally = |votes: [&ParticipantVote; 2]| {
-            let votes: BTreeMap<u32, ParticipantVote> =
-                (1..).zip(votes.into_iter().copied()).collect();
-            tally_verdict(&votes)
-        };
-        let aborted = VerdictOutcome::Abort;
+        let superseded = ParticipantVote::Abort(AbortReason::CollectionSuperseded.into());
+        let conflict = ParticipantVote::Abort(AbortReason::SerializationConflict.into());
+        let errored = ParticipantVote::Abort(AbortReason::ParticipantError.into());
 
         assert_eq!(
             tally([&ParticipantVote::Commit, &superseded]),
@@ -405,30 +432,80 @@ mod tests {
     /// A rejected plan outranks every staged abort cause, in any vote order.
     #[test]
     fn plan_rejected_outranks_staged_abort_causes() {
-        let rejected = ParticipantVote::Abort(AbortReason::PlanRejected);
-        let tally = |votes: [&ParticipantVote; 2]| {
-            let votes: BTreeMap<u32, ParticipantVote> =
-                (1..).zip(votes.into_iter().copied()).collect();
-            tally_verdict(&votes)
-        };
+        let rejected = ParticipantVote::Abort(AbortReason::PlanRejected.into());
         for other in [
-            AbortReason::SerializationConflict,
-            AbortReason::PredictionDrift,
-            AbortReason::CollectionSuperseded,
-            AbortReason::ParticipantError,
+            AbortCause::from(AbortReason::SerializationConflict),
+            AbortCause::from(AbortReason::PredictionDrift),
+            AbortCause::from(AbortReason::CollectionSuperseded),
+            AbortCause::from(AbortReason::ParticipantError),
+            AbortCause::refused(vec![1, 2, 3]),
         ] {
             let other = ParticipantVote::Abort(other);
             for votes in [[&rejected, &other], [&other, &rejected]] {
                 assert_eq!(
                     tally(votes),
-                    VerdictOutcome::Abort(AbortReason::PlanRejected),
+                    aborted(AbortReason::PlanRejected),
                     "{other:?}"
                 );
             }
         }
-        let lost = ParticipantVote::Abort(AbortReason::PartsLost);
+        let lost = ParticipantVote::Abort(AbortReason::PartsLost.into());
         for votes in [[&rejected, &lost], [&lost, &rejected]] {
-            assert_eq!(tally(votes), VerdictOutcome::Abort(AbortReason::PartsLost));
+            assert_eq!(tally(votes), aborted(AbortReason::PartsLost));
+        }
+    }
+
+    /// A refusal outranks a participant that never staged, a superseded
+    /// collection, a drifted prediction and a conflict, in any vote order.
+    #[test]
+    fn a_refusal_outranks_every_unrefused_participant_cause() {
+        let refused = ParticipantVote::Abort(AbortCause::refused(vec![7]));
+        for other in [
+            AbortReason::ParticipantError,
+            AbortReason::CollectionSuperseded,
+            AbortReason::PredictionDrift,
+            AbortReason::SerializationConflict,
+        ] {
+            let other = ParticipantVote::Abort(other.into());
+            for votes in [[&refused, &other], [&other, &refused]] {
+                assert_eq!(
+                    tally(votes),
+                    VerdictOutcome::Abort(AbortCause::refused(vec![7])),
+                    "{other:?}"
+                );
+            }
+        }
+    }
+
+    /// Two participants refuse with different refusals. Every replica picks
+    /// the lowest vShard's refusal, whatever order the votes applied in.
+    #[tokio::test]
+    async fn two_refusals_choose_the_lowest_vshard_on_every_replica() {
+        let txn = TxnId::new(32, 0);
+        let low = ParticipantVote::Abort(AbortCause::refused(b"vshard 3".to_vec()));
+        let high = ParticipantVote::Abort(AbortCause::refused(b"vshard 9".to_vec()));
+        let orders: [[(u32, &ParticipantVote); 3]; 2] = [
+            [(3, &low), (5, &ParticipantVote::Commit), (9, &high)],
+            [(9, &high), (5, &ParticipantVote::Commit), (3, &low)],
+        ];
+        for order in orders {
+            let (tx, mut rx) = mpsc::channel(8);
+            let replica = CalvinCompletionRegistry::new(tx);
+            replica.seed_expected(txn, 3);
+            for (vshard, vote) in order {
+                replica.note_vote(txn, vshard, vote.clone());
+            }
+            let expected = VerdictOutcome::Abort(AbortCause::refused(b"vshard 3".to_vec()));
+            assert_eq!(
+                rx.try_recv().expect("verdict emitted"),
+                (txn, expected.clone()),
+                "{order:?}"
+            );
+            assert_eq!(
+                replica.drain_unproposed_verdicts(),
+                vec![(txn, expected)],
+                "{order:?}"
+            );
         }
     }
 
@@ -515,7 +592,7 @@ mod tests {
             VerdictSignal {
                 epoch: 50,
                 position: 2,
-                verdict: VerdictOutcome::Commit,
+                commit: true,
             }
         );
     }
@@ -531,23 +608,13 @@ mod tests {
         let txn = TxnId::new(51, 0);
         reg.note_verdict(
             txn,
-            VerdictOutcome::Abort(AbortReason::SerializationConflict),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict.into()),
         );
 
         // Both locally registered vShard schedulers receive the broadcast; each
         // filters by its own parked (epoch, position).
-        assert!(
-            !rx1.try_recv()
-                .expect("push to vshard 1")
-                .verdict
-                .is_commit()
-        );
-        assert!(
-            !rx2.try_recv()
-                .expect("push to vshard 2")
-                .verdict
-                .is_commit()
-        );
+        assert!(!rx1.try_recv().expect("push to vshard 1").commit);
+        assert!(!rx2.try_recv().expect("push to vshard 2").commit);
     }
 
     #[tokio::test]
@@ -581,7 +648,7 @@ mod tests {
         // Must not panic despite the closed channel; the verdict still stores.
         reg.note_verdict(
             txn,
-            VerdictOutcome::Abort(AbortReason::SerializationConflict),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict.into()),
         );
         assert_eq!(reg.verdict(txn), Some(false));
     }
@@ -628,14 +695,14 @@ mod tests {
         reg.note_vote(
             txn,
             2,
-            ParticipantVote::Abort(AbortReason::SerializationConflict),
+            ParticipantVote::Abort(AbortReason::SerializationConflict.into()),
         );
         assert_eq!(reg.verdict(txn), None);
         assert_eq!(
             reg.drain_unproposed_verdicts(),
             vec![(
                 txn,
-                VerdictOutcome::Abort(AbortReason::SerializationConflict)
+                VerdictOutcome::Abort(AbortReason::SerializationConflict.into())
             )],
             "any abort vote makes the re-proposed verdict an abort"
         );

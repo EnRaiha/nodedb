@@ -116,18 +116,22 @@ pub enum SequencerEntry {
         reason: ReleaseReason,
     },
     /// One participant vShard's durable ABORT vote, carrying why it aborted.
+    /// `refusal` is the typed refusal its stage raised, encoded by the host
+    /// crate. It is set only with `ParticipantError`.
     AbortVote {
         epoch: u64,
         position: u32,
         vshard: u32,
         reason: AbortReason,
+        refusal: Option<Vec<u8>>,
     },
     /// The global ABORT verdict for a staged cross-shard txn, carrying the
-    /// winning participant reason. Participants drop their staged buffer.
+    /// winning participant cause. Participants drop their staged buffer.
     AbortVerdict {
         epoch: u64,
         position: u32,
         reason: AbortReason,
+        refusal: Option<Vec<u8>>,
     },
     /// A backup's consistent-cut marker, carrying the backup's watermark
     /// `hlc`. Every replica fans it out to each of its vShard schedulers in
@@ -304,6 +308,7 @@ mod tests {
             position: 2,
             vshard: 9,
             reason: AbortReason::ParticipantError,
+            refusal: Some(vec![0x23, 0x00, 0xff]),
         };
         let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
         let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
@@ -312,14 +317,17 @@ mod tests {
 
     #[test]
     fn abort_verdict_msgpack_roundtrip() {
-        let entry = SequencerEntry::AbortVerdict {
-            epoch: 5,
-            position: 2,
-            reason: AbortReason::SerializationConflict,
-        };
-        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
-        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
-        assert_eq!(entry, decoded);
+        for refusal in [None, Some(vec![0x23, 0x50, 0x02])] {
+            let entry = SequencerEntry::AbortVerdict {
+                epoch: 5,
+                position: 2,
+                reason: AbortReason::SerializationConflict,
+                refusal,
+            };
+            let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+            let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+            assert_eq!(entry, decoded);
+        }
     }
 
     #[test]
