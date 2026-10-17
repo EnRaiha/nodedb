@@ -308,35 +308,18 @@ async fn extended_query_oid_mismatch_text_for_int_errors_or_coerces() {
 // ── Cross-engine: SQLSTATEs through the extended protocol ───────────────────
 
 /// Undefined-function rejection (SQLSTATE `42883`) through the
-/// extended-query path. `sql_undefined_function.rs` proves this fires at
-/// PLAN time over simple-query (where Parse+Bind+Execute collapse into one
-/// round trip). Naively, `pgwire_database_authorization.rs`'s
-/// `prepared_parse_denies_*` tests suggest Parse/Describe is where this
-/// server plans a statement (authorization and undefined-table checks both
-/// reject there) — but confirmed empirically here, `.prepare()` for this
-/// statement actually *succeeds*: the function-registry existence gate is
-/// not consulted during Parse/Describe (no columns/params to resolve for
-/// this shape rules it out early), so the error is only raised once
-/// `.query()` drives Bind+Execute and the plan is actually built. Asserting
-/// on the real surfacing point, not the naive assumption.
+/// extended-query path. A call to an unregistered function is a
+/// parse-analysis error, so Parse reports it, as PostgreSQL does: the
+/// driver's prepare fails with the SQLSTATE.
 #[tokio::test]
 async fn extended_query_unknown_function_errors_42883() {
     let srv = TestServer::start().await;
 
-    let stmt = srv
+    let err = srv
         .client
         .prepare("SELECT some_function_that_does_not_exist_216(1, 2)")
         .await
-        .expect(
-            "Parse/Describe succeeds for this statement shape — the \
-             undefined-function gate is not consulted until Bind/Execute",
-        );
-
-    let err = srv
-        .client
-        .query(&stmt, &[])
-        .await
-        .expect_err("Execute must reject a call to an unregistered scalar function");
+        .expect_err("Parse must reject a call to an unregistered scalar function");
     let db_err = err
         .as_db_error()
         .expect("server must return a typed SQLSTATE for the unknown function");
