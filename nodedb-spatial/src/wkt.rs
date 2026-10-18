@@ -89,6 +89,39 @@ pub fn geometry_from_wkt(input: &str) -> Option<Geometry> {
     }
 }
 
+/// EWKT text split into its optional SRID code and its geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ewkt {
+    /// The code after `SRID=`, unresolved. `None` when the text has no prefix.
+    pub srid: Option<i64>,
+    pub geometry: Geometry,
+}
+
+/// Parse EWKT: an optional `SRID=<code>;` prefix, then WKT.
+///
+/// The prefix matches case-insensitively. The code is ASCII digits only.
+/// Returns `None` for a malformed prefix or malformed WKT.
+pub fn geometry_from_ewkt(input: &str) -> Option<Ewkt> {
+    let s = input.trim_start();
+    let Some(rest) = strip_prefix_ci(s, "SRID=") else {
+        return geometry_from_wkt(s).map(|geometry| Ewkt {
+            srid: None,
+            geometry,
+        });
+    };
+    let (code, wkt) = rest.split_once(';')?;
+    let code = code.trim();
+    if code.is_empty() || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let srid = code.parse::<i64>().ok()?;
+    let geometry = geometry_from_wkt(wkt)?;
+    Some(Ewkt {
+        srid: Some(srid),
+        geometry,
+    })
+}
+
 // ── Serialization helpers ──
 
 fn coords_to_wkt(coords: &[[f64; 2]]) -> String {
@@ -101,10 +134,13 @@ fn coords_to_wkt(coords: &[[f64; 2]]) -> String {
 
 // ── Parsing helpers ──
 
-/// Case-insensitive prefix strip.
+/// Case-insensitive prefix strip of an ASCII `prefix`.
+///
+/// Compares bytes, so a multi-byte character at the cut point never panics.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+    let head = s.as_bytes().get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        s.get(prefix.len()..)
     } else {
         None
     }
@@ -367,6 +403,43 @@ mod tests {
     fn case_insensitive_parse() {
         let parsed = geometry_from_wkt("point(5 10)").unwrap();
         assert_eq!(parsed, Geometry::point(5.0, 10.0));
+    }
+
+    #[test]
+    fn ewkt_prefix_is_case_insensitive() {
+        let square = Geometry::polygon(vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]);
+        for text in [
+            "SRID=4326;POLYGON((0 0, 1 0, 1 1, 0 0))",
+            "srid=4326;polygon((0 0, 1 0, 1 1, 0 0))",
+            "  SrId= 4326 ;POLYGON((0 0, 1 0, 1 1, 0 0))",
+        ] {
+            let parsed = geometry_from_ewkt(text).unwrap();
+            assert_eq!(parsed.srid, Some(4326), "{text}");
+            assert_eq!(parsed.geometry, square, "{text}");
+        }
+    }
+
+    #[test]
+    fn ewkt_without_prefix_has_no_srid() {
+        let parsed = geometry_from_ewkt("POINT(5 10)").unwrap();
+        assert_eq!(parsed.srid, None);
+        assert_eq!(parsed.geometry, Geometry::point(5.0, 10.0));
+    }
+
+    #[test]
+    fn malformed_ewkt_returns_none() {
+        assert!(geometry_from_ewkt("SRID=;POINT(1 2)").is_none());
+        assert!(geometry_from_ewkt("SRID=43x6;POINT(1 2)").is_none());
+        assert!(geometry_from_ewkt("SRID=-4326;POINT(1 2)").is_none());
+        assert!(geometry_from_ewkt("SRID=4326 POINT(1 2)").is_none());
+        assert!(geometry_from_ewkt("SRID=4326;GARBAGE").is_none());
+    }
+
+    #[test]
+    fn a_multibyte_character_at_the_prefix_cut_does_not_panic() {
+        assert!(geometry_from_ewkt("SRÍD=4326;POINT(1 2)").is_none());
+        assert!(geometry_from_wkt("POIÑT(1 2)").is_none());
+        assert!(geometry_from_wkt("é").is_none());
     }
 
     #[test]
