@@ -35,10 +35,17 @@ pub(super) fn inject_vector(ctx: &RlsCtx<'_>, op: &mut VectorOp) -> crate::Resul
             ..
         } => ctx.set_post_filters(collection, rls_filters),
 
-        // Refuse: both return scored document identities with no filter slot,
-        // so the rows a policy hides will still be ranked and returned.
-        VectorOp::SparseSearch { collection, .. }
-        | VectorOp::MultiVectorScoreSearch { collection, .. } => ctx.refuse_if_policy(
+        // Inject: the sparse hits carry their bodies while a filter applies,
+        // and the policy joins that filter before the top-k cut.
+        VectorOp::SparseSearch {
+            collection,
+            filters,
+            ..
+        } => ctx.set_post_filters(collection, filters),
+
+        // Refuse: the search returns scored document identities with no
+        // filter slot, so the rows a policy hides will still be ranked.
+        VectorOp::MultiVectorScoreSearch { collection, .. } => ctx.refuse_if_policy(
             collection,
             "the search returns scored document identities through a response shape that carries \
              no row filter",
@@ -395,19 +402,43 @@ mod tests {
         assert_eq!(plan, before);
     }
 
-    /// A sparse search has no filter slot, so a policy refuses it.
-    #[test]
-    fn sparse_search_is_refused_under_a_read_policy() {
-        let store = store_with_read_policy("docs");
-        let mut plan = PhysicalPlan::Vector(VectorOp::SparseSearch {
+    fn sparse_search(collection: &str) -> PhysicalPlan {
+        PhysicalPlan::Vector(VectorOp::SparseSearch {
             collection: nodedb_types::QualifiedCollection::new(
                 nodedb_types::DatabaseId::DEFAULT,
-                "docs",
+                collection,
             ),
             field_name: "sparse".into(),
             query_entries: vec![(1, 1.0)],
             top_k: 5,
-        });
-        assert_refused(inject(&mut plan, &store), "docs");
+            filters: Vec::new(),
+        })
+    }
+
+    /// A read policy joins the sparse search's filter, which narrows the
+    /// candidates before the top-k cut.
+    #[test]
+    fn sparse_search_carries_the_read_policy_in_its_filter() {
+        let store = store_with_read_policy("docs");
+        let mut plan = sparse_search("docs");
+        assert!(inject(&mut plan, &store).is_ok());
+        let PhysicalPlan::Vector(VectorOp::SparseSearch { filters, .. }) = &plan else {
+            panic!("expected SparseSearch, got {plan:?}");
+        };
+        let filters: Vec<crate::bridge::scan_filter::ScanFilter> =
+            zerompk::from_msgpack(filters).expect("decode injected filters");
+        assert!(
+            filters.iter().any(|f| f.field == "owner_id"),
+            "the policy predicate must join the filter: {filters:?}"
+        );
+    }
+
+    /// The same search is untouched when no policy applies.
+    #[test]
+    fn sparse_search_without_a_policy_is_untouched() {
+        let mut plan = sparse_search("docs");
+        let before = plan.clone();
+        assert!(inject_without_policy(&mut plan).is_ok());
+        assert_eq!(plan, before);
     }
 }

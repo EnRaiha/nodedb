@@ -35,11 +35,17 @@ pub(super) fn apply_vector(ctx: &PermCtx<'_>, op: &mut VectorOp) -> crate::Resul
             ..
         } => ctx.filter_into(collection, PermTreeLevel::Read, rls_filters),
 
-        // Refuse: both return scored document identities with no filter slot,
-        // so rows outside the caller's subtree would still be ranked and
-        // returned.
-        VectorOp::SparseSearch { collection, .. }
-        | VectorOp::MultiVectorScoreSearch { collection, .. } => ctx.refuse_if_tree(
+        // Filter: the subtree joins the sparse search's filter, which narrows
+        // the candidates before the top-k cut.
+        VectorOp::SparseSearch {
+            collection,
+            filters,
+            ..
+        } => ctx.filter_into(collection, PermTreeLevel::Read, filters),
+
+        // Refuse: the search returns scored document identities with no
+        // filter slot, so rows outside the caller's subtree will be ranked.
+        VectorOp::MultiVectorScoreSearch { collection, .. } => ctx.refuse_if_tree(
             collection,
             "the search returns scored document identities through a response shape that carries \
              no subtree filter",
@@ -174,9 +180,10 @@ mod tests {
         assert_refused(apply(&mut plan, &cache), "users");
     }
 
-    /// A sparse search has no filter slot, so a tree refuses it.
+    /// A sparse search over a governed collection is narrowed to the
+    /// readable subtree through its filter.
     #[test]
-    fn sparse_search_is_refused_under_a_tree() {
+    fn sparse_search_is_narrowed_to_the_readable_subtree() {
         let cache = cache_with_tree("docs");
         let mut plan = PhysicalPlan::Vector(VectorOp::SparseSearch {
             collection: nodedb_types::QualifiedCollection::new(
@@ -186,7 +193,14 @@ mod tests {
             field_name: "sparse".into(),
             query_entries: vec![(1, 1.0)],
             top_k: 5,
+            filters: Vec::new(),
         });
-        assert_refused(apply(&mut plan, &cache), "docs");
+        assert!(apply(&mut plan, &cache).is_ok());
+        match &plan {
+            PhysicalPlan::Vector(VectorOp::SparseSearch { filters, .. }) => {
+                assert_eq!(sorted(injected_resources(filters)), readable());
+            }
+            other => panic!("plan shape changed: {other:?}"),
+        }
     }
 }

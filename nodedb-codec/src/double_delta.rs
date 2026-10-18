@@ -119,11 +119,38 @@ impl<'a> BitReader<'a> {
         Ok(bit)
     }
 
+    /// Read `num_bits` (at most 64) bits, most significant first. Whole
+    /// byte runs are taken at once, so a wide field costs one step per byte,
+    /// not one per bit. A read past the buffer fails and consumes nothing.
     pub(crate) fn read_bits(&mut self, num_bits: usize) -> Result<u64, CodecError> {
-        let mut value = 0u64;
-        for _ in 0..num_bits {
-            value = (value << 1) | u64::from(self.read_bit()?);
+        if num_bits == 0 {
+            return Ok(0);
         }
+        if num_bits > 64 {
+            return Err(CodecError::Corrupt {
+                detail: format!("bit field of {num_bits} bits exceeds 64"),
+            });
+        }
+        let end = checked_add(self.bit_pos, num_bits, "DoubleDelta bit offset")?;
+        let bytes_needed = end.div_ceil(8);
+        if bytes_needed > self.buf.len() {
+            return Err(CodecError::Truncated {
+                expected: bytes_needed,
+                actual: self.buf.len(),
+            });
+        }
+        let mut value = 0u64;
+        let mut pos = self.bit_pos;
+        while pos < end {
+            let byte = self.buf[pos / 8];
+            let offset = pos % 8;
+            let available = 8 - offset;
+            let take = available.min(end - pos);
+            let bits = (u64::from(byte) >> (available - take)) & ((1u64 << take) - 1);
+            value = (value << take) | bits;
+            pos += take;
+        }
+        self.bit_pos = end;
         Ok(value)
     }
 }
@@ -595,5 +622,44 @@ mod tests {
         assert!(decode(&[]).is_err());
         assert!(decode(&[1, 0, 0, 0]).is_err());
         assert!(decode(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    /// Fields of every width at every bit offset read back as written, and
+    /// a read past the end fails without consuming any bit.
+    #[test]
+    fn read_bits_matches_written_fields_at_any_offset() {
+        let fields: Vec<(u64, usize)> = (0..=64usize)
+            .map(|width| {
+                let value = match width {
+                    0 => 0,
+                    64 => 0xA5C3_0F1E_9B7D_2468,
+                    w => 0x9E37_79B9_7F4A_7C15 & ((1u64 << w) - 1),
+                };
+                (value, width)
+            })
+            .collect();
+        for lead in 0..8usize {
+            let mut w = BitWriter::new();
+            w.write_bits(0, lead);
+            for &(value, width) in &fields {
+                w.write_bits(value, width);
+            }
+            let mut r = BitReader::new(w.as_bytes());
+            assert_eq!(r.read_bits(lead).unwrap(), 0);
+            for &(value, width) in &fields {
+                assert_eq!(
+                    r.read_bits(width).unwrap(),
+                    value,
+                    "width {width}, lead {lead}"
+                );
+            }
+        }
+
+        let bytes = [0xFFu8];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(3).unwrap(), 0b111);
+        assert!(matches!(r.read_bits(6), Err(CodecError::Truncated { .. })));
+        assert_eq!(r.read_bits(5).unwrap(), 0b11111);
+        assert!(matches!(r.read_bits(65), Err(CodecError::Corrupt { .. })));
     }
 }

@@ -749,16 +749,15 @@ fn surrogate_round_trip_all_engines() {
         );
 
         // The surviving cell must have attr value 10.0 (the value we stored at
-        // coord [0] which received surrogate 10).
-        if let Some(cell) = filtered_cells.as_array().and_then(|a| a.first())
-            && let Some(attrs) = cell.get("attrs").and_then(|v| v.as_array())
-        {
-            let first_attr = attrs.first().and_then(|v| v.as_f64());
-            assert_eq!(
-                first_attr,
-                Some(10.0),
-                "filtered cell attr must be 10.0 (surrogate-10's stored value)"
-            );
-        }
+        // coord [0] which received surrogate 10). A slice row names each attr.
+        let cell = filtered_cells
+            .as_array()
+            .and_then(|a| a.first())
+            .expect("one filtered cell");
+        assert_eq!(
+            cell.get("v").and_then(|v| v.as_f64()),
+            Some(10.0),
+            "filtered cell attr `v` must be 10.0 (surrogate-10's stored value): {cell}"
+        );
     }
 }

@@ -5,7 +5,7 @@
 //! Every write-class `PhysicalPlan` passes through [`admit`] before it is
 //! ordered: an autocommit write that applies on this node alone before its
 //! enqueue, and a replicated write on its data-group leader before its
-//! propose (see `leader_gate`). The gate decides one of five outcomes:
+//! propose (see `leader_gate`). The gate decides one of six outcomes:
 //!
 //! - [`WriteAdmission::FastPath`] — every lock key of the write was free and
 //!   is held now by the RAII [`WriteAdmissionGuard`]. A local write holds it
@@ -15,6 +15,12 @@
 //!   vShard with no Calvin scheduler. There is no lock table to fence against,
 //!   so the caller awaits a FIFO-fair per-key async order-lock before the WAL
 //!   append + enqueue, serializing concurrent same-key writes in arrival order.
+//! - [`WriteAdmission::Unscheduled`] — any other write to vShards with no
+//!   Calvin scheduler. It takes no key.
+//!
+//!   Every admitted write carries an admission ticket: in its guard, its
+//!   wait, or one of these two outcomes. The ticket fences each vShard's next
+//!   scheduler until the write reached its core or its log (see `tickets`).
 //! - [`WriteAdmission::RouteToCalvin`] — a key is held, and a Calvin
 //!   transaction can sequence the write, or the write homes on several
 //!   vShards. The caller submits it through the deterministic scheduler, which
@@ -56,6 +62,7 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 use super::admission_keys::{AdmissionKeys, is_calvin_apply, plan_admission_keys};
 use super::lock_keys::plan_row_key;
 use super::predicate::plan_is_write;
+use super::tickets::AdmissionTicket;
 use super::wait::AdmissionWait;
 use super::write_order_lock::KeyedWriteOrderLock;
 
@@ -101,7 +108,15 @@ pub enum WriteAdmission {
         key: LockKey,
         /// The global keyed order-lock (from `SharedState::write_order_locks`).
         keyed_lock: Arc<KeyedWriteOrderLock>,
+        /// Fences the vShard's next scheduler until this write reached its
+        /// core or its log.
+        ticket: AdmissionTicket,
     },
+    /// A write that is not a point write, on vShards with no Calvin
+    /// scheduler. No Calvin transaction can conflict with it. `ticket`
+    /// fences each vShard's next scheduler until it reached its core or its
+    /// log.
+    Unscheduled { ticket: AdmissionTicket },
     /// Submit the write through the deterministic Calvin scheduler.
     RouteToCalvin,
     /// A key is held, and no Calvin transaction can sequence the write. The
@@ -137,6 +152,9 @@ pub struct WriteAdmissionGuard {
     /// can queue behind a fast-path key); `None` when no scheduler is
     /// registered, where `release` never promotes anything.
     promotion_sender: Option<UnboundedSender<Vec<TxnId>>>,
+    /// The admission ticket of the guarded write. It fences a scheduler that
+    /// starts on a new table of the vShard while the write is in flight.
+    ticket: Option<AdmissionTicket>,
 }
 
 impl WriteAdmissionGuard {
@@ -150,6 +168,20 @@ impl WriteAdmissionGuard {
             lock_manager,
             txn,
             promotion_sender,
+            ticket: None,
+        }
+    }
+
+    /// Carry `ticket` until the guard drops or its write lands.
+    pub(super) fn carry_ticket(&mut self, ticket: AdmissionTicket) {
+        self.ticket = Some(ticket);
+    }
+
+    /// The guarded write landed at `log_index` of `group_id`. Its ticket
+    /// records the index and ends. The keys stay held.
+    pub(super) fn landed(&mut self, group_id: u64, log_index: u64) {
+        if let Some(ticket) = self.ticket.take() {
+            ticket.landed(group_id, log_index);
         }
     }
 }
@@ -190,8 +222,8 @@ impl Drop for WriteAdmissionGuard {
 /// only when a deterministic scheduler is registered for the write's vShard.
 /// With no scheduler (single-node / no-Calvin) a point write returns
 /// `FastPathBlocking` carrying the global keyed order-lock so concurrent
-/// same-key writes still serialize, and every other shape takes the fast path
-/// with no key: no Calvin transaction runs to conflict with it.
+/// same-key writes still serialize, and every other shape returns
+/// `Unscheduled` with no key: no Calvin transaction runs to conflict with it.
 pub fn admit(shared: &SharedState, target: &WriteTarget<'_>) -> crate::Result<WriteAdmission> {
     admit_routed(shared, target, true)
 }
@@ -223,20 +255,23 @@ pub(crate) fn admit_routed(
         }
     };
 
+    // The ticket opens before the table lookup (see `tickets`).
+    let ticket = shared.calvin.admission_tickets.open(vshard.as_u32());
     let Some(lock_manager) = lock_manager_of(shared, vshard) else {
         return Ok(match plan_row_key(target.plan) {
             Some(key) => WriteAdmission::FastPathBlocking {
                 key,
                 keyed_lock: Arc::clone(&shared.write_order_locks),
+                ticket,
             },
-            None => WriteAdmission::FastPath { guard: None },
+            None => WriteAdmission::Unscheduled { ticket },
         });
     };
 
     let mut request =
         plan_admission_keys(shared, target.tenant_id, target.database_id, target.plan)?;
     request.sequenced &= may_route;
-    let admission = admit_request(shared, vshard, lock_manager, request);
+    let admission = admit_request(shared, vshard, lock_manager, request).carrying(ticket);
     if matches!(
         admission,
         WriteAdmission::RouteToCalvin | WriteAdmission::Wait(_)
@@ -348,6 +383,9 @@ fn probe(
 /// any home runs one. With no scheduler on any home, no Calvin transaction
 /// conflicts with it.
 fn admit_multi_home(shared: &SharedState, homes: &[VShardId]) -> WriteAdmission {
+    // The ticket opens before the table lookups (see `tickets`).
+    let ids: Vec<u32> = homes.iter().map(|home| home.as_u32()).collect();
+    let ticket = shared.calvin.admission_tickets.open_many(&ids);
     if homes
         .iter()
         .any(|home| lock_manager_of(shared, *home).is_some())
@@ -355,7 +393,34 @@ fn admit_multi_home(shared: &SharedState, homes: &[VShardId]) -> WriteAdmission 
         ROUTED_TO_CALVIN.fetch_add(1, Ordering::Relaxed);
         WriteAdmission::RouteToCalvin
     } else {
-        WriteAdmission::FastPath { guard: None }
+        WriteAdmission::Unscheduled { ticket }
+    }
+}
+
+impl WriteAdmission {
+    /// This admission, carrying the ticket of its write.
+    ///
+    /// A guard or a wait carries the ticket until its write reached its core
+    /// or its log. A write that takes no key, routes, or is exempt ends its
+    /// ticket here: no later scheduler orders against it at the gate.
+    pub(super) fn carrying(self, ticket: AdmissionTicket) -> Self {
+        match self {
+            Self::FastPath {
+                guard: Some(mut guard),
+            } => {
+                guard.carry_ticket(ticket);
+                Self::FastPath { guard: Some(guard) }
+            }
+            Self::Wait(mut wait) => {
+                wait.carry_ticket(ticket);
+                Self::Wait(wait)
+            }
+            other @ (Self::FastPath { guard: None }
+            | Self::FastPathBlocking { .. }
+            | Self::Unscheduled { .. }
+            | Self::RouteToCalvin
+            | Self::ExemptRead) => other,
+        }
     }
 }
 
@@ -509,5 +574,90 @@ mod tests {
             admission,
             WriteAdmission::FastPath { guard: None }
         ));
+    }
+
+    /// A guarded write still between its admit and its landing when its
+    /// scheduler retires holds the next scheduler's fence. Once it lands,
+    /// the fence waits for its index. Its keys on the retired table order
+    /// nothing on the new one.
+    #[test]
+    fn a_guarded_write_in_flight_at_retirement_fences_the_next_scheduler() {
+        use super::super::tickets::{AdmissionTickets, FenceState};
+
+        const VSHARD: u32 = 7;
+        const GROUP: u64 = 4;
+        let tickets = Arc::new(AdmissionTickets::new());
+        let retired_table = Arc::new(Mutex::new(LockManager::new()));
+        let ticket = tickets.open(VSHARD);
+        let admission = probe(
+            Arc::clone(&retired_table),
+            autocommit(0),
+            request(row_write(1), true),
+            None,
+        )
+        .carrying(ticket);
+        let WriteAdmission::FastPath {
+            guard: Some(mut guard),
+        } = admission
+        else {
+            panic!("an uncontended row write holds its keys");
+        };
+
+        // The scheduler retires, and a new one starts on a new table.
+        let fence = tickets.start_fence(VSHARD);
+        assert_eq!(
+            tickets.fence_state(fence, GROUP),
+            FenceState::Open,
+            "the in-flight write holds the fence"
+        );
+
+        guard.landed(GROUP, 15);
+        assert_eq!(
+            tickets.fence_state(fence, GROUP),
+            FenceState::Through(Some(15)),
+            "the landed write fences until its index applies"
+        );
+        drop(guard);
+        assert_eq!(
+            tickets.fence_state(fence, GROUP),
+            FenceState::Through(Some(15)),
+            "dropping the keys keeps the landing"
+        );
+    }
+
+    /// A wait carries its ticket on into the guard it acquires.
+    #[tokio::test]
+    async fn a_wait_carries_its_ticket_into_its_guard() {
+        use super::super::tickets::{AdmissionTickets, FenceState};
+
+        let tickets = Arc::new(AdmissionTickets::new());
+        let table = Arc::new(Mutex::new(LockManager::new()));
+        let holder = TxnId::new(9, 0);
+        assert_eq!(
+            table
+                .lock()
+                .expect("table")
+                .acquire(holder, BTreeMap::from([(coll(), LockMode::Exclusive)])),
+            AcquireOutcome::Ready
+        );
+        let admission = probe(
+            Arc::clone(&table),
+            autocommit(0),
+            request(row_write(1), false),
+            None,
+        )
+        .carrying(tickets.open(7));
+        let WriteAdmission::Wait(wait) = admission else {
+            panic!("a contended write that cannot route waits");
+        };
+        let _ = table.lock().expect("table").release(holder);
+        let guard = wait
+            .acquire(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await
+            .expect("the keys free up");
+        let fence = tickets.start_fence(7);
+        assert_eq!(tickets.fence_state(fence, 4), FenceState::Open);
+        drop(guard);
+        assert_eq!(tickets.fence_state(fence, 4), FenceState::Through(None));
     }
 }

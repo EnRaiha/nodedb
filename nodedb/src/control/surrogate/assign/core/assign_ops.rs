@@ -7,9 +7,8 @@
 //! Every operation that can draw or ask a key's home is async: an empty
 //! cluster batch and a home request are awaited, never blocked on.
 
-use nodedb_types::{CollectionKey, TenantId};
-
-use nodedb_types::Surrogate;
+use nodedb_types::{CollectionKey, Surrogate, TenantId};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::home::HomeSurrogateAuthority;
 use super::types::SurrogateAssigner;
@@ -57,13 +56,16 @@ impl SurrogateAssigner {
             .catalog()
             .get_surrogates_for_pks(key, tenant_id, pks)?;
         let mut missing: Vec<&[u8]> = Vec::new();
-        let mut asked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut asked: FxHashSet<&[u8]> = FxHashSet::default();
         for (&pk, hit) in pks.iter().zip(&out) {
             if hit.is_none() && asked.insert(pk) {
                 missing.push(pk);
             }
         }
         if !missing.is_empty() {
+            // The authority keeps every winner in this node's catalog: every
+            // replica of the home binds it in log order, so keeping it here
+            // agrees with them.
             let winners = self
                 .home_authority()?
                 .assign(key, tenant_id, &missing)
@@ -78,12 +80,7 @@ impl SurrogateAssigner {
                     ),
                 });
             }
-            // The winner is final: every replica of the home binds it in log
-            // order, so keeping it here agrees with them.
-            let rows: Vec<(&[u8], Surrogate)> = missing.iter().copied().zip(winners).collect();
-            let bound = self.bind_many(key, tenant_id, &rows)?;
-            let kept: std::collections::HashMap<&[u8], Surrogate> =
-                missing.iter().copied().zip(bound).collect();
+            let kept: FxHashMap<&[u8], Surrogate> = missing.iter().copied().zip(winners).collect();
             for (slot, &pk) in out.iter_mut().zip(pks) {
                 if slot.is_none() {
                     *slot = kept.get(pk).copied();
@@ -173,7 +170,7 @@ impl SurrogateAssigner {
             .catalog()
             .get_surrogates_for_pks(key, tenant_id, pks)?;
         let mut missing: Vec<&[u8]> = Vec::new();
-        let mut asked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut asked: FxHashSet<&[u8]> = FxHashSet::default();
         for (&pk, hit) in pks.iter().zip(&out) {
             if hit.is_none() && asked.insert(pk) {
                 missing.push(pk);
@@ -182,6 +179,7 @@ impl SurrogateAssigner {
         if missing.is_empty() || !self.is_cluster()? {
             return Ok(out);
         }
+        // The authority keeps every found winner in this node's catalog.
         let answers = self
             .home_authority()?
             .lookup_many(key, tenant_id, &missing)
@@ -196,17 +194,11 @@ impl SurrogateAssigner {
                 ),
             });
         }
-        let rows: Vec<(&[u8], Surrogate)> = missing
-            .iter()
-            .zip(answers)
-            .filter_map(|(&pk, answer)| answer.map(|winner| (pk, winner)))
-            .collect();
-        let bound = self.bind_many(key, tenant_id, &rows)?;
-        let kept: std::collections::HashMap<&[u8], Surrogate> =
-            rows.iter().map(|&(pk, _)| pk).zip(bound).collect();
+        let kept: FxHashMap<&[u8], Option<Surrogate>> =
+            missing.iter().copied().zip(answers).collect();
         for (slot, &pk) in out.iter_mut().zip(pks) {
             if slot.is_none() {
-                *slot = kept.get(pk).copied();
+                *slot = kept.get(pk).copied().flatten();
             }
         }
         Ok(out)

@@ -11,18 +11,22 @@
 use nodedb_types::geometry::{Geometry, point_in_polygon};
 use nodedb_types::geometry_bbox;
 
-use super::edge::{point_on_ring_boundary, ring_edges};
+use super::edge::{is_collection, point_on_ring_boundary, ring_edges};
 
 /// ST_Contains(a, b) — does geometry A fully contain geometry B?
 ///
 /// Returns false if any part of B lies outside A, or if B only touches
 /// A's boundary without entering its interior.
 pub fn st_contains(a: &Geometry, b: &Geometry) -> bool {
-    // Fast path: bbox pre-filter.
-    let a_bb = geometry_bbox(a);
-    let b_bb = geometry_bbox(b);
-    if !a_bb.contains_bbox(&b_bb) {
-        return false;
+    // Fast path: bbox pre-filter. A GeometryCollection skips it: its bbox is
+    // a union whose wrap rule depends on the SRID, and the arms below test
+    // each member on its own.
+    if !is_collection(a) && !is_collection(b) {
+        let a_bb = geometry_bbox(a);
+        let b_bb = geometry_bbox(b);
+        if !a_bb.contains_bbox(&b_bb) {
+            return false;
+        }
     }
 
     match (a, b) {

@@ -189,6 +189,9 @@ pub struct AggregateParams {
     /// scan so bitemporal aggregate queries project an as-of snapshot
     /// before grouping.
     pub temporal: crate::temporal::TemporalScope,
+    /// The designated time-key column of a timeseries collection. The native
+    /// grouped timeseries scan buckets by this column only.
+    pub time_key: Option<String>,
 }
 
 /// A `time_bucket(interval, column)` GROUP BY key.

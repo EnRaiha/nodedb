@@ -292,12 +292,15 @@ impl Scheduler {
             .unwrap_or_else(|p| p.into_inner())
             .capacity_freed();
 
+        // Taken after this vShard's lock table is registered: every write the
+        // gate admitted with no table, or with a retired one, is earlier.
+        let start_fence = shared.calvin.admission_tickets.start_fence(vshard_id);
         let scheduler = Self {
             vshard_id,
             receiver,
             shared,
             multi_raft,
-            role: super::role::StageGate::default(),
+            role: super::role::StageGate::fenced(start_fence),
             sequencer_proposer,
             owed: OwedEntries::new(),
             sequencer_state_machine,

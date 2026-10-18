@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Binding aggregate calls in HAVING and post-aggregate ORDER BY.
+//! Binding aggregate calls in HAVING, post-aggregate ORDER BY, and computed
+//! grouped SELECT items.
 //!
-//! Both clauses are evaluated against finalized group rows, so an aggregate
-//! either mentions must actually be computed and must be addressed by the
-//! column name it lands under. Left as a literal `sum(...)` call, it reaches
-//! the executor as a scalar function over a row that has no such column — the
-//! predicate matches nothing, or the sort key resolves to nothing.
+//! These clauses are evaluated against finalized group rows. An aggregate one
+//! mentions must be computed and addressed by the column it lands under. Left
+//! as a literal `sum(...)` call, it reaches the executor as a scalar function
+//! over a row that has no such column. The predicate matches nothing, or the
+//! value resolves to nothing.
 //!
-//! The two clauses differ in *which* name they need, because they run on
+//! The clauses differ in *which* name they need, because they run on
 //! opposite sides of the rename to user aliases:
 //!
 //! - HAVING filters before the rename, so it addresses the canonical key
 //!   (`sum(amount)`).
-//! - ORDER BY sorts after the rename, so it addresses the output name
-//!   (`total`, when the projection said `SUM(amount) AS total`).
+//! - ORDER BY and a computed SELECT item run after the rename, so they
+//!   address the output name (`total`, when the projection said
+//!   `SUM(amount) AS total`).
 
-use sqlparser::ast;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{self, VisitMut, VisitorMut};
 
 use crate::aggregate_walk::extract_aggregates;
 use crate::error::{Result, SqlError};
@@ -90,6 +94,10 @@ fn resolve_select_aliases(expr: &ast::Expr, projection: &[ast::SelectItem]) -> a
     }
 }
 
+/// Rewrite every aggregate call in `expr` at any depth: inside a scalar
+/// function (`ROUND(AVG(v), 1)`), a CASE, a CAST, an IN list, and every other
+/// expression position. An aggregate inside a subquery belongs to that
+/// subquery, so it stays as written.
 fn bind(
     expr: &ast::Expr,
     aggregates: &mut Vec<AggregateExpr>,
@@ -97,41 +105,69 @@ fn bind(
     name: BindName,
     scope: &TableScope,
 ) -> Result<ast::Expr> {
-    match expr {
-        ast::Expr::Function(func) if is_aggregate_call(func, functions) => {
-            let column = register_aggregate(expr, aggregates, functions, name, scope)?;
-            Ok(ast::Expr::Identifier(ast::Ident::new(column)))
+    let mut bound = expr.clone();
+    let mut binder = AggregateBinder {
+        aggregates,
+        functions,
+        name,
+        scope,
+        query_depth: 0,
+        error: None,
+    };
+    let _ = bound.visit(&mut binder);
+    match binder.error {
+        Some(error) => Err(error),
+        None => Ok(bound),
+    }
+}
+
+/// Replaces each aggregate call outside a subquery with a reference to its
+/// computed column. The first registration error stops the walk.
+struct AggregateBinder<'a> {
+    aggregates: &'a mut Vec<AggregateExpr>,
+    functions: &'a FunctionRegistry,
+    name: BindName,
+    scope: &'a TableScope,
+    /// How many subqueries enclose the expression being visited.
+    query_depth: usize,
+    error: Option<SqlError>,
+}
+
+impl VisitorMut for AggregateBinder<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, _query: &mut ast::Query) -> ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut ast::Query) -> ControlFlow<Self::Break> {
+        self.query_depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    /// The walk visits the children of the replacement, an identifier, so it
+    /// does not descend into the aggregate's arguments.
+    fn pre_visit_expr(&mut self, expr: &mut ast::Expr) -> ControlFlow<Self::Break> {
+        if self.query_depth > 0 {
+            return ControlFlow::Continue(());
         }
-        ast::Expr::BinaryOp { left, op, right } => Ok(ast::Expr::BinaryOp {
-            left: Box::new(bind(left, aggregates, functions, name, scope)?),
-            op: op.clone(),
-            right: Box::new(bind(right, aggregates, functions, name, scope)?),
-        }),
-        ast::Expr::UnaryOp { op, expr } => Ok(ast::Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(bind(expr, aggregates, functions, name, scope)?),
-        }),
-        ast::Expr::Nested(inner) => Ok(ast::Expr::Nested(Box::new(bind(
-            inner, aggregates, functions, name, scope,
-        )?))),
-        ast::Expr::IsNull(inner) => Ok(ast::Expr::IsNull(Box::new(bind(
-            inner, aggregates, functions, name, scope,
-        )?))),
-        ast::Expr::IsNotNull(inner) => Ok(ast::Expr::IsNotNull(Box::new(bind(
-            inner, aggregates, functions, name, scope,
-        )?))),
-        ast::Expr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => Ok(ast::Expr::Between {
-            expr: Box::new(bind(expr, aggregates, functions, name, scope)?),
-            negated: *negated,
-            low: Box::new(bind(low, aggregates, functions, name, scope)?),
-            high: Box::new(bind(high, aggregates, functions, name, scope)?),
-        }),
-        other => Ok(other.clone()),
+        let ast::Expr::Function(func) = &*expr else {
+            return ControlFlow::Continue(());
+        };
+        if !is_aggregate_call(func, self.functions) {
+            return ControlFlow::Continue(());
+        }
+        match register_aggregate(expr, self.aggregates, self.functions, self.name, self.scope) {
+            Ok(column) => {
+                *expr = ast::Expr::Identifier(ast::Ident::new(column));
+                ControlFlow::Continue(())
+            }
+            Err(error) => {
+                self.error = Some(error);
+                ControlFlow::Break(())
+            }
+        }
     }
 }
 

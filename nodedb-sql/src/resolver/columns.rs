@@ -400,9 +400,11 @@ impl TableScope {
         factor: &sqlparser::ast::TableFactor,
     ) -> Result<()> {
         // ARRAY_*(...) table-valued function: synthesize a ResolvedTable
-        // from the array's dim+attr schema so equi-join keys against the
-        // TVF's output rows resolve.
-        if let Some(resolved) = crate::resolver::array_tvf::resolve_array_tvf(catalog, factor)? {
+        // from the columns the call's rows carry so equi-join keys against
+        // the TVF's output rows resolve.
+        if let Some(resolved) =
+            crate::resolver::array_tvf::resolve_array_tvf(catalog, factor, temporal)?
+        {
             self.add(resolved)?;
             return Ok(());
         }

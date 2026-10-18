@@ -451,6 +451,9 @@ async fn route_opcode(
             dispatch::handle_direct_op(&ctx, seq, op, fields).await
         }
 
+        // Array bulk load: the shared array bulk-load core.
+        OpCode::ArrayPutBatch => dispatch::handle_array_put_batch(&ctx, seq, fields).await,
+
         // Copy from file.
         OpCode::CopyFrom => {
             let sql = match &fields.sql {

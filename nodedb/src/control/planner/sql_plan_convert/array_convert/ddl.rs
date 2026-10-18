@@ -7,14 +7,13 @@ use std::sync::Arc;
 use nodedb_types::config::retention::BitemporalRetention;
 
 use nodedb_array::schema::{
-    ArraySchema, ArraySchemaBuilder, AttrSpec, AttrType as EngineAttrType, CellOrder, DimSpec,
-    DimType as EngineDimType, TileOrder,
+    ArraySchema, ArraySchemaBuilder, AttrSpec, CellOrder, DimSpec, DimType as EngineDimType,
+    TileOrder,
 };
 use nodedb_array::types::ArrayId;
 use nodedb_array::types::domain::{Domain, DomainBound};
 use nodedb_sql::types_array::{
-    ArrayAttrAst, ArrayAttrType, ArrayCellOrderAst, ArrayDimAst, ArrayDimType, ArrayDomainBound,
-    ArrayTileOrderAst,
+    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayDimType, ArrayDomainBound, ArrayTileOrderAst,
 };
 
 use crate::bridge::envelope::PhysicalPlan;
@@ -213,12 +212,7 @@ pub(super) fn build_schema(
         builder = builder.dim(DimSpec::new(d.name.clone(), dtype, Domain::new(lo, hi)));
     }
     for a in attrs {
-        let dtype = match a.dtype {
-            ArrayAttrType::Int64 => EngineAttrType::Int64,
-            ArrayAttrType::Float64 => EngineAttrType::Float64,
-            ArrayAttrType::String => EngineAttrType::String,
-            ArrayAttrType::Bytes => EngineAttrType::Bytes,
-        };
+        let dtype = super::attr_type::engine_attr_type(a.dtype);
         builder = builder.attr(AttrSpec::new(a.name.clone(), dtype, a.nullable));
     }
     let extents: Vec<u64> = tile_extents.iter().map(|n| *n as u64).collect();

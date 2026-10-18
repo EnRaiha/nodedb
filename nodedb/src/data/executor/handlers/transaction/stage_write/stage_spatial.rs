@@ -24,7 +24,7 @@
 //! branch). COMMIT installs the spatial write from the transaction's redo
 //! record, which serializes it from the buffered `SpatialOp` plan node.
 
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::SridGeometry;
 use nodedb_types::{RowIdentity, Surrogate};
 
 use super::context::StageCtx;
@@ -43,7 +43,7 @@ pub(in crate::data::executor) struct StageSpatialInsertParams<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub surrogate: Surrogate,
-    pub geometry: &'a Geometry,
+    pub geometry: &'a SridGeometry,
 }
 
 impl CoreLoop {

@@ -7,6 +7,7 @@ pub mod columnar_dml_updates;
 pub mod crdt_doc_payload;
 pub mod crdt_list_payload;
 pub mod crdt_payload;
+pub mod group_commit;
 pub mod manager;
 pub mod redo;
 pub mod replay;

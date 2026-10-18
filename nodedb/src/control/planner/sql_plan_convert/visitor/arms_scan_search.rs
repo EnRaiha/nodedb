@@ -22,6 +22,7 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
                 sort_keys,
                 tiered,
                 temporal,
+                output,
             } = args;
             super::super::scan::convert_timeseries_scan(
                 super::super::scan_params::TimeseriesScanParams {
@@ -40,6 +41,7 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
                     tenant_id: self.tenant_id,
                     ctx: self.ctx,
                     temporal,
+                    output,
                 },
             )
         }
@@ -101,6 +103,7 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
             field: &str,
             query_entries: &[(u32, f32)],
             top_k: usize,
+            filters: &[nodedb_sql::types::Filter],
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::scan::convert_sparse_search(
                 super::super::scan_params::SparseSearchParams {
@@ -108,6 +111,7 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
                     field,
                     query_entries,
                     top_k: &top_k,
+                    filters,
                     tenant_id: self.tenant_id,
                     database_id: self.ctx.database_id,
                 },

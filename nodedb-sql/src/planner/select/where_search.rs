@@ -23,6 +23,7 @@ use super::text_call::{TextCall, resolve_text_call};
 use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionRegistry, SearchTrigger};
 use crate::parser::normalize::normalize_ident;
+use crate::planner::computed_tail;
 use crate::types::*;
 
 /// Default `top_k` placeholder used when a WHERE-derived search plan has no
@@ -390,7 +391,7 @@ fn plan_spatial_from_where(
             detail: format!("invalid geometry in {name}: {e}"),
         }
     })?;
-    let issues = nodedb_spatial::validate::validate_geometry(&geometry);
+    let issues = nodedb_spatial::validate::validate_geometry(&geometry.geometry);
     if !issues.is_empty() {
         return Err(SqlError::InvalidFunction {
             detail: format!("invalid geometry in {name}: {}", issues.join("; ")),
@@ -401,7 +402,7 @@ fn plan_spatial_from_where(
     } else {
         0.0
     };
-    Ok(Some(SqlPlan::SpatialScan {
+    let scan = SqlPlan::SpatialScan {
         collection: table.name.clone(),
         field,
         predicate,
@@ -411,6 +412,13 @@ fn plan_spatial_from_where(
         // No LIMIT reads every matching row; an explicit LIMIT overwrites
         // this in `apply_limit`.
         limit: usize::MAX,
-        projection: projection.to_vec(),
-    }))
+        projection: computed_tail::body_projection(projection),
+    };
+    // The spatial scan evaluates no expression. A computed SELECT item runs
+    // in a tail over the matched rows.
+    Ok(Some(computed_tail::with_computed_tail(
+        scan,
+        projection,
+        computed_tail::TailBounds::default(),
+    )))
 }

@@ -396,7 +396,6 @@ fn array_routing(op: &ArrayOp) -> PlanRouting {
         | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => PlanRouting::NotAWrite,

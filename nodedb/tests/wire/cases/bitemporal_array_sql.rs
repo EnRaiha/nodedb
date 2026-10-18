@@ -7,48 +7,22 @@
 
 use crate::harness::TestServer;
 
-/// Parse the `attrs` array from a slice result row's JSON.
+/// The requested attribute values of one ARRAY_SLICE row.
 ///
-/// Each row returned by ARRAY_SLICE is a JSON object:
-/// Helper: extract the requested attribute values from an ARRAY_SLICE row.
-///
-/// ARRAY_SLICE projects one column per requested attribute (named after
-/// the attribute) plus a `coords` column.  Older versions returned a
-/// single `attrs` JSON array column; this helper accepts either shape so
-/// the assertions stay schema-agnostic.
+/// A slice row holds one column per dim and one per requested attr, each
+/// named after it. Every requested attr must be present as its own column.
 fn parse_attrs(
     row: &std::collections::HashMap<String, String>,
     requested: &[&str],
 ) -> Vec<serde_json::Value> {
-    // Shape A: AS OF queries route through a different codec path that
-    // wraps the cell into a single `result` column containing the full
-    // JSON envelope (`{"coords": [...], "attrs": [...]}`).
-    if let Some(envelope_text) = row.get("result") {
-        let v: serde_json::Value = serde_json::from_str(envelope_text)
-            .unwrap_or_else(|e| panic!("result not JSON: {envelope_text}: {e}"));
-        if let Some(arr) = v.get("attrs").and_then(|a| a.as_array()) {
-            return arr.clone();
-        }
-        panic!("result envelope missing attrs array: {envelope_text}");
-    }
-    // Shape B: live ARRAY_SLICE projects a single `attrs` column carrying
-    // the JSON array of attribute values.
-    if let Some(attrs_text) = row.get("attrs") {
-        let v: serde_json::Value = serde_json::from_str(attrs_text)
-            .unwrap_or_else(|e| panic!("attrs not JSON: {attrs_text}: {e}"));
-        return match v {
-            serde_json::Value::Array(items) => items,
-            other => panic!("attrs not an array: {other}"),
-        };
-    }
-    // Shape C: per-attribute columns named after the requested attrs.
     requested
         .iter()
         .map(|name| {
             let cell = row
                 .get(*name)
-                .unwrap_or_else(|| panic!("missing attr '{name}' in {row:?}"));
-            serde_json::from_str(cell).unwrap_or_else(|_| serde_json::Value::String(cell.clone()))
+                .unwrap_or_else(|| panic!("missing attr column '{name}' in {row:?}"));
+            serde_json::from_str(cell)
+                .unwrap_or_else(|e| panic!("attr '{name}' is not a number: {cell}: {e}"))
         })
         .collect()
 }
@@ -281,5 +255,77 @@ async fn select_from_array_as_of_system_and_valid_time_combined() {
         attrs[0].as_i64(),
         Some(42),
         "combined AS OF must return v1=42, got attrs: {attrs:?}"
+    );
+}
+
+/// The `result` of the first row of an `ARRAY_AGG` query.
+async fn agg_result(srv: &TestServer, sql: &str) -> String {
+    let rows = srv
+        .query_named_rows(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    rows.first()
+        .and_then(|row| row.get("result"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no result row for {sql}: {rows:?}"))
+}
+
+/// `ARRAY_AGG` with a box reads the box's cells at the `AS OF SYSTEM TIME`
+/// cutoff: the version before the overwrite, and no cell outside the box.
+#[tokio::test]
+async fn array_agg_box_as_of_system_time_reads_the_old_version() {
+    let srv = TestServer::start().await;
+    create_bt(&srv).await;
+
+    srv.exec("INSERT INTO ARRAY bt COORDS (0) VALUES (10), COORDS (2) VALUES (5), COORDS (9) VALUES (1000)")
+        .await
+        .expect("insert v1");
+    srv.exec("SELECT ARRAY_FLUSH('bt')")
+        .await
+        .expect("flush after v1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let ts_between = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_millis() as i64;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    srv.exec("INSERT INTO ARRAY bt COORDS (0) VALUES (99)")
+        .await
+        .expect("insert v2");
+    srv.exec("SELECT ARRAY_FLUSH('bt')")
+        .await
+        .expect("flush after v2");
+
+    let live = agg_result(
+        &srv,
+        "SELECT * FROM ARRAY_AGG('bt', 'v', 'sum', NULL, '{x: [0, 3]}')",
+    )
+    .await;
+    assert_eq!(live.parse::<f64>().ok(), Some(104.0), "live sum in the box");
+
+    let old = agg_result(
+        &srv,
+        &format!(
+            "SELECT * FROM ARRAY_AGG('bt', 'v', 'sum', NULL, '{{x: [0, 3]}}') \
+             AS OF SYSTEM TIME {ts_between}"
+        ),
+    )
+    .await;
+    assert_eq!(old.parse::<f64>().ok(), Some(15.0), "box sum at the cutoff");
+
+    let count = agg_result(
+        &srv,
+        &format!(
+            "SELECT * FROM ARRAY_AGG('bt', 'v', 'count', NULL, '{{x: [0, 3]}}') \
+             AS OF SYSTEM TIME {ts_between}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        count.parse::<f64>().ok(),
+        Some(2.0),
+        "each cell counts once"
     );
 }

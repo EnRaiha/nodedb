@@ -85,6 +85,8 @@ pub(super) struct TimeseriesScanParams<'a> {
     pub tenant_id: TenantId,
     pub ctx: &'a ConvertContext,
     pub temporal: &'a nodedb_sql::TemporalScope,
+    /// SELECT-list output columns of an aggregating scan. Empty on a raw scan.
+    pub output: &'a [nodedb_sql::types::TimeseriesAggOutput],
 }
 
 /// Parameters for `convert_vector_search`.
@@ -119,6 +121,9 @@ pub(super) struct SparseSearchParams<'a> {
     /// Query sparse vector as `(dimension, weight)` entries, parsed at plan time.
     pub query_entries: &'a [(u32, f32)],
     pub top_k: &'a usize,
+    /// The statement's residual `WHERE`, lowered to
+    /// `VectorOp::SparseSearch::filters`.
+    pub filters: &'a [Filter],
     pub tenant_id: TenantId,
     pub database_id: crate::types::DatabaseId,
 }
@@ -185,7 +190,7 @@ pub(super) struct SpatialScanParams<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub predicate: &'a nodedb_sql::types::SpatialPredicate,
-    pub query_geometry: &'a nodedb_types::geometry::Geometry,
+    pub query_geometry: &'a nodedb_types::geometry::SridGeometry,
     pub distance_meters: &'a f64,
     pub attribute_filters: &'a [Filter],
     pub limit: &'a usize,

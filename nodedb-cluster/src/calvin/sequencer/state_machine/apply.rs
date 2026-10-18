@@ -17,7 +17,7 @@ use tracing::{error, warn};
 use crate::calvin::sequencer::entry::SequencerEntry;
 use crate::calvin::sequencer::epoch_guard::{EpochCheck, SequencerHalt, classify};
 use crate::calvin::types::{EpochBatch, SchedulerInput, TxnIdWire};
-use crate::calvin::{ParticipantVote, TxnId, VerdictOutcome};
+use crate::calvin::{AbortCause, ParticipantVote, TxnId, VerdictOutcome};
 
 use super::core::{Delivery, SequencerStateMachine};
 
@@ -117,10 +117,11 @@ impl SequencerStateMachine {
                 position,
                 vshard,
                 reason,
+                refusal,
             } => self.completion_registry.note_vote(
                 TxnId::new(epoch, position),
                 vshard,
-                ParticipantVote::Abort(reason),
+                ParticipantVote::Abort(AbortCause { reason, refusal }),
             ),
             // Authoritative verdict for a staged cross-shard txn, proposed by
             // the leader once every participant voted. Applied on ALL replicas
@@ -134,9 +135,11 @@ impl SequencerStateMachine {
                 epoch,
                 position,
                 reason,
-            } => self
-                .completion_registry
-                .note_verdict(TxnId::new(epoch, position), VerdictOutcome::Abort(reason)),
+                refusal,
+            } => self.completion_registry.note_verdict(
+                TxnId::new(epoch, position),
+                VerdictOutcome::Abort(AbortCause { reason, refusal }),
+            ),
             // The owning vShard's scheduler installs the SHARED lock.
             SequencerEntry::ReserveRead { owner, vshard, key } => self.forward_reservation(
                 index,
@@ -954,19 +957,19 @@ mod tests {
             epoch: 9,
             position: 5,
             reason: crate::calvin::AbortReason::ParticipantError,
+            refusal: Some(vec![4, 2]),
         });
         sm.apply(1, &data);
 
         // The participant gate still reads a plain abort...
         assert_eq!(registry.verdict(txn), Some(false));
-        // ...and the coordinator gets the cause, not a blanket conflict.
+        // ...and the coordinator gets the cause and its refusal, not a
+        // blanket conflict.
         let rx = registry.register_completion(txn, 1);
         registry.note_completion_ack(txn, 3);
         assert_eq!(
             rx.await.expect("completion fires"),
-            crate::calvin::AttemptOutcome::Aborted {
-                reason: crate::calvin::AbortReason::ParticipantError
-            }
+            crate::calvin::AttemptOutcome::Aborted(crate::calvin::AbortCause::refused(vec![4, 2]))
         );
         assert_eq!(sm.last_applied_epoch(), None);
     }
@@ -983,13 +986,14 @@ mod tests {
             position: 6,
             vshard: 3,
             reason: crate::calvin::AbortReason::ParticipantError,
+            refusal: Some(vec![9]),
         });
         sm.apply(1, &data);
 
         assert_eq!(
-            registry.vote_tally(txn).and_then(|t| t.get(&3).copied()),
+            registry.vote_tally(txn).and_then(|t| t.get(&3).cloned()),
             Some(crate::calvin::ParticipantVote::Abort(
-                crate::calvin::AbortReason::ParticipantError
+                crate::calvin::AbortCause::refused(vec![9])
             ))
         );
     }
@@ -1008,7 +1012,7 @@ mod tests {
         sm.apply(1, &data);
 
         assert_eq!(
-            registry.vote_tally(txn).and_then(|t| t.get(&3).copied()),
+            registry.vote_tally(txn).and_then(|t| t.get(&3).cloned()),
             Some(crate::calvin::ParticipantVote::Commit)
         );
     }

@@ -145,6 +145,15 @@ pub(super) async fn collect_classify_and_finish(
                 ),
             });
         }
+        OwnedResponse::Unmergeable { error, closed } => {
+            observe(shared);
+            if let Some(late) = late_parts {
+                late.spawn(deferred_guards);
+            }
+            // A failed cancel holds the window and fails the write here.
+            closed?;
+            return Err(error);
+        }
         OwnedResponse::ChannelClosed => {
             observe(shared);
             // A producer that stopped after the deadline stopped because the

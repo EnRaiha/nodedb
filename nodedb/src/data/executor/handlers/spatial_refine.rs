@@ -10,7 +10,9 @@
 //! `spatial` / columnar-family row (fetched from columnar) alike.
 
 use nodedb_physical::physical_plan::SpatialPredicate;
-use nodedb_types::Value;
+use nodedb_spatial::SridMismatch;
+use nodedb_types::geometry::SridGeometry;
+use nodedb_types::{BboxSpace, Value};
 
 /// Extract geometry from a document field.
 ///
@@ -18,41 +20,65 @@ use nodedb_types::Value;
 /// - `Value::Geometry(g)` — native geometry (columnar path preserves type)
 /// - `Value::String(s)` — GeoJSON string (from SQL ST_Point → serialized)
 /// - `Value::Object(_)` — GeoJSON object (from schemaless doc storage)
+///
+/// GeoJSON keeps the SRID its `crs` member names; no member is WGS 84.
 pub(in crate::data::executor) fn extract_geometry(
     doc: &Value,
     field: &str,
-) -> Option<nodedb_types::geometry::Geometry> {
-    let field_val = doc.get(field)?;
-    match field_val {
-        Value::Geometry(g) => Some(g.clone()),
-        Value::String(s) => nodedb_types::geometry::from_geojson_str(s),
-        Value::Object(map) => {
-            // GeoJSON object stored as Value::Object — serialize to JSON then parse.
-            let json = serde_json::Value::from(Value::Object(map.clone()));
-            serde_json::from_value(json).ok()
-        }
-        _ => None,
-    }
+) -> Option<SridGeometry> {
+    SridGeometry::from_value(doc.get(field)?)
 }
 
 /// Apply the spatial predicate.
+///
+/// The stored and query geometries must share an SRID: a mismatch is
+/// [`SridMismatch`] (`index` the stored SRID, `entry` the query's), which
+/// the caller raises as `Error::MixedSrid` instead of skipping the row.
+/// `ST_DWithin` measures geodesic metres for 4326 and planar metres for a
+/// projected SRID.
 pub(in crate::data::executor) fn apply_predicate(
     predicate: &SpatialPredicate,
-    query: &nodedb_types::geometry::Geometry,
-    doc: &nodedb_types::geometry::Geometry,
+    query: &SridGeometry,
+    doc: &SridGeometry,
     distance_meters: f64,
-) -> bool {
-    match predicate {
+) -> Result<bool, SridMismatch> {
+    if query.srid != doc.srid {
+        return Err(SridMismatch {
+            index: doc.srid,
+            entry: query.srid,
+        });
+    }
+    let (q, d) = (&query.geometry, &doc.geometry);
+    Ok(match predicate {
         SpatialPredicate::DWithin => {
-            crate::engine::spatial::st_dwithin(query, doc, distance_meters)
+            if doc.srid.is_geographic() {
+                crate::engine::spatial::st_dwithin(q, d, distance_meters)
+            } else {
+                nodedb_spatial::planar_dwithin(q, d, distance_meters)
+            }
         }
         // `ST_Contains(loc, q)` asks whether the *stored* geometry contains
         // the query geometry — the geofencing shape, where `loc` is a zone
         // polygon and `q` a point. `ST_Within(loc, q)` is its converse. Both
         // pass the stored geometry in the position SQL named first.
-        SpatialPredicate::Contains => crate::engine::spatial::st_contains(doc, query),
-        SpatialPredicate::Intersects => crate::engine::spatial::st_intersects(query, doc),
-        SpatialPredicate::Within => crate::engine::spatial::st_within(doc, query),
+        SpatialPredicate::Contains => crate::engine::spatial::st_contains(d, q),
+        SpatialPredicate::Intersects => crate::engine::spatial::st_intersects(q, d),
+        SpatialPredicate::Within => crate::engine::spatial::st_within(d, q),
+    })
+}
+
+/// The `Error::MixedSrid` a spatial scan of `collection.field` raises for
+/// `mismatch`.
+pub(in crate::data::executor) fn mixed_srid_error(
+    collection: &str,
+    field: &str,
+    mismatch: SridMismatch,
+) -> crate::Error {
+    crate::Error::MixedSrid {
+        collection: collection.to_string(),
+        field: field.to_string(),
+        index_srid: mismatch.index.code(),
+        row_srid: mismatch.entry.code(),
     }
 }
 
@@ -116,14 +142,33 @@ pub(in crate::data::executor) fn project_doc(
     }
 }
 
-/// Expand a bounding box by a distance in meters.
+/// Metres per degree used to widen a geographic search box: the WGS 84
+/// equatorial degree of longitude, rounded. Using it for latitude too keeps
+/// the box at least as wide as the true distance.
+const METRES_PER_DEGREE: f64 = 111_320.0;
+
+/// Floor on cos(latitude) so a box near a pole stays finite.
+const MIN_COS_LAT: f64 = 0.001;
+
+/// Expand a bounding box by a distance in meters, in `space`.
+///
+/// Geographic space converts metres to degrees at the box's mean latitude.
+/// Planar space adds the metres directly.
 pub(in crate::data::executor) fn expand_bbox(
     bbox: &nodedb_types::BoundingBox,
     meters: f64,
+    space: BboxSpace,
 ) -> nodedb_types::BoundingBox {
-    let lat_delta = meters / 111_320.0;
-    let avg_lat = ((bbox.min_lat + bbox.max_lat) / 2.0).to_radians();
-    let lng_delta = meters / (111_320.0 * avg_lat.cos().max(0.001));
+    let (lng_delta, lat_delta) = match space {
+        BboxSpace::Geographic => {
+            let avg_lat = ((bbox.min_lat + bbox.max_lat) / 2.0).to_radians();
+            (
+                meters / (METRES_PER_DEGREE * avg_lat.cos().max(MIN_COS_LAT)),
+                meters / METRES_PER_DEGREE,
+            )
+        }
+        BboxSpace::Planar => (meters, meters),
+    };
 
     nodedb_types::BoundingBox::new(
         bbox.min_lng - lng_delta,

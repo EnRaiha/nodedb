@@ -28,9 +28,9 @@ impl Value {
             }
             Value::Duration(value) => quote_literal(&value.to_string()),
             Value::Decimal(value) => value.to_string(),
-            // Debug is a total, deterministic representation for this enum and
-            // avoids a fallible JSON serializer on this infallible public API.
-            Value::Geometry(value) => quote_literal(&format!("{value:?}")),
+            // `SridGeometry`'s Display is total and deterministic, and avoids a
+            // fallible JSON serializer on this infallible public API.
+            Value::Geometry(value) => quote_literal(&value.to_string()),
             Value::Range {
                 start,
                 end,
@@ -99,7 +99,7 @@ mod tests {
 
     use super::*;
     use crate::array_cell::ArrayCell;
-    use crate::geometry::Geometry;
+    use crate::geometry::{Geometry, Srid, SridGeometry};
 
     #[test]
     fn renders_every_value_variant_without_null_fallback() {
@@ -121,7 +121,7 @@ mod tests {
             Value::NaiveDateTime(crate::datetime::NdbDateTime::from_micros(0)),
             Value::Duration(crate::datetime::NdbDuration::from_micros(1)),
             Value::Decimal(rust_decimal::Decimal::new(125, 2)),
-            Value::Geometry(Geometry::point(1.0, 2.0)),
+            Value::Geometry(SridGeometry::wgs84(Geometry::point(1.0, 2.0))),
             Value::Set(vec![Value::Bool(false)]),
             Value::Regex("a'b".into()),
             Value::Range {
@@ -212,8 +212,13 @@ mod tests {
     #[test]
     fn geometry_and_ranges_have_explicit_safe_representations() {
         assert_eq!(
-            Value::Geometry(Geometry::point(1.0, 2.0)).to_sql_literal(),
+            Value::Geometry(SridGeometry::wgs84(Geometry::point(1.0, 2.0))).to_sql_literal(),
             quote_literal("Point { coordinates: [1.0, 2.0] }")
+        );
+        assert_eq!(
+            Value::Geometry(SridGeometry::new(Srid::Utm48N, Geometry::point(1.0, 2.0)))
+                .to_sql_literal(),
+            quote_literal("SRID=32648;Point { coordinates: [1.0, 2.0] }")
         );
         assert_eq!(
             Value::Range {

@@ -11,7 +11,7 @@ use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::{TextOp, VectorOp};
 
 use super::text_hybrid::{translate_hybrid_search_payload, translate_text_search_payload};
-use super::vector::translate_vector_search_payload;
+use super::vector::{VectorHitCut, translate_vector_search_payload};
 
 /// Inspect the executed plan and apply the surrogate→PK translation that
 /// matches its shape: vector search hits, full-text search hits, or hybrid
@@ -31,13 +31,28 @@ pub fn translate_search_response(
     }
 
     match plan {
+        // A slow-path search attached each body for its column projection,
+        // so the body stays after the filter. The fast path attached it only
+        // for the predicate.
         PhysicalPlan::Vector(VectorOp::Search {
             collection,
             rls_filters,
             top_k,
+            skip_payload_fetch,
             ..
-        })
-        | PhysicalPlan::Vector(VectorOp::MultiSearch {
+        }) => translate_vector_search_payload(
+            payload,
+            state,
+            database_id,
+            tenant_id,
+            collection.as_str(),
+            VectorHitCut {
+                rls_filters: rls_filters.as_slice(),
+                top_k: *top_k,
+                strip_bodies: *skip_payload_fetch,
+            },
+        ),
+        PhysicalPlan::Vector(VectorOp::MultiSearch {
             collection,
             rls_filters,
             top_k,
@@ -48,13 +63,32 @@ pub fn translate_search_response(
             database_id,
             tenant_id,
             collection.as_str(),
-            rls_filters.as_slice(),
-            *top_k,
+            VectorHitCut {
+                rls_filters: rls_filters.as_slice(),
+                top_k: *top_k,
+                strip_bodies: true,
+            },
+        ),
+        // A sparse search attaches each body for its column projection, so
+        // the body stays after the filter.
+        PhysicalPlan::Vector(VectorOp::SparseSearch {
+            collection,
+            filters,
+            top_k,
+            ..
+        }) => translate_vector_search_payload(
+            payload,
+            state,
+            database_id,
+            tenant_id,
+            collection.as_str(),
+            VectorHitCut {
+                rls_filters: filters.as_slice(),
+                top_k: *top_k,
+                strip_bodies: false,
+            },
         ),
         PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
-            collection, top_k, ..
-        })
-        | PhysicalPlan::Vector(VectorOp::SparseSearch {
             collection, top_k, ..
         }) => translate_vector_search_payload(
             payload,
@@ -62,8 +96,11 @@ pub fn translate_search_response(
             database_id,
             tenant_id,
             collection.as_str(),
-            &[],
-            *top_k,
+            VectorHitCut {
+                rls_filters: &[],
+                top_k: *top_k,
+                strip_bodies: false,
+            },
         ),
         PhysicalPlan::Text(
             TextOp::Search { collection, .. }

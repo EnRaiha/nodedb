@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::control::planner::context::PlanSecurityContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
@@ -14,6 +13,7 @@ use crate::control::server::shared::authorization::{AuthorizedTaskSet, authorize
 use crate::control::server::shared::clone_write::{
     CloneCheckedOutcome, InterceptAndAuthorizeParams, intercept_and_authorize,
 };
+use crate::control::server::shared::cluster_array_dispatch::{is_cluster_array, run_cluster_array};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::returning;
@@ -28,6 +28,7 @@ use crate::types::TraceId;
 use super::dispatch_write::{
     ReturningShape, authorization_error_to_ddl, dispatch_staged, error_to_ddl, staging_error_to_ddl,
 };
+use super::plan_statement::{PlanBuilder, PlannedStatement, StatementSource, plan_statement};
 use super::types::ddl_err;
 
 /// Plan SQL through nodedb-sql, authorize the final task set, and dispatch it.
@@ -59,54 +60,68 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         let (_, sqlstate, message) = error_to_sqlstate(&error);
         ddl_err(sqlstate, message)
     })?;
-    let sql = sql.as_str();
-    // This is a client statement — the object-literal `INSERT INTO c { … }` and
-    // `UPSERT` forms land here after being rewritten to standard SQL — so it
-    // plans under the requester's own scope, the same one it is authorized and
-    // metered as below. Planning it as the system will apply no row policy to
-    // it: read filters will not be injected, and the write gates will decide
-    // nothing, on a transport a client can reach directly.
-    //
-    // Injection happens inside planning, before the task set is consumed:
-    // implicit-edge extraction, authorization, staging, and dispatch all read
-    // `tasks` after this point, and injecting later will hand them
-    // un-injected copies.
-    let (mut tasks, output_schema, versions) = {
-        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id)?;
-        crate::control::security::auth_fence::admit_permission_view(state, tenant_id)
-            .await
-            .map_err(|error| DdlError::from_error(&error))?;
-        let sec = PlanSecurityContext {
-            identity,
-            auth: scope.auth(),
-            rls_store: &state.rls,
-            redaction_store: &state.redaction,
-            permissions: &state.permissions,
-            roles: &state.roles,
-            permission_tree: crate::control::planner::context::PermissionTreeSource::Live(
-                &state.permission_cache,
-            ),
-        };
-        let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-        // A column DEFAULT that calls `nextval` draws per row in row order,
-        // and records into this session's `currval` map, as the SQL form does.
-        query_ctx.set_session_sequences(txn_ctx.sessions.sequence_values(txn_ctx.session_id));
-        let (tasks, output_schema, versions, _) = query_ctx
-            .plan_sql_with_rls_and_versions(
-                sql,
-                tenant_id,
-                database_id,
-                &sec,
-                returning_items.as_deref(),
-            )
-            .await
-            .map_err(|error| {
-                let (_, sqlstate, message) = error_to_sqlstate(&error);
-                ddl_err(sqlstate, message)
-            })?;
-        (tasks, output_schema, versions)
+    let source = StatementSource::Sql {
+        sql: sql.as_str(),
+        returning_items: returning_items.as_deref(),
     };
-    let has_returning = returning_items.is_some();
+    let planned = plan_statement(state, identity, tenant_id, database_id, source, txn_ctx).await?;
+    dispatch_planned(
+        state,
+        identity,
+        tenant_id,
+        database_id,
+        planned,
+        txn_ctx,
+        fire_triggers,
+    )
+    .await
+}
+
+/// [`plan_and_dispatch`] for a statement whose plans `build` makes, instead
+/// of SQL text: a bulk load has rows, not SQL. The plans take the same
+/// policy pass, authorization, transaction routing and durable dispatch.
+/// The statement carries no `RETURNING`.
+pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_and_dispatch_built(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    tenant_id: nodedb_types::TenantId,
+    database_id: crate::types::DatabaseId,
+    build: PlanBuilder<'_>,
+    txn_ctx: &DmlTxnCtx<'_>,
+    fire_triggers: bool,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let source = StatementSource::Built(build);
+    let planned = plan_statement(state, identity, tenant_id, database_id, source, txn_ctx).await?;
+    dispatch_planned(
+        state,
+        identity,
+        tenant_id,
+        database_id,
+        planned,
+        txn_ctx,
+        fire_triggers,
+    )
+    .await
+}
+
+/// Authorize a planned statement's final task set and dispatch it: staged
+/// inside a transaction block, through Calvin when it spans shards, and
+/// through the durable route otherwise.
+async fn dispatch_planned(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    tenant_id: nodedb_types::TenantId,
+    database_id: crate::types::DatabaseId,
+    planned: PlannedStatement,
+    txn_ctx: &DmlTxnCtx<'_>,
+    fire_triggers: bool,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let PlannedStatement {
+        mut tasks,
+        output_schema,
+        versions,
+        has_returning,
+    } = planned;
 
     // Extraction marks catalog state and allocates surrogates. Reject an
     // unauthorized original DML task set before either side effect can occur.
@@ -294,6 +309,29 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             }
             None => task,
         };
+
+        // A `ClusterArray` plan runs on the Control Plane through the array
+        // coordinator, as every transport's dispatch loop runs it. Each shard
+        // proposes its cells through its own replicated entry, so the plan
+        // never takes the local funnel route. Inside a block the staging gate
+        // above reshapes a write into per-shard `ArrayOp` tasks, so only an
+        // autocommit write or a read arrives here.
+        if is_cluster_array(&task.plan) {
+            let authorized =
+                authorize_final_task_set(state, identity, std::slice::from_ref(&task))?
+                    .into_tasks()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| DdlError::internal("authorization returned no task"))?;
+            let shared = state.self_arc().map_err(|error| error_to_ddl(&error))?;
+            let payload = run_cluster_array(&shared, authorized)
+                .await
+                .map_err(|error| error_to_ddl(&error))?;
+            if has_returning {
+                returning_shape.fold(&task.plan, &payload, &mut returned_rows)?;
+            }
+            continue;
+        }
 
         let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
         let response = match intercept_and_authorize(InterceptAndAuthorizeParams {

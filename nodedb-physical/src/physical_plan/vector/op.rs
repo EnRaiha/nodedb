@@ -228,6 +228,11 @@ pub enum VectorOp {
         query_entries: Vec<(u32, f32)>,
         /// Maximum results to return.
         top_k: usize,
+        /// The statement's residual `WHERE` (serialized `Vec<ScanFilter>`).
+        /// Empty when none applies. With a filter the Data Plane widens the
+        /// candidate window and attaches each body. The Control Plane keeps
+        /// the `top_k` highest-scoring hits that pass.
+        filters: Vec<u8>,
     },
 
     /// Delete a document from the sparse inverted index.

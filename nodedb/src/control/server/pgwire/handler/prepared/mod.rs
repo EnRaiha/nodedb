@@ -3,6 +3,7 @@
 pub mod describe;
 pub mod execute;
 pub mod param_bind;
+pub mod parse_refusal;
 pub mod parser;
 pub mod statement;
 

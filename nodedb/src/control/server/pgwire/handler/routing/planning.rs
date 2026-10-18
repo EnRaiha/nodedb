@@ -217,6 +217,14 @@ impl NodeDbPgHandler {
                 .map_err(StatementSetupError::from)?
                 .tenant_version(tenant_id.as_u64());
         let current_rls_version = self.state.rls.tenant_version(tenant_id.as_u64());
+        // A cached plan's column reads were checked against redaction policy
+        // before row-level security was injected. A policy change evicts the
+        // entry, so the next plan is checked against the current policy.
+        let policies = crate::control::planner::descriptor_set::PolicyVersions {
+            permission_tree: current_permission_tree_version,
+            rls: current_rls_version,
+            redaction: self.state.redaction.version(),
+        };
 
         let cached_tasks = if bypass_cache {
             None
@@ -232,8 +240,7 @@ impl NodeDbPgHandler {
                 session_id,
                 &statement_sql,
                 move |id| current_descriptor_version(&state, tenant, db, id),
-                current_permission_tree_version,
-                current_rls_version,
+                policies,
             )
         };
 

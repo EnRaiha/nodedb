@@ -5,6 +5,7 @@
 //! `SurrogateReserve` Raft-apply in identical log order on every node.
 //! Never exposes `alloc_one`/`alloc`.
 
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nodedb_types::Surrogate;
@@ -50,6 +51,33 @@ impl ClusterCounter {
                 Ordering::Acquire,
             ) {
                 Ok(_) => return Some(Surrogate::new(next as u32)),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Hand out up to `n` contiguous surrogates from the reserved batch,
+    /// lock-free, as an inclusive range. The range is shorter than `n` when
+    /// the batch holds fewer. `None` means the batch is empty or `n` is 0.
+    pub fn try_alloc_reserved_range(&self, n: u32) -> Option<RangeInclusive<u32>> {
+        if n == 0 {
+            return None;
+        }
+        let end = self.reserved_end.load(Ordering::Acquire);
+        loop {
+            let next = self.reserved_next.load(Ordering::Acquire);
+            if next >= end {
+                return None;
+            }
+            let take = (end - next).min(u64::from(n));
+            match self.reserved_next.compare_exchange_weak(
+                next,
+                next + take,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                // `end` never exceeds `u32::MAX + 1`, so both bounds fit a u32.
+                Ok(_) => return Some(next as u32..=(next + take - 1) as u32),
                 Err(_) => continue,
             }
         }
@@ -207,6 +235,20 @@ mod tests {
         assert_eq!(got, expect);
         assert!(c.try_alloc_reserved().is_none());
         assert!(c.try_alloc_reserved().is_none());
+    }
+
+    #[test]
+    fn try_alloc_reserved_range_takes_one_contiguous_run() {
+        let c = ClusterCounter::new(0, 0);
+        let (start, end) = c.reserve_from_global(10).unwrap();
+        c.set_reserved_batch(start, end);
+
+        assert_eq!(c.try_alloc_reserved_range(4), Some(1..=4));
+        assert_eq!(c.try_alloc_reserved().map(|s| s.as_u32()), Some(5));
+        // Fewer remain than asked for: the run is the rest of the batch.
+        assert_eq!(c.try_alloc_reserved_range(100), Some(6..=10));
+        assert_eq!(c.try_alloc_reserved_range(1), None);
+        assert_eq!(c.try_alloc_reserved_range(0), None);
     }
 
     /// A raise retires the unissued part of the reserved batch at or below

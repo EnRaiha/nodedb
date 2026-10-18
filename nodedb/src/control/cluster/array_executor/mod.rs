@@ -27,15 +27,17 @@
 //!   dispatch-and-await scaffolding.
 //! - [`read`]: read/scan handlers (slice, aggregate, surrogate-bitmap scan) plus
 //!   the response-row parsers.
+//! - [`elementwise`]: the elementwise handler.
+//! - [`maint`]: the flush and compact handler.
 //! - [`write`]: write handlers (put, delete).
 //! - [`refusal`]: the typed cluster error a Data-Plane refusal answers with.
 
-pub mod cells;
+mod elementwise;
 mod executor;
+mod maint;
 mod read;
 mod refusal;
 mod trait_impl;
 mod write;
 
-pub use cells::flatten_blob_vec;
 pub use executor::DataPlaneArrayExecutor;

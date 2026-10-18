@@ -89,11 +89,13 @@ impl PartialAggregate {
             AggFunction::Max => cell(column.max.as_ref()),
             AggFunction::First => cell(column.first.as_ref().map(|f| &f.value)),
             AggFunction::Last => cell(column.last.as_ref().map(|l| &l.value)),
+            // A distinct count is a whole number: the estimate rounds, as
+            // the ad-hoc `approx_count_distinct` rounds it.
             AggFunction::CountDistinct => column
                 .hll
                 .as_ref()
                 .filter(|_| column.sum.count() > 0)
-                .map_or(Value::Null, |h| Value::Float(h.estimate())),
+                .map_or(Value::Null, |h| Value::Integer(h.estimate().round() as i64)),
             AggFunction::Percentile(q) => column
                 .tdigest
                 .as_ref()

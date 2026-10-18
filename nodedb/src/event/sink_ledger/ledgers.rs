@@ -19,6 +19,7 @@
 //! Each sink stores an event's key with its effect, so an event delivered
 //! again after a restart is applied once.
 
+use crate::control::state::SharedState;
 use crate::event::topic::committed::PublishLedger;
 use crate::event::trigger::lane::ActionLane;
 use crate::event::watermark::WatermarkStore;
@@ -40,8 +41,14 @@ pub struct SinkLedgers {
 impl SinkLedgers {
     /// Open the ledgers beside the watermark store, reading audited keys
     /// above the persisted watermark of each of `num_cores` cores.
+    ///
+    /// A consumer redelivers only events above its persisted watermark.
+    /// So only DML audit rows above those floors can dedup a redelivery.
+    /// The buffer and catalog rows come from the position index range above each floor.
+    /// The audit WAL holds only rows no flush has committed, so it is read too.
     pub fn open(
         wal: &WalManager,
+        shared: &SharedState,
         watermarks: &WatermarkStore,
         num_cores: usize,
     ) -> crate::Result<Self> {
@@ -49,9 +56,11 @@ impl SinkLedgers {
         for core in 0..num_cores {
             floors.push(watermarks.load(core)?.as_u64());
         }
-        let audited = AuditedKeys::from_recovered(&wal.recover_audit_entries()?, |core| {
+        let persisted = shared.dml_audits_above(&floors)?;
+        let unflushed = AuditedKeys::decode_recovered(&wal.recover_audit_entries()?)?;
+        let audited = AuditedKeys::from_entries(persisted.iter().chain(unflushed.iter()), |core| {
             floors.get(core as usize).copied().unwrap_or(0)
-        })?;
+        });
         Ok(Self {
             audited,
             crdt: CrdtLedger::open(watermarks.dir())?,

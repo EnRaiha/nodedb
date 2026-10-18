@@ -69,6 +69,7 @@ fn ts_raw_scan(collection: &str, limit: usize) -> PhysicalPlan {
         computed_columns: Vec::new(),
         having: Vec::new(),
         tiering: None,
+        output_columns: Vec::new(),
     })
 }
 

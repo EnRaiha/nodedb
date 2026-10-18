@@ -117,7 +117,7 @@ pub async fn broadcast_to_all_cores_txn(
         status: crate::bridge::envelope::Status::Ok,
         attempt: 1,
         partial: false,
-        payload: crate::bridge::envelope::Payload::from_vec(outcome.merged_array),
+        payload: crate::bridge::envelope::Payload::from_vec(outcome.merged_array()?),
         watermark_lsn: outcome.watermark_lsn,
         error_code: None,
         stage_vote: None,

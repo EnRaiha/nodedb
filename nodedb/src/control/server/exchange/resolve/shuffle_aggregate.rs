@@ -90,6 +90,7 @@ pub async fn resolve_shuffle_aggregate(
         having,
         limit,
         sort_keys,
+        group_key_aliases,
         ..
     }) = child
     else {
@@ -325,12 +326,17 @@ pub async fn resolve_shuffle_aggregate(
     //    ORDER BY). Reuse the shared extract/encode helpers — no hand-rolled framing.
     let mut elements: Vec<Vec<u8>> = Vec::new();
     for rows in &per_part_rows {
-        elements.extend(extract_msgpack_elements(rows));
+        elements.extend(extract_msgpack_elements(rows)?);
     }
     if elements.len() > limit {
         elements.truncate(limit);
     }
-    let merged = encode_msgpack_array(&elements);
+    // Each part finalizes its groups under the keys' row names. The aliases
+    // apply to the merged rows, as they do on a single-node aggregate.
+    let merged = crate::util::row_rename::rename_row_keys(
+        &encode_msgpack_array(&elements),
+        &crate::util::row_rename::group_key_renames(&group_by, &group_key_aliases),
+    )?;
 
     // The producers report the source collection's versions at read time on
     // their `ShuffleProduceResponse`; the fold above is what this aggregate

@@ -16,9 +16,10 @@
 //! ## Geometry decode on replay
 //!
 //! `SpatialPutPayload.geometry_bytes` carries msgpack-encoded
-//! `nodedb_types::geometry::Geometry` (the same format stored in
-//! `SpatialInsertMsg.geometry_bytes`).  On replay we decode it with
-//! `zerompk::from_msgpack` and pass the `&Geometry` to `execute_spatial_insert`.
+//! `nodedb_types::geometry::SridGeometry` (the same format stored in
+//! `SpatialInsertMsg.geometry_bytes`). On replay we decode it with
+//! `zerompk::from_msgpack` and pass the `&SridGeometry` to
+//! `execute_spatial_insert`.
 //!
 //! ## Why there is no replay floor or watermark here
 //!
@@ -204,7 +205,7 @@ impl CoreLoop {
                 };
 
                 // Decode geometry from msgpack bytes stored in the WAL payload.
-                let geometry: nodedb_types::geometry::Geometry =
+                let geometry: nodedb_types::geometry::SridGeometry =
                     match zerompk::from_msgpack(&payload.geometry_bytes) {
                         Ok(g) => g,
                         Err(e) => {
@@ -480,7 +481,8 @@ mod tests {
     /// idempotency gate, so these tests exercise the engine's OWN idempotency
     /// rather than the gate's — the property replay actually depends on.
     fn put_record(lsn: u64, geometry: &Geometry) -> nodedb_wal::WalRecord {
-        let geometry_bytes = zerompk::to_msgpack_vec(geometry).expect("encode geometry");
+        let tagged = nodedb_types::geometry::SridGeometry::wgs84(geometry.clone());
+        let geometry_bytes = zerompk::to_msgpack_vec(&tagged).expect("encode geometry");
         let payload = nodedb_wal::record::SpatialPutPayload::new(
             SyncProvenance::default(),
             COLLECTION,

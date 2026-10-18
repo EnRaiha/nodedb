@@ -116,9 +116,8 @@ async fn array_slice_returns_in_range_cells() {
     let srv = TestServer::start().await;
     prepare_genome(&srv).await;
 
-    // SELECT * over an ARRAY_SLICE TVF expands to one pgwire field per
-    // declared column ('coords' + each requested attr). Use named rows so
-    // the assertion does not depend on column ordering.
+    // SELECT * over an ARRAY_SLICE TVF expands to one pgwire field per dim,
+    // then one per requested attr, each named after it.
     let rows = srv
         .query_named_rows(
             "SELECT * FROM ARRAY_SLICE('genome_variants', \
@@ -131,30 +130,26 @@ async fn array_slice_returns_in_range_cells() {
         2,
         "expected two cells in chrom=1, pos<13000; got {rows:?}"
     );
-    // Each row carries a `coords` column (JSON array text) and an
-    // `attrs` column (JSON array text of the requested attribute values
-    // in projection order).  Reject any internal tagged-msgpack leak
-    // (`[18, "<base64>"]` shape).
-    for row in &rows {
-        let coords_text = row
-            .get("coords")
-            .unwrap_or_else(|| panic!("missing coords column in {row:?}"));
-        let coords: serde_json::Value = serde_json::from_str(coords_text)
-            .unwrap_or_else(|e| panic!("coords not JSON: {coords_text}: {e}"));
-        let coords_arr = coords
-            .as_array()
-            .unwrap_or_else(|| panic!("coords not an array: {coords_text}"));
-        assert!(!coords_arr.is_empty(), "coords empty in {row:?}");
-        let attrs_text = row
-            .get("attrs")
-            .unwrap_or_else(|| panic!("missing attrs column in {row:?}"));
-        let attrs: serde_json::Value = serde_json::from_str(attrs_text)
-            .unwrap_or_else(|e| panic!("attrs not JSON: {attrs_text}: {e}"));
-        let attrs_arr = attrs
-            .as_array()
-            .unwrap_or_else(|| panic!("attrs not an array: {attrs_text}"));
-        assert!(!attrs_arr.is_empty(), "attrs empty in {row:?}");
-    }
+    let mut cells: Vec<(String, String, String, String)> = rows
+        .iter()
+        .map(|row| {
+            let col = |name: &str| {
+                row.get(name)
+                    .unwrap_or_else(|| panic!("missing {name} column in {row:?}"))
+                    .clone()
+            };
+            assert_eq!(row.len(), 4, "dims then attrs, nothing else: {row:?}");
+            (col("chrom"), col("pos"), col("variant"), col("qual"))
+        })
+        .collect();
+    cells.sort();
+    assert_eq!(
+        cells,
+        vec![
+            ("1".into(), "12345".into(), "SNP".into(), "99.5".into()),
+            ("1".into(), "12346".into(), "SNP".into(), "88.2".into()),
+        ]
+    );
 }
 
 #[tokio::test]

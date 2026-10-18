@@ -14,9 +14,31 @@ use crate::util::rmpv_value::value_to_rmpv;
 pub(in crate::data::executor) struct GroupedKeyTypes<'a> {
     /// One kind per GROUP BY column, in `group_by` order.
     pub group_key_kinds: &'a [TsGroupKeyKind],
+    /// One kind per aggregate, in `aggregates` order: the kind of the column
+    /// the aggregate reads. `MIN` / `MAX` / `FIRST` / `LAST` over an instant
+    /// column render as a typed instant.
+    pub aggregate_kinds: &'a [TsGroupKeyKind],
     /// The kind of the collection's time key, which the `bucket` column
     /// derives from.
     pub bucket_kind: TimeKind,
+}
+
+/// Render one `MIN` / `MAX` / `FIRST` / `LAST` cell with its column's type.
+///
+/// The accumulator holds an instant column's cell as the integer storage
+/// holds. That integer renders as a typed instant, as the column renders
+/// ungrouped. Every other cell keeps its own type.
+fn extreme_value(
+    value: Option<&nodedb_types::Value>,
+    kind: TsGroupKeyKind,
+) -> crate::Result<rmpv::Value> {
+    match (value, kind) {
+        (Some(nodedb_types::Value::Integer(n)), TsGroupKeyKind::Instant(k)) => {
+            rmpv_time_cell(TimeKind::Instant(k), *n)
+        }
+        (Some(v), _) => Ok(value_to_rmpv(v)),
+        (None, _) => Ok(rmpv::Value::Nil),
+    }
 }
 
 /// How a grouped result is bucketed, filtered, ordered, and cut.
@@ -29,6 +51,38 @@ pub(in crate::data::executor) struct GroupedOutputShape<'a> {
     pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     /// HAVING filters applied to the finalized group rows.
     pub having: &'a [crate::bridge::scan_filter::ScanFilter],
+    /// `(encoded key, output name)` of each output column, in SELECT-list
+    /// order, applied after sort and limit. Empty keeps the encoded keys.
+    pub output_columns: &'a [(String, String)],
+}
+
+/// `row` as exactly the columns `output_columns` names, in that order.
+///
+/// Each output column takes the value the row holds under its encoded key,
+/// or NULL when the row holds none. Two output columns can read one key:
+/// `AVG(v) AS a, AVG(v) AS b` both read `avg(v)`. An empty `output_columns`
+/// returns `row` unchanged.
+pub(super) fn select_output_columns(
+    row: rmpv::Value,
+    output_columns: &[(String, String)],
+) -> rmpv::Value {
+    if output_columns.is_empty() {
+        return row;
+    }
+    let rmpv::Value::Map(fields) = row else {
+        return row;
+    };
+    let selected = output_columns
+        .iter()
+        .map(|(key, name)| {
+            let value = fields
+                .iter()
+                .find(|(k, _)| k.as_str() == Some(key.as_str()))
+                .map_or(rmpv::Value::Nil, |(_, v)| v.clone());
+            (rmpv::Value::String(name.as_str().into()), value)
+        })
+        .collect();
+    rmpv::Value::Map(selected)
 }
 
 /// Render one GROUP BY key cell with the type its column carries ungrouped.
@@ -72,9 +126,11 @@ pub(in crate::data::executor) fn encode_grouped_results(
         bucket_interval_ms,
         sort_keys,
         having,
+        output_columns,
     } = shape;
     let GroupedKeyTypes {
         group_key_kinds,
+        aggregate_kinds,
         bucket_kind,
     } = key_types;
     let has_bucket = bucket_interval_ms > 0;
@@ -128,17 +184,21 @@ pub(in crate::data::executor) fn encode_grouped_results(
         for (agg_idx, agg_key) in agg_keys.iter().enumerate() {
             let accum = &accums[agg_idx];
             let op = &aggregates[agg_idx].0;
-            // SUM is exact; MIN / MAX / FIRST / LAST keep the cell's own
-            // type, so an integer column stays an integer.
-            let cell = |v: Option<&nodedb_types::Value>| v.map_or(rmpv::Value::Nil, value_to_rmpv);
+            // SUM is exact; MIN / MAX / FIRST / LAST keep the column's own
+            // type, so an integer column stays an integer and an instant
+            // column stays an instant.
+            let kind = aggregate_kinds
+                .get(agg_idx)
+                .copied()
+                .unwrap_or(TsGroupKeyKind::Text);
             let val = match op.as_str() {
                 "count" => rmpv::Value::Integer((accum.count as i64).into()),
                 "sum" => value_to_rmpv(&accum.sum_value()?),
                 "avg" => accum.avg_f64()?.map_or(rmpv::Value::Nil, rmpv::Value::F64),
-                "min" => cell(accum.min()),
-                "max" => cell(accum.max()),
-                "first" => cell(accum.first()),
-                "last" => cell(accum.last()),
+                "min" => extreme_value(accum.min(), kind)?,
+                "max" => extreme_value(accum.max(), kind)?,
+                "first" => extreme_value(accum.first(), kind)?,
+                "last" => extreme_value(accum.last(), kind)?,
                 // The planner sends only `ts_stddev` here: the population
                 // form, NULL for fewer than 2 values.
                 "ts_stddev" if accum.count >= 2 => rmpv::Value::F64(accum.stddev_population()),
@@ -172,6 +232,12 @@ pub(in crate::data::executor) fn encode_grouped_results(
 
     super::sort::sort_rows(&mut rows, sort_keys)?;
     rows.truncate(limit);
+    // HAVING and the sort keys read the encoded keys. The output names are
+    // applied last.
+    let rows: Vec<rmpv::Value> = rows
+        .into_iter()
+        .map(|row| select_output_columns(row, output_columns))
+        .collect();
 
     let array = rmpv::Value::Array(rows);
     let mut buf = Vec::new();
@@ -211,9 +277,11 @@ mod tests {
                 bucket_interval_ms: 60_000,
                 sort_keys: &[],
                 having: &[],
+                output_columns: &[],
             },
             GroupedKeyTypes {
                 group_key_kinds: &[],
+                aggregate_kinds: &[],
                 bucket_kind,
             },
         )
@@ -252,6 +320,53 @@ mod tests {
         );
     }
 
+    /// The output columns rename, reorder, repeat, and drop the encoded keys.
+    #[test]
+    fn output_columns_follow_the_select_list() {
+        let row = rmpv::Value::Map(vec![
+            (rmpv::Value::from("bucket"), rmpv::Value::from(1)),
+            (rmpv::Value::from("host"), rmpv::Value::from("a")),
+            (rmpv::Value::from("avg(v)"), rmpv::Value::F64(2.5)),
+        ]);
+        let output = [
+            ("avg(v)".to_string(), "m".to_string()),
+            ("bucket".to_string(), "b".to_string()),
+            ("avg(v)".to_string(), "again".to_string()),
+        ];
+        assert_eq!(
+            select_output_columns(row.clone(), &output),
+            rmpv::Value::Map(vec![
+                (rmpv::Value::from("m"), rmpv::Value::F64(2.5)),
+                (rmpv::Value::from("b"), rmpv::Value::from(1)),
+                (rmpv::Value::from("again"), rmpv::Value::F64(2.5)),
+            ])
+        );
+        assert_eq!(select_output_columns(row.clone(), &[]), row);
+    }
+
+    /// `MIN` over an instant column renders the typed instant the column
+    /// renders ungrouped. Over an integer column it stays the integer.
+    #[test]
+    fn extreme_over_an_instant_column_is_a_typed_instant() {
+        let stored = nodedb_types::Value::Integer(BUCKET_MS);
+        assert_eq!(
+            extreme_value(Some(&stored), TsGroupKeyKind::Instant(InstantKind::Utc))
+                .expect("instant"),
+            rmpv::Value::Ext(
+                InstantKind::Utc.ext_type(),
+                (BUCKET_MS * 1000).to_be_bytes().to_vec()
+            )
+        );
+        assert_eq!(
+            extreme_value(Some(&stored), TsGroupKeyKind::Integer).expect("integer"),
+            rmpv::Value::Integer(BUCKET_MS.into())
+        );
+        assert_eq!(
+            extreme_value(None, TsGroupKeyKind::Instant(InstantKind::Utc)).expect("null"),
+            rmpv::Value::Nil
+        );
+    }
+
     /// Encode one ungrouped row whose accumulators were fed `feed`, and
     /// return the aggregate cells by key.
     fn aggregate_cells(
@@ -281,9 +396,11 @@ mod tests {
                 bucket_interval_ms: 0,
                 sort_keys: &[],
                 having: &[],
+                output_columns: &[],
             },
             GroupedKeyTypes {
                 group_key_kinds: &[],
+                aggregate_kinds: &[],
                 bucket_kind: TimeKind::Millis,
             },
         )
@@ -496,9 +613,11 @@ mod tests {
                 bucket_interval_ms: 0,
                 sort_keys: &[],
                 having: &[],
+                output_columns: &[],
             },
             GroupedKeyTypes {
                 group_key_kinds: &[TsGroupKeyKind::Text],
+                aggregate_kinds: &[TsGroupKeyKind::Text],
                 bucket_kind: TimeKind::Millis,
             },
         )

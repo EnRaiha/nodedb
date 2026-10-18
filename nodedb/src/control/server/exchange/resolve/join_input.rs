@@ -10,8 +10,10 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec::flatten_to_relational_rows;
 
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
-use crate::control::server::exchange::gather::{finalize_aggregate, gather_all_vshards};
+use crate::control::server::exchange::gather::gather_all_vshards;
+use crate::control::server::exchange::gather_outcome::GatherOutcome;
 
+use super::array_read_rows::is_cluster_array_read;
 use super::capture::DistributedReadCapture;
 use super::exchange::provider_scan_of_rows;
 use crate::control::server::shared::authorization::gathered_sources;
@@ -19,7 +21,7 @@ use crate::control::server::shared::authorization::gathered_sources;
 /// Resolve a `HashJoin` input slot.
 ///
 /// When the slot contains an `Exchange{Broadcast}` child, gathers the child to
-/// the coordinator and replaces the slot with a `ProviderScan{None, merged_array}`.
+/// the coordinator and replaces the slot with a `ProviderScan{None, rows}`.
 /// When the slot is already a `ProviderScan{None, ..}` or `None`, it is
 /// returned unchanged.
 ///
@@ -47,23 +49,22 @@ pub(super) async fn resolve_join_input(
             child,
             mode: ExchangeMode::Broadcast,
         })) => {
-            // Gather the broadcast child to the coordinator, then embed the
-            // merged msgpack array as an inline ProviderScan.
+            // Gather the broadcast child to the coordinator, then embed its
+            // rows as one msgpack array in an inline ProviderScan.
             //
-            // We use `merged_array` (not `raw`) because `merged_array` is a
-            // single well-formed msgpack array.  The Data-Plane executor
-            // materialises the ProviderScan via `response_with_payload(rows)`,
-            // producing a Response whose payload is exactly `merged_array`.
-            // `decode_response_to_docs` in `hash_handlers.rs` then reads that
-            // Response as a msgpack array — so the two shapes match.
+            // The Data-Plane executor materialises the ProviderScan via
+            // `response_with_payload(rows)`, producing a Response whose
+            // payload is exactly those rows. `decode_response_to_docs` in
+            // `hash_handlers.rs` then reads that Response as a msgpack
+            // array, so the two shapes match.
             // The gather reads every vShard of the child from its owner, not
             // only the groups this node replicates, and confirms each leg as
             // `scope` requires.
             let sources = gathered_sources(&child, database_id)?;
+            let array_rows = is_cluster_array_read(&child);
             let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
-            let provider_scan =
-                provider_scan_of_rows(flatten_to_relational_rows(&outcome.merged_array), sources);
-            Ok(Some(Box::new(provider_scan)))
+            let rows = relational_rows(array_rows, &outcome, false)?;
+            Ok(Some(Box::new(provider_scan_of_rows(rows, sources))))
         }
 
         // Exchange{Shuffle} inside a join input is never a shape the emit
@@ -108,6 +109,7 @@ pub(super) async fn resolve_join_input(
                 None
             };
             let sources = gathered_sources(&child, database_id)?;
+            let array_rows = is_cluster_array_read(&child);
             // Read from every vShard's owner, as the Broadcast arm does.
             let outcome = Box::pin(gather_all_vshards(state, *child, scope)).await?;
             if let Some(coll) = child_collection
@@ -123,13 +125,8 @@ pub(super) async fn resolve_join_input(
                     read_versions: outcome.read_versions.clone(),
                 });
             }
-            let merged = if as_aggregate {
-                finalize_aggregate(&outcome.merged_array)
-            } else {
-                outcome.merged_array
-            };
-            let provider_scan = provider_scan_of_rows(flatten_to_relational_rows(&merged), sources);
-            Ok(Some(Box::new(provider_scan)))
+            let rows = relational_rows(array_rows, &outcome, as_aggregate)?;
+            Ok(Some(Box::new(provider_scan_of_rows(rows, sources))))
         }
 
         // Already resolved (ProviderScan{None, ..} or any other plan):
@@ -218,7 +215,24 @@ pub(super) async fn gather_join_build_side(
     }
 
     Ok(Some(Box::new(provider_scan_of_rows(
-        flatten_to_relational_rows(&outcome.merged_array),
+        flatten_to_relational_rows(&outcome.merged_rows(false)?),
         sources,
     ))))
+}
+
+/// The relational rows of a gathered join input. A cluster array read
+/// (`array_rows`) keeps its rows as it emits them. Any other plan's merged
+/// rows pass through the storage flatten. `as_aggregate` finalizes the
+/// merged rows of a `Gather{as_aggregate}`.
+fn relational_rows(
+    array_rows: bool,
+    outcome: &GatherOutcome,
+    as_aggregate: bool,
+) -> crate::Result<Vec<u8>> {
+    if array_rows {
+        return outcome.merged_array();
+    }
+    Ok(flatten_to_relational_rows(
+        &outcome.merged_rows(as_aggregate)?,
+    ))
 }

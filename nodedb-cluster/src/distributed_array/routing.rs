@@ -100,10 +100,11 @@ mod tests {
 
     #[test]
     fn slice_routing_empty_keys_returns_every_primary() {
-        // prefix_bits=8 (stride=4): primaries 0, 4, …, 1020.
+        // prefix_bits=8 (stride=4): one primary in each stride of four.
         let shards = array_vshards_for_slice(&[], 8, VSHARD_COUNT).unwrap();
         assert_eq!(shards.len(), 256);
-        assert!(shards.iter().all(|v| v % 4 == 0));
+        let buckets: Vec<u32> = shards.iter().map(|v| v >> 2).collect();
+        assert_eq!(buckets, (0u32..256).collect::<Vec<_>>());
         // total_shards=4 keeps only primary 0.
         assert_eq!(array_vshards_for_slice(&[], 8, 4).unwrap(), vec![0]);
     }

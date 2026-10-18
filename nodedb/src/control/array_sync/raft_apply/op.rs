@@ -187,8 +187,13 @@ pub(crate) async fn apply_array_op(
             }
         }
         ArrayOpKind::Delete | ArrayOpKind::Erase => {
-            let coords = vec![op.coord.clone()];
-            let coords_msgpack = match zerompk::to_msgpack_vec(&coords) {
+            // The Data Plane and the WAL record read `Vec<ArrayDeleteCell>`.
+            let cells = vec![crate::engine::array::wal::ArrayDeleteCell {
+                coord: op.coord.clone(),
+                system_from_ms: op.header.system_from_ms,
+                erasure: matches!(op.kind, ArrayOpKind::Erase),
+            }];
+            let coords_msgpack = match zerompk::to_msgpack_vec(&cells) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(group_id, index = log_index, error = %e, "apply_array_op: coords encode failed");

@@ -54,7 +54,7 @@ impl fmt::Display for Value {
             Value::DateTime(dt) | Value::NaiveDateTime(dt) => write!(f, "{dt}"),
             Value::Duration(d) => write!(f, "{d}"),
             Value::Decimal(d) => write!(f, "{d}"),
-            Value::Geometry(g) => write!(f, "{g:?}"),
+            Value::Geometry(g) => write!(f, "{g}"),
             Value::Range {
                 start,
                 end,

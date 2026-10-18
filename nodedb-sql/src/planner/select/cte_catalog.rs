@@ -4,8 +4,9 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::error::Result;
 use crate::resolver::derived::open_subquery_relation;
-use crate::types::{CollectionInfo, SqlCatalog, SqlCatalogError};
+use crate::types::{ArrayCatalogView, CollectionInfo, SqlCatalog, SqlCatalogError};
 
 /// Catalog wrapper that answers for a synthesized relation before delegating
 /// to the stored catalog.
@@ -28,15 +29,86 @@ impl<'a> CteCatalog<'a> {
     }
 }
 
+impl CteCatalog<'_> {
+    fn relation(&self, name: &str) -> Option<CollectionInfo> {
+        self.relations
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, info)| info.clone())
+    }
+}
+
+/// A synthesized relation shadows a stored one of the same name. Every
+/// other lookup reaches the stored catalog unchanged, so a query planned
+/// against this wrapper still sees catalog tables, arrays, types and
+/// sequences.
 impl SqlCatalog for CteCatalog<'_> {
     fn get_collection(
         &self,
         database_id: DatabaseId,
         name: &str,
     ) -> std::result::Result<Option<CollectionInfo>, SqlCatalogError> {
-        if let Some((_, info)) = self.relations.iter().find(|(key, _)| key == name) {
-            return Ok(Some(info.clone()));
+        match self.relation(name) {
+            Some(info) => Ok(Some(info)),
+            None => self.inner.get_collection(database_id, name),
         }
-        self.inner.get_collection(database_id, name)
+    }
+
+    fn resolve_relation(
+        &self,
+        database_id: DatabaseId,
+        name: &str,
+    ) -> std::result::Result<Option<CollectionInfo>, SqlCatalogError> {
+        match self.relation(name) {
+            Some(info) => Ok(Some(info)),
+            None => self.inner.resolve_relation(database_id, name),
+        }
+    }
+
+    /// A synthesized relation is never a timeseries collection.
+    fn timeseries_time_key(
+        &self,
+        database_id: DatabaseId,
+        name: &str,
+    ) -> std::result::Result<Option<String>, SqlCatalogError> {
+        match self.relation(name) {
+            Some(_) => Ok(None),
+            None => self.inner.timeseries_time_key(database_id, name),
+        }
+    }
+
+    fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
+        self.inner.lookup_array(name)
+    }
+
+    fn array_exists(&self, name: &str) -> bool {
+        self.inner.array_exists(name)
+    }
+
+    fn resolve_regclass(&self, database_id: DatabaseId, tenant_id: u64, name: &str) -> Option<i64> {
+        self.inner.resolve_regclass(database_id, tenant_id, name)
+    }
+
+    fn resolve_regtype(&self, name: &str) -> Option<i64> {
+        self.inner.resolve_regtype(name)
+    }
+
+    fn sequence_nextval(&self, database_id: DatabaseId, tenant_id: u64, name: &str) -> Result<i64> {
+        self.inner.sequence_nextval(database_id, tenant_id, name)
+    }
+
+    fn sequence_currval(&self, database_id: DatabaseId, tenant_id: u64, name: &str) -> Result<i64> {
+        self.inner.sequence_currval(database_id, tenant_id, name)
+    }
+
+    fn sequence_setval(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+        value: i64,
+    ) -> Result<i64> {
+        self.inner
+            .sequence_setval(database_id, tenant_id, name, value)
     }
 }

@@ -387,7 +387,6 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Array(
             ArrayOp::OpenArray { .. }
             | ArrayOp::Slice { .. }
-            | ArrayOp::Project { .. }
             | ArrayOp::Aggregate { .. }
             | ArrayOp::Elementwise { .. }
             | ArrayOp::Flush { .. }
@@ -404,9 +403,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::Array(ArrayOp::Put { .. } | ArrayOp::Delete { .. }) => true,
 
         // ---- ClusterArray: coordinator-only, never touched by `to_replicated_entry`.
-        PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. }) => {
-            false
-        }
+        PhysicalPlan::ClusterArray(
+            ClusterArrayOp::Slice { .. }
+            | ClusterArrayOp::Agg { .. }
+            | ClusterArrayOp::Elementwise { .. }
+            | ClusterArrayOp::Flush { .. }
+            | ClusterArrayOp::Compact { .. },
+        ) => false,
         // Buffered but unencoded: `session::txn_expand` reshapes the routing
         // wrapper into per-shard `ArrayOp::Put`/`Delete` before it enters the
         // buffer, so COMMIT replays those and never the wrapper itself.
@@ -434,7 +437,7 @@ mod tests {
     use nodedb_types::calvin::{
         EngineKeySet, EngineTag, PassiveReadKey, ReadKeyIdent, SortedVec, VersionedReadEntry,
     };
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, SridGeometry};
     use nodedb_types::id::{RequestId, TxnId, VShardId};
     use nodedb_types::timeseries::continuous_agg::{ContinuousAggregateDef, RefreshPolicy};
     use nodedb_types::vector_distance::DistanceMetric;
@@ -893,6 +896,7 @@ mod tests {
                 field_name: String::new(),
                 query_entries: Vec::new(),
                 top_k: 0,
+                filters: Vec::new(),
             }),
             PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1568,6 +1572,7 @@ mod tests {
                 valid_at_ms: None,
                 having: Vec::new(),
                 tiering: None,
+                output_columns: Vec::new(),
             }),
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -1584,7 +1589,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 surrogate: Surrogate::new(1),
-                geometry: Geometry::point(0.0, 0.0),
+                geometry: SridGeometry::wgs84(Geometry::point(0.0, 0.0)),
                 provenance: None,
             }),
             PhysicalPlan::Spatial(SpatialOp::Delete {
@@ -1597,7 +1602,7 @@ mod tests {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
                 field: "f".into(),
                 predicate: SpatialPredicate::Contains,
-                query_geometry: Geometry::point(0.0, 0.0),
+                query_geometry: SridGeometry::wgs84(Geometry::point(0.0, 0.0)),
                 distance_meters: 0.0,
                 attribute_filters: Vec::new(),
                 limit: 0,
@@ -1732,6 +1737,7 @@ mod tests {
                 sub_aggregates: Vec::new(),
                 grouping_sets: Vec::new(),
                 sort_keys: Vec::new(),
+                group_key_aliases: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::PartialAggregate {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),
@@ -2081,10 +2087,6 @@ mod tests {
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
             }),
-            PhysicalPlan::Array(ArrayOp::Project {
-                array_id: array_id.clone(),
-                attr_indices: Vec::new(),
-            }),
             PhysicalPlan::Array(ArrayOp::Aggregate {
                 array_id: array_id.clone(),
                 attr_idx: 0,
@@ -2095,6 +2097,7 @@ mod tests {
                 shard_bucket: None,
                 system_as_of: None,
                 valid_at_ms: None,
+                region_msgpack: Vec::new(),
             }),
             PhysicalPlan::Array(ArrayOp::Elementwise {
                 left: array_id.clone(),
@@ -2102,6 +2105,9 @@ mod tests {
                 op: ArrayBinaryOp::Add,
                 attr_idx: 0,
                 cell_filter: None,
+                shard_bucket: None,
+                system_as_of: None,
+                valid_at_ms: None,
             }),
             PhysicalPlan::Array(ArrayOp::Flush {
                 array_id: array_id.clone(),
@@ -2153,6 +2159,25 @@ mod tests {
                 prefix_bits: 0,
                 system_as_of: None,
                 valid_at_ms: None,
+                region_msgpack: Vec::new(),
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Elementwise {
+                left: array_id.clone(),
+                right: array_id.clone(),
+                op: ArrayBinaryOp::Add,
+                attr_idx: 0,
+                prefix_bits: 0,
+                system_as_of: None,
+                valid_at_ms: None,
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Flush {
+                array_id: array_id.clone(),
+                prefix_bits: 0,
+            }),
+            PhysicalPlan::ClusterArray(ClusterArrayOp::Compact {
+                array_id: array_id.clone(),
+                audit_retain_ms: None,
+                prefix_bits: 0,
             }),
             // `ClusterArrayOp::Put`/`Delete` are flipped (buffered, unencoded)
             // and pinned by `flipped_variants_are_buffered_and_unencoded`.

@@ -4,6 +4,7 @@
 //! spatial predicates can find newly-inserted rows.
 
 use nodedb_types::columnar::{ColumnType, ColumnarSchema};
+use nodedb_types::geometry::{Srid, SridGeometry};
 use nodedb_types::value::Value;
 
 use crate::data::executor::core_loop::CoreLoop;
@@ -22,9 +23,73 @@ pub(in crate::data::executor) struct GeometryIndexDelta {
     pub inserted: Vec<(SpatialIndexKey, u64)>,
 }
 
+/// The geometry a columnar cell holds: a native geometry or GeoJSON text.
+/// Any other cell holds none.
+fn cell_geometry(value: &Value) -> Option<SridGeometry> {
+    match value {
+        Value::Geometry(g) => Some(g.clone()),
+        Value::String(s) => nodedb_types::geometry::from_geojson_str(s),
+        _ => None,
+    }
+}
+
 impl CoreLoop {
+    /// Check that every geometry cell of `ndb_rows` can join its column's
+    /// R-tree. Changes nothing.
+    ///
+    /// A non-empty index admits only its own SRID. An empty or absent index
+    /// takes the SRID of the batch's first geometry, and every later
+    /// geometry of the column must match it. The first refusal returns
+    /// `Error::MixedSrid`.
+    pub(in crate::data::executor) fn check_columnar_geometry_srids(
+        &self,
+        task: &ExecutionTask,
+        schema: &ColumnarSchema,
+        collection: &str,
+        ndb_rows: &[nodedb_types::Value],
+    ) -> crate::Result<()> {
+        let db_id = task.request.database_id;
+        let tid = task.request.tenant_id;
+        for col_def in schema
+            .columns
+            .iter()
+            .filter(|c| c.column_type == ColumnType::Geometry)
+        {
+            let index_key = (db_id, tid, collection.to_string(), col_def.name.clone());
+            let mut fixed: Option<Srid> = self
+                .spatial_indexes
+                .get(&index_key)
+                .filter(|rtree| !rtree.is_empty())
+                .map(|rtree| rtree.srid());
+            for row in ndb_rows {
+                let Value::Object(obj) = row else {
+                    continue;
+                };
+                let Some(geom) = obj.get(&col_def.name).and_then(cell_geometry) else {
+                    continue;
+                };
+                match fixed {
+                    Some(srid) if srid != geom.srid => {
+                        return Err(crate::Error::MixedSrid {
+                            collection: collection.to_string(),
+                            field: col_def.name.clone(),
+                            index_srid: srid.code(),
+                            row_srid: geom.srid.code(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => fixed = Some(geom.srid),
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Populate the R-tree for any `Geometry` columns on `schema`, from the
     /// rows just inserted (`ndb_rows`). Returns what it changed.
+    ///
+    /// Runs [`Self::check_columnar_geometry_srids`] first, so a mixed-SRID
+    /// batch fails with `Error::MixedSrid` before any index changes.
     ///
     /// `schema` is threaded in from the caller rather than re-read from
     /// `columnar_engines` here: the caller already resolved it, and taking it
@@ -38,7 +103,7 @@ impl CoreLoop {
         schema: &ColumnarSchema,
         collection: &str,
         ndb_rows: &[nodedb_types::Value],
-    ) -> GeometryIndexDelta {
+    ) -> crate::Result<GeometryIndexDelta> {
         let mut delta = GeometryIndexDelta::default();
         let db_id = task.request.database_id;
         let tid = task.request.tenant_id;
@@ -51,8 +116,9 @@ impl CoreLoop {
             .collect();
 
         if geom_cols.is_empty() {
-            return delta;
+            return Ok(delta);
         }
+        self.check_columnar_geometry_srids(task, schema, collection, ndb_rows)?;
         for row in ndb_rows {
             let obj = match row {
                 nodedb_types::Value::Object(m) => m,
@@ -91,15 +157,10 @@ impl CoreLoop {
                 // See `nodedb_types::geometry::from_geojson_str` — shared with the
                 // document index path (`apply_point_put_spatial`) and the read path
                 // (`extract_geometry`); keep all three in sync.
-                let geom: nodedb_types::geometry::Geometry = match field_val {
-                    Value::Geometry(g) => g.clone(),
-                    Value::String(s) => match nodedb_types::geometry::from_geojson_str(s) {
-                        Some(g) => g,
-                        None => continue,
-                    },
-                    _ => continue,
+                let Some(geom) = cell_geometry(field_val) else {
+                    continue;
                 };
-                let bbox = nodedb_types::bbox::geometry_bbox(&geom);
+                let bbox = geom.bbox();
                 let index_key = (db_id, tid, collection.to_string(), col_def.name.clone());
                 let entry_id = spatial_entry_id.as_u64();
                 let memory = nodedb_mem::ScopedMemory::new(
@@ -111,7 +172,17 @@ impl CoreLoop {
                 let rtree = self
                     .spatial_indexes
                     .entry(index_key.clone())
-                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
+                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory, geom.srid));
+                // The batch check above admitted every SRID here; removing a
+                // re-indexed row's prior entry can only empty the tree.
+                rtree
+                    .bind_srid(geom.srid)
+                    .map_err(|m| crate::Error::MixedSrid {
+                        collection: collection.to_string(),
+                        field: col_def.name.clone(),
+                        index_srid: m.index.code(),
+                        row_srid: m.entry.code(),
+                    })?;
                 rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                 self.spatial_doc_map.insert(
                     (
@@ -126,7 +197,7 @@ impl CoreLoop {
                 delta.inserted.push((index_key, entry_id));
             }
         }
-        delta
+        Ok(delta)
     }
 
     /// Record a geometry-index pass on `undo_log` so a rollback reverses
@@ -138,12 +209,13 @@ impl CoreLoop {
         delta: GeometryIndexDelta,
     ) {
         use crate::data::executor::handlers::transaction::undo::UndoEntry;
-        for (key, entry_id, bbox, document_id) in delta.removed {
+        for (key, entry_id, bbox, document_id, srid) in delta.removed {
             undo_log.push(UndoEntry::SpatialDelete {
                 key,
                 entry_id,
                 bbox,
                 document_id,
+                srid,
             });
         }
         for (key, entry_id) in delta.inserted {

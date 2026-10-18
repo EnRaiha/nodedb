@@ -14,10 +14,10 @@ impl PhysicalPlan {
     /// Primary read/target collection this plan touches, if it maps to
     /// exactly one user collection.
     ///
-    /// Plane-neutral twin of the Control-Plane
-    /// `crate::control::server::shared::plan_util::extract_collection` — the
-    /// two MUST stay in sync (logic replicated, not called, since the core
-    /// crate depends on `nodedb-physical`, not the reverse).
+    /// The Control Plane's `extract_collection` answers a wider question:
+    /// which collection a plan reads or writes, for redaction, clone
+    /// interception, and read-set scoping. It reports a collection for more
+    /// variants than this accessor does.
     pub fn collection(&self) -> Option<&str> {
         match self {
             PhysicalPlan::Document(DocumentOp::PointGet { collection, .. })

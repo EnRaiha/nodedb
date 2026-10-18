@@ -79,7 +79,8 @@ fn array_surrogate(
         .map(|s| s.as_u32())
 }
 
-/// Run `ARRAY_SLICE` and return each row's `attrs` JSON text.
+/// Run `ARRAY_SLICE` and return each row's `v` attr text. A slice row names
+/// each attr as its own column.
 async fn slice_attrs(client: &tokio_postgres::Client, sql: &str) -> Vec<String> {
     let msgs = client
         .simple_query(sql)
@@ -91,7 +92,7 @@ async fn slice_attrs(client: &tokio_postgres::Client, sql: &str) -> Vec<String> 
                 let names: Vec<String> = r.columns().iter().map(|c| c.name().to_string()).collect();
                 names
                     .iter()
-                    .position(|n| n == "attrs")
+                    .position(|n| n == "v")
                     .and_then(|i| r.get(i))
                     .map(|s| s.to_string())
             } else {
@@ -187,13 +188,9 @@ async fn cluster_array_cell_write_replicates_to_all_replicas() {
         1,
         "ARRAY_SLICE for x=5 must return exactly the one cell; got {attrs:?}"
     );
-    let parsed: serde_json::Value = serde_json::from_str(&attrs[0])
-        .unwrap_or_else(|e| panic!("attrs not JSON: {}: {e}", attrs[0]));
-    let v = parsed
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|x| x.as_f64())
-        .unwrap_or_else(|| panic!("missing v in slice row: {}", attrs[0]));
+    let v: f64 = attrs[0]
+        .parse()
+        .unwrap_or_else(|e| panic!("attr v is not a float: {}: {e}", attrs[0]));
     assert!((v - 42.0).abs() < 1e-6, "expected v=42.0, got {v}");
 
     cluster.shutdown().await;

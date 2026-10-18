@@ -160,15 +160,78 @@ pub enum ArrayWalError {
     Encode { detail: String },
 }
 
+/// The msgpack fixarray header of [`ArrayPutPayload`] and
+/// [`ArrayDeletePayload`]. zerompk encodes a struct as an array of its
+/// fields, and both payloads have three: `array_id`, `cells`, `provenance`.
+const PAYLOAD_ARRAY_HEADER: u8 = 0x93;
+
 /// Encode an [`ArrayPutPayload`] with a leading version byte.
 ///
 /// The resulting bytes are: `[ARRAY_WAL_FORMAT_VERSION, ...msgpack...]`.
 pub fn encode_put_with_version(payload: &ArrayPutPayload) -> Result<Vec<u8>, ArrayError> {
-    let mut buf = zerompk::to_msgpack_vec(payload).map_err(|e| ArrayError::SegmentCorruption {
-        detail: format!("encode ArrayPutPayload: {e}"),
-    })?;
-    buf.insert(0, ARRAY_WAL_FORMAT_VERSION);
+    encode_versioned(payload, "ArrayPutPayload")
+}
+
+/// Encode the versioned `ArrayPut` record of `array_id` around
+/// `cells_msgpack`, an already-encoded `Vec<ArrayPutCell>`.
+///
+/// The cell bytes are copied in as they are, never decoded. The result is
+/// byte-identical to [`encode_put_with_version`] over the decoded payload,
+/// so [`decode_put_with_version`] reads it. The caller passes cell bytes a
+/// `Vec<ArrayPutCell>` encoder produced.
+pub fn encode_put_spliced(
+    array_id: &ArrayId,
+    cells_msgpack: &[u8],
+    provenance: &Option<SyncProvenance>,
+) -> Result<Vec<u8>, ArrayError> {
+    splice_versioned(array_id, cells_msgpack, provenance, "ArrayPutPayload")
+}
+
+/// [`encode_put_spliced`] for an `ArrayDelete` record around an
+/// already-encoded `Vec<ArrayDeleteCell>`. Byte-identical to
+/// [`encode_delete_with_version`] over the decoded payload.
+pub fn encode_delete_spliced(
+    array_id: &ArrayId,
+    cells_msgpack: &[u8],
+    provenance: &Option<SyncProvenance>,
+) -> Result<Vec<u8>, ArrayError> {
+    splice_versioned(array_id, cells_msgpack, provenance, "ArrayDeletePayload")
+}
+
+/// Write the version byte, then `value`, into one buffer.
+fn encode_versioned<T: zerompk::ToMessagePack>(
+    value: &T,
+    what: &str,
+) -> Result<Vec<u8>, ArrayError> {
+    let mut buf = vec![ARRAY_WAL_FORMAT_VERSION];
+    write_into(&mut buf, value, what)?;
     Ok(buf)
+}
+
+fn splice_versioned(
+    array_id: &ArrayId,
+    cells_msgpack: &[u8],
+    provenance: &Option<SyncProvenance>,
+    what: &str,
+) -> Result<Vec<u8>, ArrayError> {
+    // The id and provenance are small. The cell bytes dominate the record.
+    let mut buf = Vec::with_capacity(cells_msgpack.len() + 128);
+    buf.push(ARRAY_WAL_FORMAT_VERSION);
+    buf.push(PAYLOAD_ARRAY_HEADER);
+    write_into(&mut buf, array_id, what)?;
+    buf.extend_from_slice(cells_msgpack);
+    write_into(&mut buf, provenance, what)?;
+    Ok(buf)
+}
+
+fn write_into<T: zerompk::ToMessagePack>(
+    buf: &mut Vec<u8>,
+    value: &T,
+    what: &str,
+) -> Result<(), ArrayError> {
+    zerompk::write_msgpack(buf, value).map_err(|e| ArrayError::SegmentCorruption {
+        detail: format!("encode {what}: {e}"),
+    })
 }
 
 /// Decode bytes produced by [`encode_put_with_version`].
@@ -189,11 +252,7 @@ pub fn decode_put_with_version(bytes: &[u8]) -> Result<ArrayPutPayload, ArrayErr
 
 /// Encode an [`ArrayDeletePayload`] with a leading version byte.
 pub fn encode_delete_with_version(payload: &ArrayDeletePayload) -> Result<Vec<u8>, ArrayError> {
-    let mut buf = zerompk::to_msgpack_vec(payload).map_err(|e| ArrayError::SegmentCorruption {
-        detail: format!("encode ArrayDeletePayload: {e}"),
-    })?;
-    buf.insert(0, ARRAY_WAL_FORMAT_VERSION);
-    Ok(buf)
+    encode_versioned(payload, "ArrayDeletePayload")
 }
 
 /// Decode bytes produced by [`encode_delete_with_version`].
@@ -275,6 +334,45 @@ mod tests {
         assert_eq!(encoded[0], ARRAY_WAL_FORMAT_VERSION);
         let decoded = decode_put_with_version(&encoded).unwrap();
         assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn spliced_put_matches_the_encoded_payload() {
+        let provenances = [
+            None,
+            Some(SyncProvenance {
+                producer_id: 7,
+                epoch: 2,
+                stream_id: 3,
+                seq: 9,
+            }),
+        ];
+        for provenance in provenances {
+            let mut p = sample_put_payload();
+            p.provenance = provenance;
+            let cells = zerompk::to_msgpack_vec(&p.cells).unwrap();
+            let spliced = encode_put_spliced(&p.array_id, &cells, &p.provenance).unwrap();
+            assert_eq!(spliced, encode_put_with_version(&p).unwrap());
+            assert_eq!(decode_put_with_version(&spliced).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn spliced_delete_matches_the_encoded_payload() {
+        let payload = ArrayDeletePayload {
+            array_id: ArrayId::new(nodedb_types::TenantId::new(1), "g"),
+            cells: vec![ArrayDeleteCell {
+                coord: vec![CoordValue::Int64(5), CoordValue::Int64(7)],
+                system_from_ms: 9_000,
+                erasure: false,
+            }],
+            provenance: None,
+        };
+        let cells = zerompk::to_msgpack_vec(&payload.cells).unwrap();
+        let spliced =
+            encode_delete_spliced(&payload.array_id, &cells, &payload.provenance).unwrap();
+        assert_eq!(spliced, encode_delete_with_version(&payload).unwrap());
+        assert_eq!(decode_delete_with_version(&spliced).unwrap(), payload);
     }
 
     #[test]

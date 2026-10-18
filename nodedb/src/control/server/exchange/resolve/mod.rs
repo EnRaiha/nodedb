@@ -29,7 +29,12 @@
 //!      per-part consumers (one per partition), and concatenate + global-cap the
 //!      finalized rows into a `Resolved::Gathered` response (distributed GROUP BY).
 //!    - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
+//!
+//! Before pass 2, `array_prefilter` replaces a vector search's array
+//! prefilter scan with the slice's surrogate bitmap read from every shard.
 
+mod array_prefilter;
+mod array_read_rows;
 mod cagg_rows;
 mod capture;
 pub mod exchange;

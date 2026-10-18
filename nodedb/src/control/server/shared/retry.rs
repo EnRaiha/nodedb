@@ -119,9 +119,11 @@ impl RetryableSchemaChange for Error {
             | Error::UndefinedColumn { .. }
             | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }
+            | Error::UngroupedColumn { .. }
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }
+            | Error::MixedSrid { .. }
             | Error::NumericValueOutOfRange { .. }
             | Error::InvalidTextRepresentation { .. }
             | Error::DatatypeMismatch { .. }

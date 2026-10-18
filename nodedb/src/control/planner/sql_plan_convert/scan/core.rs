@@ -50,7 +50,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
 
     if is_provider_relation(collection, engine) {
         let filter_bytes = serialize_filters(filters)?;
-        let proj_names = extract_projection_names(projection, window_functions);
+        // The provider tail evaluates computed columns before it prunes, so
+        // the pruning list keeps each computed alias the output schema reads.
+        let proj_names =
+            super::super::set_ops::lower_subquery_projection(projection, window_functions)?;
         let sort = convert_sort_keys(sort_keys);
         return Ok(vec![PhysicalTask {
             tenant_id,
@@ -103,6 +106,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
                 valid_at_ms: valid_at_from_scope(temporal),
                 having: Vec::new(),
                 tiering: None,
+                output_columns: Vec::new(),
             })
         }
         EngineType::Columnar => PhysicalPlan::Columnar(ColumnarOp::Scan {

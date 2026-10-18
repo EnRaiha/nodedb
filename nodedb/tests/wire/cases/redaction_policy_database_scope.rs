@@ -158,8 +158,8 @@ async fn aggregate_over_redacted_column_in_non_default_database_is_refused() {
          not answer over the unmasked stored values",
     );
     assert_eq!(
-        sqlstate, "42601",
-        "expected the redaction refusal's SQLSTATE (42601, mapped from PlanError), got: {sqlstate}"
+        sqlstate, "42501",
+        "expected the redaction refusal's SQLSTATE (42501), got: {sqlstate}"
     );
 }
 

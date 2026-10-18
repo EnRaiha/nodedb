@@ -124,7 +124,6 @@ pub(super) fn has_search_plan(plan: &SqlPlan) -> bool {
         | SqlPlan::InsertArray { .. }
         | SqlPlan::DeleteArray { .. }
         | SqlPlan::ArraySlice { .. }
-        | SqlPlan::ArrayProject { .. }
         | SqlPlan::ArrayAgg { .. }
         | SqlPlan::ArrayElementwise { .. }
         | SqlPlan::ArrayFlush { .. }

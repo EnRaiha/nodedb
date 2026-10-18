@@ -28,6 +28,7 @@
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::security::audit::verify_chain;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -260,6 +261,8 @@ pub fn kill_user_sessions(
 }
 
 /// VERIFY AUDIT CHAIN
+///
+/// Verifies the whole chain: persisted catalog rows plus the in-memory buffer, merged by seq.
 pub fn verify_audit_chain(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -269,22 +272,25 @@ pub fn verify_audit_chain(
         return Err(err("42501", "permission denied: requires superuser"));
     }
 
-    let audit = state.audit.lock().unwrap_or_else(|p| p.into_inner());
-    match audit.verify_chain() {
-        Ok(()) => {
+    let (entries, tail_hash) = state
+        .audit_chain_snapshot()
+        .map_err(|e| DdlError::from_error_in_context("audit log read failed", &e))?;
+    let report = verify_chain(&entries, 1, u64::MAX, &tail_hash);
+    match report.broken_at {
+        None => {
             let columns = vec!["status".to_string(), "entries".to_string()];
             let mut row = Map::new();
             row.insert("status".to_string(), JsonValue::String("VALID".to_string()));
             row.insert(
                 "entries".to_string(),
-                JsonValue::String(audit.len().to_string()),
+                JsonValue::String(report.checked.to_string()),
             );
             Ok(vec![DdlResult::Rows(ShapedRows::text_rows(
                 columns,
                 vec![row],
             ))])
         }
-        Err(broken_seq) => Err(err(
+        Some(broken_seq) => Err(err(
             "XX001",
             format!("audit chain broken at sequence {broken_seq}"),
         )),

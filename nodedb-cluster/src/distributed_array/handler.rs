@@ -19,12 +19,14 @@ use crate::error::{ClusterError, Result};
 
 use super::local_executor::ArrayLocalExecutor;
 use super::opcodes::{
-    ARRAY_SHARD_AGG_REQ, ARRAY_SHARD_DELETE_REQ, ARRAY_SHARD_PUT_REQ, ARRAY_SHARD_SLICE_REQ,
+    ARRAY_SHARD_AGG_REQ, ARRAY_SHARD_DELETE_REQ, ARRAY_SHARD_ELEMENTWISE_REQ,
+    ARRAY_SHARD_MAINT_REQ, ARRAY_SHARD_PUT_REQ, ARRAY_SHARD_SLICE_REQ,
     ARRAY_SHARD_SURROGATE_BITMAP_REQ,
 };
 use super::routing::{array_vshard_for_tile, array_vshards_for_slice};
 use super::wire::{
     ArrayShardAggReq, ArrayShardAggResp, ArrayShardDeleteReq, ArrayShardDeleteResp,
+    ArrayShardElementwiseReq, ArrayShardElementwiseResp, ArrayShardMaintReq, ArrayShardMaintResp,
     ArrayShardPutReq, ArrayShardPutResp, ArrayShardSliceReq, ArrayShardSliceResp,
     ArrayShardSurrogateBitmapReq, ArrayShardSurrogateBitmapResp,
 };
@@ -52,6 +54,8 @@ pub async fn handle_array_shard_rpc(
         ARRAY_SHARD_SURROGATE_BITMAP_REQ => {
             handle_surrogate_bitmap(local_vshard_id, payload, executor).await
         }
+        ARRAY_SHARD_ELEMENTWISE_REQ => handle_elementwise(local_vshard_id, payload, executor).await,
+        ARRAY_SHARD_MAINT_REQ => handle_maint(local_vshard_id, payload, executor).await,
         other => Err(ClusterError::Codec {
             detail: format!("handle_array_shard_rpc: unknown opcode {other}"),
         }),
@@ -102,6 +106,43 @@ async fn handle_agg(
         read_versions: exec.read_versions,
     };
     serialise(resp)
+}
+
+async fn handle_elementwise(
+    local_vshard_id: u32,
+    payload: &[u8],
+    executor: &Arc<dyn ArrayLocalExecutor>,
+) -> Result<Vec<u8>> {
+    let req: ArrayShardElementwiseReq =
+        zerompk::from_msgpack(payload).map_err(|e| ClusterError::Codec {
+            detail: format!("ArrayShardElementwiseReq decode: {e}"),
+        })?;
+
+    let exec = executor.exec_elementwise(local_vshard_id, &req).await?;
+
+    let resp = ArrayShardElementwiseResp {
+        shard_id: local_vshard_id,
+        rows_msgpack: exec.rows,
+        truncated_before_horizon: exec.truncated_before_horizon,
+        read_versions: exec.read_versions,
+    };
+    serialise(resp)
+}
+
+async fn handle_maint(
+    local_vshard_id: u32,
+    payload: &[u8],
+    executor: &Arc<dyn ArrayLocalExecutor>,
+) -> Result<Vec<u8>> {
+    let req: ArrayShardMaintReq =
+        zerompk::from_msgpack(payload).map_err(|e| ClusterError::Codec {
+            detail: format!("ArrayShardMaintReq decode: {e}"),
+        })?;
+    let affected = executor.exec_maint(local_vshard_id, &req).await?;
+    serialise(ArrayShardMaintResp {
+        shard_id: local_vshard_id,
+        affected,
+    })
 }
 
 async fn handle_put(
@@ -246,6 +287,7 @@ mod tests {
 
     use async_trait::async_trait;
 
+    use crate::distributed_array::group_key::ArrayAggGroupKey;
     use crate::distributed_array::merge::ArrayAggPartial;
     use crate::distributed_array::wire::{ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardPutReq};
     use crate::error::Result;
@@ -317,6 +359,26 @@ mod tests {
             })
         }
 
+        async fn exec_elementwise(
+            &self,
+            local_vshard_id: u32,
+            _req: &super::super::wire::ArrayShardElementwiseReq,
+        ) -> Result<super::super::local_executor::ArrayElementwiseExec> {
+            Ok(super::super::local_executor::ArrayElementwiseExec {
+                rows: self.rows.clone(),
+                truncated_before_horizon: self.truncated_before_horizon,
+                read_versions: stub_versions(local_vshard_id),
+            })
+        }
+
+        async fn exec_maint(
+            &self,
+            _local_vshard_id: u32,
+            _req: &super::super::wire::ArrayShardMaintReq,
+        ) -> Result<u64> {
+            Ok(self.affected)
+        }
+
         async fn exec_put(
             &self,
             _local_vshard_id: u32,
@@ -374,6 +436,7 @@ mod tests {
             system_as_of: None,
             valid_at_ms: None,
             txn_id: None,
+            region_msgpack: vec![],
         };
         zerompk::to_msgpack_vec(&req).unwrap()
     }
@@ -384,6 +447,73 @@ mod tests {
             slice_msgpack: vec![],
         };
         zerompk::to_msgpack_vec(&req).unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_elementwise_returns_executor_rows_and_versions() {
+        let row = b"pair".to_vec();
+        let executor: Arc<dyn ArrayLocalExecutor> = Arc::new(StubExecutor {
+            rows: vec![row.clone()],
+            bitmap: vec![],
+            partials: vec![],
+            truncated_before_horizon: true,
+            affected: 0,
+        });
+        let req = super::super::wire::ArrayShardElementwiseReq {
+            left_id_msgpack: vec![],
+            right_id_msgpack: vec![],
+            op_msgpack: vec![0x00],
+            attr_idx: 0,
+            shard_bucket: None,
+            system_as_of: None,
+            valid_at_ms: None,
+            txn_id: None,
+        };
+        let payload = zerompk::to_msgpack_vec(&req).unwrap();
+        let resp_bytes = handle_array_shard_rpc(
+            super::super::opcodes::ARRAY_SHARD_ELEMENTWISE_REQ,
+            3,
+            &payload,
+            &executor,
+        )
+        .await
+        .expect("elementwise handler should succeed");
+
+        let resp: super::super::wire::ArrayShardElementwiseResp =
+            zerompk::from_msgpack(&resp_bytes).expect("response should deserialise");
+        assert_eq!(resp.shard_id, 3);
+        assert_eq!(resp.rows_msgpack, vec![row]);
+        assert!(resp.truncated_before_horizon);
+        assert_eq!(resp.read_versions, stub_versions(3));
+    }
+
+    #[tokio::test]
+    async fn handle_maint_returns_the_executor_count() {
+        let executor: Arc<dyn ArrayLocalExecutor> = Arc::new(StubExecutor {
+            rows: vec![],
+            bitmap: vec![],
+            partials: vec![],
+            truncated_before_horizon: false,
+            affected: 1,
+        });
+        let req = super::super::wire::ArrayShardMaintReq {
+            array_id_msgpack: vec![],
+            op: super::super::wire::ArrayShardMaintOp::Compact {
+                audit_retain_ms: Some(60_000),
+            },
+        };
+        let payload = zerompk::to_msgpack_vec(&req).unwrap();
+        let resp_bytes = handle_array_shard_rpc(
+            super::super::opcodes::ARRAY_SHARD_MAINT_REQ,
+            5,
+            &payload,
+            &executor,
+        )
+        .await
+        .expect("maint handler should succeed");
+        let resp: super::super::wire::ArrayShardMaintResp =
+            zerompk::from_msgpack(&resp_bytes).expect("response should deserialise");
+        assert_eq!((resp.shard_id, resp.affected), (5, 1));
     }
 
     #[tokio::test]
@@ -505,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_agg_returns_executor_partials() {
-        let partial = ArrayAggPartial::from_single(0, 42.0);
+        let partial = ArrayAggPartial::from_single(ArrayAggGroupKey::Scalar, 42.0);
         let executor: Arc<dyn ArrayLocalExecutor> = Arc::new(StubExecutor {
             rows: vec![],
             bitmap: vec![],
@@ -523,7 +653,7 @@ mod tests {
         assert_eq!(resp.shard_id, 3);
         assert_eq!(resp.partials.len(), 1);
         assert_eq!(resp.partials[0].count, 1);
-        assert!((resp.partials[0].sum - 42.0).abs() < f64::EPSILON);
+        assert!((resp.partials[0].sum.as_f64() - 42.0).abs() < f64::EPSILON);
     }
 
     fn make_put_req_bytes(prefix_bits: u8) -> Vec<u8> {

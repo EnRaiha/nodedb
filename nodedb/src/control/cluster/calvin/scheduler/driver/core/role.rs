@@ -12,6 +12,12 @@
 //! proposed installs before this leader stages anything, and this leader
 //! finds that position applied.
 //!
+//! A scheduler that starts while this node already leads also waits for its
+//! start fence. A write the gate admitted earlier holds no key on this
+//! scheduler's lock table: none existed, or its keys were on a retired one.
+//! The gate stays closed until each such write applied (see
+//! `write_admission::tickets`).
+//!
 //! - Promotion stages every `Following` txn as a new grant, in sequencer
 //!   order. A txn whose verdict is already COMMIT proposes its vote again,
 //!   which changes nothing: the first vote of the vShard counts.
@@ -27,6 +33,7 @@ use super::deferred::{DispatchOutcome, DispatchStep};
 use super::owed::OwedKind;
 use super::scheduler::Scheduler;
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
+use crate::control::server::shared::write_admission::{FenceState, StartFence};
 
 /// What this node does for its vShard's Calvin txns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +53,10 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) struct StageGat
     /// The index of the term's election no-op. The gate opens once this
     /// node applied it.
     term_start: Option<u64>,
+    /// The writes the gate admitted for this vShard before this scheduler's
+    /// lock table was registered. The gate opens once they all applied.
+    /// `None` once they did.
+    start_fence: Option<StartFence>,
 }
 
 impl Default for StageGate {
@@ -54,11 +65,22 @@ impl Default for StageGate {
             role: Role::Follower,
             term: None,
             term_start: None,
+            start_fence: None,
         }
     }
 }
 
 impl StageGate {
+    /// The gate of a scheduler that starts behind `start_fence`.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn fenced(
+        start_fence: StartFence,
+    ) -> Self {
+        Self {
+            start_fence: Some(start_fence),
+            ..Self::default()
+        }
+    }
+
     /// Whether this node stages the vShard's txns.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn is_leader(&self) -> bool {
         self.role == Role::Leader
@@ -119,9 +141,42 @@ impl Scheduler {
             .shared
             .applied_index_watcher(leadership.group_id)
             .current();
-        if self.role.term_start.is_some_and(|start| applied >= start) {
+        if self.role.term_start.is_some_and(|start| applied >= start)
+            && self.start_fence_passed(leadership.group_id, applied)
+        {
             self.promote();
         }
+    }
+
+    /// Whether every write the gate admitted for this vShard before its lock
+    /// table was registered applied, with `applied` the group's applied index.
+    ///
+    /// Such a write holds no key on this table. A txn that stages before it
+    /// reached its core reads the state before it, and its redo overwrites it.
+    fn start_fence_passed(&mut self, group_id: u64, applied: u64) -> bool {
+        let Some(fence) = self.role.start_fence else {
+            return true;
+        };
+        let passed = match self
+            .shared
+            .calvin
+            .admission_tickets
+            .fence_state(fence, group_id)
+        {
+            FenceState::Open => false,
+            FenceState::Through(through) => through.is_none_or(|index| applied >= index),
+        };
+        if passed {
+            self.role.start_fence = None;
+        } else {
+            tracing::debug!(
+                vshard_id = self.vshard_id,
+                group_id,
+                applied,
+                "calvin scheduler: staging waits for writes admitted before its lock table"
+            );
+        }
+        passed
     }
 
     /// This node's term and term start in the vShard's data group, while it
@@ -280,6 +335,8 @@ fn leader_drives(state: CommitState) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use nodedb_cluster::calvin::CalvinCompletionRegistry;
     use nodedb_cluster::calvin::types::{
         EngineKeySet, ReadWriteSet, SchedulerInput, SequencedTxn, SortedVec,
@@ -399,6 +456,42 @@ mod tests {
             scheduler.pending.get(&txn_id).map(|p| p.commit_state),
             Some(CommitState::Staged)
         );
+        assert_eq!(staged_requests(&mut data_side), vec![(3, 0)]);
+    }
+
+    /// A write the gate admitted with no lock table holds the stage gate
+    /// closed until it landed and its index applied.
+    #[tokio::test]
+    async fn a_new_scheduler_stages_nothing_before_earlier_unheld_writes_applied() {
+        let (mut scheduler, _dir, mut data_side) = scheduler();
+        let tickets = Arc::clone(&scheduler.shared.calvin.admission_tickets);
+        let write = tickets.open(scheduler.vshard_id);
+        scheduler.role = StageGate::fenced(tickets.start_fence(scheduler.vshard_id));
+
+        let group_id = elect_data_group_leader(&scheduler);
+        let term_start = scheduler
+            .multi_raft
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .term_start_index(group_id)
+            .expect("the elected node names its term start");
+        let watcher = scheduler.shared.applied_index_watcher(group_id);
+        watcher.bump(term_start);
+        scheduler.process_scheduler_input(SchedulerInput::Txn(Box::new(validate_only_on(3, 1))));
+
+        scheduler.refresh_role();
+        assert!(!scheduler.role.is_leader(), "the write has not landed");
+        assert!(staged_requests(&mut data_side).is_empty());
+
+        let landed_at = term_start + 5;
+        write.landed(group_id, landed_at);
+        scheduler.refresh_role();
+        assert!(!scheduler.role.is_leader(), "the write has not applied");
+        assert!(staged_requests(&mut data_side).is_empty());
+
+        watcher.bump(landed_at);
+        scheduler.refresh_role();
+        assert!(scheduler.role.is_leader(), "the gate opens");
         assert_eq!(staged_requests(&mut data_side), vec![(3, 0)]);
     }
 

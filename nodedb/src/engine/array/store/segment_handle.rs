@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
-use nodedb_array::segment::{HilbertPackedRTree, SegmentReader};
+use nodedb_array::segment::{HilbertPackedRTree, SegmentFooter, SegmentHeader, SegmentReader};
 use nodedb_wal::crypto::WalEncryptionKey;
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,9 @@ pub struct SegmentHandle {
     schema_hash: u64,
     tile_count: usize,
     id: String,
+    /// Header and footer decoded once at open, shared by every reader.
+    header: SegmentHeader,
+    footer: Arc<SegmentFooter>,
 }
 
 impl SegmentHandle {
@@ -100,7 +103,7 @@ impl SegmentHandle {
             Arc::new(Backing::Mmap(Arc::new(mmap)))
         };
 
-        let (rtree, schema_hash, tile_count) = {
+        let (rtree, schema_hash, tile_count, header, footer) = {
             let reader =
                 SegmentReader::open(backing.bytes()).map_err(|e| SegmentHandleError::Open {
                     detail: format!("{path:?}: {e}"),
@@ -112,7 +115,13 @@ impl SegmentHandle {
                 });
             }
             let rtree = HilbertPackedRTree::build(reader.tiles());
-            (rtree, reader.schema_hash(), reader.tile_count())
+            (
+                rtree,
+                reader.schema_hash(),
+                reader.tile_count(),
+                *reader.header(),
+                Arc::clone(reader.footer()),
+            )
         };
 
         Ok(Self {
@@ -121,6 +130,8 @@ impl SegmentHandle {
             schema_hash,
             tile_count,
             id,
+            header,
+            footer,
         })
     }
 
@@ -141,11 +152,10 @@ impl SegmentHandle {
     }
 
     /// Build a borrowing `SegmentReader`. The reader must not outlive
-    /// the handle reference it was built from.
+    /// the handle reference it was built from. It shares the header and
+    /// footer decoded at open, so no read decodes the footer again.
     pub fn reader(&self) -> SegmentReader<'_> {
-        // Already validated at open time; unwrap is safe because we
-        // hold a live backing buffer of the same bytes that already parsed.
-        SegmentReader::open(self.backing.bytes()).expect("segment validated at open")
+        SegmentReader::from_parts(self.backing.bytes(), self.header, Arc::clone(&self.footer))
     }
 }
 

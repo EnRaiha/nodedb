@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Entry point: `copy_from_file`, path validation, and engine-support check.
+//! Entry point: `copy_from_file`, path validation, and the engine's bulk-load
+//! route, which `EngineRules::plan_bulk_load` answers.
 //!
 //! The result type is [`DdlResult`] / [`DdlError`] throughout. Each error
 //! site builds a `DdlError` directly via [`ddl_err`] so the whole call chain
@@ -8,10 +9,12 @@
 
 use nodedb_types::DatabaseId;
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 
-use nodedb_sql::ddl_ast::statement::CopyFormat;
-use nodedb_types::CollectionType;
+use nodedb_sql::SqlError;
+use nodedb_sql::ddl_ast::statement::{CopyFormat, CopyStdinFormat};
 
+use crate::control::planner::context::{BulkLoadRoute, QueryContext};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::neutral::collection::dml::authorize_write_target;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
@@ -21,12 +24,16 @@ use crate::control::state::SharedState;
 use crate::control::trigger::statement_txn::{fires_joined_body, in_block, with_statement_txn};
 use crate::control::trigger::{DmlEvent, TriggerScope};
 
+use super::array_load::{ArrayLoadCtx, ArrayLoader, LoadInput, TextFormat};
 use super::csv_import::{CsvOptions, import_csv};
 use super::import_ctx::ImportCtx;
 use super::json_import::{import_json_array, import_ndjson};
 
 /// Maximum file size accepted for COPY FROM (16 GiB).
 pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// How many bytes one read of an array load's file takes.
+const FILE_READ_BYTES: usize = 1024 * 1024;
 
 /// COPY FROM format and delimiter options.
 #[derive(Clone, Copy, Debug)]
@@ -81,10 +88,22 @@ pub async fn copy_from_file(
         )
     })?;
 
-    // Validate engine: reject Timeseries and Spatial.
-    check_engine_support(state, identity, database_id, collection)?;
-
     let tenant_id = identity.tenant_id;
+
+    // The engine's rules decide how it loads: row by row, in array cell
+    // chunks, or not at all (timeseries, spatial).
+    let route = QueryContext::for_state(state)
+        .bulk_load_route(collection, tenant_id, database_id)
+        .map_err(|e| bulk_load_refusal(e, tenant_id))?;
+    if let BulkLoadRoute::ArrayCells(_) = route {
+        let ctx = ArrayLoadCtx {
+            state,
+            identity,
+            database_id,
+            txn_ctx,
+        };
+        return copy_array_from_file(&ctx, collection, path, options).await;
+    }
 
     // Each row fires its collection's BEFORE, INSTEAD OF and SYNC AFTER
     // bodies, which join the statement's transaction. Outside a transaction
@@ -172,50 +191,57 @@ fn validate_path(path: &str) -> Result<(), DdlError> {
     Ok(())
 }
 
-/// Verify the collection engine supports COPY FROM.
-fn check_engine_support(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    collection: &str,
-) -> Result<(), DdlError> {
-    let tenant_id = identity.tenant_id;
-    let catalog = state.credentials.catalog();
-    let stored = match catalog.get_collection(database_id, tenant_id.as_u64(), collection) {
-        Ok(Some(c)) => c,
-        Ok(None) => return Ok(()), // Collection doesn't exist yet — will fail at INSERT.
-        Err(e) => {
-            return Err(DdlError::from_error_in_context(
-                "COPY: catalog lookup failed",
-                &e,
-            ));
-        }
-    };
-
-    match &stored.collection_type {
-        CollectionType::Columnar(profile) => {
-            use nodedb_types::ColumnarProfile;
-            match profile {
-                ColumnarProfile::Plain => Ok(()),
-                ColumnarProfile::Timeseries { .. } => Err(ddl_err(
-                    "0A000",
-                    format!(
-                        "COPY: collection '{collection}' uses the timeseries engine; \
-                         use ILP or INSERT with explicit time column instead"
-                    ),
-                )),
-                ColumnarProfile::Spatial { .. } => Err(ddl_err(
-                    "0A000",
-                    format!(
-                        "COPY: collection '{collection}' uses the spatial engine; \
-                         use INSERT with a WKT/GeoJSON geometry column instead"
-                    ),
-                )),
-            }
-        }
-        CollectionType::Document(_) => Ok(()),
-        CollectionType::KeyValue(_) => Ok(()),
+/// The DDL error of a refused bulk-load route. An engine's refusal keeps its
+/// exact text under `0A000`.
+pub(super) fn bulk_load_refusal(e: SqlError, tenant_id: nodedb_types::TenantId) -> DdlError {
+    match e {
+        SqlError::Unsupported { detail } => ddl_err("0A000", detail),
+        other => DdlError::from_sql_error(other, tenant_id),
     }
+}
+
+/// `COPY <array> FROM '<path>'`: the file's CSV rows stream through the
+/// array bulk-load core in reads of [`FILE_READ_BYTES`], as
+/// `COPY <array> FROM STDIN` does.
+async fn copy_array_from_file(
+    ctx: &ArrayLoadCtx<'_>,
+    array: &str,
+    path: &str,
+    options: CopyFromOptions<'_>,
+) -> Result<Vec<DdlResult>, DdlError> {
+    let CopyFromOptions {
+        format,
+        delimiter,
+        header,
+    } = options;
+    if format != Some(&CopyFormat::Csv) {
+        return Err(ddl_err(
+            "0A000",
+            format!("COPY: array '{array}' loads CSV rows; use WITH (FORMAT csv)"),
+        ));
+    }
+    let format = TextFormat {
+        format: CopyStdinFormat::Csv,
+        delimiter,
+        header,
+    };
+    let mut loader = ArrayLoader::open(ctx, array, LoadInput::Text(format))?;
+    let read_error =
+        |e: std::io::Error| ddl_err("58030", format!("COPY: cannot read '{path}': {e}"));
+    let mut file = tokio::fs::File::open(path).await.map_err(read_error)?;
+    let mut buf = vec![0u8; FILE_READ_BYTES];
+    loop {
+        let n = file.read(&mut buf).await.map_err(read_error)?;
+        if n == 0 {
+            break;
+        }
+        loader.feed_text(ctx, &buf[..n]).await?;
+    }
+    let rows = loader.finish(ctx).await?;
+    Ok(vec![DdlResult::Status {
+        command: format!("COPY {rows}"),
+        rows_affected: None,
+    }])
 }
 
 /// Wrap a row-level error to include the row number in the message.

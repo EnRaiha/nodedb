@@ -116,9 +116,11 @@ pub fn classify(error: &crate::Error) -> ApplyFailureClass {
         | crate::Error::UndefinedColumn { .. }
         | crate::Error::TextColumn { .. }
         | crate::Error::AmbiguousColumn { .. }
+        | crate::Error::UngroupedColumn { .. }
         | crate::Error::UnknownStrictField { .. }
         | crate::Error::DivisionByZero
         | crate::Error::DataException { .. }
+        | crate::Error::MixedSrid { .. }
         | crate::Error::NumericValueOutOfRange { .. }
         | crate::Error::InvalidTextRepresentation { .. }
         | crate::Error::DatatypeMismatch { .. }

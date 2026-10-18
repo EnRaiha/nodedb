@@ -14,8 +14,8 @@
 //! to index based on collection cardinality.
 
 use nodedb_mem::ScopedMemory;
-use nodedb_types::geometry::Geometry;
-use nodedb_types::{BoundingBox, geometry_bbox};
+use nodedb_types::geometry::{Geometry, Srid};
+use nodedb_types::{BboxSpace, BoundingBox, geometry_bbox_in};
 
 use crate::predicates;
 use crate::rtree::{RTree, RTreeEntry};
@@ -71,9 +71,14 @@ pub fn spatial_join(
                     predicates::st_contains(&probe_geom, &indexed_geom)
                 }
                 SpatialJoinPredicate::Within => predicates::st_within(&probe_geom, &indexed_geom),
-                SpatialJoinPredicate::DWithin(dist) => {
-                    predicates::st_dwithin(&probe_geom, &indexed_geom, dist)
-                }
+                SpatialJoinPredicate::DWithin(dist) => match indexed_side.space() {
+                    BboxSpace::Geographic => {
+                        predicates::st_dwithin(&probe_geom, &indexed_geom, dist)
+                    }
+                    BboxSpace::Planar => {
+                        crate::planar::planar_dwithin(&probe_geom, &indexed_geom, dist)
+                    }
+                },
             };
 
             if matches {
@@ -89,16 +94,18 @@ pub fn spatial_join(
     }
 }
 
-/// Build an R-tree from a list of (entry_id, geometry) pairs for join.
-pub fn build_join_index(entries: &[(u64, Geometry)], memory: ScopedMemory) -> RTree {
+/// Build an R-tree from a list of (entry_id, geometry) pairs, all in
+/// `srid`, for join.
+pub fn build_join_index(entries: &[(u64, Geometry)], memory: ScopedMemory, srid: Srid) -> RTree {
+    let space = srid.bbox_space();
     let rtree_entries: Vec<RTreeEntry> = entries
         .iter()
         .map(|(id, geom)| RTreeEntry {
             id: *id,
-            bbox: geometry_bbox(geom),
+            bbox: geometry_bbox_in(geom, space),
         })
         .collect();
-    RTree::bulk_load(rtree_entries, memory)
+    RTree::bulk_load(rtree_entries, memory, srid)
 }
 
 /// Which spatial predicate to use for the join.
@@ -115,6 +122,7 @@ pub enum SpatialJoinPredicate {
 mod tests {
     use super::*;
     use crate::test_support::test_memory;
+    use nodedb_types::geometry_bbox;
 
     #[test]
     fn join_overlapping_squares() {
@@ -153,7 +161,7 @@ mod tests {
             .collect();
 
         // Build index on left side.
-        let index = build_join_index(&left, test_memory());
+        let index = build_join_index(&left, test_memory(), Srid::Wgs84);
 
         // Probe with right side.
         let probe_entries: Vec<(u64, BoundingBox)> = right
@@ -200,7 +208,7 @@ mod tests {
             ]]),
         )];
 
-        let index = build_join_index(&left, test_memory());
+        let index = build_join_index(&left, test_memory(), Srid::Wgs84);
         let probes: Vec<(u64, BoundingBox)> = right
             .iter()
             .map(|(id, g)| (*id, geometry_bbox(g)))
@@ -225,7 +233,7 @@ mod tests {
         let left = vec![(1u64, Geometry::point(0.0, 0.0))];
         let right = vec![(100u64, Geometry::point(0.001, 0.0))]; // ~111m away
 
-        let index = build_join_index(&left, test_memory());
+        let index = build_join_index(&left, test_memory(), Srid::Wgs84);
         let probes: Vec<(u64, BoundingBox)> = right
             .iter()
             .map(|(id, g)| {

@@ -4,6 +4,7 @@ pub mod cell_payload;
 pub mod dense_tile;
 pub mod layout;
 pub mod mbr;
+pub mod prefix_memo;
 pub mod sparse_tile;
 
 pub use cell_payload::{
@@ -15,4 +16,5 @@ pub use layout::{
     cell_tile_prefix, tile_id_for_cell, tile_indices_for_cell, tile_prefix, tiles_per_dim,
 };
 pub use mbr::{AttrStats, TileMBR};
+pub use prefix_memo::TilePrefixMemo;
 pub use sparse_tile::SparseTile;

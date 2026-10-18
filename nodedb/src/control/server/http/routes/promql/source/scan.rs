@@ -50,6 +50,7 @@ pub(crate) async fn scan_metric(
         valid_at_ms: None,
         having: Vec::new(),
         tiering: metric.tiering.clone(),
+        output_columns: Vec::new(),
     });
     let payload = dispatch_for_identity(DispatchRequest {
         state: scope.state,

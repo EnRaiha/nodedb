@@ -13,9 +13,7 @@ use nodedb_cluster::distributed_array::partition::{partition_delete_coords, part
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp, PhysicalPlan};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use crate::control::cluster::array_executor::flatten_blob_vec;
 use crate::control::server::shared::sql::staging_predicates::StagedTagKind;
-use crate::engine::array::wal::{ArrayDeleteCell, ArrayPutCell};
 use crate::types::VShardId;
 
 /// The per-vShard `ArrayOp::{Put, Delete}` tasks a `ClusterArrayOp::{Put,
@@ -70,7 +68,13 @@ pub fn expand_for_buffering(task: PhysicalTask) -> crate::Result<Vec<PhysicalTas
 
         // Every other plan buffers verbatim. Enumerated rather than wildcarded
         // so a new fan-out variant forces an explicit decision here.
-        PhysicalPlan::ClusterArray(ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. })
+        PhysicalPlan::ClusterArray(
+            ClusterArrayOp::Slice { .. }
+            | ClusterArrayOp::Agg { .. }
+            | ClusterArrayOp::Elementwise { .. }
+            | ClusterArrayOp::Flush { .. }
+            | ClusterArrayOp::Compact { .. },
+        )
         | PhysicalPlan::Vector(_)
         | PhysicalPlan::Graph(_)
         | PhysicalPlan::Document(_)
@@ -94,27 +98,26 @@ fn expand_put(
     cells: &[(u64, Vec<u8>)],
     prefix_bits: u8,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    partition_put_cells(cells, prefix_bits)
-        .map_err(partition_error)?
+    let buckets = partition_put_cells(cells, prefix_bits).map_err(partition_error)?;
+    Ok(buckets
         .into_iter()
         .map(|bucket| {
-            let cells_msgpack =
-                flatten_blob_vec::<ArrayPutCell>(&bucket.cells_msgpack, "buffered array put")?;
-            Ok(shard_task(
+            // A bucket is the flat `Vec<ArrayPutCell>` encoding.
+            shard_task(
                 origin,
                 VShardId::new(bucket.vshard_id),
                 PhysicalPlan::Array(ArrayOp::Put {
                     array_id: array_id.clone(),
-                    cells_msgpack,
+                    cells_msgpack: bucket.cells_msgpack,
                     // Stamped by the write funnel at COMMIT replay, exactly as
                     // on the single-node planner path.
                     wal_lsn: 0,
                     provenance: None,
                     vshard_id: bucket.vshard_id,
                 }),
-            ))
+            )
         })
-        .collect()
+        .collect())
 }
 
 /// One `ArrayOp::Delete` per owning vShard, over the coords that land on it.
@@ -124,27 +127,24 @@ fn expand_delete(
     coords: &[(u64, Vec<u8>)],
     prefix_bits: u8,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    partition_delete_coords(coords, prefix_bits)
-        .map_err(partition_error)?
+    let buckets = partition_delete_coords(coords, prefix_bits).map_err(partition_error)?;
+    Ok(buckets
         .into_iter()
         .map(|bucket| {
-            let coords_msgpack = flatten_blob_vec::<ArrayDeleteCell>(
-                &bucket.coords_msgpack,
-                "buffered array delete",
-            )?;
-            Ok(shard_task(
+            // A bucket is the flat `Vec<ArrayDeleteCell>` encoding.
+            shard_task(
                 origin,
                 VShardId::new(bucket.vshard_id),
                 PhysicalPlan::Array(ArrayOp::Delete {
                     array_id: array_id.clone(),
-                    coords_msgpack,
+                    coords_msgpack: bucket.coords_msgpack,
                     wal_lsn: 0,
                     provenance: None,
                     vshard_id: bucket.vshard_id,
                 }),
-            ))
+            )
         })
-        .collect()
+        .collect())
 }
 
 /// One per-shard task, inheriting the originating statement's tenant and

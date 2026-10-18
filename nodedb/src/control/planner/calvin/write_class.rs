@@ -309,7 +309,6 @@ fn array_is_write(op: &ArrayOp) -> bool {
         | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => false,

@@ -149,7 +149,6 @@ pub(super) fn fold_leaf(
         | SqlPlan::InsertArray(_)
         | SqlPlan::DeleteArray(_)
         | SqlPlan::ArraySlice(_)
-        | SqlPlan::ArrayProject(_)
         | SqlPlan::ArrayAgg(_)
         | SqlPlan::ArrayElementwise(_)
         | SqlPlan::ArrayFlush { .. }

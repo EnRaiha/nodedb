@@ -6,6 +6,7 @@ pub mod auth_apikey;
 pub mod auth_context;
 pub mod auth_fence;
 pub mod auth_lease;
+pub mod bearer;
 pub mod blacklist;
 pub mod buses;
 pub mod catalog;

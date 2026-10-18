@@ -2,10 +2,11 @@
 
 //! Parse `COPY <collection> FROM '<path>' [WITH (FORMAT ..., DELIMITER ..., HEADER ...)]`.
 //!
-//! Only the server-side file-path form is handled here. The STDIN streaming
-//! shape (`COPY ... FROM STDIN`) is handled elsewhere (backup/restore);
-//! returning `None` lets dispatch fall through to that handler. `COPY ... TO`
-//! and `COPY (SELECT ...) TO` belong to the `copy_to` family.
+//! The server-side file-path form parses here. The STDIN streaming shape
+//! (`COPY <name> FROM STDIN`) parses in `copy_from_stdin`. The restore shape
+//! `COPY tenant_restore(<id>) FROM STDIN` returns `None`, so dispatch falls
+//! through to the backup/restore handler. `COPY ... TO` and
+//! `COPY (SELECT ...) TO` belong to the `copy_to` family.
 //!
 //! The direction is the keyword right after the copied relation, never a
 //! `FROM` or `TO` inside a path, a name, or a query.
@@ -81,8 +82,9 @@ fn relation_end(toks: &[Token<'_>]) -> Option<usize> {
 
 /// Try to parse a COPY statement.
 ///
-/// Returns `None` unless the statement is `COPY <collection> FROM '<path>'`.
-/// Returns `Some(Err)` for a malformed statement of that shape.
+/// Returns `None` unless the statement is `COPY <collection> FROM '<path>'`
+/// or `COPY <name> FROM STDIN`. Returns `Some(Err)` for a malformed
+/// statement of either shape.
 pub(super) fn try_parse(
     upper: &str,
     _parts: &[&str],
@@ -91,10 +93,11 @@ pub(super) fn try_parse(
     if !upper.starts_with("COPY ") {
         return None;
     }
-    if copy_direction(trimmed) != Some(CopyDirection::FromFile) {
-        return None;
+    match copy_direction(trimmed)? {
+        CopyDirection::FromFile => Some(parse_copy_from(trimmed)),
+        CopyDirection::FromStdin => super::copy_from_stdin::try_parse(trimmed),
+        CopyDirection::To => None,
     }
-    Some(parse_copy_from(trimmed))
 }
 
 fn parse_copy_from(sql: &str) -> Result<NodedbStatement, SqlError> {
@@ -181,7 +184,7 @@ fn parse_format_value(s: &str) -> Result<CopyFormat, SqlError> {
     }
 }
 
-fn parse_delimiter_value(s: &str) -> Result<char, SqlError> {
+pub(super) fn parse_delimiter_value(s: &str) -> Result<char, SqlError> {
     let mut chars = s.chars();
     let ch = chars.next().ok_or_else(|| SqlError::Parse {
         detail: "COPY: DELIMITER must be a single character".to_string(),
@@ -194,7 +197,7 @@ fn parse_delimiter_value(s: &str) -> Result<char, SqlError> {
     Ok(ch)
 }
 
-fn parse_bool_value(s: &str) -> Option<bool> {
+pub(super) fn parse_bool_value(s: &str) -> Option<bool> {
     match s.trim().to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
         "false" | "0" | "no" | "off" => Some(false),

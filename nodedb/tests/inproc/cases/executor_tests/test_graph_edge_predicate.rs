@@ -126,8 +126,12 @@ fn the_visit_cap_counts_only_admitted_edges() {
     );
     assert_eq!(
         unfiltered.status,
-        Status::Partial,
+        Status::Error,
         "three edges overflow a cap of one"
+    );
+    assert!(
+        !unfiltered.partial,
+        "an overflowing hop answers one terminal frame"
     );
 }
 

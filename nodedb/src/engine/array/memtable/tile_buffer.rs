@@ -25,7 +25,7 @@ use nodedb_array::tile::cell_payload::{
     is_cell_sentinel, is_cell_tombstone,
 };
 use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTileBuilder};
-use nodedb_array::tile::tile_id_for_cell;
+use nodedb_array::tile::{TilePrefixMemo, tile_id_for_cell};
 use nodedb_array::types::TileId;
 use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
@@ -194,6 +194,17 @@ impl Memtable {
     /// participates in the tile key so two writes at different
     /// system-time stamps produce two separate tile entries.
     pub fn put_cell(&mut self, schema: &ArraySchema, args: PutCell) -> ArrayResult<TileId> {
+        self.put_cell_keyed(schema, &mut TilePrefixMemo::new(), args)
+    }
+
+    /// [`Self::put_cell`] for one cell of a batch. `tiles` carries the last
+    /// cell's tile key, so a run of cells in one tile encodes it once.
+    pub fn put_cell_keyed(
+        &mut self,
+        schema: &ArraySchema,
+        tiles: &mut TilePrefixMemo,
+        args: PutCell,
+    ) -> ArrayResult<TileId> {
         let PutCell {
             coord,
             attrs,
@@ -203,7 +214,7 @@ impl Memtable {
             valid_until_ms,
             lsn,
         } = args;
-        let tile = tile_id_for_cell(schema, &coord, system_from_ms)?;
+        let tile = tiles.tile_id(schema, &coord, system_from_ms)?;
         let payload = CellPayload {
             valid_from_ms,
             valid_until_ms,

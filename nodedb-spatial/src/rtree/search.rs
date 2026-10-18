@@ -2,7 +2,7 @@
 
 //! R-tree range search and nearest-neighbor queries.
 
-use nodedb_types::BoundingBox;
+use nodedb_types::{BboxSpace, BoundingBox};
 use std::collections::BinaryHeap;
 
 use super::node::{EntryId, Node, NodeKind, RTreeEntry};
@@ -12,7 +12,8 @@ use super::node::{EntryId, Node, NodeKind, RTreeEntry};
 pub struct NnResult {
     pub entry_id: EntryId,
     pub bbox: BoundingBox,
-    /// Minimum distance in degrees (approximate).
+    /// Minimum distance in the tree's coordinate units: approximate degrees
+    /// for a geographic tree, metres for a projected one.
     pub distance: f64,
 }
 
@@ -45,15 +46,27 @@ pub(crate) fn search_node<'a>(
     }
 }
 
+/// A nearest-neighbor query point and the space its distances are taken in.
+pub(crate) struct NnQuery {
+    pub lng: f64,
+    pub lat: f64,
+    pub k: usize,
+    pub space: BboxSpace,
+}
+
 /// Nearest-neighbor search via priority queue (min-heap).
 pub(crate) fn nearest(
     nodes: &[Node],
     root: usize,
-    query_lng: f64,
-    query_lat: f64,
-    k: usize,
+    query: NnQuery,
     is_empty: bool,
 ) -> Vec<NnResult> {
+    let NnQuery {
+        lng: query_lng,
+        lat: query_lat,
+        k,
+        space,
+    } = query;
     if k == 0 || is_empty {
         return Vec::new();
     }
@@ -62,7 +75,7 @@ pub(crate) fn nearest(
     let mut results: Vec<NnResult> = Vec::with_capacity(k);
 
     heap.push(HeapItem {
-        dist: min_dist_point_bbox(query_lng, query_lat, &nodes[root].bbox),
+        dist: min_dist_point_bbox(query_lng, query_lat, &nodes[root].bbox, space),
         node_idx: root,
     });
 
@@ -74,7 +87,7 @@ pub(crate) fn nearest(
         match &node.kind {
             NodeKind::Internal { children } => {
                 for child in children {
-                    let d = min_dist_point_bbox(query_lng, query_lat, &child.bbox);
+                    let d = min_dist_point_bbox(query_lng, query_lat, &child.bbox, space);
                     if results.len() < k || d <= results[results.len() - 1].distance {
                         heap.push(HeapItem {
                             dist: d,
@@ -85,7 +98,7 @@ pub(crate) fn nearest(
             }
             NodeKind::Leaf { entries } => {
                 for entry in entries {
-                    let d = min_dist_point_bbox(query_lng, query_lat, &entry.bbox);
+                    let d = min_dist_point_bbox(query_lng, query_lat, &entry.bbox, space);
                     if results.len() < k || d < results[results.len() - 1].distance {
                         let nn = NnResult {
                             entry_id: entry.id,
@@ -132,8 +145,10 @@ impl Ord for HeapItem {
     }
 }
 
-/// Minimum distance from point to bbox (in degrees, approximate).
-fn min_dist_point_bbox(lng: f64, lat: f64, bbox: &BoundingBox) -> f64 {
+/// Minimum Euclidean distance from point to bbox in coordinate units:
+/// approximate degrees in geographic space, metres in planar space. Only
+/// geographic space honours an anti-meridian-wrapping box.
+fn min_dist_point_bbox(lng: f64, lat: f64, bbox: &BoundingBox, space: BboxSpace) -> f64 {
     let dlat = if lat < bbox.min_lat {
         bbox.min_lat - lat
     } else if lat > bbox.max_lat {
@@ -142,7 +157,11 @@ fn min_dist_point_bbox(lng: f64, lat: f64, bbox: &BoundingBox) -> f64 {
         0.0
     };
 
-    let dlng = if bbox.crosses_antimeridian() {
+    let wraps = match space {
+        BboxSpace::Geographic => bbox.crosses_antimeridian(),
+        BboxSpace::Planar => false,
+    };
+    let dlng = if wraps {
         if lng >= bbox.min_lng || lng <= bbox.max_lng {
             0.0
         } else {

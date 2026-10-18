@@ -149,21 +149,54 @@ fn resolve_output_alias<'a>(
 }
 
 /// Derive the SELECT-list output alias for each GROUP BY key by correlating
-/// each key with the projection item that references the same column. Returns
-/// a `Vec` parallel to `group_by`: `Some(alias)` when a projection item
-/// explicitly aliases that grouped column (`SELECT k AS label ... GROUP BY k`),
-/// otherwise `None` (the output column name falls back to the raw grouped
-/// column name).
+/// each key with the projection item that produces it. Returns a `Vec`
+/// parallel to `group_by`: `Some(alias)` when a projection item explicitly
+/// aliases that key, otherwise `None` (the output column name falls back to
+/// the key's own name).
+///
+/// A column key matches an aliased item that references the same column
+/// (`SELECT k AS label ... GROUP BY k`). A computed key matches an aliased
+/// item whose expression converts to the same key
+/// (`SELECT time_bucket('1 hour', ts) AS b ... GROUP BY b`).
 pub fn group_by_output_aliases(
     projection: &[ast::SelectItem],
     group_by: &[SqlExpr],
+    scope: &TableScope,
 ) -> Vec<Option<String>> {
     group_by
         .iter()
-        .map(|key| {
-            key_column_name(key).and_then(|name| projection_alias_for_column(projection, name))
+        .map(|key| match key_column_name(key) {
+            Some(name) => projection_alias_for_column(projection, name),
+            None => projection_alias_for_expr(projection, key, scope),
         })
         .collect()
+}
+
+/// The explicit alias of the projection item whose expression converts to
+/// the computed GROUP BY key `key`.
+///
+/// `SqlExpr` has no `PartialEq` (it can carry a subquery plan), so the match
+/// compares the `Debug` rendering. Both sides pass through `convert_expr`, so
+/// equal expressions render identically. An item that does not convert names
+/// no key.
+fn projection_alias_for_expr(
+    projection: &[ast::SelectItem],
+    key: &SqlExpr,
+    scope: &TableScope,
+) -> Option<String> {
+    let rendered_key = format!("{key:?}");
+    projection.iter().find_map(|item| match item {
+        ast::SelectItem::ExprWithAlias { expr, alias } => {
+            convert_expr(expr, &ColumnScope::Relations(scope))
+                .ok()
+                .filter(|converted| format!("{converted:?}") == rendered_key)
+                .map(|_| normalize_ident(alias))
+        }
+        ast::SelectItem::UnnamedExpr(_)
+        | ast::SelectItem::ExprWithAliases { .. }
+        | ast::SelectItem::QualifiedWildcard(..)
+        | ast::SelectItem::Wildcard(_) => None,
+    })
 }
 
 /// The bare column name of a GROUP BY key, when the key is a column reference.

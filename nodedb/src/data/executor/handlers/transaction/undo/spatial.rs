@@ -17,7 +17,7 @@ use super::{UndoEntry, UndoError};
 impl CoreLoop {
     pub(super) fn apply_undo_spatial(
         &mut self,
-        _entry_index: usize,
+        entry_index: usize,
         entry: UndoEntry,
     ) -> Result<(), UndoError> {
         match entry {
@@ -37,10 +37,13 @@ impl CoreLoop {
                 entry_id,
                 bbox,
                 document_id,
+                srid,
             } => {
                 // Reverse a forward spatial removal: re-insert the entry with
                 // its captured bbox and re-populate the reverse map, matching
-                // the forward `apply_point_put_spatial` insert shape.
+                // the forward `apply_point_put_spatial` insert shape. Undo
+                // runs in reverse, so every later insert into this tree is
+                // already gone and the tree binds back to `srid`.
                 let memory = nodedb_mem::ScopedMemory::new(
                     self.governor.clone(),
                     key.0,
@@ -50,7 +53,19 @@ impl CoreLoop {
                 let rtree = self
                     .spatial_indexes
                     .entry(key.clone())
-                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
+                    .or_insert_with(|| crate::engine::spatial::RTree::new(memory, srid));
+                rtree.bind_srid(srid).map_err(|m| {
+                    UndoError::failed(
+                        entry_index,
+                        format!("re-inserting a spatial entry into '{}.{}'", key.2, key.3),
+                        crate::Error::MixedSrid {
+                            collection: key.2.clone(),
+                            field: key.3.clone(),
+                            index_srid: m.index.code(),
+                            row_srid: m.entry.code(),
+                        },
+                    )
+                })?;
                 rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
                 self.spatial_doc_map
                     .insert((key.0, key.1, key.2, key.3, entry_id), document_id);
@@ -102,10 +117,9 @@ mod tests {
             key.1,
             nodedb_mem::EngineId::Spatial,
         );
-        let rtree = core
-            .spatial_indexes
-            .entry(key.clone())
-            .or_insert_with(|| crate::engine::spatial::RTree::new(memory));
+        let rtree = core.spatial_indexes.entry(key.clone()).or_insert_with(|| {
+            crate::engine::spatial::RTree::new(memory, nodedb_types::geometry::Srid::Wgs84)
+        });
         rtree.insert(crate::engine::spatial::RTreeEntry { id: entry_id, bbox });
         core.spatial_doc_map.insert(
             (key.0, key.1, key.2.clone(), key.3.clone(), entry_id),
@@ -145,6 +159,7 @@ mod tests {
             entry_id,
             bbox,
             document_id: "d1".to_string(),
+            srid: nodedb_types::geometry::Srid::Utm48N,
         };
         core.apply_undo_spatial(0, undo).unwrap();
 
@@ -156,6 +171,11 @@ mod tests {
         assert_eq!(
             restored.bbox, bbox,
             "restored bbox must match captured bbox"
+        );
+        assert_eq!(
+            core.spatial_indexes.get(&key).map(|rt| rt.srid()),
+            Some(nodedb_types::geometry::Srid::Utm48N),
+            "the re-created tree takes the captured SRID"
         );
         assert_eq!(
             core.spatial_doc_map

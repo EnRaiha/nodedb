@@ -12,4 +12,5 @@ pub mod entry;
 pub mod mutate;
 pub mod open;
 pub mod read;
+mod slice_row;
 pub mod surrogate_scan;

@@ -101,7 +101,7 @@ pub struct TenantDataSnapshot {
 
     /// PK → surrogate identity bindings for the snapshotted collections.
     ///
-    /// The surrogate map (`surrogate_pk_v3` / `surrogate_pk_rev_v3` catalog
+    /// The surrogate map (`surrogate_pk_v4` / `surrogate_pk_rev_v4` catalog
     /// tables) is DATA-derived per-node state: on the cluster apply path a
     /// follower binds it when it applies a replicated `PointInsert`/`PointPut`.
     /// The snapshot install path bypasses that apply path entirely (it installs
@@ -390,7 +390,7 @@ pub struct CrdtConstraintEntry {
 
 /// A single PK → surrogate identity binding carried in a snapshot/backup.
 ///
-/// Mirrors one row of the `surrogate_pk_v3` catalog table for one
+/// Mirrors one row of the `surrogate_pk_v4` catalog table for one
 /// `(database_id, tenant_id, collection)`. Rebound on the Control-Plane apply side via
 /// `SystemCatalog::put_surrogate` so PK point-lookups resolve on a
 /// snapshot-installed / restored node.

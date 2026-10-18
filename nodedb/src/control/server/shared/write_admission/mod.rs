@@ -12,6 +12,7 @@ pub mod leader_gate;
 pub mod lock_keys;
 pub mod predicate;
 pub mod route;
+pub mod tickets;
 pub mod wait;
 pub mod write_order_fence;
 pub mod write_order_lock;
@@ -23,6 +24,7 @@ pub use predicate::{
     all_writes_bufferable, plan_is_write, plan_requires_txn_buffering, plan_writes_user_data,
 };
 pub use route::{bare_ok_response, calvin_route_keeps, route_write_to_calvin};
+pub use tickets::{AdmissionTicket, AdmissionTickets, FenceState, StartFence};
 pub use wait::AdmissionWait;
 pub(crate) use write_order_fence::order_row_write;
 pub use write_order_fence::{WriteOrder, WriteOrderFence};

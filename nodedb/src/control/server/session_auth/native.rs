@@ -6,7 +6,9 @@
 //! - `{"method": "trust"}` — trust mode (only if configured)
 //! - `{"method": "password", "username": "...", "password": "..."}`
 //! - `{"method": "api_key", "token": "ndb_..."}`
-//! - `{"method": "oidc_bearer", "token": "eyJ..."}`
+//!
+//! An OIDC bearer token uses the `OidcBearer` auth frame, which
+//! `native::dispatch::handle_auth` verifies before any JSON body is built.
 
 use crate::config::auth::AuthMode;
 use crate::control::security::audit::{
@@ -299,40 +301,12 @@ pub async fn authenticate(
                 .map(|id| (id, None))
         }
 
-        "oidc_bearer" => {
-            let token = body["token"]
-                .as_str()
-                .ok_or_else(|| crate::Error::BadRequest {
-                    detail: "missing 'token' for oidc_bearer auth".into(),
-                })?;
-
-            // This dispatcher's `"oidc_bearer"` method string is unreachable from
-            // the native protocol: `dispatch::handle_auth` intercepts
-            // `ProtoAuth::OidcBearer` before building a JSON body for this
-            // function, and no other caller passes this method name. The
-            // verified-claims proof this returns is therefore discarded here
-            // rather than threaded further — the reachable OIDC path is
-            // `dispatch::handle_auth`.
-            let (identity, _verified_claims) =
-                crate::control::security::oidc::verify_bearer_token(state, token).await?;
-
-            state.audit_record(
-                AuditEvent::AuthSuccess,
-                Some(identity.tenant_id),
-                peer_addr,
-                &format!(
-                    "OIDC bearer login: sub={} method=oidc_bearer",
-                    identity.username
-                ),
-            );
-            state.auth_metrics.record_auth_success("oidc_bearer");
-
-            Ok((identity, None))
-        }
-
+        // An OIDC bearer token never reaches this dispatcher.
+        // `dispatch::handle_auth` verifies it and keeps the verified claims for the session.
         other => Err(crate::Error::BadRequest {
             detail: format!(
-                "unknown auth method: '{other}'. Use 'trust', 'password', 'api_key', or 'oidc_bearer'."
+                "unknown auth method: '{other}'. Use 'trust', 'password', or 'api_key'; \
+                 an OIDC bearer token uses the native OidcBearer auth frame."
             ),
         }),
     }

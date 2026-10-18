@@ -498,6 +498,7 @@ fn rollback_matrix_columnar_count_after_rollback() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );
@@ -600,6 +601,7 @@ fn rollback_matrix_timeseries_then_doc_fail() {
             computed_columns: Vec::new(),
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(scan_resp.status, Status::Ok);
@@ -715,6 +717,7 @@ fn rollback_matrix_timeseries_count_after_rollback() {
             computed_columns: Vec::new(),
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(scan_resp.status, Status::Ok);

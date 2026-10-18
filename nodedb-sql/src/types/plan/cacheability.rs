@@ -174,7 +174,6 @@ impl SqlPlan {
             | Self::InsertArray { .. }
             | Self::DeleteArray { .. }
             | Self::ArraySlice { .. }
-            | Self::ArrayProject { .. }
             | Self::ArrayAgg { .. }
             | Self::ArrayElementwise { .. }
             | Self::ArrayFlush { .. }

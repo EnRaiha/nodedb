@@ -117,12 +117,12 @@ impl NodeDbPgHandler {
             return result;
         }
 
-        // ── Wire-streaming COPY shapes for backup/restore ─────────────
-        if let Some(intent) = crate::control::backup::detect(sql_trimmed) {
-            return self
-                .intent_to_response(identity, session_id, intent)
-                .await
-                .map(|r| vec![r]);
+        // ── Wire-streaming COPY shapes: backup, restore, array load ───
+        if let Some(r) = self
+            .copy_stream_response(identity, session_id, sql_trimmed)
+            .await
+        {
+            return r.map(|r| vec![r]);
         }
 
         // ── Cursor commands ───────────────────────────────────────────

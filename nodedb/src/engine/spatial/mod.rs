@@ -6,6 +6,7 @@
 pub use nodedb_spatial::GeohashIndex;
 pub use nodedb_spatial::RTree;
 pub use nodedb_spatial::RTreeEntry;
+pub use nodedb_spatial::SridMismatch;
 pub use nodedb_spatial::geo_meta;
 pub use nodedb_spatial::geohash;
 pub use nodedb_spatial::geohash_index;

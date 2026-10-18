@@ -33,6 +33,7 @@ use super::gate::{
     WriteAdmission, WriteAdmissionGuard, WriteTarget, admit_request, admit_routed, lock_manager_of,
 };
 use super::route::calvin_route_keeps;
+use super::tickets::AdmissionTicket;
 
 /// The host side of [`DataProposeGate`]. Weak: `SharedState` outlives the
 /// Raft loop that holds the gate only while the node runs.
@@ -67,11 +68,15 @@ impl DataProposeGate for LeaderWriteGate {
         };
         admit_redo_stream(&state, &entry, deadline).map_err(gate_error)?;
         let guard = match admit_entry(&state, vshard, &entry).map_err(gate_error)? {
-            WriteAdmission::ExemptRead
-            | WriteAdmission::FastPath { guard: None }
+            WriteAdmission::ExemptRead | WriteAdmission::FastPath { guard: None } => {
+                return Ok(None);
+            }
             // No scheduler runs for the vShard here: the log alone orders
-            // the write.
-            | WriteAdmission::FastPathBlocking { .. } => return Ok(None),
+            // the write. Its landing fences the vShard's next scheduler.
+            WriteAdmission::FastPathBlocking { ticket, .. }
+            | WriteAdmission::Unscheduled { ticket } => {
+                return Ok(Some(Box::new(UnscheduledLanding { ticket })));
+            }
             WriteAdmission::FastPath { guard: Some(guard) } => guard,
             WriteAdmission::RouteToCalvin => {
                 return Err(ClusterError::Calvin(CalvinError::RouteToSequencer));
@@ -98,12 +103,27 @@ impl ProposeHold for LandedHold {
         let LandedHold {
             state,
             vshard,
-            guard,
+            mut guard,
         } = *self;
+        // The ticket records the index before the keys move to the holds. A
+        // scheduler that starts on a new table waits for that index.
+        guard.landed(group_id, log_index);
         state
             .calvin
             .admission_holds
             .hold(group_id, log_index, vshard, guard);
+    }
+}
+
+/// An admitted entry of a vShard with no scheduler. Its landing index fences
+/// the vShard's next scheduler.
+struct UnscheduledLanding {
+    ticket: AdmissionTicket,
+}
+
+impl ProposeHold for UnscheduledLanding {
+    fn landed(self: Box<Self>, group_id: u64, log_index: u64) {
+        self.ticket.landed(group_id, log_index);
     }
 }
 
@@ -296,14 +316,17 @@ fn admit_collections(
     vshard: VShardId,
     collections: &[String],
 ) -> WriteAdmission {
+    // The ticket opens before the table lookup (see `tickets`).
+    let ticket = state.calvin.admission_tickets.open(vshard.as_u32());
     match lock_manager_of(state, vshard) {
         Some(lock_manager) => admit_request(
             state,
             vshard,
             lock_manager,
             collection_admission_keys(collections),
-        ),
-        None => WriteAdmission::FastPath { guard: None },
+        )
+        .carrying(ticket),
+        None => WriteAdmission::Unscheduled { ticket },
     }
 }
 

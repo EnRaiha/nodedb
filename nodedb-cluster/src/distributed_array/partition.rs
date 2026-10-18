@@ -15,14 +15,18 @@
 //!
 //! ## Output shape
 //!
+//! Each element arrives as one msgpack value. A bucket is a msgpack array
+//! header followed by its elements' bytes, in input order. The bucket is then
+//! the msgpack encoding of `Vec<element>`, the shape the shard's Data Plane
+//! decodes, so the shard passes it through without a decode.
+//!
 //! `partition_put_cells` returns one `PutBucket` per vShard: its
-//! `representative_tile_key` and `cells_msgpack`, a zerompk-encoded
-//! `Vec<raw-cell-bytes>` (the same bytes the shard handler passes to
-//! `exec_put`).
+//! `representative_tile_key` and `cells_msgpack`, the encoding of
+//! `Vec<ArrayPutCell>`.
 //!
 //! `partition_delete_coords` returns one `DeleteBucket` per vShard: its
-//! `representative_tile_key` and `coords_msgpack`, a zerompk-encoded
-//! `Vec<raw-coord-bytes>`.
+//! `representative_tile_key` and `coords_msgpack`, the encoding of
+//! `Vec<ArrayDeleteCell>`.
 
 use std::collections::HashMap;
 
@@ -36,7 +40,7 @@ pub struct PutBucket {
     /// Tile key of the first cell added to this bucket. The shard handler
     /// routes it to check ownership (`validate_put_routing`).
     pub representative_tile_key: u64,
-    /// zerompk-encoded `Vec<raw-cell-bytes>` for all cells in this bucket.
+    /// The msgpack array of every cell in this bucket, in input order.
     pub cells_msgpack: Vec<u8>,
 }
 
@@ -46,7 +50,7 @@ pub struct DeleteBucket {
     /// Tile key of the first coord added to this bucket. The shard handler
     /// routes it to check ownership (`validate_delete_routing`).
     pub representative_tile_key: u64,
-    /// zerompk-encoded `Vec<raw-coord-bytes>` for all coords in this bucket.
+    /// The msgpack array of every coord in this bucket, in input order.
     pub coords_msgpack: Vec<u8>,
 }
 
@@ -55,33 +59,17 @@ pub struct DeleteBucket {
 /// `cells` — each element is `(tile_key, zerompk-encoded single cell)`.
 /// `prefix_bits` — routing granularity (1–16).
 ///
-/// Returns one `PutBucket` per unique owning vShard. The order of buckets
-/// in the output is unspecified but deterministic within a call.
+/// Returns one `PutBucket` per unique owning vShard, in the order of each
+/// vShard's first cell.
 pub fn partition_put_cells(cells: &[(u64, Vec<u8>)], prefix_bits: u8) -> Result<Vec<PutBucket>> {
-    if cells.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // vshard_id → (representative tile key, per-cell byte blobs)
-    let mut buckets: HashMap<u32, (u64, Vec<Vec<u8>>)> = HashMap::new();
-
-    for (tile_key, cell_bytes) in cells {
-        let vshard_id = array_vshard_for_tile(*tile_key, prefix_bits)?;
-        let entry = buckets.entry(vshard_id).or_insert((*tile_key, Vec::new()));
-        entry.1.push(cell_bytes.clone());
-    }
-
-    buckets
+    Ok(partition_flat(cells, prefix_bits)?
         .into_iter()
-        .map(|(vshard_id, (representative, cell_blobs))| {
-            let cells_msgpack = encode_blob_vec(&cell_blobs)?;
-            Ok(PutBucket {
-                vshard_id,
-                representative_tile_key: representative,
-                cells_msgpack,
-            })
+        .map(|bucket| PutBucket {
+            vshard_id: bucket.vshard_id,
+            representative_tile_key: bucket.representative_tile_key,
+            cells_msgpack: bucket.msgpack,
         })
-        .collect()
+        .collect())
 }
 
 /// Group `(tile_key, coord_msgpack)` pairs by owning vShard.
@@ -89,64 +77,119 @@ pub fn partition_put_cells(cells: &[(u64, Vec<u8>)], prefix_bits: u8) -> Result<
 /// `coords` — each element is `(tile_key, zerompk-encoded single coord)`.
 /// `prefix_bits` — routing granularity (1–16).
 ///
-/// Returns one `DeleteBucket` per unique owning vShard.
+/// Returns one `DeleteBucket` per unique owning vShard, in the order of each
+/// vShard's first coord.
 pub fn partition_delete_coords(
     coords: &[(u64, Vec<u8>)],
     prefix_bits: u8,
 ) -> Result<Vec<DeleteBucket>> {
-    if coords.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // vshard_id → (representative tile key, coord byte blobs)
-    let mut buckets: HashMap<u32, (u64, Vec<Vec<u8>>)> = HashMap::new();
-
-    for (tile_key, coord_bytes) in coords {
-        let vshard_id = array_vshard_for_tile(*tile_key, prefix_bits)?;
-        let entry = buckets.entry(vshard_id).or_insert((*tile_key, Vec::new()));
-        entry.1.push(coord_bytes.clone());
-    }
-
-    buckets
+    Ok(partition_flat(coords, prefix_bits)?
         .into_iter()
-        .map(|(vshard_id, (representative, coord_blobs))| {
-            let coords_msgpack = encode_blob_vec(&coord_blobs)?;
-            Ok(DeleteBucket {
-                vshard_id,
-                representative_tile_key: representative,
-                coords_msgpack,
-            })
+        .map(|bucket| DeleteBucket {
+            vshard_id: bucket.vshard_id,
+            representative_tile_key: bucket.representative_tile_key,
+            coords_msgpack: bucket.msgpack,
         })
-        .collect()
+        .collect())
 }
 
-/// Encode a `Vec<Vec<u8>>` (collection of opaque blobs) as a zerompk array.
-///
-/// Each blob is emitted as raw msgpack bytes (already encoded by the caller)
-/// wrapped in a msgpack bin or str value. We re-encode the entire collection
-/// as a msgpack array of byte-arrays so the shard handler can deserialise it
-/// as `Vec<raw-bytes>` and forward to the engine.
-fn encode_blob_vec(blobs: &[Vec<u8>]) -> Result<Vec<u8>> {
-    // zerompk::to_msgpack_vec requires Sized, so pass as a Vec reference.
-    let owned: Vec<Vec<u8>> = blobs.to_vec();
-    zerompk::to_msgpack_vec(&owned).map_err(|e| ClusterError::Codec {
-        detail: format!("partition encode blob vec: {e}"),
-    })
+/// One vShard's elements as one msgpack array.
+struct FlatBucket {
+    vshard_id: u32,
+    representative_tile_key: u64,
+    msgpack: Vec<u8>,
+}
+
+/// Group `(tile_key, element_msgpack)` pairs by owning vShard. Each bucket
+/// is sized once and written once: no element is copied twice.
+fn partition_flat(items: &[(u64, Vec<u8>)], prefix_bits: u8) -> Result<Vec<FlatBucket>> {
+    struct Slot {
+        vshard_id: u32,
+        representative_tile_key: u64,
+        count: usize,
+        bytes: usize,
+    }
+    let mut slot_of_vshard: HashMap<u32, usize> = HashMap::new();
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut slot_of: Vec<usize> = Vec::with_capacity(items.len());
+    // Consecutive elements mostly share a vShard, so the last one answers
+    // before the map.
+    let mut last: Option<(u32, usize)> = None;
+    for (tile_key, element) in items {
+        let vshard_id = array_vshard_for_tile(*tile_key, prefix_bits)?;
+        let slot = match last {
+            Some((vshard, slot)) if vshard == vshard_id => slot,
+            _ => *slot_of_vshard.entry(vshard_id).or_insert_with(|| {
+                slots.push(Slot {
+                    vshard_id,
+                    representative_tile_key: *tile_key,
+                    count: 0,
+                    bytes: 0,
+                });
+                slots.len() - 1
+            }),
+        };
+        last = Some((vshard_id, slot));
+        slots[slot].count += 1;
+        slots[slot].bytes += element.len();
+        slot_of.push(slot);
+    }
+    let mut buffers: Vec<Vec<u8>> = slots
+        .iter()
+        .map(|slot| {
+            let mut buf = Vec::with_capacity(ARRAY_HEADER_MAX + slot.bytes);
+            write_array_header(&mut buf, slot.count)?;
+            Ok(buf)
+        })
+        .collect::<Result<_>>()?;
+    for ((_, element), &slot) in items.iter().zip(&slot_of) {
+        buffers[slot].extend_from_slice(element);
+    }
+    Ok(slots
+        .into_iter()
+        .zip(buffers)
+        .map(|(slot, msgpack)| FlatBucket {
+            vshard_id: slot.vshard_id,
+            representative_tile_key: slot.representative_tile_key,
+            msgpack,
+        })
+        .collect())
+}
+
+/// The longest msgpack array header: the `array 32` marker and a `u32`.
+const ARRAY_HEADER_MAX: usize = 5;
+
+/// Write the msgpack array header for `len` elements, in the shortest form,
+/// as zerompk writes it.
+fn write_array_header(buf: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len < 16 {
+        buf.push(0x90 | len as u8);
+    } else if let Ok(len) = u16::try_from(len) {
+        buf.push(0xdc);
+        buf.extend_from_slice(&len.to_be_bytes());
+    } else {
+        let len = u32::try_from(len).map_err(|_| ClusterError::Codec {
+            detail: format!("partition: a bucket of {len} elements exceeds a msgpack array"),
+        })?;
+        buf.push(0xdd);
+        buf.extend_from_slice(&len.to_be_bytes());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Build a fake (tile_key, cell_bytes) pair. The cell_bytes are
-    // opaque for the partitioner — any non-empty Vec<u8> works.
+    // Build a fake (tile_key, cell_bytes) pair. The cell is one msgpack
+    // value: `tag` as a positive fixint.
     fn cell(prefix: u64, tag: u8) -> (u64, Vec<u8>) {
-        (prefix, vec![tag])
+        (prefix, vec![tag & 0x7f])
     }
 
     // Build a fake coord pair.
     fn coord(prefix: u64, tag: u8) -> (u64, Vec<u8>) {
-        (prefix, vec![tag])
+        (prefix, vec![tag & 0x7f])
     }
 
     // Helper: compute expected vshard for a given tile key and prefix_bits.
@@ -202,9 +245,34 @@ mod tests {
                 .iter()
                 .find(|b| b.vshard_id == vshard)
                 .expect("bucket for key");
-            let blobs: Vec<Vec<u8>> = zerompk::from_msgpack(&bucket.cells_msgpack).unwrap();
-            assert_eq!(blobs.len(), want, "key={key:#x}");
+            let cells: Vec<u64> = zerompk::from_msgpack(&bucket.cells_msgpack).unwrap();
+            assert_eq!(cells.len(), want, "key={key:#x}");
         }
+        // A bucket holds its cells in input order.
+        let first = buckets
+            .iter()
+            .find(|b| b.vshard_id == expected_vshard(p0, 10))
+            .expect("bucket for p0");
+        let cells: Vec<u64> = zerompk::from_msgpack(&first.cells_msgpack).unwrap();
+        assert_eq!(cells, vec![0x01, 0x03]);
+    }
+
+    /// A bucket of more than 15 elements takes the `array 16` header, and
+    /// still decodes as the flat array of its elements.
+    #[test]
+    fn a_large_bucket_is_one_flat_msgpack_array() {
+        let cells: Vec<(u64, Vec<u8>)> = (0..40u64)
+            .map(|i| (0, zerompk::to_msgpack_vec(&(i * 1_000)).unwrap()))
+            .collect();
+        let buckets = partition_put_cells(&cells, 10).unwrap();
+        assert_eq!(buckets.len(), 1);
+        let decoded: Vec<u64> = zerompk::from_msgpack(&buckets[0].cells_msgpack).unwrap();
+        assert_eq!(decoded, (0..40u64).map(|i| i * 1_000).collect::<Vec<_>>());
+        assert_eq!(
+            buckets[0].cells_msgpack,
+            zerompk::to_msgpack_vec(&decoded).unwrap(),
+            "the bucket is byte-identical to zerompk's own encoding"
+        );
     }
 
     #[test]
@@ -222,8 +290,8 @@ mod tests {
                 .iter()
                 .find(|b| b.vshard_id == vshard)
                 .expect("bucket for key");
-            let blobs: Vec<Vec<u8>> = zerompk::from_msgpack(&bucket.coords_msgpack).unwrap();
-            assert_eq!(blobs.len(), want, "key={key:#x}");
+            let coords: Vec<u64> = zerompk::from_msgpack(&bucket.coords_msgpack).unwrap();
+            assert_eq!(coords.len(), want, "key={key:#x}");
         }
     }
 

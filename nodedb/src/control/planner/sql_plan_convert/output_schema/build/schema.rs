@@ -12,16 +12,18 @@ use std::collections::HashMap;
 
 use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
+use nodedb_sql::resolver::array_tvf::ARRAY_HORIZON_COLUMN;
 use nodedb_sql::types::query::Projection;
 use nodedb_sql::types::{
-    ArrayProjectPlan, ArraySlicePlan, CtePlan, DocumentIndexLookupPlan, HybridSearchPlan,
-    HybridSearchTriplePlan, InsertPlan, KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan,
-    RangeScanPlan, RecursiveScanPlan, RecursiveValuePlan, SqlPlan, TextSearchPlan,
-    TimeseriesIngestPlan, TimeseriesScanPlan, UpsertPlan, VectorPrimaryDeletePlan,
-    VectorPrimaryInsertPlan, VectorPrimaryUpdatePlan,
+    CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, InsertPlan,
+    KvInsertPlan, LateralLoopPlan, LateralTopKPlan, MergePlan, RangeScanPlan, RecursiveScanPlan,
+    RecursiveValuePlan, SqlPlan, TextSearchPlan, TimeseriesIngestPlan, TimeseriesScanPlan,
+    UpsertPlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan, VectorPrimaryUpdatePlan,
 };
 
-use crate::control::server::response_shape::schema::{OutputColumn, OutputSchema};
+use crate::control::server::response_shape::schema::{
+    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type_with_width,
+};
 use crate::control::server::response_shape::types::DdlColType;
 
 use super::super::columns::{
@@ -54,27 +56,16 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
     };
 
     Ok(match plan {
-        // A grouped or aggregating timeseries scan announces the columns its
-        // aggregate encoder emits, in that encoder's order: each GROUP BY key,
-        // then each aggregate. An ungrouped aggregate takes this arm too: the
-        // raw-scan arm below announces no column for it, and its cells then
-        // lose the SELECT-list order. A GROUP BY key carries its own catalog
-        // type, so one stored instant renders the same grouped as it does
-        // through a plain `SELECT`. An aggregate result stays `Text`: the timeseries plan
-        // carries no SELECT-list alias for it, so its type cannot be resolved
-        // with certainty.
-        //
-        // A `time_bucket` query is excluded: its encoder prepends a `bucket`
-        // boundary column that the plan's GROUP BY list does not name, so the
-        // announced shape would not be the emitted one.
-        SqlPlan::TimeseriesScan(TimeseriesScanPlan {
-            collection,
-            group_by,
-            aggregates,
-            bucket_interval_ms,
-            ..
-        }) if (!group_by.is_empty() || !aggregates.is_empty()) && *bucket_interval_ms == 0 => {
-            timeseries_group_schema(catalog, database_id, collection, group_by, aggregates)?
+        // A grouped, bucketed, or aggregating timeseries scan announces its
+        // SELECT-list columns in SELECT-list order, under their aliases, typed
+        // as the generic aggregate types them. An ungrouped aggregate takes
+        // this arm too: the raw-scan arm below announces no column for it.
+        SqlPlan::TimeseriesScan(scan)
+            if !scan.group_by.is_empty()
+                || !scan.aggregates.is_empty()
+                || scan.bucket_interval_ms > 0 =>
+        {
+            timeseries_group_schema(catalog, database_id, scan)?
         }
         SqlPlan::Scan {
             collection,
@@ -219,12 +210,15 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         SqlPlan::Cte(CtePlan { definitions, outer }) => {
             let stored = CatalogRef(catalog);
             let overlay = CteTypesCatalog::build(&stored, definitions, database_id)?;
-            build_output_schema(
+            let schema = build_output_schema(
                 std::slice::from_ref(outer.as_ref()),
                 &overlay,
                 database_id,
                 returning,
-            )?
+            )?;
+            // An outer query that runs as a body unchanged reads each column
+            // under the key the body's rows carry it.
+            overlay.read_through(outer, schema)
         }
         // A post-processor's projected shape is its outer projection over the
         // body's announced columns. An empty projection (SELECT *) inherits
@@ -263,24 +257,14 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
             let types = HashMap::new();
             schema_from_projection(projection, &types, &[])
         }
-        SqlPlan::ArraySlice(ArraySlicePlan {
-            attr_projection, ..
-        })
-        | SqlPlan::ArrayProject(ArrayProjectPlan {
-            attr_projection, ..
-        }) => OutputSchema {
-            columns: attr_projection
-                .iter()
-                .map(|name| OutputColumn {
-                    display_name: name.clone(),
-                    lookup_key: name.clone(),
-                    ty: DdlColType::Text,
-                })
-                .collect(),
-            is_star: false,
-            cp_computed: Vec::new(),
-            declared_key: None,
-        },
+        // A cell read announces the columns its rows carry: every dim, then
+        // the requested attrs, each typed from the array schema.
+        SqlPlan::ArraySlice(slice) => {
+            let view = array_view(catalog, &slice.name)?;
+            array_columns_schema(&nodedb_sql::resolver::array_tvf::array_slice_columns(
+                &view, slice,
+            ))
+        }
         // A write announces exactly what its `RETURNING` clause projects, from
         // the target collection's declared columns. `RETURNING` is a
         // projection, so it is typed like one: a `SELECT ts, host, v` and an
@@ -318,14 +302,67 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         | SqlPlan::DropIndex { .. }
         | SqlPlan::ArrayFlush { .. }
         | SqlPlan::ArrayCompact { .. } => OutputSchema::default(),
-        // `ArrayAgg` / `ArrayElementwise` compile to `ArrayOp::Aggregate` /
-        // `ArrayOp::Elementwise`, which `describe_plan` classifies as
-        // `PlanKind::MultiRow`. `MultiRow` responses are shaped by
-        // `shape_generic_rows` -> `shape_decoded_rows`, which derives column
-        // names from the decoded JSON payload itself, not from
-        // `OutputSchema`. An empty schema here is therefore correct.
-        SqlPlan::ArrayAgg { .. } | SqlPlan::ArrayElementwise { .. } => OutputSchema::default(),
+        // An aggregate announces `group`, typed as its group dim the way a
+        // slice types that dim, then `result`, typed by the reducer. A
+        // temporal aggregate ends with a summary row, so it also announces
+        // the row's `truncated_before_horizon` flag.
+        SqlPlan::ArrayAgg(agg) => {
+            let view = array_view(catalog, &agg.name)?;
+            let mut schema = array_columns_schema(
+                &nodedb_sql::resolver::array_tvf::array_agg_columns(&view, agg)?,
+            );
+            if agg.temporal.is_temporal() {
+                schema.columns.push(OutputColumn {
+                    display_name: ARRAY_HORIZON_COLUMN.to_string(),
+                    lookup_key: ARRAY_HORIZON_COLUMN.to_string(),
+                    ty: DdlColType::Bool,
+                });
+            }
+            schema
+        }
+        // `ArrayElementwise` compiles to `ArrayOp::Elementwise`, which
+        // `describe_plan` classifies as `PlanKind::MultiRow`. `MultiRow`
+        // responses are shaped by `shape_generic_rows` ->
+        // `shape_decoded_rows`, which derives column names from the decoded
+        // payload when the schema is empty.
+        SqlPlan::ArrayElementwise { .. } => OutputSchema::default(),
     })
+}
+
+/// The array `name` names, or the unknown-table error a plan over a dropped
+/// array reports.
+fn array_view<C: SqlCatalog + ?Sized>(
+    catalog: &C,
+    name: &str,
+) -> Result<nodedb_sql::types::ArrayCatalogView, SqlError> {
+    catalog
+        .lookup_array(name)
+        .ok_or_else(|| SqlError::UnknownTable {
+            name: name.to_string(),
+        })
+}
+
+/// One output column per relation column, in order, under its own name and
+/// its wire type. A narrow attr announces its own width: `int2`, `int4`, or
+/// `float4`.
+fn array_columns_schema(columns: &[nodedb_sql::types::ColumnInfo]) -> OutputSchema {
+    OutputSchema {
+        columns: columns
+            .iter()
+            .map(|column| OutputColumn {
+                display_name: column.name.clone(),
+                lookup_key: column.name.clone(),
+                ty: sql_data_type_to_ddl_col_type_with_width(
+                    &column.data_type,
+                    column.int_width,
+                    column.float_width,
+                ),
+            })
+            .collect(),
+        is_star: false,
+        cp_computed: Vec::new(),
+        declared_key: None,
+    }
 }
 
 #[cfg(test)]

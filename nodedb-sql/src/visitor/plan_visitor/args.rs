@@ -10,13 +10,16 @@ use crate::temporal::TemporalScope;
 use crate::types::SqlPlan;
 use crate::types::filter::Filter;
 use crate::types::plan::{
-    ArrayPrefilter, MergePlanClause, TextScoreColumn, TextSearchShape, VectorAnnOptions,
-    VectorPrimaryInsertIntent, VectorPrimaryRow, WriteRoute,
+    ArrayPrefilter, MergePlanClause, TextScoreColumn, TextSearchShape, TimeseriesAggOutput,
+    VectorAnnOptions, VectorPrimaryInsertIntent, VectorPrimaryRow, WriteRoute,
 };
 use crate::types::query::{
     AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate, WindowSpec,
 };
-use crate::types_array::{ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayTileOrderAst};
+use crate::types_array::{
+    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayReducerAst, ArraySliceAst,
+    ArrayTileOrderAst, ArrayZoneAst,
+};
 use crate::types_expr::{SqlExpr, SqlPayloadAtom, SqlValue};
 use nodedb_types::vector_distance::DistanceMetric;
 
@@ -123,6 +126,9 @@ pub struct AggregateVisitArgs<'a> {
     pub limit: usize,
     pub grouping_sets: Option<&'a [Vec<usize>]>,
     pub sort_keys: &'a [SortKey],
+    /// SELECT-list output alias of each GROUP BY key, parallel to `group_by`.
+    /// Empty, or a `None` entry, keeps the key's own row name.
+    pub group_by_aliases: &'a [Option<String>],
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::timeseries_scan`].
@@ -141,6 +147,8 @@ pub struct TimeseriesScanVisitArgs<'a> {
     pub sort_keys: &'a [SortKey],
     pub tiered: bool,
     pub temporal: &'a TemporalScope,
+    /// SELECT-list output columns of an aggregating scan. Empty on a raw scan.
+    pub output: &'a [TimeseriesAggOutput],
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::vector_search`].
@@ -214,7 +222,7 @@ pub struct SpatialScanVisitArgs<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub predicate: &'a SpatialPredicate,
-    pub query_geometry: &'a nodedb_types::geometry::Geometry,
+    pub query_geometry: &'a nodedb_types::geometry::SridGeometry,
     pub distance_meters: f64,
     pub attribute_filters: &'a [Filter],
     pub limit: usize,
@@ -254,6 +262,19 @@ pub struct CreateArrayVisitArgs<'a> {
     pub prefix_bits: u8,
     pub audit_retain_ms: Option<u64>,
     pub minimum_audit_retain_ms: Option<u64>,
+}
+
+/// Parameters for [`super::trait_def::PlanVisitor::array_agg`].
+pub struct ArrayAggVisitArgs<'a> {
+    pub name: &'a str,
+    pub attr: &'a str,
+    pub reducer: ArrayReducerAst,
+    pub group_by_dim: Option<&'a str>,
+    /// Coordinate box the aggregate reads. No dim range = the whole array.
+    pub slice: &'a ArraySliceAst,
+    /// Polygon zone inside the box. `None` = the whole box.
+    pub zone: Option<&'a ArrayZoneAst>,
+    pub temporal: &'a TemporalScope,
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::merge`].

@@ -345,7 +345,7 @@ mod tests {
         scheduler.propose_sequencer_entry(
             txn_id,
             SchedulerProposal::Vote {
-                abort: Some(nodedb_cluster::calvin::AbortReason::PlanRejected),
+                abort: Some(nodedb_cluster::calvin::AbortReason::PlanRejected.into()),
             },
         );
         scheduler.retry_owed_sequencer_entries();
@@ -365,7 +365,7 @@ mod tests {
         scheduler.propose_sequencer_entry(
             TxnId::new(24, 0),
             SchedulerProposal::Vote {
-                abort: Some(nodedb_cluster::calvin::AbortReason::PlanRejected),
+                abort: Some(nodedb_cluster::calvin::AbortReason::PlanRejected.into()),
             },
         );
         assert!(proposer.accepted().is_empty());

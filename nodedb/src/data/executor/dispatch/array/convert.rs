@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Engine-boundary conversion between `nodedb_types::Value` (the wire
-//! and SQL-surface carrier) and the array engine's typed
-//! `CoordValue` / `CellValue`.
+//! Engine-boundary conversion from the array engine's typed `CoordValue` /
+//! `CellValue` to `nodedb_types::Value`, the wire and SQL-surface carrier.
 //!
 //! Every match is exhaustive on the source enum so adding a new variant
-//! fails to compile until handled here explicitly.
-//!
-//! Read, aggregate, and elementwise handlers call every helper here,
-//! so no module-wide dead-code allowance is needed.
+//! fails to compile until handled here explicitly. The opposite direction
+//! runs on the Control Plane, where a literal narrows to the attr's
+//! declared type before any cell reaches the Data Plane.
 
 use nodedb_array::schema::ArraySchema;
-use nodedb_array::schema::attr_spec::AttrType;
-use nodedb_array::schema::dim_spec::DimType;
 use nodedb_array::tile::sparse_tile::{RowKind, SparseTile};
 use nodedb_array::types::cell_value::value::CellValue;
+use nodedb_array::types::cell_value::widen_f32;
 use nodedb_array::types::coord::value::CoordValue;
-use nodedb_types::{ArrayCell, NodeDbError, Value};
+use nodedb_types::{ArrayCell, Value};
 
 /// Convert one coordinate scalar from the engine's typed representation
 /// to the generic wire `Value`.
@@ -29,55 +26,10 @@ pub fn coord_value_to_value(c: &CoordValue) -> Value {
     }
 }
 
-/// Coerce a generic `Value` to a typed `CoordValue`, rejecting any
-/// combination that the target dimension type cannot represent.
-#[allow(dead_code)] // consumed by SQL DML extractors
-pub fn value_to_coord_value(v: &Value, expected: DimType) -> Result<CoordValue, NodeDbError> {
-    match (v, expected) {
-        (Value::Integer(i), DimType::Int64) => Ok(CoordValue::Int64(*i)),
-        (Value::Integer(i), DimType::TimestampMs) => Ok(CoordValue::TimestampMs(*i)),
-        (Value::Integer(i), DimType::Float64) => Ok(CoordValue::Float64(*i as f64)),
-        (Value::Float(f), DimType::Float64) => Ok(CoordValue::Float64(*f)),
-        (Value::String(s), DimType::String) => Ok(CoordValue::String(s.clone())),
-        // Every other Value variant is explicitly unsupported for coords.
-        (
-            Value::Null
-            | Value::Bool(_)
-            | Value::Integer(_)
-            | Value::Float(_)
-            | Value::String(_)
-            | Value::Bytes(_)
-            | Value::Array(_)
-            | Value::Object(_)
-            | Value::Uuid(_)
-            | Value::Ulid(_)
-            | Value::DateTime(_)
-            | Value::NaiveDateTime(_)
-            | Value::Duration(_)
-            | Value::Decimal(_)
-            | Value::Geometry(_)
-            | Value::Set(_)
-            | Value::Regex(_)
-            | Value::Range { .. }
-            | Value::Record { .. }
-            | Value::ArrayCell(_),
-            _,
-        ) => Err(NodeDbError::codec(format!(
-            "coord value {} not convertible to {:?}",
-            value_kind(v),
-            expected
-        ))),
-        // Value is #[non_exhaustive]; future variants are unsupported as coords.
-        (_, _) => Err(NodeDbError::codec(format!(
-            "coord value {} not convertible to {:?}",
-            value_kind(v),
-            expected
-        ))),
-    }
-}
-
 /// Convert one attribute value from the engine's typed representation
-/// to the generic wire `Value`.
+/// to the generic wire `Value`. A narrow integer widens to `Integer`. A
+/// `Float32` widens through `widen_f32`, so `0.1` stored as `FLOAT32` reads
+/// as `0.1` over JSON, the native protocol, and pgwire.
 pub fn cell_value_to_value(c: &CellValue) -> Value {
     match c {
         CellValue::Int64(v) => Value::Integer(*v),
@@ -85,54 +37,12 @@ pub fn cell_value_to_value(c: &CellValue) -> Value {
         CellValue::String(v) => Value::String(v.clone()),
         CellValue::Bytes(v) => Value::Bytes(v.clone()),
         CellValue::Null => Value::Null,
-    }
-}
-
-/// Coerce a generic `Value` to a typed `CellValue`, rejecting any
-/// combination the target attribute type cannot represent. `Null` maps
-/// to `CellValue::Null` regardless of the declared attribute type;
-/// nullability is enforced elsewhere (schema validation).
-#[allow(dead_code)] // consumed by SQL DML extractors
-pub fn value_to_cell_value(v: &Value, expected: AttrType) -> Result<CellValue, NodeDbError> {
-    match (v, expected) {
-        (Value::Null, _) => Ok(CellValue::Null),
-        (Value::Integer(i), AttrType::Int64) => Ok(CellValue::Int64(*i)),
-        (Value::Integer(i), AttrType::Float64) => Ok(CellValue::Float64(*i as f64)),
-        (Value::Float(f), AttrType::Float64) => Ok(CellValue::Float64(*f)),
-        (Value::String(s), AttrType::String) => Ok(CellValue::String(s.clone())),
-        (Value::Bytes(b), AttrType::Bytes) => Ok(CellValue::Bytes(b.clone())),
-        (
-            Value::Bool(_)
-            | Value::Integer(_)
-            | Value::Float(_)
-            | Value::String(_)
-            | Value::Bytes(_)
-            | Value::Array(_)
-            | Value::Object(_)
-            | Value::Uuid(_)
-            | Value::Ulid(_)
-            | Value::DateTime(_)
-            | Value::NaiveDateTime(_)
-            | Value::Duration(_)
-            | Value::Decimal(_)
-            | Value::Geometry(_)
-            | Value::Set(_)
-            | Value::Regex(_)
-            | Value::Range { .. }
-            | Value::Record { .. }
-            | Value::ArrayCell(_),
-            _,
-        ) => Err(NodeDbError::codec(format!(
-            "attr value {} not convertible to {:?}",
-            value_kind(v),
-            expected
-        ))),
-        // Value is #[non_exhaustive]; future variants are unsupported as attrs.
-        (_, _) => Err(NodeDbError::codec(format!(
-            "attr value {} not convertible to {:?}",
-            value_kind(v),
-            expected
-        ))),
+        CellValue::UInt8(v) => Value::Integer(i64::from(*v)),
+        CellValue::Int16(v) => Value::Integer(i64::from(*v)),
+        CellValue::UInt16(v) => Value::Integer(i64::from(*v)),
+        CellValue::Int32(v) => Value::Integer(i64::from(*v)),
+        CellValue::UInt32(v) => Value::Integer(i64::from(*v)),
+        CellValue::Float32(v) => Value::Float(widen_f32(*v)),
     }
 }
 
@@ -173,29 +83,35 @@ pub fn sparse_tile_to_array_cells(schema: &ArraySchema, tile: &SparseTile) -> Ve
     cells
 }
 
-fn value_kind(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Integer(_) => "integer",
-        Value::Float(_) => "float",
-        Value::String(_) => "string",
-        Value::Bytes(_) => "bytes",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-        Value::Uuid(_) => "uuid",
-        Value::Ulid(_) => "ulid",
-        Value::DateTime(_) => "datetime",
-        Value::NaiveDateTime(_) => "naive_datetime",
-        Value::Duration(_) => "duration",
-        Value::Decimal(_) => "decimal",
-        Value::Geometry(_) => "geometry",
-        Value::Set(_) => "set",
-        Value::Regex(_) => "regex",
-        Value::Range { .. } => "range",
-        Value::Record { .. } => "record",
-        Value::ArrayCell(_) => "array_cell",
-        // Value is #[non_exhaustive]; future variants report as "unknown".
-        _ => "unknown",
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_cells_widen_to_wire_values() {
+        assert_eq!(
+            cell_value_to_value(&CellValue::UInt8(255)),
+            Value::Integer(255)
+        );
+        assert_eq!(
+            cell_value_to_value(&CellValue::Int16(-2)),
+            Value::Integer(-2)
+        );
+        assert_eq!(
+            cell_value_to_value(&CellValue::UInt32(u32::MAX)),
+            Value::Integer(4_294_967_295)
+        );
+        assert_eq!(
+            cell_value_to_value(&CellValue::Float32(0.5)),
+            Value::Float(0.5)
+        );
+        assert_eq!(
+            cell_value_to_value(&CellValue::Float32(0.1)),
+            Value::Float(0.1)
+        );
+        assert_eq!(
+            cell_value_to_value(&CellValue::Float32(f32::MAX)),
+            Value::Float(3.4028235e38)
+        );
     }
 }

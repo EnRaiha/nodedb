@@ -2,6 +2,7 @@
 
 //! Shared equality-to-index rewrite for the document engines.
 
+use crate::planner::computed_tail;
 use crate::types::*;
 
 use super::params::ScanParams;
@@ -90,22 +91,36 @@ pub(crate) fn try_document_index_lookup(
             value
         };
 
-        return Some(SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan {
+        // The indexed fetch evaluates no expression. A computed SELECT item
+        // runs in a tail over the fetched rows, and the tail takes the
+        // DISTINCT and row bound, which apply to the computed output.
+        let tail = computed_tail::needs_computed_tail(&params.projection);
+        let bounds = computed_tail::TailBounds {
+            distinct: params.distinct,
+            limit: params.limit,
+            offset: params.offset,
+        };
+        let lookup = SqlPlan::DocumentIndexLookup(DocumentIndexLookupPlan {
             collection: params.collection.clone(),
             alias: params.alias.clone(),
             engine,
             field: idx.field.clone(),
             value: lookup_value,
             filters: remaining,
-            projection: params.projection.clone(),
+            projection: computed_tail::body_projection(&params.projection),
             sort_keys: params.sort_keys.clone(),
-            limit: params.limit,
-            offset: params.offset,
-            distinct: params.distinct,
+            limit: if tail { None } else { params.limit },
+            offset: if tail { 0 } else { params.offset },
+            distinct: !tail && params.distinct,
             window_functions: params.window_functions.clone(),
             case_insensitive: idx.case_insensitive,
             temporal: params.temporal,
-        }));
+        });
+        return Some(computed_tail::with_computed_tail(
+            lookup,
+            &params.projection,
+            bounds,
+        ));
     }
     None
 }

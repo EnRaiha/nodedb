@@ -69,6 +69,7 @@ pub(super) fn build_group_setup(
     let tracker = Arc::new(
         ProposeTracker::new()
             .with_group_watchers(handle.group_watchers.clone())
+            .with_admission_holds(Arc::clone(&shared.calvin.admission_holds))
             .with_waiter_window(std::time::Duration::from_secs(
                 shared.tuning.network.default_deadline_secs,
             )),

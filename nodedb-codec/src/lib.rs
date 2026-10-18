@@ -31,6 +31,7 @@ pub mod error;
 pub mod fastlanes;
 pub mod fsst;
 pub mod gorilla;
+pub mod gorilla_f32;
 pub mod lz4;
 pub mod pcodec;
 pub mod pipeline;

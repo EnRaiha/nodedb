@@ -401,7 +401,10 @@ pub fn fold_function_call_scoped(
             e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
             | nodedb_query::EvalError::ArgumentType { .. }
             | nodedb_query::EvalError::InvalidJsonPath { .. }
-            | nodedb_query::EvalError::NumericOverflow { .. }),
+            | nodedb_query::EvalError::NumericOverflow { .. }
+            | nodedb_query::EvalError::UnsupportedSrid { .. }
+            | nodedb_query::EvalError::MixedSrid { .. }
+            | nodedb_query::EvalError::ProjectionDomain { .. }),
         ) => Err(SqlError::DataException {
             detail: e.to_string(),
         }),
@@ -445,7 +448,8 @@ fn ndb_to_sql_value(v: Value) -> SqlValue {
         // Geometry and Object values are serialized to JSON strings so that
         // nested function calls like ST_Distance(ST_Point(...), ST_Point(...))
         // survive the SqlValue round-trip. The geo evaluator's geom_arg helper
-        // recovers Geometry from a GeoJSON string; Object results (e.g. from
+        // recovers Geometry from a GeoJSON string, SRID included through the
+        // `crs` member; Object results (e.g. from
         // ST_GeoHashDecode) reach the client as a JSON-encoded string column.
         Value::Geometry(g) => sonic_rs::to_string(&g)
             .map(SqlValue::String)

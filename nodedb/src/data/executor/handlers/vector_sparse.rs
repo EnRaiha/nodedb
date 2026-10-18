@@ -11,6 +11,17 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::vector::sparse::SparseInvertedIndex;
 
+/// Parameters for [`CoreLoop::execute_sparse_search`].
+pub(in crate::data::executor) struct SparseSearchParams<'a> {
+    pub collection: &'a str,
+    pub field_name: &'a str,
+    pub query_entries: &'a [(u32, f32)],
+    pub top_k: usize,
+    /// Serialized `Vec<ScanFilter>`: the statement's residual `WHERE`.
+    /// Empty when none applies.
+    pub filters: &'a [u8],
+}
+
 impl CoreLoop {
     /// Get or create a sparse inverted index for a collection/field.
     pub(in crate::data::executor) fn get_or_create_sparse_index(
@@ -91,21 +102,32 @@ impl CoreLoop {
     }
 
     /// Search the sparse inverted index via dot-product scoring.
+    ///
+    /// `filters` is the statement's residual `WHERE` (serialized
+    /// `Vec<ScanFilter>`). With one, the candidate window widens, as a dense
+    /// vector search's does. Each hit carries its body for the filter and
+    /// the projection. The Control Plane applies the filter and the `top_k`
+    /// cut.
     pub(in crate::data::executor) fn execute_sparse_search(
         &self,
         task: &ExecutionTask,
         tid: u64,
-        collection: &str,
-        field_name: &str,
-        query_entries: &[(u32, f32)],
-        top_k: usize,
+        params: SparseSearchParams<'_>,
     ) -> Response {
+        let SparseSearchParams {
+            collection,
+            field_name,
+            query_entries,
+            top_k,
+            filters,
+        } = params;
         debug!(
             core = self.core_id,
             %collection,
             %field_name,
             query_nnz = query_entries.len(),
             top_k,
+            filtered = !filters.is_empty(),
             "sparse search"
         );
 
@@ -134,32 +156,36 @@ impl CoreLoop {
             }
         };
 
-        let results = crate::engine::vector::sparse::search::dot_product_topk(index, &query, top_k);
-
-        // Convert to VectorSearchHit. The sparse index keys documents by their
-        // hex surrogate `doc_id`; emit that surrogate's storage key as the hit
-        // `id` and leave `doc_id` unset, exactly like the dense vector search —
-        // the Control-Plane response translator (`translate_vector_search_payload`)
-        // then resolves the surrogate back to the user PK for the projection.
-        // Fall back to `Headless(internal_id)` only if `doc_id` is somehow not
-        // a hex surrogate.
-        let hits: Vec<super::super::response_codec::VectorSearchHit> = results
-            .iter()
-            .map(|r| {
-                let id = r
-                    .doc_id
-                    .as_deref()
-                    .and_then(nodedb_types::StorageKey::parse)
-                    .map(super::hybrid_key::HybridFusionKey::Bound)
-                    .unwrap_or(super::hybrid_key::HybridFusionKey::Headless(r.internal_id));
-                super::super::response_codec::VectorSearchHit {
-                    id,
-                    distance: r.score,
-                    doc_id: None,
-                    body: None,
+        // The Control Plane encoded these bytes. Bytes that do not decode
+        // fail the search: ranking without the filter cannot size the window.
+        let residual: Vec<nodedb_query::scan_filter::ScanFilter> = if filters.is_empty() {
+            Vec::new()
+        } else {
+            match zerompk::from_msgpack(filters) {
+                Ok(filters) => filters,
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("sparse search residual filter decode: {e}"),
+                        },
+                    );
                 }
-            })
-            .collect();
+            }
+        };
+
+        // Each hit's `id` is its surrogate's storage key and `doc_id` stays
+        // unset, as in the dense vector search. The Control-Plane translator
+        // resolves the surrogate to the user PK.
+        let hits = match super::vector_sparse_window::rank_sparse_window(
+            top_k,
+            &residual,
+            |k| crate::engine::vector::sparse::search::dot_product_topk(index, &query, k),
+            |hit| self.attach_body(database_id, tid, collection, true, hit),
+        ) {
+            Ok(hits) => hits,
+            Err(e) => return self.response_error(task, e),
+        };
 
         match super::super::response_codec::encode(&hits) {
             Ok(payload) => self.response_with_payload(task, payload),

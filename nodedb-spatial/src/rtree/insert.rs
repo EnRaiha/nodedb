@@ -2,7 +2,7 @@
 
 //! R*-tree insertion with overflow treatment (forced reinsert).
 
-use nodedb_types::BoundingBox;
+use nodedb_types::{BboxSpace, BoundingBox};
 
 use super::node::{ChildRef, NodeKind, REINSERT_COUNT_LEAF, RTreeEntry};
 use super::split::split_node;
@@ -15,7 +15,7 @@ impl RTree {
         let mut reinserted_levels = Vec::new();
         insert_entry(self, entry, 0, &mut reinserted_levels);
         self.len += 1;
-        self.nodes[self.root].bbox = self.nodes[self.root].bbox.union(&bbox);
+        self.nodes[self.root].bbox = self.nodes[self.root].bbox.union_in(&bbox, self.space);
     }
 
     /// Insert with reinsert tracking (used internally and by delete).
@@ -43,7 +43,7 @@ fn insert_entry(
             return;
         }
     }
-    tree.nodes[leaf_idx].recompute_bbox();
+    tree.nodes[leaf_idx].recompute_bbox(tree.space);
 
     if tree.nodes[leaf_idx].is_overflow() {
         treat_overflow(tree, leaf_idx, reinserted_levels);
@@ -69,21 +69,25 @@ fn choose_subtree(
                 return node_idx;
             }
             let best = if tree.nodes[children[0].node_idx].is_leaf() {
-                choose_least_overlap(children, entry_bbox)
+                choose_least_overlap(children, entry_bbox, tree.space)
             } else {
-                choose_least_enlargement(children, entry_bbox)
+                choose_least_enlargement(children, entry_bbox, tree.space)
             };
             choose_subtree(tree, children[best].node_idx, entry_bbox, target_level)
         }
     }
 }
 
-fn choose_least_enlargement(children: &[ChildRef], entry_bbox: &BoundingBox) -> usize {
+fn choose_least_enlargement(
+    children: &[ChildRef],
+    entry_bbox: &BoundingBox,
+    space: BboxSpace,
+) -> usize {
     let mut best = 0;
     let mut best_enlarge = f64::INFINITY;
     let mut best_area = f64::INFINITY;
     for (i, child) in children.iter().enumerate() {
-        let enlarge = child.bbox.enlargement(entry_bbox);
+        let enlarge = child.bbox.enlargement_in(entry_bbox, space);
         let area = child.bbox.area();
         if enlarge < best_enlarge || (enlarge == best_enlarge && area < best_area) {
             best = i;
@@ -94,13 +98,17 @@ fn choose_least_enlargement(children: &[ChildRef], entry_bbox: &BoundingBox) -> 
     best
 }
 
-fn choose_least_overlap(children: &[ChildRef], entry_bbox: &BoundingBox) -> usize {
+fn choose_least_overlap(
+    children: &[ChildRef],
+    entry_bbox: &BoundingBox,
+    space: BboxSpace,
+) -> usize {
     let mut best = 0;
     let mut best_oi = f64::INFINITY;
     let mut best_enlarge = f64::INFINITY;
     let mut best_area = f64::INFINITY;
     for (i, child) in children.iter().enumerate() {
-        let enlarged = child.bbox.union(entry_bbox);
+        let enlarged = child.bbox.union_in(entry_bbox, space);
         let mut before = 0.0_f64;
         let mut after = 0.0_f64;
         for (j, other) in children.iter().enumerate() {
@@ -110,7 +118,7 @@ fn choose_least_overlap(children: &[ChildRef], entry_bbox: &BoundingBox) -> usiz
             }
         }
         let oi = after - before;
-        let enlarge = child.bbox.enlargement(entry_bbox);
+        let enlarge = child.bbox.enlargement_in(entry_bbox, space);
         let area = child.bbox.area();
         if oi < best_oi
             || (oi == best_oi && enlarge < best_enlarge)
@@ -160,7 +168,7 @@ fn forced_reinsert(tree: &mut RTree, node_idx: usize) -> Vec<RTreeEntry> {
             db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
         let removed: Vec<RTreeEntry> = entries.drain(..reinsert_count).collect();
-        tree.nodes[node_idx].recompute_bbox();
+        tree.nodes[node_idx].recompute_bbox(tree.space);
         removed
     } else {
         Vec::new()

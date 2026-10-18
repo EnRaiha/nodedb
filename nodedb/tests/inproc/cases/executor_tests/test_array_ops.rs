@@ -252,6 +252,7 @@ fn array_agg_aggregate() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );

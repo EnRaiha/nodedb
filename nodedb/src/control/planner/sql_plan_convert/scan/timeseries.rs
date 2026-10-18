@@ -37,7 +37,21 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
         tenant_id,
         ctx,
         temporal,
+        output,
     } = p;
+    // The scan writes each group row under the SELECT-list names, in order.
+    let output_columns: Vec<(String, String)> = output
+        .iter()
+        .map(|column| {
+            column
+                .key_and_name(aggregates)
+                .ok_or(crate::Error::Internal {
+                    detail: format!(
+                        "timeseries output column {column:?} names no aggregate of the scan"
+                    ),
+                })
+        })
+        .collect::<crate::Result<_>>()?;
     let collection_key = nodedb_types::CollectionKey::from_bare(ctx.database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(ctx.database_id, collection);
     let filter_bytes = serialize_filters(filters)?;
@@ -87,6 +101,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
             valid_at_ms: valid_at_from_scope(temporal),
             having: having_bytes,
             tiering,
+            output_columns,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

@@ -168,6 +168,95 @@ async fn audit_sequence_survives_restart() {
     }
 }
 
+/// The audit reader returns entries on both sides of a flush, once each, in seq order.
+#[tokio::test]
+async fn recent_audit_entries_merges_flushed_and_buffered() {
+    let state = make_state_with_catalog();
+    let su = superuser();
+
+    ddl_ok(&state, &su, "CREATE USER ryw_first WITH PASSWORD 'pass'").await;
+    state.flush_audit_log();
+    assert!(
+        state.credentials.catalog().audit_entry_count().unwrap() > 0,
+        "the flush must persist the first entry to the catalog"
+    );
+    ddl_ok(&state, &su, "CREATE USER ryw_second WITH PASSWORD 'pass'").await;
+
+    let entries = state.recent_audit_entries(10_000, |_| true).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.detail.contains("created user 'ryw_first'")),
+        "the flushed entry must be visible"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.detail.contains("created user 'ryw_second'")),
+        "the buffered entry must be visible"
+    );
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "entries must be unique and ascending: {seqs:?}"
+    );
+
+    // The limit applies after the filter and keeps the newest match.
+    let newest = state
+        .recent_audit_entries(1, |e| e.event == AuditEvent::PrivilegeChange)
+        .unwrap();
+    assert_eq!(newest.len(), 1);
+    assert!(
+        newest[0].detail.contains("created user 'ryw_second'"),
+        "LIMIT 1 must return the newest matching entry: {:?}",
+        newest[0]
+    );
+
+    // A second flush moves the buffered entry without duplicating it.
+    state.flush_audit_log();
+    let after = state.recent_audit_entries(10_000, |_| true).unwrap();
+    let after_seqs: Vec<u64> = after.iter().map(|e| e.seq).collect();
+    assert!(
+        after_seqs.windows(2).all(|w| w[0] < w[1]),
+        "entries must stay unique and ascending after a flush: {after_seqs:?}"
+    );
+    assert!(
+        seqs.iter().all(|s| after_seqs.contains(s)),
+        "a flush must not hide a visible entry: before {seqs:?}, after {after_seqs:?}"
+    );
+}
+
+/// `VERIFY AUDIT CHAIN` passes on both sides of a flush, and fails on an altered persisted row.
+#[tokio::test]
+async fn verify_audit_chain_spans_flushes_and_detects_tampering() {
+    let state = make_state_with_catalog();
+    let su = superuser();
+
+    ddl_ok(&state, &su, "CREATE USER chain_first WITH PASSWORD 'pass'").await;
+    ddl_ok(&state, &su, "VERIFY AUDIT CHAIN").await;
+    state.flush_audit_log();
+    ddl_ok(&state, &su, "VERIFY AUDIT CHAIN").await;
+    ddl_ok(&state, &su, "CREATE USER chain_second WITH PASSWORD 'pass'").await;
+    ddl_ok(&state, &su, "VERIFY AUDIT CHAIN").await;
+    state.flush_audit_log();
+
+    let catalog = state.credentials.catalog();
+    let mut rows = catalog
+        .load_recent_audit_entries(usize::MAX, |_| true)
+        .unwrap();
+    assert!(rows.len() >= 2, "the flushes must persist the entries");
+    let tampered_seq = rows[0].seq;
+    rows[0].detail = "tampered".to_string();
+    catalog.append_audit_entries(&rows[..1]).unwrap();
+
+    let message =
+        nodedb_test_support::pgwire_auth_helpers::ddl_err(&state, &su, "VERIFY AUDIT CHAIN").await;
+    assert!(
+        message.contains(&format!("broken at sequence {}", tampered_seq + 1)),
+        "the first failing link must be reported: {message}"
+    );
+}
+
 /// `CREATE DATABASE` emits a `DatabaseCreated` audit entry with the correct
 /// database_id populated in the in-memory audit log.
 #[tokio::test]

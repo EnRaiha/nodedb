@@ -21,7 +21,6 @@ pub(super) fn apply_array(_ctx: &PermCtx<'_>, op: &ArrayOp) -> crate::Result<()>
         // No-op: cell reads, addressed by `ArrayId`, which no tree definition
         // can be keyed on.
         ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => Ok(()),
@@ -45,8 +44,11 @@ pub(super) fn apply_cluster_array(_ctx: &PermCtx<'_>, op: &ClusterArrayOp) -> cr
         // addressed by the same `ArrayId`.
         ClusterArrayOp::Slice { .. }
         | ClusterArrayOp::Agg { .. }
+        | ClusterArrayOp::Elementwise { .. }
         | ClusterArrayOp::Put { .. }
-        | ClusterArrayOp::Delete { .. } => Ok(()),
+        | ClusterArrayOp::Delete { .. }
+        | ClusterArrayOp::Flush { .. }
+        | ClusterArrayOp::Compact { .. } => Ok(()),
     }
 }
 

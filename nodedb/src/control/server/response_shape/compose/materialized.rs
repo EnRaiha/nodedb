@@ -84,7 +84,7 @@ pub fn shape_response_materialized(
     let translated = translate_search_response(&wrapped, plan, state, database_id, tenant_id);
 
     let shaped = match plan_kind {
-        PlanKind::ArraySlice => shape_array_slice(&translated, redaction)?,
+        PlanKind::ArraySlice => shape_array_slice(&translated, projection, redaction, sequences)?,
         // `RETURNING` rows are held to the columns already announced to the
         // client, when any were — see `super::returning`.
         PlanKind::ReturningRows => {
@@ -127,7 +127,9 @@ pub fn shape_payload_no_plan(
         PlanKind::Execution | PlanKind::DmlResult(_) | PlanKind::DmlResultByOp => {
             ShapeOutcome::Passthrough
         }
-        PlanKind::ArraySlice => ShapeOutcome::Rows(shape_array_slice(payload, redaction)?),
+        PlanKind::ArraySlice => ShapeOutcome::Rows(shape_array_slice(
+            payload, projection, redaction, sequences,
+        )?),
         PlanKind::ReturningRows => ShapeOutcome::Rows(shape_returning_rows(
             payload, projection, redaction, sequences,
         )?),

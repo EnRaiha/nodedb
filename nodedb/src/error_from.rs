@@ -16,26 +16,6 @@ impl From<nodedb_query::expr_parse::ExprParseError> for Error {
     }
 }
 
-/// The `match` is exhaustive rather than a `_ =>` fallback, so a new
-/// evaluator error picks its own `crate::Error` mapping instead of silently
-/// inheriting one.
-impl From<nodedb_query::EvalError> for Error {
-    fn from(e: nodedb_query::EvalError) -> Self {
-        match e {
-            nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
-            nodedb_query::EvalError::UnknownFunction { name } => Self::UndefinedFunction { name },
-            e @ (nodedb_query::EvalError::VectorDimensionMismatch { .. }
-            | nodedb_query::EvalError::ArgumentType { .. }
-            | nodedb_query::EvalError::InvalidJsonPath { .. }) => Self::DataException {
-                detail: e.to_string(),
-            },
-            e @ nodedb_query::EvalError::NumericOverflow { .. } => Self::NumericValueOutOfRange {
-                detail: e.to_string(),
-            },
-        }
-    }
-}
-
 /// A non-scalar offered where a raw KV body is required is a request
 /// shape error, not an internal fault.
 impl From<nodedb_types::NotScalar> for Error {
@@ -276,7 +256,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
             // A routed Calvin abort, rebuilt as the error a local submit
             // returns for the same verdict.
             TypedClusterError::CalvinAborted { reason } => {
-                crate::control::planner::calvin::calvin_abort_error(reason)
+                crate::control::planner::calvin::calvin_abort_error(reason.into())
             }
             TypedClusterError::Internal { code, message } => {
                 // Legacy or unknown codes retain their message without panicking.
@@ -424,9 +404,11 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
             | Error::UndefinedColumn { .. }
             | Error::TextColumn { .. }
             | Error::AmbiguousColumn { .. }
+            | Error::UngroupedColumn { .. }
             | Error::UnknownStrictField { .. }
             | Error::DivisionByZero
             | Error::DataException { .. }
+            | Error::MixedSrid { .. }
             | Error::NumericValueOutOfRange { .. }
             | Error::InvalidLimitValue { .. }
             | Error::RetryableLeaderChange { .. }

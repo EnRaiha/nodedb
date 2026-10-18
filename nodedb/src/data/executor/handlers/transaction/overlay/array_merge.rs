@@ -3,7 +3,7 @@
 //! Read-your-own-writes merge of a transaction's [`ArrayTxnOverlay`] into
 //! the tile set an array read is about to reduce.
 //!
-//! Every array read (Slice, Project, Aggregate, Elementwise) resolves its
+//! Every array read (Slice, Aggregate, Elementwise) resolves its
 //! base state into sparse tiles, then filters and projects those tiles. This
 //! module rewrites that tile set in place, BEFORE the read's own filters run:
 //!
@@ -22,7 +22,6 @@ use std::collections::{HashMap, HashSet};
 
 use nodedb_array::ArrayError;
 use nodedb_array::schema::ArraySchema;
-use nodedb_array::segment::TilePayload;
 use nodedb_array::tile::sparse_tile::{RowKind, SparseRow, SparseTile, SparseTileBuilder};
 use nodedb_array::tile::tile_id_for_cell;
 use nodedb_array::types::ArrayId;
@@ -67,44 +66,6 @@ impl CoreLoop {
         }
         self.touch_overlay(txn_id);
         merge_overlay(overlay, p.array_id, p.schema, p.valid_at_ms, tiles)
-    }
-
-    /// [`Self::merge_array_overlay_tiles`] over the raw `scan_tiles` payload
-    /// shape (Project / Elementwise). Every payload must be sparse; the
-    /// synthetic tiles come back as `TilePayload::Sparse`.
-    pub(in crate::data::executor) fn merge_array_overlay_payloads(
-        &self,
-        p: ArrayOverlayMergeParams<'_>,
-        tiles: &mut Vec<TilePayload>,
-    ) -> Result<(), ArrayError> {
-        let Some(txn_id) = p.txn_id else {
-            return Ok(());
-        };
-        let Some(overlay) = self.array_txn_overlays.get(&txn_id) else {
-            return Ok(());
-        };
-        if !overlay.touches(p.array_id) {
-            return Ok(());
-        }
-        self.touch_overlay(txn_id);
-        let mut prefixed: Vec<(u64, SparseTile)> = Vec::with_capacity(tiles.len());
-        for payload in tiles.drain(..) {
-            match payload {
-                TilePayload::Sparse(tile) => prefixed.push((0, tile)),
-                TilePayload::Dense(_) => {
-                    return Err(ArrayError::InvalidOp {
-                        detail: "dense tile payload in array overlay merge".to_string(),
-                    });
-                }
-            }
-        }
-        merge_overlay(overlay, p.array_id, p.schema, p.valid_at_ms, &mut prefixed)?;
-        tiles.extend(
-            prefixed
-                .into_iter()
-                .map(|(_, tile)| TilePayload::Sparse(tile)),
-        );
-        Ok(())
     }
 }
 

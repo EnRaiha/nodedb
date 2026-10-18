@@ -44,29 +44,63 @@ impl TxnId {
 pub enum AttemptOutcome {
     /// The global verdict was COMMIT.
     Completed,
-    /// The global verdict was ABORT. `reason` names the cause.
-    Aborted { reason: AbortReason },
+    /// The global verdict was ABORT, with its cause.
+    Aborted(AbortCause),
+}
+
+/// The cause of an abort vote or verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbortCause {
+    /// The class of the abort.
+    pub reason: AbortReason,
+    /// The typed refusal a participant's stage raised, encoded by the host
+    /// crate and opaque to the sequencer. Set only with
+    /// [`AbortReason::ParticipantError`].
+    ///
+    /// Every replica stages the same slice and raises the same refusal. A
+    /// participant that never staged (an expired request, a drained core)
+    /// carries none.
+    pub refusal: Option<Vec<u8>>,
+}
+
+impl AbortCause {
+    /// A participant error that carries the typed refusal `refusal`.
+    pub fn refused(refusal: Vec<u8>) -> Self {
+        Self {
+            reason: AbortReason::ParticipantError,
+            refusal: Some(refusal),
+        }
+    }
+}
+
+impl From<AbortReason> for AbortCause {
+    fn from(reason: AbortReason) -> Self {
+        Self {
+            reason,
+            refusal: None,
+        }
+    }
 }
 
 /// One participant vShard's durable commit vote.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParticipantVote {
     Commit,
-    Abort(AbortReason),
+    Abort(AbortCause),
 }
 
 /// A commit/abort decision: the tally aggregated from votes, and the
 /// authoritative verdict stored on a `PendingCompletion`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerdictOutcome {
     Commit,
-    Abort(AbortReason),
+    Abort(AbortCause),
 }
 
 impl VerdictOutcome {
     /// `true` for a commit decision. The scheduler's flush/drop gate needs only
-    /// this bit; the reason travels to the coordinator instead.
-    pub fn is_commit(self) -> bool {
+    /// this bit. The cause travels to the coordinator instead.
+    pub fn is_commit(&self) -> bool {
         matches!(self, Self::Commit)
     }
 }
@@ -120,7 +154,7 @@ impl Inner {
     pub(crate) fn settle(&mut self, txn: TxnId) {
         if let Some(entry) = self.completions.get_mut(&txn)
             && entry.is_terminal()
-            && let Some(verdict) = entry.verdict
+            && let Some(verdict) = entry.verdict.clone()
             && let Some(waiter) = entry.completion_tx.take()
         {
             let results = entry.take_ack_results();
@@ -141,7 +175,7 @@ impl Inner {
 fn outcome_for(verdict: VerdictOutcome) -> AttemptOutcome {
     match verdict {
         VerdictOutcome::Commit => AttemptOutcome::Completed,
-        VerdictOutcome::Abort(reason) => AttemptOutcome::Aborted { reason },
+        VerdictOutcome::Abort(cause) => AttemptOutcome::Aborted(cause),
     }
 }
 
@@ -538,7 +572,7 @@ mod tests {
         reg.seed_expected(txn, 2);
         reg.note_verdict(
             txn,
-            VerdictOutcome::Abort(AbortReason::SerializationConflict),
+            VerdictOutcome::Abort(AbortReason::SerializationConflict.into()),
         );
         let rx = reg.register_completion(txn, 2);
         reg.note_completion_ack(txn, 10);
@@ -546,9 +580,7 @@ mod tests {
         let outcome = rx.await.expect("completion fires");
         assert_eq!(
             outcome,
-            AttemptOutcome::Aborted {
-                reason: AbortReason::SerializationConflict
-            },
+            AttemptOutcome::Aborted(AbortReason::SerializationConflict.into()),
             "a stored ABORT verdict must surface as Aborted, not Completed"
         );
         assert_eq!(reg.pending_completions_len(), 0);
@@ -562,15 +594,13 @@ mod tests {
         let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(32, 1);
         reg.seed_expected(txn, 2);
-        reg.note_verdict(txn, VerdictOutcome::Abort(AbortReason::PlanRejected));
+        reg.note_verdict(txn, VerdictOutcome::Abort(AbortReason::PlanRejected.into()));
         reg.note_completion_ack(txn, 10);
         reg.note_completion_ack(txn, 20);
         let mut rx = reg.register_completion(txn, 2);
         assert_eq!(
             rx.try_recv(),
-            Ok(AttemptOutcome::Aborted {
-                reason: AbortReason::PlanRejected
-            }),
+            Ok(AttemptOutcome::Aborted(AbortReason::PlanRejected.into())),
             "registration on a terminal entry fires at once"
         );
         assert_eq!(
@@ -683,22 +713,24 @@ mod tests {
         let txn = TxnId::new(40, 2);
         reg.seed_expected(txn, 1);
         let rx = reg.register_completion(txn, 1);
-        reg.note_vote(txn, 1, ParticipantVote::Abort(AbortReason::PlanRejected));
-        reg.note_verdict(txn, VerdictOutcome::Abort(AbortReason::PlanRejected));
+        reg.note_vote(
+            txn,
+            1,
+            ParticipantVote::Abort(AbortReason::PlanRejected.into()),
+        );
+        reg.note_verdict(txn, VerdictOutcome::Abort(AbortReason::PlanRejected.into()));
         reg.note_completion_ack(txn, 1);
         assert_eq!(
             rx.await.expect("completion fires"),
-            AttemptOutcome::Aborted {
-                reason: AbortReason::PlanRejected
-            }
+            AttemptOutcome::Aborted(AbortReason::PlanRejected.into())
         );
 
         let progress = reg.participant_progress(txn, 1).expect("entry stays");
         assert!(progress.voted && progress.acked && progress.has_verdict);
         assert_eq!(reg.verdict(txn), Some(false));
         assert_eq!(
-            reg.vote_tally(txn).and_then(|tally| tally.get(&1).copied()),
-            Some(ParticipantVote::Abort(AbortReason::PlanRejected))
+            reg.vote_tally(txn).and_then(|tally| tally.get(&1).cloned()),
+            Some(ParticipantVote::Abort(AbortReason::PlanRejected.into()))
         );
 
         reg.set_waiterless_ttl(Duration::ZERO);

@@ -242,6 +242,7 @@ pub(super) fn rewrite_timeseries(
             valid_at_ms,
             having,
             tiering,
+            output_columns,
         } if ctx.is_target(collection) => Ok(SourceRewrite::task(PhysicalPlan::Timeseries(
             TimeseriesOp::Scan {
                 collection: ctx.source_qualified.clone(),
@@ -260,6 +261,7 @@ pub(super) fn rewrite_timeseries(
                 valid_at_ms: *valid_at_ms,
                 having: having.clone(),
                 tiering: tiering.clone(),
+                output_columns: output_columns.clone(),
             },
         ))),
 

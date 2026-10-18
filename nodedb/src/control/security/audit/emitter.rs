@@ -61,11 +61,18 @@ impl AuditEmitter for ArcAuditEmitter {
             user_name: ctx.auth_user_name.to_string(),
             session_id: String::new(),
         };
-        let mut log = match self.0.lock() {
-            Ok(l) => l,
-            Err(p) => p.into_inner(),
-        };
-        log.record_with_auth(event, ctx.tenant_id, ctx.database_id, source, detail, &auth);
+        // The sync wait runs with the audit lock released, so concurrent emitters share one fsync.
+        super::log_commit::record_concurrent(
+            &self.0,
+            super::log::AuditRecordInput {
+                event,
+                tenant_id: ctx.tenant_id,
+                database_id: ctx.database_id,
+                source,
+                detail,
+                auth: &auth,
+            },
+        );
     }
 }
 

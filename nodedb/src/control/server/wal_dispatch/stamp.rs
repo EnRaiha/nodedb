@@ -58,7 +58,6 @@ fn stamp_array_op(op: &mut ArrayOp, lsn: Lsn) {
         | ArrayOp::OpenArray { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::SurrogateBitmapScan { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::DropArray { .. }

@@ -66,12 +66,10 @@ pub(super) fn refuse_traversal(
     if collection.as_str().is_empty() || !ctx.collection_is_redacted(collection.as_str()) {
         return Ok(());
     }
-    Err(crate::Error::PlanError {
-        detail: format!(
-            "redaction policies on '{collection}' are not supported with graph traversal: a \
-             traversal returns graph topology, which column redaction cannot be applied to"
-        ),
-    })
+    Err(ctx.refusal(format!(
+        "redaction policies on '{collection}' are not supported with graph traversal: a \
+         traversal returns graph topology, which column redaction cannot be applied to"
+    )))
 }
 
 /// Refuse a pattern match whose target collection carries a rule. The
@@ -110,11 +108,11 @@ fn refuse_unscoped_match(ctx: &RefusalCtx<'_>) -> crate::Result<()> {
     if !ctx.identity_has_any_rule() {
         return Ok(());
     }
-    Err(crate::Error::PlanError {
-        detail: "graph pattern matching is not supported while a redaction policy applies to \
-                 this role and the pattern names no collection: the match returns graph \
-                 topology, which column redaction cannot be applied to, and its scope cannot be \
-                 narrowed to an unprotected collection"
+    Err(ctx.refusal(
+        "graph pattern matching is not supported while a redaction policy applies to \
+         this role and the pattern names no collection: the match returns graph \
+         topology, which column redaction cannot be applied to, and its scope cannot be \
+         narrowed to an unprotected collection"
             .to_string(),
-    })
+    ))
 }

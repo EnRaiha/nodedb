@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod array_copy;
 mod auth;
 mod connection_admin;
 mod copy_handler;
@@ -30,5 +31,6 @@ mod transaction_cmds;
 mod transaction_savepoint;
 mod trust_auth;
 
+pub use self::array_copy::ArrayCopyState;
 pub use self::copy_handler::NodeDbCopyHandler;
 pub use self::core::NodeDbPgHandler;

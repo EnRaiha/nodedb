@@ -2,7 +2,7 @@
 
 //! Miscellaneous DDL/DML statements.
 
-use crate::ddl_ast::statement::maintenance::{CopyFormat, CopyToSource};
+use crate::ddl_ast::statement::maintenance::{CopyFormat, CopyStdinFormat, CopyToSource};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MiscStmt {
@@ -18,12 +18,23 @@ pub enum MiscStmt {
     // ── Bulk import ──────────────────────────────────────────────
     /// `COPY <collection> FROM '<path>' [WITH (FORMAT ..., DELIMITER ..., HEADER ...)]`
     ///
-    /// Server-side file-path bulk import. Does not handle STDIN streaming
-    /// (that is a different protocol path) or COPY ... TO.
+    /// Server-side file-path bulk import. `CopyFromStdin` is the streaming
+    /// form, and `CopyToFile` the export.
     CopyFromFile {
         collection: String,
         path: String,
         format: Option<CopyFormat>,
+        delimiter: Option<char>,
+        header: bool,
+    },
+
+    /// `COPY <name> FROM STDIN [WITH (FORMAT csv|text, DELIMITER '<c>', HEADER [bool])]`
+    ///
+    /// Streaming bulk import: the client sends the rows over the pgwire
+    /// COPY protocol. `header` defaults to false, as in PostgreSQL.
+    CopyFromStdin {
+        collection: String,
+        format: CopyStdinFormat,
         delimiter: Option<char>,
         header: bool,
     },

@@ -136,15 +136,17 @@ fn coord_compatible(c: &ArrayCoordLiteral, dtype: ArrayDimType) -> bool {
     )
 }
 
+/// Whether a literal's kind fits the attr type. An integer fits every
+/// integer and float type, a float fits the float types. Range is checked
+/// where the literal narrows to the engine cell.
 fn attr_compatible(a: &ArrayAttrLiteral, dtype: ArrayAttrType) -> bool {
-    matches!(
-        (a, dtype),
-        (ArrayAttrLiteral::Int64(_), ArrayAttrType::Int64)
-            | (ArrayAttrLiteral::Int64(_), ArrayAttrType::Float64)
-            | (ArrayAttrLiteral::Float64(_), ArrayAttrType::Float64)
-            | (ArrayAttrLiteral::String(_), ArrayAttrType::String)
-            | (ArrayAttrLiteral::Bytes(_), ArrayAttrType::Bytes)
-    )
+    match a {
+        ArrayAttrLiteral::Int64(_) => dtype.is_integer() || dtype.is_float(),
+        ArrayAttrLiteral::Float64(_) => dtype.is_float(),
+        ArrayAttrLiteral::String(_) => dtype == ArrayAttrType::String,
+        ArrayAttrLiteral::Bytes(_) => dtype == ArrayAttrType::Bytes,
+        ArrayAttrLiteral::Null => true,
+    }
 }
 
 #[cfg(test)]

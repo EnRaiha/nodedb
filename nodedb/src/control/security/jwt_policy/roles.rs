@@ -8,10 +8,12 @@
 //! custom role grants something only while it is defined in the tenant the
 //! provider is bound to. An identity holding an undefined role would hold
 //! nothing, and a just-in-time provisioned record would store it. So the
-//! login is refused with a typed error naming the role, and the refusal is
-//! recorded in the audit log, before anything is provisioned.
+//! login is refused with a typed error naming the role, before anything is
+//! provisioned.
+//!
+//! The bearer route that called the policy records the refusal.
+//! It writes one `AuthFailure` with the provider, the peer address, and this error as the reason.
 
-use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::role_assignment::{self, RoleRefusal};
 use crate::control::state::SharedState;
@@ -36,12 +38,6 @@ pub fn refuse_undefined_roles(
         RoleRefusal::Undefined { name } => name,
         other => other.to_string(),
     };
-    state.audit_record(
-        AuditEvent::AuthFailure,
-        Some(tenant_id),
-        &identity.username,
-        &format!("external login refused: role \"{role}\" is not defined in tenant {tenant_id}"),
-    );
     Err(crate::Error::ExternalRoleUndefined {
         subject: identity.username.clone(),
         role,
@@ -55,6 +51,7 @@ mod tests {
 
     use super::*;
     use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::audit::AuditEvent;
     use crate::control::security::identity::{AuthMethod, Role};
     use crate::types::TenantId;
     use crate::wal::WalManager;
@@ -91,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn an_undefined_claimed_role_refuses_the_login_and_is_audited() {
+    fn an_undefined_claimed_role_refuses_the_login() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = state(&dir);
         let identity = external(5, vec![Role::ReadOnly, Role::Custom("ghost".into())]);
@@ -110,8 +107,8 @@ mod tests {
         }
         let failures = auth_failures(&state);
         assert!(
-            failures.iter().any(|detail| detail.contains("\"ghost\"")),
-            "the refusal must be audited: {failures:?}"
+            failures.is_empty(),
+            "the bearer route records the refusal, so the policy writes nothing: {failures:?}"
         );
     }
 

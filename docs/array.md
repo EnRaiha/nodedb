@@ -50,13 +50,37 @@ CREATE ARRAY spatial_grid
 | Parameter         | Required | Default     | Description                                                                                                        |
 | ----------------- | -------- | ----------- | ------------------------------------------------------------------------------------------------------------------ |
 | `DIMS`            | Yes      | —           | List of dimensions. Each has a name, type (`INT64`, `FLOAT64`, `TIMESTAMP_MS`, `STRING`), and optional domain bounds `[lo..hi]`. |
-| `ATTRS`           | Yes      | —           | List of attributes (cell values). Each has a name and type (`INT64`, `FLOAT64`, `STRING`, `BYTES`).               |
+| `ATTRS`           | Yes      | —           | List of attributes (cell values). Each has a name, a type (see [Attribute Types](#attribute-types)), and an optional `NOT NULL`. |
 | `TILE_EXTENTS`    | Yes      | —           | Tuple of tile extent per dimension. All > 0. Determines cell locality and compression block granularity.           |
-| `CELL_ORDER`      | No       | `Z_ORDER`   | `ROW_MAJOR`, `COL_MAJOR`, `Z_ORDER`, or `HILBERT`. Affects spatial cache locality.                                 |
-| `TILE_ORDER`      | No       | —           | `ROW_MAJOR`, `COL_MAJOR`, `Z_ORDER`, or `HILBERT`. Optional tile ordering.                                         |
+| `CELL_ORDER`      | No       | `HILBERT`   | Unquoted: `ROW_MAJOR`, `COL_MAJOR`, `HILBERT`, or `ZORDER` (`Z_ORDER` is accepted). Affects spatial cache locality. |
+| `TILE_ORDER`      | No       | `HILBERT`   | Unquoted: `ROW_MAJOR`, `COL_MAJOR`, `HILBERT`, or `ZORDER` (`Z_ORDER` is accepted). Affects tile layout.           |
 | `prefix_bits`     | No       | `8`         | Bits for key prefix compression (1–16). Lower = better compression, higher = faster prefix filtering.              |
 | `audit_retain_ms` | No       | `NULL`      | Milliseconds. Tiles older than now - `audit_retain_ms` (by system time) are eligible for purge. `NULL` = keep all. |
 | `minimum_audit_retain_ms` | No | —        | Minimum retention window enforced for compliance.                                                                  |
+
+### Attribute Types
+
+An attribute stores each cell at its declared width. A value outside the width is refused with SQLSTATE `22003` on `INSERT`, `COPY`, and the native bulk load. It is never wrapped or clamped.
+
+| Type      | Aliases                    | Range                              | Column type (OID)         |
+| --------- | -------------------------- | ---------------------------------- | ------------------------- |
+| `UINT8`   |                            | 0 to 255                           | `smallint` (21)           |
+| `INT16`   | `SMALLINT`, `INT2`         | -32768 to 32767                    | `smallint` (21)           |
+| `UINT16`  |                            | 0 to 65535                         | `integer` (23)            |
+| `INT32`   | `INTEGER`, `INT`, `INT4`   | -2147483648 to 2147483647          | `integer` (23)            |
+| `UINT32`  |                            | 0 to 4294967295                    | `bigint` (20)             |
+| `INT64`   | `BIGINT`                   | 64-bit signed                      | `bigint` (20)             |
+| `FLOAT32` | `REAL`, `FLOAT4`           | 32-bit IEEE float                  | `real` (700)              |
+| `FLOAT64` | `DOUBLE`, `FLOAT`          | 64-bit IEEE float                  | `double precision` (701)  |
+| `STRING`  | `TEXT`, `VARCHAR`          | UTF-8 text                         | `text` (25)               |
+| `BYTES`   | `BLOB`, `BYTEA`            | raw bytes                          | `bytea` (17)              |
+
+- An unsigned type reads as the next wider signed column type, so every stored value fits.
+- `INT` is the 4-byte `INT32`, as in PostgreSQL. A bare `FLOAT` is the 8-byte `FLOAT64`.
+- A float written to a `FLOAT32` attribute rounds to the nearest `f32`. Only a finite value past the `f32` range is refused. `0.1` stored as `FLOAT32` reads back as `0.1`.
+- An integer literal is accepted by every integer and float type. A float literal is accepted by `FLOAT32` and `FLOAT64` only.
+- An integer column compresses by its value range, so a `UINT16` column takes the same bytes on disk as an `INT64` column of the same values. A `FLOAT32` column stores at most 4 bytes per value, half the raw width of `FLOAT64`.
+- A `NULL` stays `NULL` through a flush and a compaction, in every type.
 
 ## Examples
 
@@ -74,12 +98,18 @@ CREATE ARRAY elevation_map
   )
   TILE_EXTENTS (256, 256);
 
--- Insert cells (or rows of cells)
--- Cells are written as objects with dim names as keys
-INSERT INTO elevation_map (lon, lat, height) VALUES
-  (-73.5, 40.7, 10.5),
-  (-73.6, 40.8, 12.3),
-  (-73.7, 40.6, 8.9);
+-- Insert cells: COORDS lists the dims in schema order, VALUES lists the attrs in schema order.
+-- Values are literals: numbers, strings, or NULL for an attribute.
+INSERT INTO ARRAY elevation_map
+  COORDS (-73.5, 40.7) VALUES (10.5),
+  COORDS (-73.6, 40.8) VALUES (12.3),
+  COORDS (-73.7, 40.6) VALUES (8.9);
+
+-- Remove cells by coordinate
+DELETE FROM ARRAY elevation_map WHERE COORDS IN ((-73.7, 40.6));
+
+-- Writing a coordinate again overwrites its cell.
+-- DROP ARRAY [IF EXISTS] <name> removes the whole array.
 
 -- Flush memtable to persistent storage
 SELECT ARRAY_FLUSH('elevation_map');
@@ -103,13 +133,13 @@ CREATE ARRAY climate_forecast
   WITH (audit_retain_ms = 7776000000);  -- 90 days
 
 -- Insert forecast data at a specific valid time
-INSERT INTO climate_forecast (lon, lat, altitude_m, temp_c, humidity) VALUES
-  (10, 20, 5000, -10.5, 65.0),
-  (10, 20, 10000, -20.3, 40.0);
+INSERT INTO ARRAY climate_forecast
+  COORDS (10, 20, 5000) VALUES (-10.5, 65.0),
+  COORDS (10, 20, 10000) VALUES (-20.3, 40.0);
 
 -- Query at a specific moment in time (system time)
 SELECT lon, lat, altitude_m, temp_c
-FROM ARRAY_SLICE('climate_forecast', {lon: [10, 15), lat: [20, 25), altitude_m: [5000, 15000)}, ['temp_c'])
+FROM ARRAY_SLICE('climate_forecast', '{lon: [10, 14], lat: [20, 24], altitude_m: [5000, 14999]}', ['temp_c'])
 AS OF SYSTEM TIME 1700000000000;
 ```
 
@@ -124,7 +154,7 @@ Returns cells within a multi-dimensional range:
 ```sql
 SELECT * FROM ARRAY_SLICE(
   'elevation_map',
-  {lon: [-74.0, -73.0), lat: [40.0, 41.0)},
+  '{lon: [-74.0, -73.0], lat: [40.0, 41.0]}',
   ['height'],  -- projecting only 'height' (optional)
   1000         -- limit to 1000 cells (optional)
 );
@@ -132,14 +162,62 @@ SELECT * FROM ARRAY_SLICE(
 
 | Parameter | Required | Type          | Description                                                     |
 | --------- | -------- | ------------- | --------------------------------------------------------------- |
-| `array`   | Yes      | STRING        | Array name                                                      |
-| `bounds`  | Yes      | OBJECT        | Dict of dim name → `[lo, hi)` bounds. Omitted dims = full range |
-| `attrs`   | No       | ARRAY[STRING] | Attributes to project. `NULL` = all attributes                  |
-| `limit`   | No       | INT64         | Max cells returned. `NULL` = no limit                           |
+| `array`   | Yes      | STRING        | Array name, as a string literal                                 |
+| `bounds`  | Yes      | STRING        | Quoted object literal `'{ dim: [lo, hi] }'`. Each range is closed: both ends are included. Omitted dims = full range |
+| `attrs`   | No       | ARRAY[STRING] | Attributes to project, such as `['height']`. `'*'` = all attributes. Omit it to read all attributes |
+| `limit`   | No       | INT         | Max cells returned, as a non-negative integer literal. Omit it for no limit |
+
+#### Result Relation
+
+`ARRAY_SLICE` and `ARRAY_PROJECT` return one row per cell. The row has one column per dimension, then one column per requested attribute, or every attribute when the list is empty. Each column carries its declared type:
+
+| Declared type | Column type        |
+| ------------- | ------------------ |
+| `UINT8`, `INT16` (attribute only) | `smallint` |
+| `UINT16`, `INT32` (attribute only) | `integer` |
+| `UINT32` (attribute only) | `bigint` |
+| `INT64`       | `bigint`           |
+| `FLOAT32` (attribute only) | `real` |
+| `FLOAT64`     | `double precision` |
+| `TIMESTAMP_MS` (dimension) | `timestamp` |
+| `STRING`      | `text`             |
+| `BYTES`       | `bytea` (attribute only) |
+
+`SELECT *` lists the dimensions first, then the attributes, in schema order. For a 2-D image with `nir` and `red` bands:
+
+```sql
+SELECT * FROM ARRAY_SLICE('img', '{x: [0, 3], y: [0, 3]}');
+--  x | y | nir  | red
+-- ---+---+------+------
+--  0 | 0 | 0.80 | 0.20
+--  0 | 1 | 0.60 | 0.30
+```
+
+Every SELECT clause applies to the rows: `WHERE`, computed columns, `GROUP BY`, aggregates, `HAVING`, `ORDER BY`, `DISTINCT`, `LIMIT` / `OFFSET`, and window functions. Qualify a column with the call's alias, or with the array name when the call has no alias.
+
+```sql
+-- NDVI per cell, vegetated cells only, greenest first
+SELECT x, y, (nir - red) / (nir + red) AS ndvi
+FROM ARRAY_SLICE('img', '{x: [0, 3], y: [0, 3]}') AS t
+WHERE t.nir > t.red
+ORDER BY ndvi DESC
+LIMIT 10;
+
+-- Mean NIR per column of pixels
+SELECT x, AVG(nir) AS mean_nir
+FROM ARRAY_SLICE('img', '{x: [0, 3], y: [0, 3]}')
+GROUP BY x;
+```
+
+The 4th-argument `limit` caps the cells the slice reads before any clause applies. An outer `LIMIT` applies to the query's result, and a smaller one also lowers the read cap when no other clause reads past the cut. A `WHERE` bound on a dimension narrows the read range only when the slice has no cap, so a capped slice keeps the cells its cap selects.
+
+`AS OF SYSTEM TIME NULL` adds a `_ts_system` column: the version's system time in milliseconds. `SELECT *` omits it. Name it to read it.
+
+`ARRAY_AGG` and `ARRAY_ELEMENTWISE` return rows of their own shape, not dimensions and attributes. A query over them takes `*` or their own output columns, and `LIMIT`. Every other clause is refused with an error that names the clause. Use `ARRAY_SLICE` to filter, group, or order cells.
 
 ### ARRAY_PROJECT — Select Attributes
 
-Returns all cells, optionally filtered to specific attributes:
+Returns all cells with only the listed attributes. The attribute list is required and must not be empty. It reads the whole domain, as an `ARRAY_SLICE` with no bounds does, and honors `AS OF` the same way:
 
 ```sql
 SELECT * FROM ARRAY_PROJECT(
@@ -148,35 +226,72 @@ SELECT * FROM ARRAY_PROJECT(
 );
 ```
 
-### ARRAY_AGG — Aggregate Over Dimensions
+### ARRAY_AGG — Aggregate an Attribute
 
-Aggregates an attribute over a dimension, reducing dimensionality:
+Reduces one attribute with a reducer. The optional 4th argument names a dimension to group by:
 
 ```sql
--- Sum temperature over the x dimension, keeping y and z
-SELECT * FROM ARRAY_AGG(
-  'spatial_grid',
-  'temperature',
-  'SUM',
-  'x'  -- aggregate over x; result has one less dimension
-);
+-- One result for the whole array
+SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'SUM');
+
+-- One result per value of x
+SELECT * FROM ARRAY_AGG('spatial_grid', 'temperature', 'SUM', 'x');
 ```
 
-Supported reducers: `'SUM'`, `'AVG'`, `'MIN'`, `'MAX'`, `'COUNT'`.
+The result has a `result` column. A grouped call also has a `group` column that holds the dimension value. The `group` column takes the group dimension's declared type: `TIMESTAMP_MS` gives `timestamp`, `FLOAT64` gives `float8`, `INT64` gives `int8`, and `STRING` gives `text`. A temporal call (`AS OF`) appends one summary row with the `bool` column `truncated_before_horizon`. Reducers are case-insensitive: `'SUM'`, `'COUNT'`, `'MIN'`, `'MAX'`, and `'MEAN'` (or `'AVG'`).
+
+The `result` type follows the reducer and the attribute type:
+
+| Reducer       | Integer attribute                      | Float attribute    |
+| ------------- | -------------------------------------- | ------------------ |
+| `COUNT`       | `bigint`                               | `bigint`           |
+| `SUM`         | `bigint`, exact                        | `double precision` |
+| `MIN` / `MAX` | the attribute's own column type, exact | the attribute's own column type |
+| `MEAN`        | `double precision`                     | `double precision` |
+
+`SUM`, `MEAN`, `MIN`, and `MAX` accept integer and float attributes only. `COUNT` accepts every attribute type. Another reducer over a `STRING` or `BYTES` attribute is refused at plan time with a type mismatch error.
+
+An integer `SUM` adds exactly, so `2^53 + 1` stays `9007199254740993`. A `SUM` past the `bigint` range is refused with SQLSTATE `22003`. `MIN` and `MAX` sort `NaN` above every other float, as PostgreSQL does.
+
+Three more optional arguments bound the cells the reducer reads:
+
+- **5th, box**: a slice predicate in the `ARRAY_SLICE` form, such as `'{lon: [101, 103], lat: [2, 4]}'`. Bounds are inclusive.
+- **6th and 7th, zone**: a WKT `POLYGON` or `MULTIPOLYGON`, then the two dimensions it is drawn over, x first, such as `ARRAY['lon', 'lat']`. Both dimensions must be `INT64` or `FLOAT64`. Pass both arguments or neither.
+
+Pass `NULL` for an argument to skip it:
+
+```sql
+-- Mean NDVI inside a field boundary
+SELECT * FROM ARRAY_AGG(
+  'scene', 'ndvi', 'MEAN', NULL, NULL,
+  'POLYGON((101 2, 103 2, 103 4, 101 4, 101 2))', ARRAY['lon', 'lat']
+);
+
+-- Sum per lon value inside a box
+SELECT * FROM ARRAY_AGG('scene', 'ndvi', 'SUM', 'lon', '{lon: [101, 103]}');
+```
+
+A cell is in a zone when it lies inside one member polygon and outside that polygon's holes. Edges are half-open: on a rectangle, a cell on the lower x or y edge is inside and a cell on the upper edge is outside. A region that holds no cell returns `NULL` for every reducer, `COUNT` included. Tiles whose bounding boxes miss the region are skipped before decode.
 
 ### ARRAY_ELEMENTWISE — Element-wise Operations
 
-Applies an operation between two arrays (or array and scalar) with the same shape:
+Applies an operation between two arrays of the same shape. Both arrays must have the same dimensions, attributes, tile extents, cell order, and `prefix_bits`. Arrays that differ are refused at planning:
 
 ```sql
 -- Subtract a baseline from all cells
 SELECT * FROM ARRAY_ELEMENTWISE(
   'current_grid',
   'baseline_grid',
-  'SUBTRACT',
-  'temperature'  -- the attribute to operate on
+  'sub',          -- 'add', 'sub', 'mul', or 'div' (case-insensitive)
+  'temperature'   -- the attribute to operate on
 );
 ```
+
+The result has `coords` and `attrs` columns, both JSON. `attrs` holds one value: the operation applied to the named attribute. A coordinate present in one array only takes that array's value.
+
+On integer attributes, `add`, `sub`, and `mul` are exact 64-bit integers, and a result past the `bigint` range is refused with SQLSTATE `22003`. `div`, and every operation on a float attribute, yields a 64-bit float. Division by zero yields `NULL`.
+
+`AS OF SYSTEM TIME` and `AS OF VALID TIME` apply to both arrays. A temporal query appends one `{"truncated_before_horizon": bool}` row, as `ARRAY_AGG` does. `AS OF SYSTEM TIME NULL` is refused.
 
 ## Maintenance Functions
 
@@ -185,22 +300,22 @@ SELECT * FROM ARRAY_ELEMENTWISE(
 Forces in-memory cells to durable storage:
 
 ```sql
-SELECT ARRAY_FLUSH('spatial_grid') AS result;
--- Returns: {result: true}
+SELECT ARRAY_FLUSH('spatial_grid');
+-- Returns: {"flushed": 1}
 ```
 
-Returns a single row `{result: BOOL}`. Always returns `true`; failure is fatal and raises an error.
+Returns one object `{"flushed": 1}` on success. A failure raises an error.
 
 ### ARRAY_COMPACT
 
 Merges tile versions and reclaims space:
 
 ```sql
-SELECT ARRAY_COMPACT('spatial_grid') AS result;
--- Returns: {result: true}
+SELECT ARRAY_COMPACT('spatial_grid');
+-- Returns: {"compacted": 1}
 ```
 
-Compaction is background-automatic, but can be triggered manually.
+Returns one object `{"compacted": n}`. `n` counts the cores that merged segments. It is `0` when the compaction picker found nothing to merge. A failure raises an error. Compaction is background-automatic, but can be triggered manually.
 
 ## Bitemporal Support
 
@@ -215,7 +330,7 @@ Query as of either or both:
 -- Read cells as they existed at a point in the past
 SELECT * FROM ARRAY_SLICE(
   'data',
-  {x: [0, 100), y: [0, 100)},
+  '{x: [0, 99], y: [0, 99]}',
   ['value']
 )
 AS OF SYSTEM TIME 1700000000000;
@@ -223,7 +338,7 @@ AS OF SYSTEM TIME 1700000000000;
 -- Read cells that were valid at a specific time
 SELECT * FROM ARRAY_SLICE(
   'forecast',
-  {x: [0, 100), y: [0, 100)},
+  '{x: [0, 99], y: [0, 99]}',
   ['temp']
 )
 AS OF VALID TIME 1700000000000;
@@ -231,23 +346,23 @@ AS OF VALID TIME 1700000000000;
 -- Read cells that were valid AND existed at a specific time
 SELECT * FROM ARRAY_SLICE(
   'forecast',
-  {x: [0, 100), y: [0, 100)},
+  '{x: [0, 99], y: [0, 99]}',
   ['temp']
 )
 AS OF SYSTEM TIME 1700000000000 AS OF VALID TIME 1700000001000;
 ```
 
+A time is an integer in milliseconds since the Unix epoch, `NOW()`, or an ISO-8601 string such as `'2024-01-15T00:00:00Z'`.
+
 ## Cross-Engine Integration
 
-Array cells are addressable via surrogate identity alongside other engines. Combine array queries with vector search, graph traversal, and full-text search:
+Array cells are addressable via surrogate identity alongside other engines. An `ARRAY_SLICE` or `ARRAY_PROJECT` call can be a `JOIN` source. A slice row holds one field per dimension and attribute, keyed by name, so a join key reads them directly. A slice row has no `id` column.
 
 ```sql
--- Find cells near a vector embedding, return array slice
-SELECT *
-FROM ARRAY_SLICE('spatial_data', slice_bounds, ['attr1', 'attr2'])
-WHERE id IN (
-  SEARCH vectors USING VECTOR(embedding, query_vec, 100)
-);
+-- Join slice cells to a collection on a dimension value
+SELECT c.x, c.y, c.attr1, s.name
+FROM ARRAY_SLICE('spatial_data', '{x: [0, 999], y: [0, 999]}', ['attr1']) AS c
+JOIN sites s ON c.x = s.grid_x;
 ```
 
 See [Architecture — Cross-engine identity](architecture.md#cross-engine-identity) for details.

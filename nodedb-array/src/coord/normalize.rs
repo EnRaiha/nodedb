@@ -51,6 +51,26 @@ pub fn normalize_coord(
     Ok(out)
 }
 
+/// Check one cell coordinate as [`normalize_coord`] does, with no allocation:
+/// the arity, each value's type, and each value against its dim's domain.
+pub fn check_coord_domain(
+    schema: &ArraySchema,
+    components: &[CoordValue],
+    bits: u32,
+) -> ArrayResult<()> {
+    if components.len() != schema.arity() {
+        return Err(ArrayError::CoordArityMismatch {
+            array: schema.name.clone(),
+            expected: schema.arity(),
+            got: components.len(),
+        });
+    }
+    for (dim, value) in schema.dims.iter().zip(components.iter()) {
+        normalize_one(&schema.name, dim, value, bits)?;
+    }
+    Ok(())
+}
+
 fn normalize_one(array: &str, dim: &DimSpec, value: &CoordValue, bits: u32) -> ArrayResult<u64> {
     let max = if bits >= 64 {
         u64::MAX

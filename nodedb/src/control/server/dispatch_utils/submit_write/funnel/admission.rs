@@ -7,7 +7,7 @@ use tokio::sync::OwnedMutexGuard;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::shared::write_admission::gate::admit_routed;
 use crate::control::server::shared::write_admission::{
-    WriteAdmission, WriteAdmissionGuard, WriteTarget,
+    AdmissionTicket, WriteAdmission, WriteAdmissionGuard, WriteTarget,
 };
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -33,6 +33,9 @@ pub(super) enum AdmissionOutcome {
         admission: crate::bridge::envelope::Admission,
         admission_guard: Option<WriteAdmissionGuard>,
         order_guard: Option<OwnedMutexGuard<()>>,
+        /// The ticket of a write to a vShard with no scheduler, held until
+        /// the write's enqueue.
+        unscheduled: Option<AdmissionTicket>,
     },
     /// The deterministic Calvin scheduler must apply the write.
     RouteToCalvin,
@@ -72,6 +75,7 @@ pub(super) async fn admit_write(
             ),
             admission_guard: None,
             order_guard: None,
+            unscheduled: None,
         },
         WriteOrdering::Gate => match admit_routed(
             shared,
@@ -89,13 +93,25 @@ pub(super) async fn admit_write(
                 ),
                 admission_guard: None,
                 order_guard: None,
+                unscheduled: None,
             },
             WriteAdmission::FastPath { guard } => AdmissionOutcome::Proceed {
                 admission: crate::bridge::envelope::Admission::Admitted,
                 admission_guard: guard,
                 order_guard: None,
+                unscheduled: None,
             },
-            WriteAdmission::FastPathBlocking { key, keyed_lock } => {
+            WriteAdmission::Unscheduled { ticket } => AdmissionOutcome::Proceed {
+                admission: crate::bridge::envelope::Admission::Admitted,
+                admission_guard: None,
+                order_guard: None,
+                unscheduled: Some(ticket),
+            },
+            WriteAdmission::FastPathBlocking {
+                key,
+                keyed_lock,
+                ticket,
+            } => {
                 // Single-node serialization point: acquire the per-key FIFO
                 // order-lock FIRST, before the WAL append and enqueue below.
                 // `tokio::sync::Mutex` is fair, so concurrent same-key writers
@@ -108,6 +124,7 @@ pub(super) async fn admit_write(
                     admission: crate::bridge::envelope::Admission::Admitted,
                     admission_guard: None,
                     order_guard: Some(order_guard),
+                    unscheduled: Some(ticket),
                 }
             }
             WriteAdmission::RouteToCalvin => AdmissionOutcome::RouteToCalvin,
@@ -118,6 +135,7 @@ pub(super) async fn admit_write(
                         .await?,
                 ),
                 order_guard: None,
+                unscheduled: None,
             },
         },
     })

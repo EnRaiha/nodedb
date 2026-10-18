@@ -23,8 +23,9 @@ use crate::sync::wire::ack_status::AckStatus;
 /// bounding box from the geometry, and inserts the entry into
 /// `CoreLoop::spatial_indexes`.
 ///
-/// `geometry_bytes` is a MessagePack-serialised `nodedb_types::geometry::Geometry`
-/// value produced via `zerompk::to_msgpack_vec(&geometry)`.
+/// `geometry_bytes` is a MessagePack-serialised
+/// `nodedb_types::geometry::SridGeometry` produced via
+/// `zerompk::to_msgpack_vec(&geometry)`: `[srid_code_u32, geometry]`.
 #[derive(
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
@@ -37,7 +38,7 @@ pub struct SpatialInsertMsg {
     pub field: String,
     /// External document identifier.
     pub doc_id: String,
-    /// MessagePack-serialised `Geometry` value.
+    /// MessagePack-serialised `SridGeometry` value.
     pub geometry_bytes: Vec<u8>,
     /// Monotonic batch ID (Lite-assigned, per-operation). Used for ACK correlation.
     pub batch_id: u64,

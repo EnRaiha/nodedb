@@ -60,12 +60,9 @@ impl CoreLoop {
         }
         let n = cells.len();
         if let Err(e) = self.array_engine.put_cells(array_id, cells, wal_lsn) {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("array put: {e}"),
-                },
-            );
+            // A refused cell keeps its SQLSTATE: 22003 for a value out of
+            // range, 42804 for a value of another type than its attr.
+            return self.response_error(task, ErrorCode::from(crate::Error::from(e)));
         }
         if let Err(e) = self.settle_array_write(task, array_id, wal_lsn) {
             return self.response_error(task, e);

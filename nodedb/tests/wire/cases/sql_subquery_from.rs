@@ -197,14 +197,33 @@ async fn aggregate_argument_division_by_zero_over_constant_derived_table_errors_
 }
 
 /// Division by zero in a GROUP BY key over a constant derived table must
-/// raise `22012`, never return an empty result with a missing column.
+/// raise `22012`, never return an empty result with a missing column. The
+/// SELECT list reads the key expression, which PostgreSQL accepts.
 #[tokio::test]
 async fn group_by_key_division_by_zero_over_constant_derived_table_errors_22012() {
     let srv = TestServer::start().await;
 
     srv.expect_error(
-        "SELECT x, COUNT(*) FROM (SELECT 1 AS x) AS s GROUP BY x / 0",
+        "SELECT x / 0 AS q, COUNT(*) FROM (SELECT 1 AS x) AS s GROUP BY x / 0",
         "22012",
+    )
+    .await;
+    srv.expect_error(
+        "SELECT COUNT(*) FROM (SELECT 1 AS x) AS s GROUP BY x / 0",
+        "22012",
+    )
+    .await;
+}
+
+/// A column inside a GROUP BY expression is not a key by itself. PostgreSQL
+/// refuses `SELECT x ... GROUP BY x / 0` at plan time with `42803`.
+#[tokio::test]
+async fn column_inside_a_group_by_expression_is_a_grouping_error_42803() {
+    let srv = TestServer::start().await;
+
+    srv.expect_error(
+        "SELECT x, COUNT(*) FROM (SELECT 1 AS x) AS s GROUP BY x / 0",
+        "42803",
     )
     .await;
 }

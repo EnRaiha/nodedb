@@ -36,6 +36,7 @@ impl CoreLoop {
                 valid_at_ms,
                 having,
                 tiering,
+                output_columns,
             } => self.execute_timeseries_scan(TimeseriesScanParams {
                 task,
                 tid: task.request.tenant_id,
@@ -54,6 +55,7 @@ impl CoreLoop {
                 valid_at_ms: *valid_at_ms,
                 having,
                 tiering: tiering.as_ref(),
+                output_columns,
             }),
 
             TimeseriesOp::Ingest {
@@ -201,6 +203,7 @@ mod tests {
                 valid_at_ms: None,
                 having: Vec::new(),
                 tiering: None,
+                output_columns: Vec::new(),
             }),
             None,
         )

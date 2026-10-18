@@ -508,6 +508,7 @@ mod tests {
             valid_at_ms: None,
             having: vec![],
             tiering: None,
+            output_columns: Vec::new(),
         });
 
         let outcome = super::super::wal_append_if_write(

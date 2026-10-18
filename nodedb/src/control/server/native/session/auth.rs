@@ -136,13 +136,15 @@ impl NativeSession {
                 // Every other auth method keeps the identity-only context.
                 // The context is built before admission capacity is acquired,
                 // so a session-id generation error leaves no state behind.
+                // A bearer login reuses the session id its `AuthSuccess` entry recorded.
                 let auth_context_result = match &verified_jwt {
-                    Some(claims) => crate::control::security::auth_context::generate_session_id()
-                        .map(|session_id| {
-                            crate::control::security::auth_context::AuthContext::from_verified_jwt(
-                                claims, &identity, session_id,
-                            )
-                        }),
+                    Some(bearer) => Ok(
+                        crate::control::security::auth_context::AuthContext::from_verified_jwt(
+                            &bearer.claims,
+                            &identity,
+                            bearer.session_id.clone(),
+                        ),
+                    ),
                     None => super::super::super::session_auth::build_auth_context(&identity),
                 };
                 let mut auth_context = match auth_context_result {
@@ -213,7 +215,7 @@ impl NativeSession {
                 // rebuild its per-request `RequestAuthScope` with the same
                 // claim-derived enrichment (see `session::request::handle_request`),
                 // not just the auth frame's own response.
-                self.verified_jwt = verified_jwt;
+                self.verified_jwt = verified_jwt.map(|bearer| bearer.claims);
                 self.cleanup.publish_identity(identity.clone());
                 self.identity = Some(identity);
                 resp

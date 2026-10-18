@@ -19,6 +19,7 @@ impl RedactionStore {
         let key = policy_key(policy.tenant_id, &policy.collection, &policy.for_role);
         let mut policies = self.lock_write();
         policies.insert(key, policy);
+        self.bump_version();
     }
 
     /// Remove a replicated policy from the in-memory registry.
@@ -31,7 +32,9 @@ impl RedactionStore {
     ) -> bool {
         let key = policy_key(tenant_id, collection, for_role);
         let mut policies = self.lock_write();
-        policies.remove(&key).is_some()
+        let removed = policies.remove(&key).is_some();
+        self.bump_version();
+        removed
     }
 
     /// Check whether a policy already exists for the given

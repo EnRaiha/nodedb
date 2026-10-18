@@ -147,6 +147,12 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, ErrorCode::from(e)),
         };
 
+        // A geometry in an SRID its column's R-tree refuses fails the insert
+        // before any row is written.
+        if let Err(e) = self.check_columnar_geometry_srids(task, &schema, collection, &ndb_rows) {
+            return self.response_error(task, ErrorCode::from(e));
+        }
+
         let outcome = match self.insert_columnar_rows(
             task,
             RowIngestParams {
@@ -172,8 +178,13 @@ impl CoreLoop {
         }
 
         // Populate R-tree for geometry columns so spatial predicates work.
+        // The SRID check above ran on the same rows, so this changes the
+        // index or fails before touching it.
         let geometry_delta =
-            self.index_columnar_geometry_columns(task, &schema, collection, &ndb_rows);
+            match self.index_columnar_geometry_columns(task, &schema, collection, &ndb_rows) {
+                Ok(delta) => delta,
+                Err(e) => return self.response_error(task, ErrorCode::from(e)),
+            };
         if let Some(undo_log) = spatial_undo {
             Self::push_geometry_index_undo(undo_log, geometry_delta);
         }

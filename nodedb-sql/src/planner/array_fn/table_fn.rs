@@ -3,37 +3,73 @@
 //! `SELECT * FROM ARRAY_*(...)` table-valued function planning:
 //! slice / project / aggregate / elementwise.
 
-use crate::types::{ArrayAggPlan, ArrayElementwisePlan, ArrayProjectPlan, ArraySlicePlan};
+use crate::types::{ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan};
 use sqlparser::ast;
-
-use nodedb_types::Value;
 
 use super::helpers::{
     collect_args, expect_string_array, expect_string_literal, expect_u32, is_null_literal,
-    require_array_name, value_to_coord_literal,
+    parse_slice_arg, require_array_name,
 };
+use super::zone::parse_zone_args;
 use crate::error::{Result, SqlError};
-use crate::parser::object_literal::parse_object_literal_complete;
+use crate::resolver::array_tvf::check_agg_reducer;
 use crate::temporal::TemporalScope;
 use crate::types::{SqlCatalog, SqlPlan};
-use crate::types_array::{ArrayBinaryOpAst, ArrayReducerAst, ArraySliceAst, NamedDimRange};
+use crate::types_array::{ArrayBinaryOpAst, ArrayReducerAst, ArraySliceAst};
+
+/// One planned array table-valued function call.
+///
+/// `Slice` and `Project` read cells: their rows carry the array's dims and
+/// the requested attrs, so a SELECT reads them as a relation. `Agg` and
+/// `Elementwise` emit rows of their own shape and form no such relation.
+///
+/// `ARRAY_PROJECT` is a slice over the whole domain with a required attr
+/// list, so it plans to the slice read and keeps only its own name.
+#[derive(Debug, Clone)]
+pub enum ArrayTableFn {
+    Slice(ArraySlicePlan),
+    Project(ArraySlicePlan),
+    Agg(ArrayAggPlan),
+    Elementwise(ArrayElementwisePlan),
+}
+
+impl ArrayTableFn {
+    /// The plan that reads this call's rows.
+    pub fn into_plan(self) -> SqlPlan {
+        match self {
+            ArrayTableFn::Slice(plan) | ArrayTableFn::Project(plan) => SqlPlan::ArraySlice(plan),
+            ArrayTableFn::Agg(plan) => SqlPlan::ArrayAgg(plan),
+            ArrayTableFn::Elementwise(plan) => SqlPlan::ArrayElementwise(plan),
+        }
+    }
+
+    /// The SQL name of the function, as an error message names it.
+    pub fn sql_name(&self) -> &'static str {
+        match self {
+            ArrayTableFn::Slice(_) => "ARRAY_SLICE",
+            ArrayTableFn::Project(_) => "ARRAY_PROJECT",
+            ArrayTableFn::Agg(_) => "ARRAY_AGG",
+            ArrayTableFn::Elementwise(_) => "ARRAY_ELEMENTWISE",
+        }
+    }
+}
 
 /// Try to intercept a `SELECT * FROM array_xxx(...)` table-valued
-/// function call. Returns `Ok(Some(plan))` on a match, `Ok(None)` if
+/// function call. Returns `Ok(Some(call))` on a match, `Ok(None)` if
 /// the FROM is not an array function (caller falls through to normal
 /// catalog resolution).
 ///
 /// `temporal` carries any `AS OF SYSTEM TIME` / `AS OF VALID TIME` qualifiers
-/// extracted by the pre-processor. It is propagated verbatim into
-/// `SqlPlan::ArraySlice` and `SqlPlan::ArrayAgg` so the planner-to-physical
-/// conversion can populate the corresponding `ArrayOp` fields. When neither
-/// clause was present, `temporal` is `TemporalScope::default()`, which maps to
-/// the live-state fast path in the Data Plane handler.
+/// extracted by the pre-processor. It is propagated verbatim into the slice
+/// and aggregate plans so the planner-to-physical conversion can populate
+/// the corresponding `ArrayOp` fields. When neither clause was present,
+/// `temporal` is `TemporalScope::default()`, which maps to the live-state
+/// fast path in the Data Plane handler.
 pub fn try_plan_array_table_fn(
     from: &[ast::TableWithJoins],
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
-) -> Result<Option<SqlPlan>> {
+) -> Result<Option<ArrayTableFn>> {
     if from.len() != 1 {
         return Ok(None);
     }
@@ -58,10 +94,18 @@ pub fn try_plan_array_table_fn(
     let fn_name = crate::parser::normalize::normalize_object_name_checked(name)?;
     let arg_exprs = collect_args(&args.args);
     match fn_name.as_str() {
-        "array_slice" => Ok(Some(plan_slice(&arg_exprs, catalog, temporal)?)),
-        "array_project" => Ok(Some(plan_project(&arg_exprs, catalog)?)),
-        "array_agg" => Ok(Some(plan_agg(&arg_exprs, catalog, temporal)?)),
-        "array_elementwise" => Ok(Some(plan_elementwise(&arg_exprs, catalog)?)),
+        "array_slice" => Ok(Some(ArrayTableFn::Slice(plan_slice(
+            &arg_exprs, catalog, temporal,
+        )?))),
+        "array_project" => Ok(Some(ArrayTableFn::Project(plan_project(
+            &arg_exprs, catalog, temporal,
+        )?))),
+        "array_agg" => Ok(Some(ArrayTableFn::Agg(plan_agg(
+            &arg_exprs, catalog, temporal,
+        )?))),
+        "array_elementwise" => Ok(Some(ArrayTableFn::Elementwise(plan_elementwise(
+            &arg_exprs, catalog, temporal,
+        )?))),
         _ => Ok(None),
     }
 }
@@ -70,7 +114,7 @@ fn plan_slice(
     args: &[ast::Expr],
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
-) -> Result<SqlPlan> {
+) -> Result<ArraySlicePlan> {
     if args.len() < 2 || args.len() > 4 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -86,40 +130,7 @@ fn plan_slice(
             detail: format!("ARRAY_SLICE: array '{name}' not found"),
         })?;
 
-    // Slice-predicate literal: encoded as a quoted string carrying the
-    // brace-form object literal. The PostgreSQL dialect does not accept
-    // bare `{...}` in expression position, so we decode the string
-    // contents here.
-    let slice_str = expect_string_literal(&args[1], "ARRAY_SLICE slice predicate")?;
-    let parsed =
-        parse_object_literal_complete(&slice_str).ok_or_else(|| SqlError::Unsupported {
-            detail: format!("ARRAY_SLICE: slice predicate must be an object literal: {slice_str}"),
-        })?;
-    let map = parsed.map_err(|detail| SqlError::Unsupported {
-        detail: format!("ARRAY_SLICE: slice parse: {detail}"),
-    })?;
-    let mut dim_ranges: Vec<NamedDimRange> = Vec::with_capacity(map.len());
-    for (dim, val) in map {
-        // Verify the dim exists on the array.
-        if !view.dims.iter().any(|d| d.name == dim) {
-            return Err(SqlError::Unsupported {
-                detail: format!("ARRAY_SLICE: array '{name}' has no dim '{dim}'"),
-            });
-        }
-        let arr = match val {
-            Value::Array(a) if a.len() == 2 => a,
-            _ => {
-                return Err(SqlError::Unsupported {
-                    detail: format!(
-                        "ARRAY_SLICE: dim '{dim}' range must be a 2-element array [lo, hi]"
-                    ),
-                });
-            }
-        };
-        let lo = value_to_coord_literal(&arr[0], &dim)?;
-        let hi = value_to_coord_literal(&arr[1], &dim)?;
-        dim_ranges.push(NamedDimRange { dim, lo, hi });
-    }
+    let slice = parse_slice_arg(&args[1], "ARRAY_SLICE", &name, &view)?;
 
     let attr_projection = if args.len() >= 3 {
         match &args[2] {
@@ -146,16 +157,20 @@ fn plan_slice(
         0
     };
 
-    Ok(SqlPlan::ArraySlice(ArraySlicePlan {
+    Ok(ArraySlicePlan {
         name,
-        slice: ArraySliceAst { dim_ranges },
+        slice,
         attr_projection,
         limit,
         temporal,
-    }))
+    })
 }
 
-fn plan_project(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlPlan> {
+fn plan_project(
+    args: &[ast::Expr],
+    catalog: &dyn SqlCatalog,
+    temporal: TemporalScope,
+) -> Result<ArraySlicePlan> {
     if args.len() != 2 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -183,23 +198,32 @@ fn plan_project(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlPlan>
             });
         }
     }
-    Ok(SqlPlan::ArrayProject(ArrayProjectPlan {
+    Ok(ArraySlicePlan {
         name,
+        slice: ArraySliceAst::default(),
         attr_projection,
-    }))
+        limit: 0,
+        temporal,
+    })
 }
 
 fn plan_agg(
     args: &[ast::Expr],
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
-) -> Result<SqlPlan> {
-    if args.len() < 3 || args.len() > 4 {
+) -> Result<ArrayAggPlan> {
+    if !(3..=7).contains(&args.len()) {
         return Err(SqlError::Unsupported {
             detail: format!(
-                "ARRAY_AGG expects 3..=4 args (name, attr, reducer, [group_by_dim]); got {}",
+                "ARRAY_AGG expects 3..=7 args (name, attr, reducer, [group_by_dim], [slice], \
+                 [zone_wkt, zone_dims]); got {}",
                 args.len()
             ),
+        });
+    }
+    if args.len() == 6 {
+        return Err(SqlError::Unsupported {
+            detail: "ARRAY_AGG: zone_wkt needs zone_dims; pass both, or neither".into(),
         });
     }
     let name = require_array_name(args, 0, "ARRAY_AGG", catalog)?;
@@ -210,39 +234,60 @@ fn plan_agg(
         })?;
 
     let attr = expect_string_literal(&args[1], "ARRAY_AGG attr")?;
-    if !view.attrs.iter().any(|a| a.name == attr) {
-        return Err(SqlError::Unsupported {
+    let attr_type = view
+        .attrs
+        .iter()
+        .find(|a| a.name == attr)
+        .map(|a| a.dtype)
+        .ok_or_else(|| SqlError::Unsupported {
             detail: format!("ARRAY_AGG: array '{name}' has no attr '{attr}'"),
-        });
-    }
+        })?;
 
     let reducer_str = expect_string_literal(&args[2], "ARRAY_AGG reducer")?;
     let reducer = ArrayReducerAst::parse(&reducer_str).ok_or_else(|| SqlError::Unsupported {
         detail: format!("ARRAY_AGG: unknown reducer '{reducer_str}' (want sum/count/min/max/mean)"),
     })?;
+    check_agg_reducer(reducer, &attr, attr_type)?;
 
-    let group_by_dim = if args.len() == 4 && !is_null_literal(&args[3]) {
-        let dim = expect_string_literal(&args[3], "ARRAY_AGG group_by_dim")?;
-        if !view.dims.iter().any(|d| d.name == dim) {
-            return Err(SqlError::Unsupported {
-                detail: format!("ARRAY_AGG: array '{name}' has no dim '{dim}'"),
-            });
+    let group_by_dim = match args.get(3) {
+        Some(arg) if !is_null_literal(arg) => {
+            let dim = expect_string_literal(arg, "ARRAY_AGG group_by_dim")?;
+            if !view.dims.iter().any(|d| d.name == dim) {
+                return Err(SqlError::Unsupported {
+                    detail: format!("ARRAY_AGG: array '{name}' has no dim '{dim}'"),
+                });
+            }
+            Some(dim)
         }
-        Some(dim)
-    } else {
-        None
+        _ => None,
     };
 
-    Ok(SqlPlan::ArrayAgg(ArrayAggPlan {
+    let slice = match args.get(4) {
+        Some(arg) if !is_null_literal(arg) => parse_slice_arg(arg, "ARRAY_AGG", &name, &view)?,
+        _ => ArraySliceAst::default(),
+    };
+
+    let zone = match (args.get(5), args.get(6)) {
+        (Some(wkt), Some(dims)) => Some(parse_zone_args(wkt, dims, &name, &view)?),
+        _ => None,
+    };
+
+    Ok(ArrayAggPlan {
         name,
         attr,
         reducer,
         group_by_dim,
+        slice,
+        zone,
         temporal,
-    }))
+    })
 }
 
-fn plan_elementwise(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlPlan> {
+fn plan_elementwise(
+    args: &[ast::Expr],
+    catalog: &dyn SqlCatalog,
+    temporal: TemporalScope,
+) -> Result<ArrayElementwisePlan> {
     if args.len() != 4 {
         return Err(SqlError::Unsupported {
             detail: format!(
@@ -280,21 +325,22 @@ fn plan_elementwise(args: &[ast::Expr], catalog: &dyn SqlCatalog) -> Result<SqlP
             detail: format!("ARRAY_ELEMENTWISE: array '{left}' has no attr '{attr}'"),
         });
     }
-    Ok(SqlPlan::ArrayElementwise(ArrayElementwisePlan {
+    Ok(ArrayElementwisePlan {
         left,
         right,
         op,
         attr,
-    }))
+        temporal,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use crate::catalog::{ArrayCatalogView, SqlCatalogError};
-    use crate::error::Result;
+    use crate::error::{Result, SqlError};
     use crate::functions::registry::FunctionRegistry;
     use crate::parser::statement::parse_sql;
-    use crate::types::{ArrayAggPlan, ArrayProjectPlan, ArraySlicePlan};
+    use crate::types::{ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan};
     use crate::types::{CollectionInfo, SqlCatalog, SqlPlan};
     use crate::types_array::{
         ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound, ArrayReducerAst,
@@ -377,13 +423,27 @@ mod tests {
         )
     }
 
+    /// The body a relational array read plans to: the one definition of the
+    /// CTE its outer query reads.
+    fn relation_body(plan: SqlPlan) -> SqlPlan {
+        match plan {
+            SqlPlan::Cte(crate::types::CtePlan {
+                mut definitions, ..
+            }) => {
+                assert_eq!(definitions.len(), 1, "one array relation definition");
+                definitions.remove(0).1
+            }
+            other => panic!("expected Cte over the array relation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn slice_happy() {
         let p = plan_one(
             "SELECT * FROM ARRAY_SLICE('g', '{chrom: [1,1], pos: [0, 100]}', ['qual'], 50)",
         )
         .unwrap();
-        match p {
+        match relation_body(p) {
             SqlPlan::ArraySlice(ArraySlicePlan {
                 name,
                 slice,
@@ -411,15 +471,45 @@ mod tests {
     #[test]
     fn project_happy() {
         let p = plan_one("SELECT * FROM ARRAY_PROJECT('g', ['qual', 'variant'])").unwrap();
-        match p {
-            SqlPlan::ArrayProject(ArrayProjectPlan {
+        match relation_body(p) {
+            SqlPlan::ArraySlice(ArraySlicePlan {
                 name,
+                slice,
                 attr_projection,
+                limit,
+                ..
             }) => {
                 assert_eq!(name, "g");
+                assert!(
+                    slice.dim_ranges.is_empty(),
+                    "a project reads the whole domain"
+                );
                 assert_eq!(attr_projection, vec!["qual".to_string(), "variant".into()]);
+                assert_eq!(limit, 0);
             }
-            other => panic!("expected ArrayProject, got {other:?}"),
+            other => panic!("expected a whole-domain ArraySlice, got {other:?}"),
+        }
+    }
+
+    /// A project reads the cells visible at its `AS OF` scope, as a slice
+    /// does.
+    #[test]
+    fn project_carries_the_temporal_scope() {
+        let stmts = parse_sql("SELECT * FROM ARRAY_PROJECT('g', ['qual'])").unwrap();
+        let sqlparser::ast::Statement::Query(q) = &stmts[0] else {
+            panic!("not a query");
+        };
+        let temporal = crate::TemporalScope {
+            system_time: nodedb_types::SystemTimeScope::AsOf(1_234),
+            valid_time: crate::temporal::ValidTime::At(99),
+        };
+        let p = crate::planner::select::plan_query(q, &cat(), &FunctionRegistry::new(), temporal)
+            .unwrap();
+        match relation_body(p) {
+            SqlPlan::ArraySlice(ArraySlicePlan { temporal: got, .. }) => {
+                assert_eq!(got, temporal);
+            }
+            other => panic!("expected a whole-domain ArraySlice, got {other:?}"),
         }
     }
 
@@ -470,10 +560,157 @@ mod tests {
     }
 
     #[test]
+    fn agg_carries_its_box_and_zone() {
+        let p = plan_one(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'mean', NULL, '{chrom: [1, 2]}', \
+             'POLYGON((0 1, 100 1, 100 3, 0 3, 0 1))', ARRAY['pos', 'chrom'])",
+        )
+        .unwrap();
+        let SqlPlan::ArrayAgg(ArrayAggPlan {
+            group_by_dim,
+            slice,
+            zone,
+            ..
+        }) = p
+        else {
+            panic!("expected ArrayAgg, got {p:?}");
+        };
+        assert!(group_by_dim.is_none());
+        assert_eq!(slice.dim_ranges.len(), 1);
+        assert_eq!(slice.dim_ranges[0].dim, "chrom");
+        let zone = zone.expect("zone");
+        assert_eq!(zone.x_dim, "pos");
+        assert_eq!(zone.y_dim, "chrom");
+        assert_eq!(zone.polygons.len(), 1);
+        assert_eq!(zone.polygons[0][0].len(), 5);
+    }
+
+    #[test]
+    fn agg_null_box_reads_the_whole_array() {
+        let p = plan_one(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', 'chrom', NULL, \
+             'MULTIPOLYGON(((0 0, 9 0, 9 9, 0 9, 0 0)), ((20 20, 29 20, 29 29, 20 20)))', \
+             ARRAY['pos', 'chrom'])",
+        )
+        .unwrap();
+        let SqlPlan::ArrayAgg(ArrayAggPlan {
+            group_by_dim,
+            slice,
+            zone,
+            ..
+        }) = p
+        else {
+            panic!("expected ArrayAgg, got {p:?}");
+        };
+        assert_eq!(group_by_dim.as_deref(), Some("chrom"));
+        assert!(slice.dim_ranges.is_empty());
+        assert_eq!(zone.expect("zone").polygons.len(), 2);
+    }
+
+    fn agg_error(sql: &str) -> String {
+        format!("{}", plan_one(sql).expect_err("refused"))
+    }
+
+    #[test]
+    fn agg_numeric_reducer_over_string_attr_is_refused() {
+        for reducer in ["sum", "mean", "min", "max"] {
+            let sql = format!("SELECT * FROM ARRAY_AGG('g', 'variant', '{reducer}')");
+            match plan_one(&sql) {
+                Err(SqlError::TypeMismatch { detail }) => {
+                    assert!(detail.contains("STRING attr 'variant'"), "{detail}");
+                }
+                other => panic!("{sql} must be refused at plan time: {other:?}"),
+            }
+        }
+        plan_one("SELECT * FROM ARRAY_AGG('g', 'variant', 'count')")
+            .expect("COUNT over a STRING attr plans");
+    }
+
+    #[test]
+    fn agg_zone_needs_its_dims() {
+        let err = agg_error(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, \
+             'POLYGON((0 0, 1 0, 1 1, 0 0))')",
+        );
+        assert!(err.contains("zone_dims"), "{err}");
+    }
+
+    #[test]
+    fn agg_box_on_an_unknown_dim_is_refused() {
+        let err = agg_error("SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, '{nope: [1, 2]}')");
+        assert!(
+            err.contains("ARRAY_AGG: array 'g' has no dim 'nope'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn agg_zone_must_be_a_polygon() {
+        let err = agg_error(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, 'POINT(1 2)', \
+             ARRAY['pos', 'chrom'])",
+        );
+        assert!(err.contains("POLYGON or MULTIPOLYGON"), "{err}");
+        let err = agg_error(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, 'POLYGON((0 0, 1', \
+             ARRAY['pos', 'chrom'])",
+        );
+        assert!(err.contains("not valid WKT"), "{err}");
+    }
+
+    #[test]
+    fn agg_zone_dims_name_two_distinct_dims() {
+        let zone = "'POLYGON((0 0, 1 0, 1 1, 0 0))'";
+        let err = agg_error(&format!(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, {zone}, ARRAY['pos'])"
+        ));
+        assert!(err.contains("two dims"), "{err}");
+        let err = agg_error(&format!(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, {zone}, ARRAY['pos', 'pos'])"
+        ));
+        assert!(err.contains("two different dims"), "{err}");
+        let err = agg_error(&format!(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, {zone}, ARRAY['pos', 'lat'])"
+        ));
+        assert!(err.contains("no dim 'lat'"), "{err}");
+    }
+
+    #[test]
+    fn agg_more_than_seven_args_is_refused() {
+        let err = agg_error(
+            "SELECT * FROM ARRAY_AGG('g', 'qual', 'sum', NULL, NULL, \
+             'POLYGON((0 0, 1 0, 1 1, 0 0))', ARRAY['pos', 'chrom'], 1)",
+        );
+        assert!(err.contains("3..=7 args"), "{err}");
+    }
+
+    #[test]
     fn elementwise_happy() {
         let p =
             plan_one("SELECT * FROM ARRAY_ELEMENTWISE('left', 'right', 'add', 'qual')").unwrap();
         assert!(matches!(p, SqlPlan::ArrayElementwise { .. }));
+    }
+
+    /// An elementwise op reads both operands at its `AS OF` scope.
+    #[test]
+    fn elementwise_carries_the_temporal_scope() {
+        let stmts =
+            parse_sql("SELECT * FROM ARRAY_ELEMENTWISE('left', 'right', 'add', 'qual')").unwrap();
+        let sqlparser::ast::Statement::Query(q) = &stmts[0] else {
+            panic!("not a query");
+        };
+        let temporal = crate::TemporalScope {
+            system_time: nodedb_types::SystemTimeScope::AsOf(5_000),
+            valid_time: crate::temporal::ValidTime::At(7),
+        };
+        let p = crate::planner::select::plan_query(q, &cat(), &FunctionRegistry::new(), temporal)
+            .unwrap();
+        match p {
+            SqlPlan::ArrayElementwise(ArrayElementwisePlan { temporal: got, .. }) => {
+                assert_eq!(got, temporal);
+            }
+            other => panic!("expected ArrayElementwise, got {other:?}"),
+        }
     }
 
     #[test]

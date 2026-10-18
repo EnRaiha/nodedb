@@ -85,9 +85,10 @@ impl SyncSession {
                     // Only an authorized DeltaPush needs the handler's audit/DLQ
                     // state. Keeping these guards scoped to this synchronous call
                     // avoids the audit-emitter self-deadlock and never spans await.
-                    let mut audit = shared.audit.lock().unwrap_or_else(|p| p.into_inner());
+                    // The audit guard exports the recorded rejections to SIEM after it unlocks.
+                    let mut audit = crate::control::security::audit::lock_audit_log(&shared.audit);
                     let mut dlq = shared.sync_dlq.lock().unwrap_or_else(|p| p.into_inner());
-                    self.handle_delta_push(&msg, rls_store, Some(&mut audit), Some(&mut dlq))
+                    self.handle_delta_push(&msg, rls_store, Some(&mut *audit), Some(&mut dlq))
                 } else {
                     self.handle_delta_push(&msg, rls_store, audit_log, dlq)
                 }

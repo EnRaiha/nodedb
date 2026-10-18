@@ -355,6 +355,15 @@ pub enum Error {
     #[error("column reference \"{column}\" is ambiguous")]
     AmbiguousColumn { column: String },
 
+    /// A grouped SELECT list read a column that is neither a GROUP BY key
+    /// nor inside an aggregate. Propagated from `SqlError::UngroupedColumn`;
+    /// the pgwire layer renders it as SQLSTATE `42803` (grouping_error).
+    #[error(
+        "column \"{column}\" must appear in the GROUP BY clause or be used in an \
+         aggregate function"
+    )]
+    UngroupedColumn { column: String },
+
     /// A write body carried a field the collection's strict schema does not
     /// declare. The same condition the planner reports as an unknown column,
     /// detected at encode time for the transports that bypass the planner:
@@ -373,6 +382,20 @@ pub enum Error {
     /// SQLSTATE `22000` (data_exception) at the pgwire layer.
     #[error("{detail}")]
     DataException { detail: String },
+
+    /// A geometry's SRID differs from the SRID of the spatial index it
+    /// writes to or queries. The index SRID is fixed by its first entry, and
+    /// no implicit transform runs. Rendered as SQLSTATE `22000`
+    /// (data_exception) at the pgwire layer.
+    #[error(
+        "spatial index on {collection}.{field} is SRID {index_srid}; geometry is SRID {row_srid}"
+    )]
+    MixedSrid {
+        collection: String,
+        field: String,
+        index_srid: u32,
+        row_srid: u32,
+    },
 
     /// A value does not fit its numeric type: an integer past a column's
     /// declared width, a float that overflows `REAL`, a literal past the exact

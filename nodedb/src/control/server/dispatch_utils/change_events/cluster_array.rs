@@ -17,7 +17,11 @@ pub(super) fn cluster_array_change_meta(op: &ClusterArrayOp) -> Vec<WriteChangeM
         ClusterArrayOp::Delete { array_id, .. } => {
             vec![(array_id.name.clone(), every_row(), ChangeOperation::Delete)]
         }
-        // Slice/Agg are reads — no row changed.
-        ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. } => Vec::new(),
+        // Reads and maintenance change no row.
+        ClusterArrayOp::Slice { .. }
+        | ClusterArrayOp::Agg { .. }
+        | ClusterArrayOp::Elementwise { .. }
+        | ClusterArrayOp::Flush { .. }
+        | ClusterArrayOp::Compact { .. } => Vec::new(),
     }
 }

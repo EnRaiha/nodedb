@@ -48,7 +48,6 @@ impl SqlPlan {
             SqlPlan::InsertArray { .. } => "InsertArray",
             SqlPlan::DeleteArray { .. } => "DeleteArray",
             SqlPlan::ArraySlice { .. } => "ArraySlice",
-            SqlPlan::ArrayProject { .. } => "ArrayProject",
             SqlPlan::ArrayAgg { .. } => "ArrayAgg",
             SqlPlan::ArrayElementwise { .. } => "ArrayElementwise",
             SqlPlan::ArrayFlush { .. } => "ArrayFlush",

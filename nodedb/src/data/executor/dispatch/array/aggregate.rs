@@ -10,10 +10,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use nodedb_array::query::aggregate::{GroupAggregate, aggregate_attr, group_by_dim};
+use nodedb_array::query::region::{ArrayRegion, filter_region_owned};
 use nodedb_array::schema::ArraySchema;
 use nodedb_array::segment::TilePayload;
 use nodedb_array::types::ArrayId;
 use nodedb_array::types::coord::value::CoordValue;
+use nodedb_cluster::distributed_array::ArrayAggGroupKey;
 use nodedb_cluster::distributed_array::merge::ArrayAggPartial;
 use nodedb_types::array_route::shard_bucket_admits;
 use nodedb_types::{ShardBucket, SurrogateBitmap};
@@ -27,7 +29,7 @@ use nodedb_physical::physical_plan::ArrayReducer;
 
 use super::aggregate_helpers::{
     AggCell, agg_result_to_partial, apply_surrogate_filter, coord_to_agg_cell, coord_to_group_key,
-    encode_agg_rows, encode_bitemporal_agg_partial, float_or_null, map_reducer, unwrap_sparse,
+    encode_agg_rows, encode_bitemporal_agg_partial, map_reducer, result_cell, unwrap_sparse,
 };
 
 /// Aggregate query parameters bundled to avoid exceeding the 7-argument limit.
@@ -44,6 +46,8 @@ pub(in crate::data::executor) struct AggParams<'a> {
     pub system_as_of: Option<i64>,
     /// Bitemporal valid-time point. `None` = no valid-time filter.
     pub valid_at_ms: Option<i64>,
+    /// zerompk-encoded [`ArrayRegion`]. Empty = the whole array.
+    pub region_msgpack: &'a [u8],
 }
 
 /// Bundled inputs for [`CoreLoop::collect_agg_tiles`].
@@ -56,6 +60,8 @@ struct AggTileScan<'a> {
     /// The transaction whose staged cells merge into the scan, or `None`
     /// for an autocommit read, a distributed partial, or a temporal read.
     overlay_txn: Option<TxnId>,
+    /// Only cells inside it contribute. `None` = the whole array.
+    region: Option<&'a ArrayRegion>,
 }
 
 /// Bundled inputs for [`CoreLoop::reduce_and_encode_agg`] — keeps the kernel
@@ -95,10 +101,26 @@ impl CoreLoop {
             shard_bucket,
             system_as_of,
             valid_at_ms,
+            region_msgpack,
         } = p;
         if let Err(resp) = self.ensure_array_open(task, array_id) {
             return resp;
         }
+        let region: Option<ArrayRegion> = if region_msgpack.is_empty() {
+            None
+        } else {
+            match zerompk::from_msgpack(region_msgpack) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("array aggregate region decode: {e}"),
+                        },
+                    );
+                }
+            }
+        };
 
         let schema = match self.array_engine.store(array_id) {
             Ok(store) => store.schema().clone(),
@@ -136,6 +158,7 @@ impl CoreLoop {
             system_as_of,
             valid_at_ms,
             overlay_txn,
+            region: region.as_ref(),
         }) {
             Ok(v) => v,
             Err(detail) => {
@@ -168,6 +191,9 @@ impl CoreLoop {
     /// `valid_at_ms` narrow the cutoff for point-in-time queries; the same
     /// `shard_bucket` filter applies in all cases.
     ///
+    /// A `region` prunes whole prefixes before decode. Its exact cell filter
+    /// runs after the overlay merge, so staged cells outside it drop too.
+    ///
     /// Returns an error *detail* string (wrapped into `ErrorCode::Internal` by
     /// the caller) rather than a `Response`, so it can borrow `&self` cleanly.
     fn collect_agg_tiles(&self, scan: AggTileScan<'_>) -> Result<(Vec<TilePayload>, bool), String> {
@@ -178,6 +204,7 @@ impl CoreLoop {
             system_as_of,
             valid_at_ms,
             overlay_txn,
+            region,
         } = scan;
         let cutoff = system_as_of.unwrap_or(i64::MAX);
         let store = self
@@ -185,7 +212,7 @@ impl CoreLoop {
             .store(array_id)
             .map_err(|e| format!("array '{}' not open: {e}", array_id.name))?;
         let (mut resolved_tiles, truncated_before_horizon) = store
-            .scan_tiles_at(cutoff, valid_at_ms)
+            .scan_shard_tiles_at(cutoff, valid_at_ms, shard_bucket, region)
             .map_err(|e| format!("array aggregate scan: {e}"))?;
         // Staged cells join the SAME tile set the base cells reduce through,
         // ahead of the shard bucket filter, so they fold into the same partial
@@ -200,11 +227,18 @@ impl CoreLoop {
             &mut resolved_tiles,
         )
         .map_err(|e| format!("array aggregate overlay merge: {e}"))?;
-        let tiles = resolved_tiles
-            .into_iter()
-            .filter(|(hp, _)| shard_bucket_admits(shard_bucket, *hp))
-            .map(|(_, tile)| TilePayload::Sparse(tile))
-            .collect();
+        let mut tiles = Vec::with_capacity(resolved_tiles.len());
+        for (hp, tile) in resolved_tiles {
+            if !shard_bucket_admits(shard_bucket, hp) {
+                continue;
+            }
+            let tile = match region {
+                Some(region) => filter_region_owned(schema, tile, region)
+                    .map_err(|e| format!("array aggregate region filter: {e}"))?,
+                None => tile,
+            };
+            tiles.push(TilePayload::Sparse(tile));
+        }
         Ok((tiles, truncated_before_horizon))
     }
 
@@ -257,17 +291,9 @@ impl CoreLoop {
                 });
             }
             if return_partial {
-                let partial =
-                    acc.map(|a| agg_result_to_partial(0, a))
-                        .unwrap_or_else(|| ArrayAggPartial {
-                            group_key: 0,
-                            count: 0,
-                            sum: 0.0,
-                            min: f64::INFINITY,
-                            max: f64::NEG_INFINITY,
-                            welford_mean: 0.0,
-                            welford_m2: 0.0,
-                        });
+                let partial = acc
+                    .map(|a| agg_result_to_partial(ArrayAggGroupKey::Scalar, a))
+                    .unwrap_or_else(|| ArrayAggPartial::empty(ArrayAggGroupKey::Scalar));
                 return encode_bitemporal_agg_partial(
                     self,
                     task,
@@ -275,10 +301,13 @@ impl CoreLoop {
                     truncated_before_horizon,
                 );
             }
-            let final_val = acc.and_then(|a| a.finalize());
+            let result = match result_cell(acc) {
+                Ok(cell) => cell,
+                Err(code) => return self.response_error(task, code),
+            };
             let mut rows: Vec<BTreeMap<&'static str, AggCell>> = Vec::new();
             let mut row: BTreeMap<&'static str, AggCell> = BTreeMap::new();
-            row.insert("result", float_or_null(final_val));
+            row.insert("result", result);
             rows.push(row);
             push_horizon_summary(&mut rows, emit_horizon, truncated_before_horizon);
             return encode_agg_rows(self, task, &rows);
@@ -323,10 +352,17 @@ impl CoreLoop {
 
         let mut rows: Vec<BTreeMap<&'static str, AggCell>> = Vec::with_capacity(order.len() + 1);
         for key in order {
-            let result_val = by_key.remove(&key).and_then(|r| r.finalize());
+            let result = match result_cell(by_key.remove(&key)) {
+                Ok(cell) => cell,
+                Err(code) => return self.response_error(task, code),
+            };
+            let group = match coord_to_agg_cell(&key) {
+                Ok(cell) => cell,
+                Err(code) => return self.response_error(task, code),
+            };
             let mut row: BTreeMap<&'static str, AggCell> = BTreeMap::new();
-            row.insert("group", coord_to_agg_cell(&key));
-            row.insert("result", float_or_null(result_val));
+            row.insert("group", group);
+            row.insert("result", result);
             rows.push(row);
         }
         push_horizon_summary(&mut rows, emit_horizon, truncated_before_horizon);
@@ -358,6 +394,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use nodedb_array::query::region::{PolygonZone, ZonePolygon};
+    use nodedb_array::query::slice::{DimRange, Slice};
     use nodedb_array::schema::ArraySchemaBuilder;
     use nodedb_array::schema::attr_spec::{AttrSpec, AttrType};
     use nodedb_array::schema::dim_spec::{DimSpec, DimType};
@@ -550,6 +588,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "agg failed: {r:?}");
         let rows = decode_agg_rows(r.payload.as_ref());
@@ -584,6 +623,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "agg failed: {r:?}");
 
@@ -595,8 +635,8 @@ mod tests {
             .expect("return_partial payload must be a (Vec<ArrayAggPartial>, bool) tuple");
         assert_eq!(partials.len(), 1);
         assert!(
-            (partials[0].sum - 3.0).abs() < 1e-9,
-            "sum got {}",
+            (partials[0].sum.as_f64() - 3.0).abs() < 1e-9,
+            "sum got {:?}",
             partials[0].sum
         );
         assert!(
@@ -637,6 +677,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: Some(150),
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "temporal agg failed: {r:?}");
         let rows = decode_agg_rows(r.payload.as_ref());
@@ -669,6 +710,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: Some(50),
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert_eq!(r2.status, Status::Ok, "below-horizon agg failed: {r2:?}");
         let rows2 = decode_agg_rows(r2.payload.as_ref());
@@ -704,6 +746,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "group agg failed: {r:?}");
         let rows = decode_agg_rows(r.payload.as_ref());
@@ -758,6 +801,7 @@ mod tests {
             shard_bucket: None,
             system_as_of: None,
             valid_at_ms: None,
+            region_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "agg+filter failed: {r:?}");
         let rows = decode_agg_rows(r.payload.as_ref());
@@ -767,5 +811,317 @@ mod tests {
             .and_then(|v| v.as_f64())
             .expect("result f64");
         assert!((f - 9.0).abs() < 1e-9, "filtered sum got {f}");
+    }
+
+    /// `x` in `[x0, x1]` and `y` in `[y0, y1]`.
+    fn int_box(x0: i64, x1: i64, y0: i64, y1: i64) -> Slice {
+        let r = |lo, hi| {
+            Some(DimRange::new(
+                DomainBound::Int64(lo),
+                DomainBound::Int64(hi),
+            ))
+        };
+        Slice::new(vec![r(x0, x1), r(y0, y1)])
+    }
+
+    fn square(lo: f64, hi: f64) -> Vec<[f64; 2]> {
+        vec![[lo, lo], [hi, lo], [hi, hi], [lo, hi], [lo, lo]]
+    }
+
+    /// A zone over dims `x` then `y` holding one polygon.
+    fn zone_region(exterior: Vec<[f64; 2]>, holes: Vec<Vec<[f64; 2]>>) -> ArrayRegion {
+        ArrayRegion::new(
+            Slice::default(),
+            Some(PolygonZone {
+                x_dim: 0,
+                y_dim: 1,
+                polygons: vec![ZonePolygon { exterior, holes }],
+            }),
+        )
+    }
+
+    struct RegionAgg<'a> {
+        aid: &'a ArrayId,
+        reducer: ArrayReducer,
+        group_by_dim: i32,
+        region: &'a ArrayRegion,
+        system_as_of: Option<i64>,
+        return_partial: bool,
+    }
+
+    impl RegionAgg<'_> {
+        fn op(&self) -> ArrayOp {
+            ArrayOp::Aggregate {
+                array_id: self.aid.clone(),
+                attr_idx: 0,
+                reducer: self.reducer,
+                group_by_dim: self.group_by_dim,
+                cell_filter: None,
+                return_partial: self.return_partial,
+                shard_bucket: None,
+                system_as_of: self.system_as_of,
+                valid_at_ms: None,
+                region_msgpack: zerompk::to_msgpack_vec(self.region).unwrap(),
+            }
+        }
+    }
+
+    fn scalar(aid: &ArrayId, reducer: ArrayReducer, region: &ArrayRegion) -> ArrayOp {
+        RegionAgg {
+            aid,
+            reducer,
+            group_by_dim: -1,
+            region,
+            system_as_of: None,
+            return_partial: false,
+        }
+        .op()
+    }
+
+    fn result_of(h: &mut Harness, op: ArrayOp) -> serde_json::Value {
+        let r = h.send(op);
+        assert_eq!(r.status, Status::Ok, "agg failed: {r:?}");
+        let rows = decode_agg_rows(r.payload.as_ref());
+        rows[0].get("result").cloned().expect("result column")
+    }
+
+    /// The box keeps the cells inside it, across a flushed segment and the
+    /// memtable.
+    #[test]
+    fn a_box_aggregates_only_its_cells() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("rg_box");
+        let aid = ArrayId::new(TenantId::new(1), "rg_box");
+        h.open(&aid, &s, 0xB1);
+        h.put(&aid, vec![cell(0, 0, 1.0), cell(1, 1, 2.0)], 1);
+        h.flush(&aid);
+        h.put(&aid, vec![cell(2, 2, 3.0), cell(9, 9, 100.0)], 2);
+
+        let region = ArrayRegion::new(int_box(0, 2, 0, 2), None);
+        let mean = result_of(&mut h, scalar(&aid, ArrayReducer::Mean, &region));
+        assert_eq!(mean.as_f64(), Some(2.0));
+    }
+
+    /// A cell on a polygon's minimum edge is in, one on its maximum edge is
+    /// out.
+    #[test]
+    fn a_polygon_keeps_its_minimum_edges_and_drops_its_maximum_edges() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("rg_poly");
+        let aid = ArrayId::new(TenantId::new(1), "rg_poly");
+        h.open(&aid, &s, 0xB2);
+        h.put(
+            &aid,
+            vec![
+                cell(0, 1, 2.0),
+                cell(2, 2, 4.0),
+                cell(1, 0, 8.0),
+                cell(4, 2, 100.0),
+                cell(2, 4, 200.0),
+            ],
+            1,
+        );
+        h.flush(&aid);
+
+        let region = zone_region(square(0.0, 4.0), Vec::new());
+        let mean = result_of(&mut h, scalar(&aid, ArrayReducer::Mean, &region))
+            .as_f64()
+            .expect("mean");
+        assert!((mean - 14.0 / 3.0).abs() < 1e-9, "mean got {mean}");
+    }
+
+    #[test]
+    fn a_hole_excludes_its_cells() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("rg_hole");
+        let aid = ArrayId::new(TenantId::new(1), "rg_hole");
+        h.open(&aid, &s, 0xB3);
+        h.put(
+            &aid,
+            vec![cell(1, 1, 1.0), cell(4, 4, 50.0), cell(6, 6, 3.0)],
+            1,
+        );
+        h.flush(&aid);
+
+        let region = zone_region(square(0.0, 8.0), vec![square(3.0, 5.0)]);
+        let sum = result_of(&mut h, scalar(&aid, ArrayReducer::Sum, &region));
+        assert_eq!(sum.as_f64(), Some(4.0));
+    }
+
+    /// A region that holds no cell answers NULL for every reducer, count
+    /// included, as an aggregate over an empty array does.
+    #[test]
+    fn an_empty_region_answers_null() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("rg_empty");
+        let aid = ArrayId::new(TenantId::new(1), "rg_empty");
+        h.open(&aid, &s, 0xB4);
+        h.put(&aid, vec![cell(0, 0, 1.0), cell(1, 1, 2.0)], 1);
+        h.flush(&aid);
+
+        let region = ArrayRegion::new(int_box(12, 15, 12, 15), None);
+        for reducer in [
+            ArrayReducer::Sum,
+            ArrayReducer::Count,
+            ArrayReducer::Min,
+            ArrayReducer::Max,
+            ArrayReducer::Mean,
+        ] {
+            let v = result_of(&mut h, scalar(&aid, reducer, &region));
+            assert!(v.is_null(), "{reducer:?} over an empty region got {v}");
+        }
+    }
+
+    #[test]
+    fn a_grouped_aggregate_reads_only_the_box() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("rg_grp");
+        let aid = ArrayId::new(TenantId::new(1), "rg_grp");
+        h.open(&aid, &s, 0xB5);
+        h.put(
+            &aid,
+            vec![
+                cell(0, 0, 1.0),
+                cell(0, 1, 2.0),
+                cell(1, 0, 10.0),
+                cell(5, 5, 99.0),
+            ],
+            1,
+        );
+        h.flush(&aid);
+
+        let region = ArrayRegion::new(int_box(0, 1, 0, 15), None);
+        let r = h.send(
+            RegionAgg {
+                aid: &aid,
+                reducer: ArrayReducer::Sum,
+                group_by_dim: 0,
+                region: &region,
+                system_as_of: None,
+                return_partial: false,
+            }
+            .op(),
+        );
+        assert_eq!(r.status, Status::Ok, "group agg failed: {r:?}");
+        let mut totals: Vec<(i64, f64)> = decode_agg_rows(r.payload.as_ref())
+            .iter()
+            .map(|row| {
+                (
+                    row["group"].as_i64().expect("group"),
+                    row["result"].as_f64().expect("result"),
+                )
+            })
+            .collect();
+        totals.sort_by_key(|(g, _)| *g);
+        assert_eq!(totals, vec![(0, 3.0), (1, 10.0)]);
+    }
+
+    /// `AS OF SYSTEM TIME` reads the region at the cutoff, and a cell
+    /// overwritten across segments counts once at its version.
+    #[test]
+    fn a_region_reads_each_cell_once_at_the_cutoff() {
+        let mut h = Harness::new();
+        let s = schema_2d_f64("rg_asof");
+        let aid = ArrayId::new(TenantId::new(1), "rg_asof");
+        h.open(&aid, &s, 0xB6);
+        let at = |x: i64, y: i64, v: f64, sys: i64| ArrayPutCell {
+            system_from_ms: sys,
+            ..cell(x, y, v)
+        };
+        h.put(&aid, vec![at(1, 1, 5.0, 100), at(2, 2, 1.0, 100)], 1);
+        h.flush(&aid);
+        h.put(&aid, vec![at(1, 1, 7.0, 200)], 2);
+        h.flush(&aid);
+
+        let region = ArrayRegion::new(int_box(0, 3, 0, 3), None);
+        let count = result_of(&mut h, scalar(&aid, ArrayReducer::Count, &region));
+        assert_eq!(
+            count.as_f64(),
+            Some(2.0),
+            "the overwritten cell counts once"
+        );
+        let live = result_of(&mut h, scalar(&aid, ArrayReducer::Sum, &region));
+        assert_eq!(live.as_f64(), Some(8.0));
+
+        let as_of = RegionAgg {
+            aid: &aid,
+            reducer: ArrayReducer::Sum,
+            group_by_dim: -1,
+            region: &region,
+            system_as_of: Some(150),
+            return_partial: false,
+        };
+        let old = result_of(&mut h, as_of.op());
+        assert_eq!(old.as_f64(), Some(6.0), "AS OF reads the first version");
+    }
+
+    /// A distributed partial grouped by a Float64 dim carries the dim value
+    /// itself as its key, not its bit pattern.
+    #[test]
+    fn a_float_group_partial_carries_the_typed_key() {
+        let mut h = Harness::new();
+        let s = ArraySchemaBuilder::new("rg_lon")
+            .dim(DimSpec::new(
+                "lon",
+                DimType::Float64,
+                Domain::new(DomainBound::Float64(0.0), DomainBound::Float64(16.0)),
+            ))
+            .dim(DimSpec::new(
+                "lat",
+                DimType::Float64,
+                Domain::new(DomainBound::Float64(0.0), DomainBound::Float64(16.0)),
+            ))
+            .attr(AttrSpec::new("v", AttrType::Float64, true))
+            .tile_extents(vec![4, 4])
+            .build()
+            .unwrap();
+        let aid = ArrayId::new(TenantId::new(1), "rg_lon");
+        h.open(&aid, &s, 0xB7);
+        let at = |lon: f64, lat: f64, v: f64, sur: u32| ArrayPutCell {
+            coord: vec![CoordValue::Float64(lon), CoordValue::Float64(lat)],
+            attrs: vec![CellValue::Float64(v)],
+            surrogate: Surrogate(sur),
+            system_from_ms: 0,
+            valid_from_ms: 0,
+            valid_until_ms: i64::MAX,
+        };
+        h.put(
+            &aid,
+            vec![
+                at(1.5, 1.0, 1.0, 1),
+                at(1.5, 2.0, 2.0, 2),
+                at(2.5, 1.0, 4.0, 3),
+                at(9.5, 9.0, 8.0, 4),
+            ],
+            1,
+        );
+
+        let region = zone_region(square(0.0, 5.0), Vec::new());
+        let r = h.send(
+            RegionAgg {
+                aid: &aid,
+                reducer: ArrayReducer::Sum,
+                group_by_dim: 0,
+                region: &region,
+                system_as_of: None,
+                return_partial: true,
+            }
+            .op(),
+        );
+        assert_eq!(r.status, Status::Ok, "partial agg failed: {r:?}");
+        let (mut partials, _): (Vec<ArrayAggPartial>, bool) =
+            zerompk::from_msgpack(r.payload.as_ref()).expect("partial tuple");
+        partials.sort_by(|a, b| a.group_key.cmp(&b.group_key));
+        let got: Vec<(ArrayAggGroupKey, f64)> = partials
+            .iter()
+            .map(|p| (p.group_key.clone(), p.sum.as_f64()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (ArrayAggGroupKey::Float64(1.5), 3.0),
+                (ArrayAggGroupKey::Float64(2.5), 4.0),
+            ]
+        );
     }
 }

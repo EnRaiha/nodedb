@@ -207,6 +207,14 @@ impl NodeDb for NativeClient {
     async fn execute_sql(&self, query: &str, params: &[Value]) -> NodeDbResult<QueryResult> {
         self.execute_sql_impl(query, params).await
     }
+
+    async fn array_put_cells(
+        &self,
+        array: &str,
+        cells: Vec<nodedb_types::protocol::ArrayCellWrite>,
+    ) -> NodeDbResult<u64> {
+        self.array_put_cells_impl(array, cells).await
+    }
 }
 
 #[cfg(test)]

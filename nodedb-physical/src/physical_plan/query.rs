@@ -209,6 +209,13 @@ pub enum QueryOp {
         /// groups are finalized and HAVING is filtered.
         #[serde(default)]
         sort_keys: Vec<crate::physical_plan::SortKeySpec>,
+        /// SELECT-list output alias of each GROUP BY key, parallel to
+        /// `group_by`. A `Some` entry renames the key's `output_name` in every
+        /// result row, after HAVING, sort, and limit. HAVING and the sort keys
+        /// read the `output_name`. Empty, or a `None` entry, keeps the
+        /// `output_name`.
+        #[serde(default)]
+        group_key_aliases: Vec<Option<String>>,
     },
 
     /// Partial aggregate: each core computes locally, Control Plane merges.

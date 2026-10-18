@@ -2,36 +2,55 @@
 
 //! Distance, length, perimeter, area, and bearing.
 //!
-//! Every measure is geodesic and reported in meters (or square meters), the
-//! same basis as `nodedb_spatial::st_distance`.
+//! Every measure is reported in metres (or square metres). A WGS 84 geometry
+//! is measured geodesically, the same basis as `nodedb_spatial::st_distance`.
+//! A projected geometry is measured in planar grid metres.
 
 use nodedb_types::Value;
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::{Geometry, SridGeometry};
 
-use super::helpers::{geom_arg, num_arg};
+use super::helpers::{GeoEval, geom_arg, num_arg, same_srid};
 use crate::value_ops::to_value_number;
 
-pub(super) fn eval(canonical: &str, args: &[Value]) -> Option<Value> {
+pub(super) fn eval(canonical: &'static str, args: &[Value]) -> GeoEval {
     let result = match canonical {
         "st_distance" => {
             let (Some(a), Some(b)) = (geom_arg(args, 0), geom_arg(args, 1)) else {
-                return Some(Value::Null);
+                return Some(Ok(Value::Null));
             };
-            to_value_number(nodedb_spatial::st_distance(&a, &b))
+            let srid = match same_srid(canonical, &a, &b) {
+                Ok(srid) => srid,
+                Err(e) => return Some(Err(e)),
+            };
+            let d = if srid.is_geographic() {
+                nodedb_spatial::st_distance(&a.geometry, &b.geometry)
+            } else {
+                nodedb_spatial::planar_distance(&a.geometry, &b.geometry)
+            };
+            to_value_number(d)
         }
-        "st_length" => unary(args, linear_length),
-        "st_perimeter" => unary(args, perimeter),
-        "st_area" => unary(args, nodedb_spatial::st_area),
+        "st_length" => unary(args, linear_length, nodedb_spatial::planar_length),
+        "st_perimeter" => unary(args, perimeter, nodedb_spatial::planar_perimeter),
+        "st_area" => unary(args, nodedb_spatial::st_area, nodedb_spatial::planar_area),
         "geo_distance" => haversine(args, nodedb_types::geometry::haversine_distance),
         "geo_bearing" => haversine(args, nodedb_types::geometry::haversine_bearing),
         _ => return None,
     };
-    Some(result)
+    Some(Ok(result))
 }
 
-fn unary(args: &[Value], f: fn(&Geometry) -> f64) -> Value {
+/// A unary measure: `geodesic` for a WGS 84 geometry, `planar` for a
+/// projected one.
+fn unary(args: &[Value], geodesic: fn(&Geometry) -> f64, planar: fn(&Geometry) -> f64) -> Value {
     match geom_arg(args, 0) {
-        Some(geom) => to_value_number(f(&geom)),
+        Some(SridGeometry { srid, geometry }) => {
+            let f = if srid.is_geographic() {
+                geodesic
+            } else {
+                planar
+            };
+            to_value_number(f(&geometry))
+        }
         None => Value::Null,
     }
 }
@@ -106,9 +125,55 @@ fn closed_ring_length(ring: &[[f64; 2]]) -> f64 {
 mod tests {
     use super::*;
     use crate::value_ops::value_to_f64;
+    use nodedb_types::geometry::Srid;
+
+    /// The evaluator with a fault turned into a test failure.
+    fn eval(canonical: &'static str, args: &[Value]) -> Option<Value> {
+        super::eval(canonical, args).map(|r| r.expect("no fault expected"))
+    }
 
     fn geom(v: Geometry) -> Vec<Value> {
-        vec![Value::Geometry(v)]
+        vec![Value::Geometry(SridGeometry::wgs84(v))]
+    }
+
+    fn utm48(v: Geometry) -> Value {
+        Value::Geometry(SridGeometry::new(Srid::Utm48N, v))
+    }
+
+    #[test]
+    fn projected_area_of_hundred_metre_square() {
+        let square = utm48(Geometry::polygon(vec![vec![
+            [500_000.0, 100_000.0],
+            [500_100.0, 100_000.0],
+            [500_100.0, 100_100.0],
+            [500_000.0, 100_100.0],
+            [500_000.0, 100_000.0],
+        ]]));
+        let area = eval("st_area", &[square]).and_then(|v| value_to_f64(&v, true));
+        assert_eq!(area, Some(10_000.0));
+    }
+
+    #[test]
+    fn projected_distance_and_length_are_planar() {
+        let a = utm48(Geometry::point(500_000.0, 0.0));
+        let b = utm48(Geometry::point(500_300.0, 400.0));
+        let d = eval("st_distance", &[a, b]).and_then(|v| value_to_f64(&v, true));
+        assert_eq!(d, Some(500.0));
+        let line = utm48(Geometry::line_string(vec![[0.0, 0.0], [300.0, 400.0]]));
+        let l = eval("st_length", &[line]).and_then(|v| value_to_f64(&v, true));
+        assert_eq!(l, Some(500.0));
+    }
+
+    #[test]
+    fn mixed_srid_distance_fails() {
+        let args = [
+            Value::Geometry(SridGeometry::wgs84(Geometry::point(0.0, 0.0))),
+            utm48(Geometry::point(0.0, 0.0)),
+        ];
+        assert!(matches!(
+            super::eval("st_distance", &args),
+            Some(Err(crate::expr::EvalError::MixedSrid { .. }))
+        ));
     }
 
     #[test]

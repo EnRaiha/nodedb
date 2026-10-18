@@ -35,8 +35,7 @@ use super::text::refuse_text_op;
 /// Refuse `plan` when it reads something a redaction policy protects but the
 /// result-path masking hook cannot rewrite.
 ///
-/// Returns `Err(crate::Error::PlanError)` — the same typed refusal RLS raises
-/// for the operation types it cannot filter.
+/// Returns `Err(crate::Error::RejectedAuthz)`, which clients see as `42501`.
 pub fn refuse_unredactable_plan(
     plan: &PhysicalPlan,
     tenant_id: TenantId,
@@ -393,6 +392,7 @@ mod tests {
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
             sort_keys: Vec::new(),
+            group_key_aliases: Vec::new(),
         })
     }
 
@@ -408,8 +408,8 @@ mod tests {
 
     fn assert_refused(result: crate::Result<()>) {
         match result {
-            Err(crate::Error::PlanError { .. }) => {}
-            other => panic!("expected PlanError refusal, got {other:?}"),
+            Err(crate::Error::RejectedAuthz { .. }) => {}
+            other => panic!("expected RejectedAuthz refusal, got {other:?}"),
         }
     }
 
@@ -546,6 +546,7 @@ mod tests {
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
             sort_keys: Vec::new(),
+            group_key_aliases: Vec::new(),
         })
     }
 
@@ -690,6 +691,7 @@ mod tests {
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
             sort_keys: Vec::new(),
+            group_key_aliases: Vec::new(),
         })
     }
 

@@ -2,7 +2,7 @@
 
 //! R-tree node types and constants.
 
-use nodedb_types::BoundingBox;
+use nodedb_types::{BboxSpace, BoundingBox};
 use serde::{Deserialize, Serialize};
 use zerompk::{FromMessagePack, ToMessagePack};
 
@@ -119,7 +119,8 @@ impl Node {
         self.len() < self.min_fill()
     }
 
-    pub fn recompute_bbox(&mut self) {
+    /// Recompute this node's bbox from its children, unioned in `space`.
+    pub fn recompute_bbox(&mut self, space: BboxSpace) {
         match &self.kind {
             NodeKind::Internal { children } => {
                 if children.is_empty() {
@@ -128,7 +129,7 @@ impl Node {
                 }
                 let mut bb = children[0].bbox;
                 for c in &children[1..] {
-                    bb = bb.union(&c.bbox);
+                    bb = bb.union_in(&c.bbox, space);
                 }
                 self.bbox = bb;
             }
@@ -139,7 +140,7 @@ impl Node {
                 }
                 let mut bb = entries[0].bbox;
                 for e in &entries[1..] {
-                    bb = bb.union(&e.bbox);
+                    bb = bb.union_in(&e.bbox, space);
                 }
                 self.bbox = bb;
             }

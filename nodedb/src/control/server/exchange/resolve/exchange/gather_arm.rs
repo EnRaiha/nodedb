@@ -6,9 +6,8 @@
 use nodedb_physical::physical_plan::PhysicalPlan;
 
 use crate::control::server::exchange::full_scan::{ScanSide, full_scan_plan_for_collection};
-use crate::control::server::exchange::gather::{
-    GatherOutcome, finalize_aggregate, gather_all_vshards, outcome_to_response,
-};
+use crate::control::server::exchange::gather::{gather_all_vshards, outcome_to_response};
+use crate::control::server::exchange::gather_outcome::GatherOutcome;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::state::SharedState;
 
@@ -125,11 +124,7 @@ pub(super) async fn resolve_gather(
         });
     }
 
-    let payload = if as_aggregate {
-        finalize_aggregate(&outcome.merged_array)
-    } else {
-        outcome.merged_array
-    };
+    let payload = outcome.merged_rows(as_aggregate)?;
     Ok(Resolved::Gathered(
         outcome_to_response(payload, outcome.watermark_lsn, outcome.read_versions),
         outcome.shard_watermarks,
@@ -148,7 +143,7 @@ pub(super) async fn resolve_broadcast(
     let outcome = gather_all_vshards(state, child, ctx).await?;
     Ok(Resolved::Gathered(
         outcome_to_response(
-            outcome.merged_array,
+            outcome.merged_rows(false)?,
             outcome.watermark_lsn,
             outcome.read_versions,
         ),

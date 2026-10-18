@@ -195,7 +195,7 @@ pub(crate) async fn submit_prepared_and_await(
     // The verdict's reason picks the error the client sees.
     match report.outcome {
         AttemptOutcome::Completed => {}
-        AttemptOutcome::Aborted { reason } => return Err(calvin_abort_error(reason)),
+        AttemptOutcome::Aborted(cause) => return Err(calvin_abort_error(cause)),
     }
     if binds_authorization {
         crate::control::security::auth_lease::calvin_write_barrier(

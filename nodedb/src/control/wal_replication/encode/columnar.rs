@@ -94,7 +94,7 @@ pub(super) fn spatial_insert(
     collection: &str,
     field: &str,
     surrogate: u32,
-    geometry: &nodedb_types::geometry::Geometry,
+    geometry: &nodedb_types::geometry::SridGeometry,
     provenance: Option<Vec<u8>>,
 ) -> crate::Result<ReplicatedWrite> {
     // A failed encode refuses the write rather than replicate bytes that

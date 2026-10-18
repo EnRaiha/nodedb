@@ -8,15 +8,16 @@
 //! satisfy the compiler that this match is exhaustive over the full
 //! `SqlPlan` enum without repeating their field lists.
 use super::args::{
-    CreateArrayVisitArgs, LateralLoopVisitArgs, LateralTopKVisitArgs, MergeVisitArgs,
-    VectorPrimaryDeleteVisitArgs, VectorPrimaryInsertVisitArgs, VectorPrimaryUpdateVisitArgs,
+    ArrayAggVisitArgs, CreateArrayVisitArgs, LateralLoopVisitArgs, LateralTopKVisitArgs,
+    MergeVisitArgs, VectorPrimaryDeleteVisitArgs, VectorPrimaryInsertVisitArgs,
+    VectorPrimaryUpdateVisitArgs,
 };
 use super::trait_def::PlanVisitor;
 use crate::types::SqlPlan;
 use crate::types::{
-    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArrayProjectPlan, ArraySlicePlan,
-    CreateArrayPlan, CreateIndexPlan, CtePlan, DeleteArrayPlan, DropIndexPlan, InsertArrayPlan,
-    LateralLoopPlan, LateralTopKPlan, MergePlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan,
+    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan, CreateArrayPlan,
+    CreateIndexPlan, CtePlan, DeleteArrayPlan, DropIndexPlan, InsertArrayPlan, LateralLoopPlan,
+    LateralTopKPlan, MergePlan, VectorPrimaryDeletePlan, VectorPrimaryInsertPlan,
     VectorPrimaryTruncatePlan, VectorPrimaryUpdatePlan,
 };
 
@@ -86,23 +87,30 @@ pub(super) fn dispatch_rest<V: PlanVisitor>(
             limit,
             temporal,
         }) => visitor.array_slice(name, slice, attr_projection, *limit, temporal),
-        SqlPlan::ArrayProject(ArrayProjectPlan {
-            name,
-            attr_projection,
-        }) => visitor.array_project(name, attr_projection),
         SqlPlan::ArrayAgg(ArrayAggPlan {
             name,
             attr,
             reducer,
             group_by_dim,
+            slice,
+            zone,
             temporal,
-        }) => visitor.array_agg(name, attr, reducer, group_by_dim.as_deref(), temporal),
+        }) => visitor.array_agg(ArrayAggVisitArgs {
+            name,
+            attr,
+            reducer: *reducer,
+            group_by_dim: group_by_dim.as_deref(),
+            slice,
+            zone: zone.as_ref(),
+            temporal,
+        }),
         SqlPlan::ArrayElementwise(ArrayElementwisePlan {
             left,
             right,
             op,
             attr,
-        }) => visitor.array_elementwise(left, right, *op, attr),
+            temporal,
+        }) => visitor.array_elementwise(left, right, *op, attr, temporal),
         SqlPlan::ArrayFlush { name } => visitor.array_flush(name),
         SqlPlan::ArrayCompact { name } => visitor.array_compact(name),
         SqlPlan::Merge(MergePlan {

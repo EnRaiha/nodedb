@@ -56,7 +56,8 @@ pub(crate) fn admission_operation(op: OpCode) -> &'static str {
         | OpCode::DocumentRegister
         | OpCode::DocumentDropIndex
         | OpCode::DocumentBatchInsert
-        | OpCode::ColumnarInsert => "point_put",
+        | OpCode::ColumnarInsert
+        | OpCode::ArrayPutBatch => "point_put",
 
         // Scans.
         OpCode::RangeScan

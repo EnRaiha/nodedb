@@ -7,10 +7,14 @@
 //! in only one operand contribute a Null on the other side, which
 //! propagates as Null through the op (SQL-style null semantics).
 //!
-//! Numeric attrs (Int64, Float64) participate in the op; non-numeric
-//! attrs (String, Bytes) are passed through from the left operand
-//! unchanged — the op is undefined for them. Division by zero yields
-//! Null rather than infinity so downstream aggregates stay finite.
+//! The op reads one named attr. Every other attr passes through from the
+//! left operand. A non-numeric value (String, Bytes) in the named attr also
+//! passes through, since the op is undefined for it. Division by zero yields
+//! Null rather than infinity, so downstream aggregates stay finite.
+//!
+//! Integer Add, Sub, and Mul are exact `Int64` and refuse past the `i64`
+//! range with SQLSTATE `22003`. Div, and any op over a float attr, yields
+//! `Float64`.
 
 use std::collections::BTreeMap;
 
@@ -28,15 +32,25 @@ pub enum BinaryOp {
     Div,
 }
 
-/// Apply `op` to every aligned pair of cells. The result tile carries
-/// the union of both coord sets.
+/// Apply `op` to attr `attr_idx` of every aligned pair of cells. The result
+/// tile carries the union of both coord sets. Every other attr passes
+/// through, from the left operand when it has the cell.
 pub fn elementwise(
     schema: &ArraySchema,
     a: &SparseTile,
     b: &SparseTile,
     op: BinaryOp,
+    attr_idx: usize,
 ) -> ArrayResult<SparseTile> {
     let n_attrs = schema.attrs.len();
+    if attr_idx >= n_attrs {
+        return Err(ArrayError::InvalidOp {
+            detail: format!(
+                "elementwise: attr index {attr_idx} is out of range for {n_attrs} attrs of '{}'",
+                schema.name
+            ),
+        });
+    }
     let by_coord_a = index_rows(a)?;
     let by_coord_b = index_rows(b)?;
     let mut keys: BTreeMap<Vec<CoordKey>, ()> = BTreeMap::new();
@@ -53,17 +67,38 @@ pub fn elementwise(
         for i in 0..n_attrs {
             let l = lhs.map(|v| v[i].clone()).unwrap_or(CellValue::Null);
             let r = rhs.map(|v| v[i].clone()).unwrap_or(CellValue::Null);
-            out.push(apply(&l, &r, op));
+            out.push(if i == attr_idx {
+                apply(&l, &r, op)?
+            } else {
+                passthrough(&l, &r)
+            });
         }
         builder.push(&coord, &out)?;
     }
     Ok(builder.build())
 }
 
-fn apply(l: &CellValue, r: &CellValue, op: BinaryOp) -> CellValue {
-    let (lf, rf) = match (to_f64(l), to_f64(r)) {
+/// Add, Sub, and Mul of two integer cells is an exact `Int64`, refused past
+/// the `i64` range. Div, and any op with a float operand, is a `Float64`.
+fn apply(l: &CellValue, r: &CellValue, op: BinaryOp) -> ArrayResult<CellValue> {
+    if let (Some(a), Some(b)) = (l.as_i64(), r.as_i64()) {
+        let exact = match op {
+            BinaryOp::Add => Some(a.checked_add(b)),
+            BinaryOp::Sub => Some(a.checked_sub(b)),
+            BinaryOp::Mul => Some(a.checked_mul(b)),
+            BinaryOp::Div => None,
+        };
+        if let Some(v) = exact {
+            return v
+                .map(CellValue::Int64)
+                .ok_or_else(|| ArrayError::NumericOverflow {
+                    detail: format!("elementwise {op:?} of {a} and {b} is out of range for bigint"),
+                });
+        }
+    }
+    let (lf, rf) = match (l.as_f64(), r.as_f64()) {
         (Some(a), Some(b)) => (a, b),
-        _ => return passthrough(l, r),
+        _ => return Ok(widen_to_result(passthrough(l, r), op)),
     };
     let v = match op {
         BinaryOp::Add => lf + rf,
@@ -71,20 +106,28 @@ fn apply(l: &CellValue, r: &CellValue, op: BinaryOp) -> CellValue {
         BinaryOp::Mul => lf * rf,
         BinaryOp::Div => {
             if rf == 0.0 {
-                return CellValue::Null;
+                return Ok(CellValue::Null);
             }
             lf / rf
         }
     };
-    // Preserve Int64 when both operands were integral and result is
-    // exact — keeps integer attrs from drifting to floats unnecessarily.
-    if let (CellValue::Int64(_), CellValue::Int64(_)) = (l, r)
-        && v.fract() == 0.0
-        && v.is_finite()
-    {
-        return CellValue::Int64(v as i64);
+    Ok(CellValue::Float64(v))
+}
+
+/// A passed-through numeric value of the op attr takes the type the op
+/// yields, so the result column holds one type: `Int64` for an integer
+/// Add, Sub, or Mul, and `Float64` otherwise.
+fn widen_to_result(v: CellValue, op: BinaryOp) -> CellValue {
+    let int_op = match op {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => true,
+        BinaryOp::Div => false,
+    };
+    match (v.as_i64(), v.as_float()) {
+        (Some(i), _) if int_op => CellValue::Int64(i),
+        (Some(i), _) => CellValue::Float64(i as f64),
+        (None, Some(f)) => CellValue::Float64(f),
+        (None, None) => v,
     }
-    CellValue::Float64(v)
 }
 
 fn passthrough(l: &CellValue, r: &CellValue) -> CellValue {
@@ -94,14 +137,6 @@ fn passthrough(l: &CellValue, r: &CellValue) -> CellValue {
         r.clone()
     } else {
         CellValue::Null
-    }
-}
-
-fn to_f64(v: &CellValue) -> Option<f64> {
-    match v {
-        CellValue::Int64(x) => Some(*x as f64),
-        CellValue::Float64(x) => Some(*x),
-        _ => None,
     }
 }
 
@@ -206,7 +241,7 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 1), (1, 2)]);
         let b = tile(&[(0, 10), (1, 20)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
         assert_eq!(out.nnz(), 2);
         assert_eq!(out.attr_cols[0][0], CellValue::Int64(11));
         assert_eq!(out.attr_cols[0][1], CellValue::Int64(22));
@@ -217,7 +252,7 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 1)]);
         let b = tile(&[(1, 2)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
         assert_eq!(out.nnz(), 2);
         // Both rows are missing one operand → both become Null+something
         // → passthrough gives the present operand.
@@ -232,7 +267,7 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 5)]);
         let b = tile(&[(0, 0)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Div).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Div, 0).unwrap();
         assert_eq!(out.attr_cols[0][0], CellValue::Null);
     }
 
@@ -267,7 +302,7 @@ mod tests {
             .unwrap();
         let a = builder.build();
         let b = tile(&[(1, 6)]);
-        let out = elementwise(&s, &a, &b, BinaryOp::Add).unwrap();
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
         assert_eq!(out.nnz(), 1);
         assert_eq!(out.attr_cols[0][0], CellValue::Int64(10));
     }
@@ -277,9 +312,115 @@ mod tests {
         let s = schema();
         let a = tile(&[(0, 10)]);
         let b = tile(&[(0, 3)]);
-        let s1 = elementwise(&s, &a, &b, BinaryOp::Sub).unwrap();
-        let s2 = elementwise(&s, &a, &b, BinaryOp::Mul).unwrap();
+        let s1 = elementwise(&s, &a, &b, BinaryOp::Sub, 0).unwrap();
+        let s2 = elementwise(&s, &a, &b, BinaryOp::Mul, 0).unwrap();
         assert_eq!(s1.attr_cols[0][0], CellValue::Int64(7));
         assert_eq!(s2.attr_cols[0][0], CellValue::Int64(30));
+    }
+
+    fn two_attr_schema() -> ArraySchema {
+        ArraySchemaBuilder::new("g2")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("a", AttrType::Int64, true))
+            .attr(AttrSpec::new("b", AttrType::Int64, true))
+            .tile_extents(vec![16])
+            .build()
+            .unwrap()
+    }
+
+    fn two_attr_tile(s: &ArraySchema, k: i64, a: i64, b: i64) -> SparseTile {
+        let mut builder = SparseTileBuilder::new(s);
+        builder
+            .push(
+                &[CoordValue::Int64(k)],
+                &[CellValue::Int64(a), CellValue::Int64(b)],
+            )
+            .unwrap();
+        builder.build()
+    }
+
+    /// Only the named attr takes the op. The other attr keeps the left
+    /// operand's value.
+    #[test]
+    fn the_op_reads_the_named_attr_only() {
+        let s = two_attr_schema();
+        let left = two_attr_tile(&s, 0, 1, 2);
+        let right = two_attr_tile(&s, 0, 10, 20);
+        let on_b = elementwise(&s, &left, &right, BinaryOp::Add, 1).unwrap();
+        assert_eq!(on_b.attr_cols[1][0], CellValue::Int64(22));
+        assert_eq!(on_b.attr_cols[0][0], CellValue::Int64(1));
+        let on_a = elementwise(&s, &left, &right, BinaryOp::Add, 0).unwrap();
+        assert_eq!(on_a.attr_cols[0][0], CellValue::Int64(11));
+        assert_eq!(on_a.attr_cols[1][0], CellValue::Int64(2));
+    }
+
+    fn typed_tile(dtype: AttrType, rows: &[(i64, CellValue)]) -> (ArraySchema, SparseTile) {
+        let s = ArraySchemaBuilder::new("t")
+            .dim(DimSpec::new(
+                "k",
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("v", dtype, true))
+            .tile_extents(vec![16])
+            .build()
+            .unwrap();
+        let mut b = SparseTileBuilder::new(&s);
+        for (k, v) in rows {
+            b.push(&[CoordValue::Int64(*k)], std::slice::from_ref(v))
+                .unwrap();
+        }
+        let t = b.build();
+        (s, t)
+    }
+
+    /// Narrow integers add exactly into `Int64`, and a passed-through cell
+    /// takes the same type.
+    #[test]
+    fn narrow_integers_add_into_int64() {
+        let (s, a) = typed_tile(
+            AttrType::UInt16,
+            &[(0, CellValue::UInt16(65535)), (1, CellValue::UInt16(3))],
+        );
+        let (_, b) = typed_tile(AttrType::UInt16, &[(0, CellValue::UInt16(65535))]);
+        let out = elementwise(&s, &a, &b, BinaryOp::Add, 0).unwrap();
+        assert_eq!(out.attr_cols[0][0], CellValue::Int64(131_070));
+        assert_eq!(out.attr_cols[0][1], CellValue::Int64(3));
+    }
+
+    #[test]
+    fn integer_overflow_is_refused() {
+        let s = schema();
+        let a = tile(&[(0, i64::MAX)]);
+        let b = tile(&[(0, 2)]);
+        assert!(matches!(
+            elementwise(&s, &a, &b, BinaryOp::Mul, 0),
+            Err(ArrayError::NumericOverflow { .. })
+        ));
+    }
+
+    /// Div of integers, and any op over a float attr, yields `Float64`.
+    #[test]
+    fn div_and_floats_yield_float64() {
+        let s = schema();
+        let a = tile(&[(0, 6), (1, 7)]);
+        let b = tile(&[(0, 3)]);
+        let out = elementwise(&s, &a, &b, BinaryOp::Div, 0).unwrap();
+        assert_eq!(out.attr_cols[0][0], CellValue::Float64(2.0));
+        assert_eq!(out.attr_cols[0][1], CellValue::Float64(7.0));
+        let (fs, fa) = typed_tile(AttrType::Float32, &[(0, CellValue::Float32(0.5))]);
+        let out = elementwise(&fs, &fa, &fa, BinaryOp::Add, 0).unwrap();
+        assert_eq!(out.attr_cols[0][0], CellValue::Float64(1.0));
+    }
+
+    #[test]
+    fn an_attr_index_out_of_range_is_refused() {
+        let s = two_attr_schema();
+        let t = two_attr_tile(&s, 0, 1, 2);
+        assert!(elementwise(&s, &t, &t, BinaryOp::Add, 2).is_err());
     }
 }

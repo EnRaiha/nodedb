@@ -3,6 +3,7 @@
 //! Per-opcode dispatch handlers for the native protocol.
 
 mod admission_op;
+mod array_batch;
 mod auth;
 mod cluster_array;
 mod conversion;
@@ -32,6 +33,7 @@ mod transaction;
 mod transaction_savepoint;
 
 pub(crate) use admission_op::admission_operation;
+pub(crate) use array_batch::handle_array_put_batch;
 pub(crate) use auth::{NativeAuthOutcome, handle_auth, handle_ping};
 pub(crate) use conversion::{
     apply_dml_outcome, ddl_result_to_native, dml_fold_error_to_native, error_code_to_native,

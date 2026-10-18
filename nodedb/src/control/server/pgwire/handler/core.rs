@@ -51,6 +51,8 @@ pub struct NodeDbPgHandler {
     pub(crate) sessions: Arc<SessionStore>,
     /// Per-connection in-flight COPY IN restore accumulators.
     pub(crate) restore_state: Arc<crate::control::backup::RestoreState>,
+    /// Per-connection open `COPY <array> FROM STDIN` loads.
+    pub(crate) array_copy: Arc<super::array_copy::ArrayCopyState>,
     pub(crate) registry: Arc<ConnectionRegistry>,
     pub(crate) session_id: SessionId,
 }
@@ -78,6 +80,7 @@ impl NodeDbPgHandler {
             auth_mode,
             sessions,
             restore_state: Arc::new(crate::control::backup::RestoreState::new()),
+            array_copy: Arc::new(super::array_copy::ArrayCopyState::new()),
             registry: Arc::new(ConnectionRegistry::new()),
             session_id: SessionId::LegacySocket(([0, 0, 0, 0], 0).into()),
         }
@@ -93,6 +96,7 @@ impl NodeDbPgHandler {
         auth_mode: AuthMode,
         sessions: Arc<SessionStore>,
         restore_state: Arc<crate::control::backup::RestoreState>,
+        array_copy: Arc<super::array_copy::ArrayCopyState>,
         registry: Arc<ConnectionRegistry>,
         connection_id: ConnectionId,
     ) -> Self {
@@ -109,6 +113,7 @@ impl NodeDbPgHandler {
             auth_mode,
             sessions,
             restore_state,
+            array_copy,
             registry,
             session_id,
         }

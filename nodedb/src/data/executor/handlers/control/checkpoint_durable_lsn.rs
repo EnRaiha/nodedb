@@ -193,7 +193,7 @@ impl CoreLoop {
     /// Unlike the engines above this writes no checkpoint file of its own: the
     /// array engine's durable form IS its on-disk segments, and
     /// `checkpoint_array_engines` calls the same `ArrayEngine::flush` an
-    /// `NDARRAY_FLUSH` does. The bug it closes is that the flush was reachable
+    /// `ARRAY_FLUSH` does. The bug it closes is that the flush was reachable
     /// ONLY by that explicit command, so every cell written since the last one a
     /// user happened to run sat in a memory-only memtable while its `ArrayPut`
     /// records were truncated out from under it.
@@ -809,7 +809,8 @@ mod tests {
             nodedb_types::TenantId::new(1),
             nodedb_mem::EngineId::Spatial,
         );
-        let mut rtree = crate::engine::spatial::RTree::new(memory);
+        let mut rtree =
+            crate::engine::spatial::RTree::new(memory, nodedb_types::geometry::Srid::Wgs84);
         rtree.insert(crate::engine::spatial::RTreeEntry {
             id: 1,
             bbox: nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0),

@@ -59,6 +59,7 @@ fn timeseries_scan_isolated() {
             computed_columns: vec![],
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(resp_a.status, Status::Ok);
@@ -90,6 +91,7 @@ fn timeseries_scan_isolated() {
             computed_columns: vec![],
             having: Vec::new(),
             tiering: None,
+            output_columns: Vec::new(),
         }),
     );
     assert_eq!(resp_b.status, Status::Ok);

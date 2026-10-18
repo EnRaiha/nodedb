@@ -16,15 +16,14 @@
 //   [u32 LE valid_from_ms_len][gorilla payload]
 //   [u32 LE valid_until_ms_len][gorilla payload]
 //   [u32 LE attr_count]
-//   per attr: [u32 LE col_len][column_codec payload]
+//   per attr: [u32 LE col_len][attr_col payload]
 //
 // For CodecTag::Raw, the full SparseTile is serialised with zerompk and
 // written verbatim after the two header bytes (tag + version). The decoder
 // mirrors this.
 
-use crate::codec::column_codec::{
-    encode_attr_col, encode_row_kinds, encode_surrogates, encode_timestamps_col,
-};
+use crate::codec::attr_col::encode_attr_col;
+use crate::codec::column_codec::{encode_row_kinds, encode_surrogates, encode_timestamps_col};
 use crate::codec::coord_rle::encode_coord_axis_rle;
 use crate::codec::tag::CodecTag;
 use crate::error::{ArrayError, ArrayResult};
@@ -212,6 +211,10 @@ mod tests {
         assert_eq!(decoded.surrogates, tile.surrogates);
         assert_eq!(decoded.attr_cols, tile.attr_cols);
         assert_eq!(decoded.dim_dicts.len(), tile.dim_dicts.len());
+        // Readers count and bound a tile by its MBR, so a structural tile
+        // decodes with the MBR it was built with.
+        assert_eq!(decoded.nnz(), 100);
+        assert_eq!(decoded.mbr, tile.mbr);
     }
 
     #[test]
@@ -284,6 +287,38 @@ mod tests {
         assert_eq!(decoded.surrogates, tile.surrogates);
         assert_eq!(decoded.surrogates[0], None);
         assert_eq!(decoded.surrogates[1], Some(Surrogate::new(101)));
+        // The MBR folds live rows only, as the builder does.
+        assert_eq!(decoded.mbr, tile.mbr);
+        assert_eq!(decoded.nnz(), 13);
+    }
+
+    /// A NULL in a numeric attr survives the structural codec as NULL.
+    #[test]
+    fn structural_tile_keeps_numeric_nulls() {
+        let s = schema();
+        let mut b = SparseTileBuilder::new(&s);
+        for i in 0..20i64 {
+            let attr = if i % 2 == 0 {
+                CellValue::Null
+            } else {
+                CellValue::Int64(i)
+            };
+            b.push_row(SparseRow::live(
+                &[CoordValue::Int64(i), CoordValue::Int64(i)],
+                &[attr],
+                Surrogate::new(1 + i as u32),
+                0,
+                OPEN_UPPER,
+            ))
+            .unwrap();
+        }
+        let tile = b.build();
+        let mut buf = Vec::new();
+        encode_sparse_tile(&tile, &mut buf).unwrap();
+        assert_eq!(buf[0], CodecTag::Structural.as_byte());
+        let decoded = decode_sparse_tile(&buf).unwrap();
+        assert_eq!(decoded.attr_cols, tile.attr_cols);
+        assert_eq!(decoded.attr_cols[0][0], CellValue::Null);
     }
 
     /// A derived result tile holds no identity, so it is never written.

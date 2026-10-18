@@ -328,7 +328,9 @@ mod tests {
             ("id".to_string(), Value::String("a".into())),
             (
                 "geom".to_string(),
-                Value::Geometry(nodedb_types::geometry::Geometry::point(1.0, 2.0)),
+                Value::Geometry(nodedb_types::geometry::SridGeometry::wgs84(
+                    nodedb_types::geometry::Geometry::point(1.0, 2.0),
+                )),
             ),
             (
                 "emb".to_string(),

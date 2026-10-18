@@ -1,18 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Axis-aligned bounding box for 2D geometries (WGS-84).
+//! Axis-aligned bounding box for 2D geometries.
 //!
-//! Handles the anti-meridian (±180° date line) correctly: when a geometry
-//! crosses the date line, `min_lng > max_lng`. All intersection and
-//! containment logic accounts for this split case.
+//! In [`BboxSpace::Geographic`] space the box handles the anti-meridian
+//! (±180° date line): when a geometry crosses the date line,
+//! `min_lng > max_lng`. All intersection and containment logic accounts for
+//! this split case. In [`BboxSpace::Planar`] space x is a projected easting in
+//! metres, nothing wraps, and `min_lng <= max_lng` always holds for a
+//! non-empty box.
 
 use crate::geometry::Geometry;
 use serde::{Deserialize, Serialize};
 use zerompk::{FromMessagePack, ToMessagePack};
 
-/// An axis-aligned bounding box in WGS-84 coordinates.
+/// Metres per degree of latitude, the WGS 84 meridian average used by the
+/// equirectangular expansion.
+const METRES_PER_DEGREE_LAT: f64 = 110_540.0;
+
+/// Metres per degree of longitude at the equator (WGS 84 semi-major axis
+/// times π / 180, rounded).
+const METRES_PER_DEGREE_LNG_EQUATOR: f64 = 111_320.0;
+
+/// The coordinate space a bounding box lives in.
 ///
-/// **Anti-meridian convention:** When `min_lng > max_lng`, the bbox wraps
+/// Derived from the SRID of the geometries it bounds
+/// (`Srid::bbox_space`). Union and enlargement depend on it: only
+/// geographic longitude wraps at ±180°.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BboxSpace {
+    /// Longitude / latitude degrees. Longitude wraps at the anti-meridian.
+    #[default]
+    Geographic,
+    /// Projected metres. No axis wraps.
+    Planar,
+}
+
+/// An axis-aligned bounding box. The `lng` fields hold x and the `lat` fields
+/// hold y: degrees for a geographic SRID, metres for a projected one.
+///
+/// **Anti-meridian convention (geographic only):** When `min_lng > max_lng`, the bbox wraps
 /// across the ±180° date line. For example, a geometry spanning 170°E to
 /// 170°W has `min_lng = 170.0, max_lng = -170.0`.
 ///
@@ -119,11 +145,28 @@ impl BoundingBox {
         }
     }
 
+    /// Union in geographic space. Same as `union_in(other, BboxSpace::Geographic)`.
     pub fn union(&self, other: &BoundingBox) -> BoundingBox {
+        self.union_in(other, BboxSpace::Geographic)
+    }
+
+    /// Smallest box covering both, in `space`.
+    ///
+    /// Geographic space picks the shorter of the direct and the
+    /// anti-meridian-wrapping longitude span. Planar space takes plain
+    /// per-axis min / max, so two disjoint metre boxes never wrap.
+    pub fn union_in(&self, other: &BoundingBox, space: BboxSpace) -> BoundingBox {
         let min_lat = self.min_lat.min(other.min_lat);
         let max_lat = self.max_lat.max(other.max_lat);
-        let (min_lng, max_lng) =
-            union_longitude(self.min_lng, self.max_lng, other.min_lng, other.max_lng);
+        let (min_lng, max_lng) = match space {
+            BboxSpace::Geographic => {
+                union_longitude(self.min_lng, self.max_lng, other.min_lng, other.max_lng)
+            }
+            BboxSpace::Planar => (
+                self.min_lng.min(other.min_lng),
+                self.max_lng.max(other.max_lng),
+            ),
+        };
         BoundingBox {
             min_lng,
             min_lat,
@@ -151,11 +194,28 @@ impl BoundingBox {
         }
     }
 
-    /// Expand by meters (equirectangular approximation, <0.5% error ±70°).
+    /// Expand by meters in geographic space. Same as
+    /// `expand_meters_in(meters, BboxSpace::Geographic)`.
     pub fn expand_meters(&self, meters: f64) -> BoundingBox {
-        let dlat = meters / 110_540.0;
-        let center_lat = (self.min_lat + self.max_lat) / 2.0;
-        let dlng = meters / (111_320.0 * center_lat.to_radians().cos());
+        self.expand_meters_in(meters, BboxSpace::Geographic)
+    }
+
+    /// Expand by `meters` on every side, in `space`.
+    ///
+    /// Geographic space converts metres to degrees with an equirectangular
+    /// approximation (<0.5% error within ±70° latitude). Planar space adds
+    /// the metres directly.
+    pub fn expand_meters_in(&self, meters: f64, space: BboxSpace) -> BoundingBox {
+        let (dlng, dlat) = match space {
+            BboxSpace::Geographic => {
+                let center_lat = (self.min_lat + self.max_lat) / 2.0;
+                (
+                    meters / (METRES_PER_DEGREE_LNG_EQUATOR * center_lat.to_radians().cos()),
+                    meters / METRES_PER_DEGREE_LAT,
+                )
+            }
+            BboxSpace::Planar => (meters, meters),
+        };
         BoundingBox {
             min_lng: self.min_lng - dlng,
             min_lat: self.min_lat - dlat,
@@ -177,8 +237,15 @@ impl BoundingBox {
         lat_overlap * lng_overlap
     }
 
+    /// Enlargement in geographic space. Same as
+    /// `enlargement_in(other, BboxSpace::Geographic)`.
     pub fn enlargement(&self, other: &BoundingBox) -> f64 {
-        self.union(other).area() - self.area()
+        self.enlargement_in(other, BboxSpace::Geographic)
+    }
+
+    /// Area added by growing `self` to cover `other`, in `space`.
+    pub fn enlargement_in(&self, other: &BoundingBox, space: BboxSpace) -> f64 {
+        self.union_in(other, space).area() - self.area()
     }
 }
 
@@ -240,8 +307,16 @@ fn union_longitude(a_min: f64, a_max: f64, b_min: f64, b_max: f64) -> (f64, f64)
     }
 }
 
-/// Compute bounding box for any Geometry.
+/// Compute bounding box for any Geometry in geographic space. Same as
+/// `geometry_bbox_in(geom, BboxSpace::Geographic)`.
 pub fn geometry_bbox(geom: &Geometry) -> BoundingBox {
+    geometry_bbox_in(geom, BboxSpace::Geographic)
+}
+
+/// Compute bounding box for any Geometry in `space`.
+///
+/// `space` decides how the members of a GeometryCollection combine.
+pub fn geometry_bbox_in(geom: &Geometry, space: BboxSpace) -> BoundingBox {
     match geom {
         Geometry::Point { coordinates } => BoundingBox::from_point(coordinates[0], coordinates[1]),
         Geometry::LineString { coordinates } => bbox_from_coords(coordinates),
@@ -268,9 +343,9 @@ pub fn geometry_bbox(geom: &Geometry) -> BoundingBox {
             if geometries.is_empty() {
                 return BoundingBox::new(0.0, 0.0, 0.0, 0.0);
             }
-            let mut result = geometry_bbox(&geometries[0]);
+            let mut result = geometry_bbox_in(&geometries[0], space);
             for geom in &geometries[1..] {
-                result = result.union(&geometry_bbox(geom));
+                result = result.union_in(&geometry_bbox_in(geom, space), space);
             }
             result
         }
@@ -366,6 +441,26 @@ mod tests {
         let u = a.union(&b);
         assert_eq!(u.min_lng, 0.0);
         assert_eq!(u.max_lng, 10.0);
+    }
+
+    /// Two disjoint metre boxes far past ±180 must not be read as longitude
+    /// and wrapped across the anti-meridian.
+    #[test]
+    fn planar_union_of_disjoint_metre_boxes_does_not_wrap() {
+        let a = BoundingBox::new(1e5, 0.0, 2e5, 10.0);
+        let b = BoundingBox::new(7e5, 0.0, 8e5, 10.0);
+        let u = a.union_in(&b, BboxSpace::Planar);
+        assert_eq!((u.min_lng, u.max_lng), (1e5, 8e5));
+        assert!(!u.crosses_antimeridian());
+        assert!((a.enlargement_in(&b, BboxSpace::Planar) - (7e5 - 1e5) * 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn planar_expand_adds_metres_directly() {
+        let bb = BoundingBox::from_point(500_000.0, 100.0);
+        let e = bb.expand_meters_in(250.0, BboxSpace::Planar);
+        assert_eq!((e.min_lng, e.max_lng), (499_750.0, 500_250.0));
+        assert_eq!((e.min_lat, e.max_lat), (-150.0, 350.0));
     }
 
     #[test]

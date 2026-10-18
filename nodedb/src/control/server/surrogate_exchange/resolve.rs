@@ -45,8 +45,10 @@ use crate::control::cluster::warm_peers::register_peers_from_topology;
 use crate::control::state::SharedState;
 use crate::types::{TenantId, TraceId, VShardId};
 
+use super::unbound::{assign_unbound_routed, lookup_unbound_routed};
+
 /// Where a routed surrogate exchange for a given home vShard must run.
-enum Route<'a> {
+pub(super) enum Route<'a> {
     /// Resolve against THIS node's allocator / catalog.
     Local,
     /// Send exactly one RPC to the home vShard's leader.
@@ -59,7 +61,7 @@ enum Route<'a> {
 /// Decide whether the exchange resolves locally or must be routed to a remote
 /// leader. Shared by the assign and lookup entry points so the two can never
 /// drift into disagreeing about which node is authoritative for a key.
-fn route_for<'a>(
+pub(super) fn route_for<'a>(
     state: &'a SharedState,
     vshard: VShardId,
     collection: &str,
@@ -133,16 +135,16 @@ fn leader_for(
 /// Bundled rather than passed as loose parameters because these six travel
 /// together to the leader as one request and mean nothing apart: a `pk` without
 /// its `collection`, or either without the scoping ids, names no row.
-struct ExchangeKey<'a> {
-    vshard: VShardId,
-    collection: CollectionKey<'a>,
-    tenant_id: TenantId,
-    pk: &'a [u8],
-    trace_id: TraceId,
+pub(super) struct ExchangeKey<'a> {
+    pub(super) vshard: VShardId,
+    pub(super) collection: CollectionKey<'a>,
+    pub(super) tenant_id: TenantId,
+    pub(super) pk: &'a [u8],
+    pub(super) trace_id: TraceId,
 }
 
 /// Build the one-shot request sent to the home leader.
-fn build_request(
+pub(super) fn build_request(
     state: &SharedState,
     key: ExchangeKey<'_>,
     lookup_only: bool,
@@ -176,7 +178,7 @@ fn build_request(
 /// Dispatch the one-shot RPC to `leader`, returning the reply body or a typed
 /// error. Registers the leader's address first so a not-yet-warmed peer does not
 /// fail with `NodeUnreachable`.
-async fn send_to_leader(
+pub(super) async fn send_to_leader(
     state: &SharedState,
     transport: &Arc<NexarTransport>,
     leader: u64,
@@ -236,7 +238,7 @@ pub async fn assign_surrogate_routed(
 /// replica's apply, or a winner kept earlier), so it answers without a
 /// request. The other keys go to the home: on the home leader they are minted
 /// in one Raft entry; from any other node they go to the leader as concurrent
-/// requests, at most [`MAX_ROUTED_IN_FLIGHT`] at a time. Every winner a remote
+/// requests, at most `MAX_ROUTED_IN_FLIGHT` at a time. Every winner a remote
 /// home answers is bound in this node's catalog first-wins, so a later lookup
 /// here makes no request.
 pub async fn assign_surrogates_routed(
@@ -246,48 +248,17 @@ pub async fn assign_surrogates_routed(
     pks: &[&[u8]],
     trace_id: TraceId,
 ) -> crate::Result<Vec<Surrogate>> {
-    use futures::StreamExt;
-
     let LocalBindings { mut out, missing } = local_bindings(state, collection, tenant_id, pks)?;
     if missing.is_empty() {
         return finish(out, collection);
     }
-    let vshard = VShardId::from_collection(collection);
-    let winners: Vec<Surrogate> = match route_for(state, vshard, collection.name())? {
-        Route::Local => {
-            super::authority::assign_many_at_home(state, vshard, collection, tenant_id, &missing)
-                .await?
-        }
-        Route::Remote { leader, transport } => {
-            // Built in a loop, not by an iterator closure: a closure that
-            // takes a borrowed key, held across the await below, makes every
-            // caller's future fail its `Send` check.
-            let mut requests = Vec::with_capacity(missing.len());
-            for &pk in &missing {
-                let key = ExchangeKey {
-                    vshard,
-                    collection,
-                    tenant_id,
-                    pk,
-                    trace_id,
-                };
-                requests.push(assign_remote(state, transport, leader, key));
-            }
-            let answered: Vec<Surrogate> = futures::stream::iter(requests)
-                .buffered(MAX_ROUTED_IN_FLIGHT)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<crate::Result<_>>()?;
-            keep_winners(state, collection, tenant_id, &missing, &answered)?
-        }
-    };
+    let winners = assign_unbound_routed(state, collection, tenant_id, &missing, trace_id).await?;
     fill(&mut out, pks, &missing, winners.into_iter().map(Some));
     finish(out, collection)
 }
 
 /// [`lookup_surrogate_routed`] for many keys of one collection, in `pks`
-/// order, local bindings first, at most [`MAX_ROUTED_IN_FLIGHT`] requests in
+/// order, local bindings first, at most `MAX_ROUTED_IN_FLIGHT` requests in
 /// flight at a time. Every winner a remote home answers is bound in this
 /// node's catalog first-wins.
 pub async fn lookup_surrogates_routed(
@@ -297,63 +268,14 @@ pub async fn lookup_surrogates_routed(
     pks: &[&[u8]],
     trace_id: TraceId,
 ) -> crate::Result<Vec<Option<Surrogate>>> {
-    use futures::StreamExt;
-
     let LocalBindings { mut out, missing } = local_bindings(state, collection, tenant_id, pks)?;
     if missing.is_empty() {
         return Ok(out);
     }
-    let vshard = VShardId::from_collection(collection);
-    let Route::Remote { leader, transport } = route_for(state, vshard, collection.name())? else {
-        // This node is the home: its catalog miss is the home's answer.
-        return Ok(out);
-    };
-    // Built in a loop for the reason given in `assign_surrogates_routed`.
-    let mut lookups = Vec::with_capacity(missing.len());
-    for &pk in &missing {
-        let key = ExchangeKey {
-            vshard,
-            collection,
-            tenant_id,
-            pk,
-            trace_id,
-        };
-        lookups.push(lookup_remote(state, transport, leader, key));
-    }
-    let answered: Vec<Option<Surrogate>> = futures::stream::iter(lookups)
-        .buffered(MAX_ROUTED_IN_FLIGHT)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<crate::Result<_>>()?;
-    // Every answered winner binds first-wins in one catalog transaction.
-    let found: Vec<(&[u8], Surrogate)> = missing
-        .iter()
-        .zip(&answered)
-        .filter_map(|(&pk, answer)| answer.map(|winner| (pk, winner)))
-        .collect();
-    let mut bound = state
-        .surrogate_assigner
-        .bind_many(collection, tenant_id, &found)?
-        .into_iter();
-    let mut kept = Vec::with_capacity(answered.len());
-    for answer in &answered {
-        kept.push(match answer {
-            Some(_) => Some(bound.next().ok_or_else(|| crate::Error::Internal {
-                detail: format!(
-                    "a found key of '{}' stayed unbound after bind",
-                    collection.name()
-                ),
-            })?),
-            None => None,
-        });
-    }
+    let kept = lookup_unbound_routed(state, collection, tenant_id, &missing, trace_id).await?;
     fill(&mut out, pks, &missing, kept.into_iter());
     Ok(out)
 }
-
-/// Routed requests one batch keeps in flight to a remote home leader.
-const MAX_ROUTED_IN_FLIGHT: usize = 64;
 
 /// Resolve `(collection, pk)` to the surrogate of an EXISTING row without ever
 /// allocating one, routing the lookup to the home vShard's leader when this node
@@ -398,32 +320,13 @@ fn local_bindings<'k>(
         .surrogate_assigner
         .lookup_bound_many(collection, tenant_id, pks)?;
     let mut missing: Vec<&[u8]> = Vec::new();
-    let mut asked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    let mut asked: rustc_hash::FxHashSet<&[u8]> = rustc_hash::FxHashSet::default();
     for (&pk, hit) in pks.iter().zip(&out) {
         if hit.is_none() && asked.insert(pk) {
             missing.push(pk);
         }
     }
     Ok(LocalBindings { out, missing })
-}
-
-/// Bind each remote winner in this node's catalog first-wins, in one catalog
-/// transaction, and return the kept values in `missing` order.
-fn keep_winners(
-    state: &SharedState,
-    collection: CollectionKey<'_>,
-    tenant_id: TenantId,
-    missing: &[&[u8]],
-    winners: &[Surrogate],
-) -> crate::Result<Vec<Surrogate>> {
-    let rows: Vec<(&[u8], Surrogate)> = missing
-        .iter()
-        .copied()
-        .zip(winners.iter().copied())
-        .collect();
-    state
-        .surrogate_assigner
-        .bind_many(collection, tenant_id, &rows)
 }
 
 /// Write the answers for `missing` (in its order) into every unfilled slot of
@@ -434,7 +337,7 @@ fn fill(
     missing: &[&[u8]],
     answers: impl Iterator<Item = Option<Surrogate>>,
 ) {
-    let by_key: std::collections::HashMap<&[u8], Option<Surrogate>> =
+    let by_key: rustc_hash::FxHashMap<&[u8], Option<Surrogate>> =
         missing.iter().copied().zip(answers).collect();
     for (slot, pk) in out.iter_mut().zip(pks) {
         if slot.is_none()
@@ -460,41 +363,4 @@ fn finish(
             })
         })
         .collect()
-}
-
-/// One assign at the remote home leader.
-async fn assign_remote(
-    state: &SharedState,
-    transport: &Arc<NexarTransport>,
-    leader: u64,
-    key: ExchangeKey<'_>,
-) -> crate::Result<Surrogate> {
-    let req = build_request(state, key, false);
-    let resp = send_to_leader(state, transport, leader, req).await?;
-    Ok(Surrogate::new(resp.surrogate))
-}
-
-/// One lookup at the remote home leader.
-async fn lookup_remote(
-    state: &SharedState,
-    transport: &Arc<NexarTransport>,
-    leader: u64,
-    key: ExchangeKey<'_>,
-) -> crate::Result<Option<Surrogate>> {
-    let name = key.collection.name().to_string();
-    let req = build_request(state, key, true);
-    let resp = send_to_leader(state, transport, leader, req).await?;
-    // `found` is the discriminator, never `surrogate == 0`: zero is a reserved
-    // sentinel that also appears in catalog-less fixtures. A reply with no
-    // flag cannot be read as a lookup at all.
-    match resp.found {
-        Some(true) => Ok(Some(Surrogate::new(resp.surrogate))),
-        Some(false) => Ok(None),
-        None => Err(crate::Error::Internal {
-            detail: format!(
-                "surrogate-exchange: leader node {leader} answered a lookup for '{name}' \
-                 without a found flag; cannot tell a hit from a miss"
-            ),
-        }),
-    }
 }

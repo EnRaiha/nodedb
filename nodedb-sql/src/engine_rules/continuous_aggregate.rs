@@ -90,6 +90,11 @@ impl EngineRules for ContinuousAggregateRules {
         Err(read_only("TRUNCATE", &p.collection))
     }
 
+    /// Each row loads as one INSERT, which `plan_insert` refuses.
+    fn plan_bulk_load(&self, _p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        Ok(BulkLoadPlan::RowInserts)
+    }
+
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
         refuse_temporal(&p.collection, &p.temporal)?;
         let base_scan = SqlPlan::Scan {

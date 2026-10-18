@@ -29,7 +29,11 @@ pub async fn convert_bound(
     ctx: &mut ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
     ctx.prefetched = prefetch_plan_surrogates(plans, ctx).await?;
-    convert_resolving_misses(plans, tenant_id, ctx).await
+    let converted = convert_resolving_misses(plans, tenant_id, ctx).await;
+    // The kept array keys are keyed by the address of `plans`' rows, which
+    // stays valid only while `plans` is borrowed here.
+    ctx.prefetched.forget_array_keys();
+    converted
 }
 
 /// Convert each of `plans` with the answers `ctx` holds, resolving the misses
@@ -105,7 +109,12 @@ mod tests {
 
     /// A cluster-mode assigner whose reserved batch is empty.
     fn cluster_assigner() -> Arc<SurrogateAssigner> {
-        let credentials = Arc::new(CredentialStore::new().expect("in-memory credential store"));
+        cluster_assigner_on(Arc::new(
+            CredentialStore::new().expect("in-memory credential store"),
+        ))
+    }
+
+    fn cluster_assigner_on(credentials: Arc<CredentialStore>) -> Arc<SurrogateAssigner> {
         let registry = Arc::new(RwLock::new(SurrogateRegistry::from_persisted_cluster(0, 0)));
         let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
         Arc::new(SurrogateAssigner::new(registry, credentials, wal))
@@ -214,28 +223,34 @@ mod tests {
     }
 
     /// A home that binds each new key to the next value from 500, after a
-    /// real await point.
-    #[derive(Default)]
+    /// real await point. As the authority contract requires, it keeps every
+    /// answer in the asking node's catalog.
     struct CountingHome {
         bound: Mutex<HashMap<Vec<u8>, Surrogate>>,
+        local: Arc<CredentialStore>,
     }
 
     impl HomeSurrogateAuthority for CountingHome {
         fn assign<'a>(
             &'a self,
-            _key: CollectionKey<'a>,
-            _tenant_id: nodedb_types::TenantId,
+            key: CollectionKey<'a>,
+            tenant_id: nodedb_types::TenantId,
             pks: &'a [&'a [u8]],
         ) -> BoxFuture<'a, crate::Result<Vec<Surrogate>>> {
             async move {
                 tokio::task::yield_now().await;
-                let mut bound = self.bound.lock().unwrap_or_else(|p| p.into_inner());
-                let mut answers = Vec::with_capacity(pks.len());
-                for pk in pks {
-                    let next = Surrogate::new(500 + bound.len() as u32);
-                    answers.push(*bound.entry(pk.to_vec()).or_insert(next));
-                }
-                Ok(answers)
+                let answers: Vec<Surrogate> = {
+                    let mut bound = self.bound.lock().unwrap_or_else(|p| p.into_inner());
+                    pks.iter()
+                        .map(|pk| {
+                            let next = Surrogate::new(500 + bound.len() as u32);
+                            *bound.entry(pk.to_vec()).or_insert(next)
+                        })
+                        .collect()
+                };
+                let rows: Vec<(&[u8], Surrogate)> = pks.iter().copied().zip(answers).collect();
+                let kept = self.local.catalog().put_surrogates(key, tenant_id, &rows)?;
+                Ok(kept.into_iter().map(|binding| binding.surrogate).collect())
             }
             .boxed()
         }
@@ -260,8 +275,12 @@ mod tests {
     /// the home's values.
     #[tokio::test(flavor = "current_thread")]
     async fn missed_keys_are_bound_at_their_home_without_blocking() {
-        let assigner = cluster_assigner();
-        assigner.install_home_authority(Arc::new(CountingHome::default()));
+        let credentials = Arc::new(CredentialStore::new().expect("in-memory credential store"));
+        let assigner = cluster_assigner_on(Arc::clone(&credentials));
+        assigner.install_home_authority(Arc::new(CountingHome {
+            bound: Mutex::new(HashMap::new()),
+            local: credentials,
+        }));
         let mut ctx = cluster_ctx(&assigner);
         let plans = vec![SqlPlan::Update {
             collection: "cache".to_string(),

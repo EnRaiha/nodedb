@@ -23,8 +23,9 @@ pub struct SpatialScatterPayload {
     pub collection: String,
     pub field: String,
     pub predicate: String,
-    /// Typed query geometry, parsed and validated on the originating CP.
-    pub query_geometry: nodedb_types::geometry::Geometry,
+    /// Typed query geometry and its SRID, parsed and validated on the
+    /// originating CP.
+    pub query_geometry: nodedb_types::geometry::SridGeometry,
     pub distance_meters: f64,
     pub limit: u32,
 }
@@ -70,7 +71,7 @@ impl SpatialScatterGather {
         collection: &str,
         field: &str,
         predicate: &str,
-        query_geometry: nodedb_types::geometry::Geometry,
+        query_geometry: nodedb_types::geometry::SridGeometry,
         distance_meters: f64,
         limit: usize,
     ) -> Result<Vec<(u32, VShardEnvelope)>> {
@@ -210,7 +211,9 @@ mod tests {
                 "buildings",
                 "geom",
                 "st_dwithin",
-                nodedb_types::geometry::Geometry::point(0.0, 0.0),
+                nodedb_types::geometry::SridGeometry::wgs84(
+                    nodedb_types::geometry::Geometry::point(0.0, 0.0),
+                ),
                 1000.0,
                 100,
             )

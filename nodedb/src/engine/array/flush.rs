@@ -177,6 +177,30 @@ mod tests {
         assert!(e.store(&aid()).unwrap().manifest().segments.len() == 1);
     }
 
+    /// A flushed tile of 8 or more cells is stored with the structural codec.
+    /// Every one of its cells reads back from the segment.
+    #[test]
+    fn a_flushed_structural_tile_reads_back_every_cell() {
+        let dir = TempDir::new().unwrap();
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(aid(), schema(), 0xCAFE).unwrap();
+        // One full 4x4 tile: 16 cells.
+        for x in 0..4 {
+            for y in 0..4 {
+                put_one(&mut e, x, y, x * 4 + y, 1);
+            }
+        }
+        e.flush(&aid(), ReplayStamp::through(1))
+            .unwrap()
+            .expect("non-empty flush");
+        let store = e.store(&aid()).unwrap();
+        assert!(store.memtable.is_empty(), "the flush drained the memtable");
+        let (tiles, truncated) = store.scan_tiles_at(i64::MAX, None).unwrap();
+        assert!(!truncated);
+        let cells: u32 = tiles.iter().map(|(_, t)| t.nnz()).sum();
+        assert_eq!(cells, 16, "every flushed cell reads back from the segment");
+    }
+
     #[test]
     fn flush_no_op_when_memtable_empty() {
         let dir = TempDir::new().unwrap();

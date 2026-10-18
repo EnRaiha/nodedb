@@ -30,7 +30,7 @@ CREATE RLS POLICY tenant_isolation ON orders FOR ALL
 
 -- Audit is per-database; RLS is per-tenant
 ALTER DATABASE us_west SET AUDIT_DML = 'writes';
-SHOW AUDIT IN DATABASE us_west WHERE event_type = 'DmlAudit';
+SHOW AUDIT IN DATABASE us_west WHERE event_type = 'dml_audit';
 ```
 
 ## Creating Tenants

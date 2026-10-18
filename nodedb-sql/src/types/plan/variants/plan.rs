@@ -16,8 +16,8 @@ use crate::types::query::{
 use super::super::vector_opts::{ArrayPrefilter, VectorAnnOptions};
 
 use super::array::{
-    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArrayProjectPlan, ArraySlicePlan,
-    CreateArrayPlan, DeleteArrayPlan, InsertArrayPlan,
+    AlterArrayPlan, ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan, CreateArrayPlan,
+    DeleteArrayPlan, InsertArrayPlan,
 };
 use super::cte::CtePlan;
 use super::hybrid::{HybridSearchPlan, HybridSearchTriplePlan};
@@ -279,6 +279,9 @@ pub enum SqlPlan {
         field: String,
         query_entries: Vec<(u32, f32)>,
         top_k: usize,
+        /// The statement's residual `WHERE`. It narrows the candidates
+        /// before the `top_k` cut.
+        filters: Vec<Filter>,
         /// Resolved SELECT target list, for output-schema derivation.
         projection: Vec<Projection>,
     },
@@ -296,7 +299,9 @@ pub enum SqlPlan {
         collection: String,
         field: String,
         predicate: SpatialPredicate,
-        query_geometry: nodedb_types::geometry::Geometry,
+        /// The query geometry and its SRID. A scan whose index is in another
+        /// SRID is refused, never transformed implicitly.
+        query_geometry: nodedb_types::geometry::SridGeometry,
         distance_meters: f64,
         attribute_filters: Vec<Filter>,
         limit: usize,
@@ -394,10 +399,9 @@ pub enum SqlPlan {
     InsertArray(InsertArrayPlan),
     /// `DELETE FROM ARRAY <name> WHERE COORDS IN ((...), (...))`.
     DeleteArray(DeleteArrayPlan),
-    /// `SELECT * FROM ARRAY_SLICE(name, {dim:[lo,hi],..}, [attrs], limit)`.
+    /// `SELECT * FROM ARRAY_SLICE(name, {dim:[lo,hi],..}, [attrs], limit)`,
+    /// and `ARRAY_PROJECT(name, [attrs])` as a slice over the whole domain.
     ArraySlice(ArraySlicePlan),
-    /// `SELECT * FROM ARRAY_PROJECT(name, [attrs])`.
-    ArrayProject(ArrayProjectPlan),
     /// `SELECT * FROM ARRAY_AGG(name, attr, reducer [, group_by_dim])`.
     ArrayAgg(ArrayAggPlan),
     /// `SELECT * FROM ARRAY_ELEMENTWISE(left, right, op, attr)`.

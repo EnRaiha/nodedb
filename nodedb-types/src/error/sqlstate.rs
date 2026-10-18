@@ -198,6 +198,10 @@ pub const UNDEFINED_COLUMN: &str = "42703";
 /// more than one relation in scope.
 pub const AMBIGUOUS_COLUMN: &str = "42702";
 
+/// `42803` — `grouping_error`: a grouped SELECT list reads a column that is
+/// neither a GROUP BY key nor inside an aggregate.
+pub const GROUPING_ERROR: &str = "42803";
+
 /// `42804` — `datatype_mismatch` (a literal the declared column type cannot
 /// represent, such as a column `DEFAULT` refused at `CREATE`)
 pub const DATATYPE_MISMATCH: &str = "42804";
@@ -439,6 +443,7 @@ mod tests {
             SYNTAX_ERROR,
             UNDEFINED_COLUMN,
             AMBIGUOUS_COLUMN,
+            GROUPING_ERROR,
             UNDEFINED_OBJECT,
             DATATYPE_MISMATCH,
             WRONG_OBJECT_TYPE,
@@ -503,6 +508,7 @@ mod tests {
         assert_eq!(UNIQUE_VIOLATION, "23505");
         assert_eq!(UNDEFINED_COLUMN, "42703");
         assert_eq!(AMBIGUOUS_COLUMN, "42702");
+        assert_eq!(GROUPING_ERROR, "42803");
         assert_eq!(UNDEFINED_TABLE, "42P01");
         assert_eq!(INSUFFICIENT_PRIVILEGE, "42501");
         assert_eq!(QUERY_CANCELED.0, "57014");

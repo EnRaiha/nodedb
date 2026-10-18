@@ -2,6 +2,8 @@
 
 //! R*-tree node splitting (axis split strategy).
 
+use nodedb_types::BboxSpace;
+
 use super::node::{ChildRef, MIN_FILL_INTERNAL, MIN_FILL_LEAF, Node, NodeKind, RTreeEntry};
 use super::tree::RTree;
 
@@ -9,21 +11,22 @@ use super::tree::RTree;
 pub(crate) fn split_node(tree: &mut RTree, node_idx: usize) {
     let is_root = node_idx == tree.root;
     let level = tree.nodes[node_idx].level;
+    let space = tree.space;
 
     let (sibling_idx, sibling_bbox) = match &mut tree.nodes[node_idx].kind {
         NodeKind::Leaf { entries } => {
             let all = std::mem::take(entries);
-            let (keep, split_off) = split_leaf_entries(all);
+            let (keep, split_off) = split_leaf_entries(all, space);
             if let NodeKind::Leaf { entries } = &mut tree.nodes[node_idx].kind {
                 *entries = keep;
             }
-            tree.nodes[node_idx].recompute_bbox();
+            tree.nodes[node_idx].recompute_bbox(space);
 
             let mut sibling = Node::new_leaf();
             if let NodeKind::Leaf { entries } = &mut sibling.kind {
                 *entries = split_off;
             }
-            sibling.recompute_bbox();
+            sibling.recompute_bbox(space);
             let bbox = sibling.bbox;
             let idx = tree.nodes.len();
             tree.nodes.push(sibling);
@@ -31,17 +34,17 @@ pub(crate) fn split_node(tree: &mut RTree, node_idx: usize) {
         }
         NodeKind::Internal { children } => {
             let all = std::mem::take(children);
-            let (keep, split_off) = split_internal_children(all);
+            let (keep, split_off) = split_internal_children(all, space);
             if let NodeKind::Internal { children } = &mut tree.nodes[node_idx].kind {
                 *children = keep;
             }
-            tree.nodes[node_idx].recompute_bbox();
+            tree.nodes[node_idx].recompute_bbox(space);
 
             let mut sibling = Node::new_internal(level);
             if let NodeKind::Internal { children } = &mut sibling.kind {
                 *children = split_off;
             }
-            sibling.recompute_bbox();
+            sibling.recompute_bbox(space);
             let bbox = sibling.bbox;
             let idx = tree.nodes.len();
             tree.nodes.push(sibling);
@@ -62,7 +65,7 @@ pub(crate) fn split_node(tree: &mut RTree, node_idx: usize) {
                 node_idx: sibling_idx,
             });
         }
-        new_root.recompute_bbox();
+        new_root.recompute_bbox(space);
         let new_root_idx = tree.nodes.len();
         tree.nodes.push(new_root);
         tree.root = new_root_idx;
@@ -82,7 +85,7 @@ pub(crate) fn split_node(tree: &mut RTree, node_idx: usize) {
                     }
                 }
             }
-            tree.nodes[pidx].recompute_bbox();
+            tree.nodes[pidx].recompute_bbox(space);
             if tree.nodes[pidx].is_overflow() {
                 split_node(tree, pidx);
             }
@@ -91,29 +94,35 @@ pub(crate) fn split_node(tree: &mut RTree, node_idx: usize) {
 }
 
 /// Choose split axis (min margin sum), then split index (min overlap).
-fn split_leaf_entries(mut entries: Vec<RTreeEntry>) -> (Vec<RTreeEntry>, Vec<RTreeEntry>) {
+fn split_leaf_entries(
+    mut entries: Vec<RTreeEntry>,
+    space: BboxSpace,
+) -> (Vec<RTreeEntry>, Vec<RTreeEntry>) {
     let min_fill = MIN_FILL_LEAF;
-    let best_axis = choose_best_axis_leaf(&mut entries, min_fill);
+    let best_axis = choose_best_axis_leaf(&mut entries, min_fill, space);
 
     sort_entries_by_axis(&mut entries, best_axis);
-    let best_k = choose_best_split_leaf(&entries, min_fill);
+    let best_k = choose_best_split_leaf(&entries, min_fill, space);
 
     let split_off = entries.split_off(best_k);
     (entries, split_off)
 }
 
-fn split_internal_children(mut children: Vec<ChildRef>) -> (Vec<ChildRef>, Vec<ChildRef>) {
+fn split_internal_children(
+    mut children: Vec<ChildRef>,
+    space: BboxSpace,
+) -> (Vec<ChildRef>, Vec<ChildRef>) {
     let min_fill = MIN_FILL_INTERNAL;
-    let best_axis = choose_best_axis_internal(&mut children, min_fill);
+    let best_axis = choose_best_axis_internal(&mut children, min_fill, space);
 
     sort_children_by_axis(&mut children, best_axis);
-    let best_k = choose_best_split_internal(&children, min_fill);
+    let best_k = choose_best_split_internal(&children, min_fill, space);
 
     let split_off = children.split_off(best_k);
     (children, split_off)
 }
 
-fn choose_best_axis_leaf(entries: &mut [RTreeEntry], min_fill: usize) -> usize {
+fn choose_best_axis_leaf(entries: &mut [RTreeEntry], min_fill: usize, space: BboxSpace) -> usize {
     let mut best_axis = 0;
     let mut best_margin = f64::INFINITY;
     for axis in 0..2 {
@@ -122,10 +131,10 @@ fn choose_best_axis_leaf(entries: &mut [RTreeEntry], min_fill: usize) -> usize {
         for k in min_fill..=(entries.len() - min_fill) {
             let left = entries[..k]
                 .iter()
-                .fold(entries[0].bbox, |a, e| a.union(&e.bbox));
+                .fold(entries[0].bbox, |a, e| a.union_in(&e.bbox, space));
             let right = entries[k..]
                 .iter()
-                .fold(entries[k].bbox, |a, e| a.union(&e.bbox));
+                .fold(entries[k].bbox, |a, e| a.union_in(&e.bbox, space));
             margin_sum += left.margin() + right.margin();
         }
         if margin_sum < best_margin {
@@ -136,7 +145,11 @@ fn choose_best_axis_leaf(entries: &mut [RTreeEntry], min_fill: usize) -> usize {
     best_axis
 }
 
-fn choose_best_axis_internal(children: &mut [ChildRef], min_fill: usize) -> usize {
+fn choose_best_axis_internal(
+    children: &mut [ChildRef],
+    min_fill: usize,
+    space: BboxSpace,
+) -> usize {
     let mut best_axis = 0;
     let mut best_margin = f64::INFINITY;
     for axis in 0..2 {
@@ -145,10 +158,10 @@ fn choose_best_axis_internal(children: &mut [ChildRef], min_fill: usize) -> usiz
         for k in min_fill..=(children.len() - min_fill) {
             let left = children[..k]
                 .iter()
-                .fold(children[0].bbox, |a, c| a.union(&c.bbox));
+                .fold(children[0].bbox, |a, c| a.union_in(&c.bbox, space));
             let right = children[k..]
                 .iter()
-                .fold(children[k].bbox, |a, c| a.union(&c.bbox));
+                .fold(children[k].bbox, |a, c| a.union_in(&c.bbox, space));
             margin_sum += left.margin() + right.margin();
         }
         if margin_sum < best_margin {
@@ -159,17 +172,17 @@ fn choose_best_axis_internal(children: &mut [ChildRef], min_fill: usize) -> usiz
     best_axis
 }
 
-fn choose_best_split_leaf(entries: &[RTreeEntry], min_fill: usize) -> usize {
+fn choose_best_split_leaf(entries: &[RTreeEntry], min_fill: usize, space: BboxSpace) -> usize {
     let mut best_k = min_fill;
     let mut best_overlap = f64::INFINITY;
     let mut best_area = f64::INFINITY;
     for k in min_fill..=(entries.len() - min_fill) {
         let left = entries[..k]
             .iter()
-            .fold(entries[0].bbox, |a, e| a.union(&e.bbox));
+            .fold(entries[0].bbox, |a, e| a.union_in(&e.bbox, space));
         let right = entries[k..]
             .iter()
-            .fold(entries[k].bbox, |a, e| a.union(&e.bbox));
+            .fold(entries[k].bbox, |a, e| a.union_in(&e.bbox, space));
         let overlap = left.overlap_area(&right);
         let area = left.area() + right.area();
         if overlap < best_overlap || (overlap == best_overlap && area < best_area) {
@@ -181,17 +194,17 @@ fn choose_best_split_leaf(entries: &[RTreeEntry], min_fill: usize) -> usize {
     best_k
 }
 
-fn choose_best_split_internal(children: &[ChildRef], min_fill: usize) -> usize {
+fn choose_best_split_internal(children: &[ChildRef], min_fill: usize, space: BboxSpace) -> usize {
     let mut best_k = min_fill;
     let mut best_overlap = f64::INFINITY;
     let mut best_area = f64::INFINITY;
     for k in min_fill..=(children.len() - min_fill) {
         let left = children[..k]
             .iter()
-            .fold(children[0].bbox, |a, c| a.union(&c.bbox));
+            .fold(children[0].bbox, |a, c| a.union_in(&c.bbox, space));
         let right = children[k..]
             .iter()
-            .fold(children[k].bbox, |a, c| a.union(&c.bbox));
+            .fold(children[k].bbox, |a, c| a.union_in(&c.bbox, space));
         let overlap = left.overlap_area(&right);
         let area = left.area() + right.area();
         if overlap < best_overlap || (overlap == best_overlap && area < best_area) {

@@ -7,7 +7,7 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::spatial_refine::{
-    SpatialHit, apply_predicate, extract_geometry, hit_rows, project_doc,
+    SpatialHit, apply_predicate, extract_geometry, hit_rows, mixed_srid_error, project_doc,
 };
 use crate::data::executor::handlers::transaction::overlay::SpatialOverlayMergeParams;
 use crate::data::executor::response_codec;
@@ -24,7 +24,7 @@ pub(super) struct SpatialFullScanParams<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub predicate: &'a SpatialPredicate,
-    pub query_geom: &'a nodedb_types::geometry::Geometry,
+    pub query_geom: &'a nodedb_types::geometry::SridGeometry,
     pub distance_meters: f64,
     pub limit: usize,
     pub projection: &'a [String],
@@ -102,8 +102,13 @@ impl CoreLoop {
                 None => continue,
             };
 
-            if !apply_predicate(predicate, query_geom, &doc_geom, distance_meters) {
-                continue;
+            match apply_predicate(predicate, query_geom, &doc_geom, distance_meters) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(mismatch) => {
+                    return self
+                        .response_error(task, mixed_srid_error(collection, field, mismatch));
+                }
             }
 
             match ScanFilter::all_match_value(attr_filters, &doc) {

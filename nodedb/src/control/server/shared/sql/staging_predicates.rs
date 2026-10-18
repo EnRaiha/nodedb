@@ -710,9 +710,15 @@ mod tests {
             StagedTagKind::Delete
         );
 
-        let slice = PhysicalPlan::Array(ArrayOp::Project {
+        let slice = PhysicalPlan::Array(ArrayOp::Slice {
             array_id: ArrayId::new(TenantId::new(1), "a"),
-            attr_indices: Vec::new(),
+            slice_msgpack: Vec::new(),
+            attr_projection: Vec::new(),
+            limit: 0,
+            cell_filter: None,
+            shard_bucket: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
         });
         assert!(!is_stageable_write(&slice));
     }

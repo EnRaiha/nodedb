@@ -189,7 +189,7 @@ pub(crate) fn owner_response(
     let payload = match payloads.len() {
         0 => Vec::new(),
         1 => payloads.into_iter().next().unwrap_or_default(),
-        _ => merge_msgpack_arrays(&payloads),
+        _ => merge_msgpack_arrays(&payloads)?,
     };
     Ok(response(
         Status::Ok,

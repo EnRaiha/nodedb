@@ -181,6 +181,33 @@ impl SqlCatalog for OriginCatalog {
         }))
     }
 
+    /// The time key the collection stores, as `CREATE COLLECTION` designated
+    /// it. A later `ALTER ADD COLUMN` cannot change it.
+    fn timeseries_time_key(
+        &self,
+        _database_id: nodedb_types::DatabaseId,
+        name: &str,
+    ) -> std::result::Result<Option<String>, SqlCatalogError> {
+        let stored = self
+            .credentials
+            .catalog()
+            .get_collection(self.database_id, self.tenant_id, name)
+            .map_err(|e| SqlCatalogError::Unreadable {
+                relation: name.to_string(),
+                detail: e.to_string(),
+            })?;
+        Ok(stored.and_then(|stored| {
+            if let nodedb_types::CollectionType::Columnar(
+                nodedb_types::columnar::ColumnarProfile::Timeseries { time_key, .. },
+            ) = stored.collection_type
+            {
+                Some(time_key)
+            } else {
+                None
+            }
+        }))
+    }
+
     fn resolve_regclass(
         &self,
         _database_id: nodedb_types::DatabaseId,
@@ -269,11 +296,9 @@ impl SqlCatalog for OriginCatalog {
     }
 
     fn lookup_array(&self, name: &str) -> Option<ArrayCatalogView> {
-        use nodedb_array::schema::{ArraySchema, AttrType as EAT, DimType as EDT};
+        use nodedb_array::schema::{ArraySchema, DimType as EDT};
         use nodedb_array::types::domain::DomainBound;
-        use nodedb_sql::types_array::{
-            ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound,
-        };
+        use nodedb_sql::types_array::{ArrayAttrAst, ArrayDimAst, ArrayDimType, ArrayDomainBound};
 
         let entry = {
             // A poisoned lock still holds a consistent mirror: every writer
@@ -311,12 +336,9 @@ impl SqlCatalog for OriginCatalog {
             .iter()
             .map(|a| ArrayAttrAst {
                 name: a.name.clone(),
-                dtype: match a.dtype {
-                    EAT::Int64 => ArrayAttrType::Int64,
-                    EAT::Float64 => ArrayAttrType::Float64,
-                    EAT::String => ArrayAttrType::String,
-                    EAT::Bytes => ArrayAttrType::Bytes,
-                },
+                dtype: crate::control::planner::sql_plan_convert::array_convert::sql_attr_type(
+                    a.dtype,
+                ),
                 nullable: a.nullable,
             })
             .collect();

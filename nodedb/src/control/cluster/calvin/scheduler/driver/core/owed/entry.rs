@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use nodedb_cluster::calvin::{AbortReason, ParticipantProgress, SequencerEntry};
+use nodedb_cluster::calvin::{AbortCause, ParticipantProgress, SequencerEntry};
 
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::control::cluster::calvin::scheduler::metrics::sequencer_propose_kind;
@@ -19,8 +19,8 @@ use crate::control::cluster::calvin::scheduler::metrics::sequencer_propose_kind;
 /// A sequencer entry the scheduler proposes for one txn on its vShard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerProposal {
-    /// This vShard's commit vote. `Some(reason)` is an abort vote.
-    Vote { abort: Option<AbortReason> },
+    /// This vShard's commit vote. `Some(cause)` is an abort vote.
+    Vote { abort: Option<AbortCause> },
     /// This vShard applied or dropped the txn. `result` is the apply result
     /// the coordinator reads: the timeseries install counts of the apply.
     /// Empty when there are none.
@@ -46,13 +46,12 @@ impl SchedulerProposal {
                 position,
                 vshard,
             },
-            Self::Vote {
-                abort: Some(reason),
-            } => SequencerEntry::AbortVote {
+            Self::Vote { abort: Some(cause) } => SequencerEntry::AbortVote {
                 epoch,
                 position,
                 vshard,
-                reason: *reason,
+                reason: cause.reason,
+                refusal: cause.refusal.clone(),
             },
             Self::CompletionAck { result } => SequencerEntry::CompletionAck {
                 epoch,
@@ -131,6 +130,8 @@ pub type OwedEntries = BTreeMap<(TxnId, OwedKind), OwedEntry>;
 
 #[cfg(test)]
 mod tests {
+    use nodedb_cluster::calvin::AbortReason;
+
     use super::*;
 
     fn progress() -> ParticipantProgress {
@@ -197,19 +198,20 @@ mod tests {
         ));
         assert!(matches!(
             SchedulerProposal::Vote {
-                abort: Some(AbortReason::SerializationConflict)
+                abort: Some(AbortReason::SerializationConflict.into())
             }
             .entry(txn, 9, 1),
             SequencerEntry::AbortVote {
                 epoch: 3,
                 position: 4,
                 vshard: 9,
-                reason: AbortReason::SerializationConflict
+                reason: AbortReason::SerializationConflict,
+                refusal: None,
             }
         ));
         assert!(matches!(
             SchedulerProposal::Vote {
-                abort: Some(AbortReason::PlanRejected)
+                abort: Some(AbortReason::PlanRejected.into())
             }
             .entry(txn, 9, 1),
             SequencerEntry::AbortVote {
@@ -217,5 +219,22 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_vote_proposal_carries_its_refusal() {
+        assert_eq!(
+            SchedulerProposal::Vote {
+                abort: Some(AbortCause::refused(vec![1, 2]))
+            }
+            .entry(TxnId::new(3, 5), 9, 1),
+            SequencerEntry::AbortVote {
+                epoch: 3,
+                position: 5,
+                vshard: 9,
+                reason: AbortReason::ParticipantError,
+                refusal: Some(vec![1, 2]),
+            }
+        );
     }
 }

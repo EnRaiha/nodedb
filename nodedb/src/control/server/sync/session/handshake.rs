@@ -154,11 +154,14 @@ impl SyncSession {
         // is unverifiable and the handshake is refused rather than falling
         // through to the trust branch above.
         let identity = match shared {
-            Some(state) => {
-                crate::control::server::session_auth::authenticate_bearer_jwt(state, &msg.jwt_token)
-                    .await
-                    .map(|(identity, _claims)| identity)
-            }
+            Some(state) => crate::control::server::session_auth::authenticate_bearer_jwt(
+                state,
+                &msg.jwt_token,
+                &self.device_metadata.remote_addr,
+                &self.session_id,
+            )
+            .await
+            .map(|(identity, _claims)| identity),
             None => None,
         };
         let Some(identity) = identity else {

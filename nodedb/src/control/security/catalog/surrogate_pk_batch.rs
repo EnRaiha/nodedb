@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Batched surrogate ↔ PK catalog ops for the `_system.surrogate_pk{,_rev}_v3`
-//! tables.
+//! Batched surrogate ↔ PK catalog ops on the surrogate PK map tables.
 //!
 //! A batch binds many keys of one collection in one redb write transaction.
 //! The transaction commits once with the database's default durability, so a
-//! batch of N keys costs one durable sync instead of N.
+//! batch of N keys costs one durable sync instead of N. A batch sorts its keys
+//! and walks each table with one cursor (see [`super::surrogate_sorted`]).
 
 use nodedb_types::{CollectionKey, DatabaseId, Surrogate, TenantId};
-use redb::{ReadableDatabase, ReadableTable};
+use redb::ReadableDatabase;
 
 use crate::types::SurrogateBindEntry;
 
 use super::surrogate_hwm::{HWM_KEY, SURROGATE_HWM};
-use super::types::{SURROGATE_PK_REV_V3, SURROGATE_PK_V3, SystemCatalog, catalog_err};
+use super::surrogate_scope::{read_scope, rev_key, scope_or_create};
+use super::surrogate_sorted::{SortedKeys, insert_rev_sorted, merge_insert, probe};
+use super::types::{SURROGATE_PK, SURROGATE_PK_REV, SystemCatalog, catalog_err};
 
 /// The outcome of binding one key in a batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,41 +56,44 @@ impl SystemCatalog {
         if rows.is_empty() && hwm.is_none() {
             return Ok(Vec::new());
         }
-        let db_id = key.database_id().as_u64();
-        let tid = tenant_id.as_u64();
-        let collection = key.name();
         let txn = self
             .db
             .begin_write()
             .map_err(|e| catalog_err("surrogate_pk batch write txn", e))?;
         let mut out = Vec::with_capacity(rows.len());
         {
-            let mut fwd = txn
-                .open_table(SURROGATE_PK_V3)
-                .map_err(|e| catalog_err("open surrogate_pk", e))?;
-            let mut rev = txn
-                .open_table(SURROGATE_PK_REV_V3)
-                .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
-            for &(pk_bytes, surrogate) in rows {
-                let existing = fwd
-                    .get((db_id, tid, collection, pk_bytes))
-                    .map_err(|e| catalog_err("get surrogate_pk", e))?
-                    .map(|v| Surrogate::new(v.value()));
-                if let Some(bound) = existing {
-                    out.push(BatchBinding {
-                        surrogate: bound,
-                        inserted: false,
+            if !rows.is_empty() {
+                let scope = scope_or_create(&txn, key, tenant_id)?;
+                let keys = SortedKeys::new(scope, rows.iter().map(|&(pk, _)| pk));
+                // A repeated key binds the surrogate of its first occurrence.
+                let carried = |u: usize| rows[keys.first(u)].1.as_u32();
+                let before = {
+                    let mut fwd = txn
+                        .open_table(SURROGATE_PK)
+                        .map_err(|e| catalog_err("open surrogate_pk", e))?;
+                    merge_insert(&mut fwd, &keys, carried)?
+                };
+                let reverse: Vec<(u128, &[u8])> = (0..keys.len())
+                    .filter(|&u| before[u].is_none())
+                    .map(|u| (rev_key(scope, carried(u)), keys.pk(u)))
+                    .collect();
+                let mut rev = txn
+                    .open_table(SURROGATE_PK_REV)
+                    .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
+                insert_rev_sorted(&mut rev, reverse)?;
+                for i in 0..rows.len() {
+                    let u = keys.unique_of(i);
+                    out.push(match before[u] {
+                        Some(bound) => BatchBinding {
+                            surrogate: Surrogate::new(bound),
+                            inserted: false,
+                        },
+                        None => BatchBinding {
+                            surrogate: Surrogate::new(carried(u)),
+                            inserted: keys.first(u) == i,
+                        },
                     });
-                    continue;
                 }
-                fwd.insert((db_id, tid, collection, pk_bytes), surrogate.as_u32())
-                    .map_err(|e| catalog_err("insert surrogate_pk", e))?;
-                rev.insert((db_id, tid, collection, surrogate.as_u32()), pk_bytes)
-                    .map_err(|e| catalog_err("insert surrogate_pk_rev", e))?;
-                out.push(BatchBinding {
-                    surrogate,
-                    inserted: true,
-                });
             }
             if let Some(hwm) = hwm {
                 let mut table = txn
@@ -105,9 +110,10 @@ impl SystemCatalog {
     }
 
     /// Insert or overwrite many bindings of one collection in one write
-    /// transaction, as [`Self::put_surrogate`] does for one. A later row for a
-    /// key replaces an earlier one. Used where the caller's bindings are
-    /// authoritative, such as a Raft snapshot install.
+    /// transaction. A later row for a key replaces an earlier one. A key that
+    /// moves to a new surrogate loses the reverse row of its old one. Used
+    /// where the caller's bindings are authoritative, such as a Raft snapshot
+    /// install.
     pub fn overwrite_surrogates(
         &self,
         key: CollectionKey<'_>,
@@ -117,26 +123,46 @@ impl SystemCatalog {
         if rows.is_empty() {
             return Ok(());
         }
-        let db_id = key.database_id().as_u64();
-        let tid = tenant_id.as_u64();
-        let collection = key.name();
         let txn = self
             .db
             .begin_write()
             .map_err(|e| catalog_err("surrogate_pk overwrite txn", e))?;
         {
-            let mut fwd = txn
-                .open_table(SURROGATE_PK_V3)
-                .map_err(|e| catalog_err("open surrogate_pk", e))?;
-            let mut rev = txn
-                .open_table(SURROGATE_PK_REV_V3)
-                .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
-            for &(pk_bytes, surrogate) in rows {
-                fwd.insert((db_id, tid, collection, pk_bytes), surrogate.as_u32())
-                    .map_err(|e| catalog_err("insert surrogate_pk", e))?;
-                rev.insert((db_id, tid, collection, surrogate.as_u32()), pk_bytes)
-                    .map_err(|e| catalog_err("insert surrogate_pk_rev", e))?;
+            let scope = scope_or_create(&txn, key, tenant_id)?;
+            let keys = SortedKeys::new(scope, rows.iter().map(|&(pk, _)| pk));
+            // The last occurrence of a key is its authoritative surrogate.
+            let mut last: Vec<u32> = vec![0; keys.len()];
+            for (i, &(_, surrogate)) in rows.iter().enumerate() {
+                last[keys.unique_of(i)] = surrogate.as_u32();
             }
+            let mut stale: Vec<u128> = Vec::new();
+            {
+                let mut fwd = txn
+                    .open_table(SURROGATE_PK)
+                    .map_err(|e| catalog_err("open surrogate_pk", e))?;
+                for (u, &surrogate) in last.iter().enumerate() {
+                    let old = fwd
+                        .insert(keys.key(u), surrogate)
+                        .map_err(|e| catalog_err("insert surrogate_pk", e))?
+                        .map(|v| v.value());
+                    if let Some(old) = old.filter(|&old| old != surrogate) {
+                        stale.push(rev_key(scope, old));
+                    }
+                }
+            }
+            let mut rev = txn
+                .open_table(SURROGATE_PK_REV)
+                .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
+            for old in stale {
+                rev.remove(old)
+                    .map_err(|e| catalog_err("remove surrogate_pk_rev", e))?;
+            }
+            let reverse: Vec<(u128, &[u8])> = last
+                .iter()
+                .enumerate()
+                .map(|(u, &surrogate)| (rev_key(scope, surrogate), keys.pk(u)))
+                .collect();
+            insert_rev_sorted(&mut rev, reverse)?;
         }
         txn.commit()
             .map_err(|e| catalog_err("surrogate_pk overwrite commit", e))
@@ -182,24 +208,21 @@ impl SystemCatalog {
         if pks.is_empty() {
             return Ok(Vec::new());
         }
-        let db_id = key.database_id().as_u64();
-        let tid = tenant_id.as_u64();
-        let collection = key.name();
         let txn = self
             .db
             .begin_read()
             .map_err(|e| catalog_err("surrogate_pk batch read txn", e))?;
+        let Some(scope) = read_scope(&txn, key, tenant_id)? else {
+            return Ok(vec![None; pks.len()]);
+        };
         let table = txn
-            .open_table(SURROGATE_PK_V3)
+            .open_table(SURROGATE_PK)
             .map_err(|e| catalog_err("open surrogate_pk", e))?;
-        pks.iter()
-            .map(|pk_bytes| {
-                table
-                    .get((db_id, tid, collection, *pk_bytes))
-                    .map_err(|e| catalog_err("get surrogate_pk", e))
-                    .map(|hit| hit.map(|v| Surrogate::new(v.value())))
-            })
-            .collect()
+        let keys = SortedKeys::new(scope, pks.iter().copied());
+        let found = probe(&table, &keys)?;
+        Ok((0..pks.len())
+            .map(|i| found[keys.unique_of(i)].map(Surrogate::new))
+            .collect())
     }
 }
 
@@ -288,6 +311,70 @@ mod tests {
         cat.put_surrogates_with_hwm(users(), T0, &rows, Some(7))
             .expect("put");
         assert_eq!(cat.get_surrogate_hwm().expect("hwm"), 7);
+    }
+
+    /// A later batch that rewrites half the keys of an earlier one keeps
+    /// every earlier binding, binds the new keys, and leaves the reverse
+    /// table the exact inverse of the forward table.
+    #[test]
+    fn a_later_overlapping_batch_keeps_bindings_and_the_reverse_map_inverse() {
+        let (_dir, cat) = open();
+        let pks: Vec<Vec<u8>> = (0..400u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let first: Vec<(&[u8], Surrogate)> = pks[..300]
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, pk)| (pk.as_slice(), Surrogate::new(1 + i as u32)))
+            .collect();
+        cat.put_surrogates(users(), T0, &first)
+            .expect("first batch");
+        let second: Vec<(&[u8], Surrogate)> = pks[150..]
+            .iter()
+            .enumerate()
+            .map(|(i, pk)| (pk.as_slice(), Surrogate::new(10_000 + i as u32)))
+            .collect();
+        let out = cat
+            .put_surrogates(users(), T0, &second)
+            .expect("second batch");
+        for (i, binding) in out.iter().enumerate() {
+            let index = 150 + i;
+            if index < 300 {
+                assert_eq!(binding.surrogate, Surrogate::new(1 + index as u32));
+                assert!(!binding.inserted);
+            } else {
+                assert_eq!(binding.surrogate, Surrogate::new(10_000 + i as u32));
+                assert!(binding.inserted);
+            }
+        }
+        let scanned = cat
+            .scan_surrogates_for_collection(users(), T0)
+            .expect("scan");
+        assert_eq!(scanned.len(), 400);
+        for (pk, surrogate) in &scanned {
+            assert_eq!(
+                cat.get_pk_for_surrogate(users(), T0, *surrogate)
+                    .expect("rev"),
+                Some(pk.clone())
+            );
+        }
+        for losing in 10_000..10_150u32 {
+            assert_eq!(
+                cat.get_pk_for_surrogate(users(), T0, Surrogate::new(losing))
+                    .expect("rev"),
+                None,
+                "a losing carried surrogate writes no reverse row"
+            );
+        }
+        let refs: Vec<&[u8]> = pks.iter().map(Vec::as_slice).collect();
+        let read = cat
+            .get_surrogates_for_pks(users(), T0, &refs)
+            .expect("read");
+        for (pk, hit) in refs.iter().zip(&read) {
+            assert_eq!(
+                *hit,
+                cat.get_surrogate_for_pk(users(), T0, pk).expect("get")
+            );
+        }
     }
 
     #[test]

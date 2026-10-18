@@ -36,8 +36,7 @@ use crate::engine::spatial::{RTree, RTreeEntry};
 use crate::types::TenantId;
 use crate::util::fnv1a_hash;
 use nodedb_types::Surrogate;
-use nodedb_types::bbox::geometry_bbox;
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::{Geometry, SridGeometry};
 use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 
 /// Parameters for a spatial geometry insert on the Data Plane.
@@ -50,7 +49,7 @@ pub(in crate::data::executor) struct SpatialInsertExec<'a> {
     pub collection: &'a str,
     pub field: &'a str,
     pub surrogate: Surrogate,
-    pub geometry: &'a Geometry,
+    pub geometry: &'a SridGeometry,
     pub provenance: Option<&'a SyncProvenance>,
 }
 
@@ -113,6 +112,23 @@ impl CoreLoop {
             }
         }
 
+        // ── SRID check, before any write ────────────────────────────────────
+        let db_id = task.request.database_id;
+        let tenant_id = TenantId::new(tid);
+        let spatial_key = (db_id, tenant_id, collection.to_string(), field.to_string());
+        if let Some(rtree) = self.spatial_indexes.get(&spatial_key)
+            && !rtree.accepts_srid(geometry.srid)
+        {
+            let mismatch = crate::engine::spatial::SridMismatch {
+                index: rtree.srid(),
+                entry: geometry.srid,
+            };
+            return self.response_error(
+                task,
+                super::spatial_refine::mixed_srid_error(collection, field, mismatch),
+            );
+        }
+
         // ── 1. Serialise + write minimal geometry document to sparse store ──
         let geom_value = geometry_to_value(geometry);
         let mut doc_map = std::collections::HashMap::new();
@@ -164,9 +180,6 @@ impl CoreLoop {
         }
 
         // ── 2. Update R-tree ────────────────────────────────────────────────
-        let db_id = task.request.database_id;
-        let tenant_id = TenantId::new(tid);
-        let spatial_key = (db_id, tenant_id, collection.to_string(), field.to_string());
         let entry_id = fnv1a_hash(doc_id.as_bytes());
         let doc_map_key = (
             db_id,
@@ -184,7 +197,7 @@ impl CoreLoop {
             rtree.delete(entry_id);
         }
 
-        let bbox = geometry_bbox(geometry);
+        let bbox = geometry.bbox();
         let memory = nodedb_mem::ScopedMemory::new(
             self.governor.clone(),
             db_id,
@@ -194,7 +207,15 @@ impl CoreLoop {
         let rtree = self
             .spatial_indexes
             .entry(spatial_key)
-            .or_insert_with(|| RTree::new(memory));
+            .or_insert_with(|| RTree::new(memory, geometry.srid));
+        // The SRID check above admitted this SRID; the stale-entry delete can
+        // only empty the tree.
+        if let Err(mismatch) = rtree.bind_srid(geometry.srid) {
+            return self.response_error(
+                task,
+                super::spatial_refine::mixed_srid_error(collection, field, mismatch),
+            );
+        }
         rtree.insert(RTreeEntry { id: entry_id, bbox });
         self.spatial_doc_map.insert(doc_map_key, doc_id);
 
@@ -308,16 +329,38 @@ impl CoreLoop {
     }
 }
 
-/// Convert a `Geometry` into a `nodedb_types::Value` for msgpack serialisation.
+/// Convert a `SridGeometry` into a `nodedb_types::Value` for msgpack
+/// serialisation.
 ///
 /// Produces a JSON-compatible nested structure matching what a pgwire INSERT
-/// with a GeoJSON geometry value would produce.
+/// with a GeoJSON geometry value produces. A non-4326 SRID adds the
+/// GeoJSON `crs` member, so the read path recovers the SRID.
 ///
 /// Shared with the in-transaction staging path
 /// (`transaction::stage_write::stage_spatial`), which stages the identical
 /// `{field: geometry, "id": surrogate_hex}` document shape as an overlay
 /// `Put` body.
-pub(in crate::data::executor) fn geometry_to_value(geometry: &Geometry) -> nodedb_types::Value {
+pub(in crate::data::executor) fn geometry_to_value(geometry: &SridGeometry) -> nodedb_types::Value {
+    use nodedb_types::Value;
+    let mut shape = shape_to_value(&geometry.geometry);
+    if !geometry.srid.is_geographic()
+        && let Value::Object(map) = &mut shape
+    {
+        let mut properties = std::collections::HashMap::new();
+        properties.insert(
+            "name".to_string(),
+            Value::String(format!("EPSG:{}", geometry.srid.code())),
+        );
+        let mut crs = std::collections::HashMap::new();
+        crs.insert("type".to_string(), Value::String("name".to_string()));
+        crs.insert("properties".to_string(), Value::Object(properties));
+        map.insert("crs".to_string(), Value::Object(crs));
+    }
+    shape
+}
+
+/// The GeoJSON object of one shape, as a `Value`.
+fn shape_to_value(geometry: &Geometry) -> nodedb_types::Value {
     use nodedb_types::Value;
     use nodedb_types::geometry::Geometry::*;
 
@@ -415,7 +458,7 @@ mod tests {
             collection: "places",
             field: "loc",
             surrogate,
-            geometry: &Geometry::point(10.0, 20.0),
+            geometry: &SridGeometry::wgs84(Geometry::point(10.0, 20.0)),
             provenance: None,
         })
     }

@@ -5,6 +5,7 @@
 use crate::error::Result;
 use crate::types::SqlPlan;
 
+use super::bulk_load::{BulkLoadParams, BulkLoadPlan};
 use super::params::{
     AggregateParams, DeleteParams, InsertParams, InsertSelectParams, MergeParams, PointGetParams,
     ScanParams, TruncateParams, UpdateFromParams, UpdateParams, UpsertParams,
@@ -45,6 +46,10 @@ pub trait EngineRules {
     /// Plan a TRUNCATE. Returns `Err(SqlError::Unsupported)` for engines
     /// that carry no whole-collection clear on the SQL surface (array).
     fn plan_truncate(&self, params: TruncateParams) -> Result<Vec<SqlPlan>>;
+    /// Plan one chunk of a bulk load (`COPY ... FROM`), or say how the
+    /// engine loads rows when the parameters carry no cells. Returns `Err`
+    /// for an engine that refuses a bulk load (timeseries, spatial).
+    fn plan_bulk_load(&self, params: BulkLoadParams) -> Result<BulkLoadPlan>;
     /// Plan a GROUP BY / aggregate query.
     fn plan_aggregate(&self, params: AggregateParams) -> Result<SqlPlan>;
     /// Plan a MERGE statement.

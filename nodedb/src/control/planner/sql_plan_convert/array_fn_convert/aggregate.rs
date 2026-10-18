@@ -2,34 +2,35 @@
 
 //! ARRAY_AGG → PhysicalPlan::Array(ArrayOp::Aggregate) or ClusterArray(Agg).
 
-use nodedb_array::schema::ArraySchema;
 use nodedb_array::types::ArrayId;
-use nodedb_sql::temporal::TemporalScope;
-use nodedb_sql::types_array::ArrayReducerAst;
+use nodedb_sql::ArrayAggVisitArgs;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
 
 use super::super::convert::ConvertContext;
-use super::helpers::{load_entry, map_reducer};
+use super::helpers::{decode_schema, load_entry, map_reducer};
+use super::region::resolve_region;
+use super::tile_keys::compute_slice_tile_keys;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 pub(crate) fn convert_agg(
-    name: &str,
-    attr: &str,
-    reducer: ArrayReducerAst,
-    group_by_dim: Option<&str>,
-    temporal: TemporalScope,
+    args: ArrayAggVisitArgs<'_>,
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ArrayAggVisitArgs {
+        name,
+        attr,
+        reducer,
+        group_by_dim,
+        slice,
+        zone,
+        temporal,
+    } = args;
     let entry = load_entry(name, tenant_id, ctx)?;
-    let schema: ArraySchema =
-        zerompk::from_msgpack(&entry.schema_msgpack).map_err(|e| crate::Error::Serialization {
-            format: "msgpack".into(),
-            detail: format!("array schema decode: {e}"),
-        })?;
+    let schema = decode_schema(&entry)?;
 
     let attr_idx = schema
         .attrs
@@ -51,7 +52,17 @@ pub(crate) fn convert_agg(
     };
 
     let (system_as_of, valid_at_ms) =
-        super::helpers::resolve_array_temporal(temporal, "ARRAY_AGG")?;
+        super::helpers::resolve_array_temporal(*temporal, "ARRAY_AGG")?;
+    let region = resolve_region(name, slice, zone, &schema)?;
+    let region_msgpack = match &region {
+        Some(region) => {
+            zerompk::to_msgpack_vec(region).map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("array region encode: {e}"),
+            })?
+        }
+        None => Vec::new(),
+    };
     let mapped = map_reducer(reducer);
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = ctx.collection_key(name).vshard();
@@ -64,15 +75,21 @@ pub(crate) fn convert_agg(
                 format: "msgpack".into(),
                 detail: format!("array reducer encode: {e}"),
             })?;
+        // The fan-out covers the shards that own a tile of the region's box.
+        let box_ranges = region
+            .as_ref()
+            .map(|r| r.slice.dim_ranges.as_slice())
+            .unwrap_or_default();
         PhysicalPlan::ClusterArray(ClusterArrayOp::Agg {
             array_id: aid,
             attr_idx,
             reducer_msgpack,
             group_by_dim: group_by_dim_idx,
-            slice_tile_keys: vec![],
+            slice_tile_keys: compute_slice_tile_keys(&schema, box_ranges, entry.prefix_bits),
             prefix_bits: entry.prefix_bits,
             system_as_of,
             valid_at_ms,
+            region_msgpack,
         })
     } else {
         PhysicalPlan::Array(ArrayOp::Aggregate {
@@ -85,6 +102,7 @@ pub(crate) fn convert_agg(
             shard_bucket: None,
             system_as_of,
             valid_at_ms,
+            region_msgpack,
         })
     };
 
@@ -103,6 +121,28 @@ mod tests {
     use super::*;
     use crate::control::array_catalog::ArrayCatalogEntry;
     use crate::control::planner::sql_plan_convert::convert::ConvertContext;
+    use nodedb_array::query::region::ArrayRegion;
+    use nodedb_array::query::slice::DimRange;
+    use nodedb_sql::temporal::TemporalScope;
+    use nodedb_sql::types_array::{
+        ArrayCoordLiteral, ArrayReducerAst, ArraySliceAst, NamedDimRange,
+    };
+
+    /// `SUM(revenue)` over `sales` within `slice`.
+    fn sum_args<'a>(
+        slice: &'a ArraySliceAst,
+        temporal: &'a TemporalScope,
+    ) -> ArrayAggVisitArgs<'a> {
+        ArrayAggVisitArgs {
+            name: "sales",
+            attr: "revenue",
+            reducer: ArrayReducerAst::Sum,
+            group_by_dim: None,
+            slice,
+            zone: None,
+            temporal,
+        }
+    }
     use nodedb_array::schema::{ArraySchemaBuilder, AttrSpec, AttrType, DimSpec, DimType};
     use nodedb_array::types::domain::{Domain, DomainBound};
 
@@ -166,34 +206,25 @@ mod tests {
     fn single_node_emits_local_agg() {
         let ctx = make_ctx(false);
         let tasks = convert_agg(
-            "sales",
-            "revenue",
-            ArrayReducerAst::Sum,
-            None,
-            TemporalScope::default(),
+            sum_args(&ArraySliceAst::default(), &TemporalScope::default()),
             TenantId::new(1),
             &ctx,
         )
         .expect("convert");
         assert_eq!(tasks.len(), 1);
-        assert!(
-            matches!(
-                &tasks[0].plan,
-                PhysicalPlan::Array(ArrayOp::Aggregate { .. })
-            ),
-            "expected local Array variant"
-        );
+        match &tasks[0].plan {
+            PhysicalPlan::Array(ArrayOp::Aggregate { region_msgpack, .. }) => {
+                assert!(region_msgpack.is_empty(), "no region reads the whole array");
+            }
+            other => panic!("expected local Array variant, got {other:?}"),
+        }
     }
 
     #[test]
     fn cluster_mode_emits_cluster_agg() {
         let ctx = make_ctx(true);
         let tasks = convert_agg(
-            "sales",
-            "revenue",
-            ArrayReducerAst::Sum,
-            None,
-            TemporalScope::default(),
+            sum_args(&ArraySliceAst::default(), &TemporalScope::default()),
             TenantId::new(1),
             &ctx,
         )
@@ -208,6 +239,69 @@ mod tests {
         );
     }
 
+    /// A box rides to every shard as the encoded region, and the fan-out
+    /// covers only the tiles inside it.
+    #[test]
+    fn a_box_encodes_the_region_and_narrows_the_fan_out() {
+        let ctx = make_ctx(true);
+        let slice = ArraySliceAst {
+            dim_ranges: vec![NamedDimRange {
+                dim: "month".into(),
+                lo: ArrayCoordLiteral::Int64(3),
+                hi: ArrayCoordLiteral::Int64(4),
+            }],
+        };
+        let tasks = convert_agg(
+            sum_args(&slice, &TemporalScope::default()),
+            TenantId::new(1),
+            &ctx,
+        )
+        .expect("convert");
+        let PhysicalPlan::ClusterArray(ClusterArrayOp::Agg {
+            region_msgpack,
+            slice_tile_keys,
+            ..
+        }) = &tasks[0].plan
+        else {
+            panic!("expected ClusterArray variant, got {:?}", tasks[0].plan);
+        };
+        let region: ArrayRegion = zerompk::from_msgpack(region_msgpack).expect("region decodes");
+        assert_eq!(
+            region.slice.dim_ranges,
+            vec![Some(DimRange::new(
+                DomainBound::Int64(3),
+                DomainBound::Int64(4)
+            ))]
+        );
+        assert!(region.zone.is_none());
+        assert!(
+            (1..=2).contains(&slice_tile_keys.len()),
+            "two one-month tiles fan out to at most two buckets: {slice_tile_keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_box_on_an_unknown_dim_is_refused() {
+        let ctx = make_ctx(false);
+        let slice = ArraySliceAst {
+            dim_ranges: vec![NamedDimRange {
+                dim: "year".into(),
+                lo: ArrayCoordLiteral::Int64(1),
+                hi: ArrayCoordLiteral::Int64(2),
+            }],
+        };
+        let err = convert_agg(
+            sum_args(&slice, &TemporalScope::default()),
+            TenantId::new(1),
+            &ctx,
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(&err, crate::Error::PlanError { detail } if detail.contains("no dim 'year'")),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn all_versions_aggregate_is_rejected() {
         // AS OF SYSTEM TIME NULL (AllVersions) is meaningless for an aggregate —
@@ -216,18 +310,14 @@ mod tests {
         // live read. This is why `ArrayOp::Aggregate` / `ClusterArrayOp::Agg`
         // carry `Option<i64>` (Current | AsOf) and not `SystemTimeScope`: the
         // AllVersions state is made unrepresentable by rejecting it here.
-        // Audit-log reads go through NDARRAY_SLICE instead.
+        // Audit-log reads go through ARRAY_SLICE instead.
         let ctx = make_ctx(false);
         let temporal = TemporalScope {
             system_time: nodedb_types::SystemTimeScope::AllVersions,
             ..TemporalScope::default()
         };
         let err = convert_agg(
-            "sales",
-            "revenue",
-            ArrayReducerAst::Sum,
-            None,
-            temporal,
+            sum_args(&ArraySliceAst::default(), &temporal),
             TenantId::new(1),
             &ctx,
         )

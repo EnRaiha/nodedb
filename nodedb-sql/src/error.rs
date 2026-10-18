@@ -85,6 +85,16 @@ pub enum SqlError {
     #[error("ambiguous column '{column}' — qualify with table name")]
     AmbiguousColumn { column: String },
 
+    /// A grouped SELECT list reads a column that is neither a GROUP BY key
+    /// nor inside an aggregate. The finalized group row does not carry it.
+    /// PostgreSQL rejects the same input with SQLSTATE `42803`
+    /// (`grouping_error`).
+    #[error(
+        "column \"{column}\" must appear in the GROUP BY clause or be used in an \
+         aggregate function"
+    )]
+    UngroupedColumn { column: String },
+
     #[error("type mismatch: {detail}")]
     TypeMismatch { detail: String },
 

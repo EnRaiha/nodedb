@@ -5,8 +5,8 @@
 //! The native scan sorts its encoded group rows before LIMIT. Those rows
 //! carry each GROUP BY column under its own name, the time bucket under
 //! `bucket`, and each aggregate under its canonical key (`count(*)`,
-//! `sum(v)`). The SELECT-list aliases are applied later, by the Control
-//! Plane. So a sort key must name the encoded column: an alias resolves to
+//! `sum(v)`). The scan renames them to their SELECT-list names after the
+//! sort. So a sort key must name the encoded column: an alias resolves to
 //! its expression, an aggregate call binds to its canonical key, and a
 //! `time_bucket(...)` call names `bucket`.
 
@@ -24,7 +24,7 @@ use crate::resolver::expr::convert_expr;
 use crate::types::{AggregateExpr, SortKey};
 
 /// The column the native scan writes the time bucket under.
-const BUCKET_COLUMN: &str = "bucket";
+const BUCKET_COLUMN: &str = crate::types::TIMESERIES_BUCKET_KEY;
 
 /// Sort keys for a native grouped timeseries scan computing `aggregates`.
 ///

@@ -12,7 +12,7 @@
 use sqlparser::ast;
 
 use nodedb_query::geo_functions;
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::SridGeometry;
 
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::normalize_ident;
@@ -24,7 +24,9 @@ use crate::types::*;
 /// the caller falls through to the shared constant-folding pipeline.
 ///
 /// The stored form is a GeoJSON string, which is what the spatial read path
-/// parses back. A call whose arguments do not describe a valid geometry is an
+/// parses back. A geometry in any SRID other than 4326 carries the `crs`
+/// member, so the SRID survives storage. A call whose arguments do not
+/// describe a valid geometry is an
 /// error rather than a NULL: silently storing NULL for a malformed
 /// `ST_GeomFromText('POINT(')` would lose the row's geometry with no signal.
 pub(crate) fn fold_geometry_function(func: &ast::Function) -> Option<Result<SqlValue>> {
@@ -47,7 +49,7 @@ pub(crate) fn fold_geometry_function(func: &ast::Function) -> Option<Result<SqlV
 /// typed error naming the offending expression — never a Display-formatted
 /// AST handed to a parser, which reports a JSON offset into SQL source text
 /// and tells the caller nothing about what was actually wrong.
-pub(crate) fn resolve_geometry_expr(expr: &ast::Expr) -> Result<Geometry> {
+pub(crate) fn resolve_geometry_expr(expr: &ast::Expr) -> Result<SridGeometry> {
     match resolve(expr)? {
         Some(geom) => Ok(geom),
         None => Err(SqlError::InvalidFunction {
@@ -62,7 +64,7 @@ pub(crate) fn resolve_geometry_expr(expr: &ast::Expr) -> Result<Geometry> {
 ///
 /// `Ok(None)` means the expression folded but is not a geometry, or could not
 /// be folded at plan time at all.
-fn resolve(expr: &ast::Expr) -> Result<Option<Geometry>> {
+fn resolve(expr: &ast::Expr) -> Result<Option<SridGeometry>> {
     let sql_expr =
         crate::resolver::expr::convert_expr(expr, &crate::resolver::ColumnScope::Unchecked)?;
     let Some(value) = crate::planner::const_fold::fold_constant_default(&sql_expr)? else {
@@ -74,14 +76,15 @@ fn resolve(expr: &ast::Expr) -> Result<Option<Geometry>> {
 /// Geometry travels through `SqlValue` as its GeoJSON string form, which is
 /// also how it is stored; WKT literals are accepted here for the same reason
 /// they are accepted by the evaluator.
-fn geometry_from_value(value: &SqlValue) -> Option<Geometry> {
+fn geometry_from_value(value: &SqlValue) -> Option<SridGeometry> {
     match value {
         SqlValue::String(text) => geo_functions::geometry_from_text(text),
         _ => None,
     }
 }
 
-fn serialize(geom: &Geometry, name: &str) -> Result<SqlValue> {
+/// GeoJSON text of `geom`, with the `crs` member for a non-4326 SRID.
+fn serialize(geom: &SridGeometry, name: &str) -> Result<SqlValue> {
     sonic_rs::to_string(geom)
         .map(SqlValue::String)
         .map_err(|e| SqlError::InvalidFunction {
@@ -111,7 +114,7 @@ fn function_name(func: &ast::Function) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, Srid, SridGeometry};
 
     use super::{fold_geometry_function, resolve_geometry_expr};
     use crate::types::SqlValue;
@@ -137,6 +140,7 @@ mod tests {
 
     fn resolved(sql: &str) -> Geometry {
         resolve_geometry_expr(&expr(sql))
+            .map(|g| g.geometry)
             .unwrap_or_else(|e| panic!("`{sql}` must resolve to a geometry: {e}"))
     }
 
@@ -219,9 +223,41 @@ mod tests {
         };
         assert_eq!(
             nodedb_types::geometry::from_geojson_str(&geojson),
-            Some(Geometry::point(1.0, 2.0)),
+            Some(SridGeometry::wgs84(Geometry::point(1.0, 2.0))),
             "stored form must parse back through the spatial read path"
         );
+        assert!(
+            !geojson.contains("crs"),
+            "4326 writes no crs member: {geojson}"
+        );
+    }
+
+    /// A projected geometry folds with its `crs` member, so the stored form
+    /// keeps the SRID.
+    #[test]
+    fn projected_geometry_folds_with_crs_member() {
+        let sqlparser::ast::Expr::Function(func) = expr("ST_GeomFromText('POINT(1 2)', 3375)")
+        else {
+            panic!("expected a function");
+        };
+        let Some(Ok(SqlValue::String(geojson))) = fold_geometry_function(&func) else {
+            panic!("a geometry constructor must fold to its stored form");
+        };
+        assert!(geojson.contains("EPSG:3375"), "{geojson}");
+        assert_eq!(
+            nodedb_types::geometry::from_geojson_str(&geojson).map(|g| g.srid),
+            Some(Srid::PeninsularRso)
+        );
+        let tagged = resolve_geometry_expr(&expr("ST_SetSRID(ST_Point(1, 2), 32648)"))
+            .expect("must resolve");
+        assert_eq!(tagged.srid, Srid::Utm48N);
+    }
+
+    /// A mixed-SRID operation in geometry position is an error, not a fold.
+    #[test]
+    fn mixed_srid_operation_is_an_error() {
+        let sql = "ST_Union(ST_Point(1, 2), ST_SetSRID(ST_Point(1, 2), 32648))";
+        assert!(resolve_geometry_expr(&expr(sql)).is_err());
     }
 
     /// A non-geometry call falls through so the generic constant folder handles

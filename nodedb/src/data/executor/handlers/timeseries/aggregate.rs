@@ -52,6 +52,9 @@ pub(in crate::data::executor) struct TsAggregateParams<'a> {
     /// AUTO_TIER buckets of the part of `time_range` raw partitions no
     /// longer serve, already grouped like the result.
     pub tier_partials: Option<GroupedAggResult>,
+    /// `(encoded key, output name)` of each output column, in SELECT-list
+    /// order. Empty keeps the encoded keys.
+    pub output_columns: &'a [(String, String)],
 }
 
 impl CoreLoop {
@@ -77,6 +80,7 @@ impl CoreLoop {
             staged,
             raw_range,
             tier_partials,
+            output_columns,
         } = params;
 
         let key = (task.request.database_id, tid, collection.to_string());
@@ -272,6 +276,12 @@ impl CoreLoop {
         // encoder is told each key column's declared shape.
         let group_key_kinds =
             self.ts_group_key_kinds(task.request.database_id, tid, collection, group_by);
+        // The column each aggregate reads, so an extreme over an instant
+        // column renders as an instant. `*` names no column and reads Text.
+        let aggregate_fields: Vec<String> =
+            aggregates.iter().map(|(_, field)| field.clone()).collect();
+        let aggregate_kinds =
+            self.ts_group_key_kinds(task.request.database_id, tid, collection, &aggregate_fields);
         let bucket_kind = self.ts_time_key_kind(task.request.database_id, tid, collection);
         let payload = match super::encode::encode_grouped_results(
             &merged,
@@ -282,9 +292,11 @@ impl CoreLoop {
                 bucket_interval_ms,
                 sort_keys,
                 having,
+                output_columns,
             },
             super::encode::GroupedKeyTypes {
                 group_key_kinds: &group_key_kinds,
+                aggregate_kinds: &aggregate_kinds,
                 bucket_kind,
             },
         ) {

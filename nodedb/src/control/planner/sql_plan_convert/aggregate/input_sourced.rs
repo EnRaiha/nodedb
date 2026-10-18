@@ -25,6 +25,8 @@ pub(super) struct InputSourcedAggregateParams<'a> {
     pub grouping_sets: Option<&'a [Vec<usize>]>,
     /// Post-aggregate sort keys, already lowered to bridge specs.
     pub sort_keys: Vec<SortKeySpec>,
+    /// SELECT-list output alias of each GROUP BY key, parallel to `group_by`.
+    pub group_by_aliases: &'a [Option<String>],
     pub tenant_id: TenantId,
     pub ctx: &'a ConvertContext,
 }
@@ -49,6 +51,7 @@ pub(super) fn convert_input_sourced_aggregate(
         limit,
         grouping_sets,
         sort_keys,
+        group_by_aliases,
         tenant_id,
         ctx,
     } = p;
@@ -78,6 +81,7 @@ pub(super) fn convert_input_sourced_aggregate(
             limit,
             grouping_sets,
             sort_keys,
+            group_by_aliases,
             names: input_field_names(input),
         },
     )?])

@@ -359,7 +359,7 @@ impl CoreLoop {
 
         // 3d. Flush the array engines. Same memory-only memtable as columnar,
         //     but the durable form already exists: this calls the very
-        //     `ArrayEngine::flush` an `NDARRAY_FLUSH` calls, whose segments the
+        //     `ArrayEngine::flush` an `ARRAY_FLUSH` calls, whose segments the
         //     boot path already mmaps. The hazard was that nothing but that
         //     explicit user command ever invoked it.
         durable_lsns.push(self.checkpoint_array_durable_lsn());

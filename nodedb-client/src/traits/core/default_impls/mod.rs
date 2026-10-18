@@ -9,7 +9,9 @@ mod collections;
 mod dispatch;
 mod graph;
 
-pub(super) use batch::{batch_graph_insert_edges_default, batch_vector_insert_default};
+pub(super) use batch::{
+    array_put_cells_default, batch_graph_insert_edges_default, batch_vector_insert_default,
+};
 pub(super) use collections::{
     drop_collection_purge_default, list_dropped_collections_default, on_collection_purged_default,
     undrop_collection_default,

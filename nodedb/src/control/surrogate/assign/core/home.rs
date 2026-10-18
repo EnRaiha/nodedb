@@ -16,6 +16,10 @@ use nodedb_types::{CollectionKey, Surrogate, TenantId};
 
 /// Resolves keys at their collection home. Every method awaits the home and
 /// never blocks the runtime.
+///
+/// The caller passes distinct keys its own catalog binds none of. Every
+/// answer is bound in this node's catalog before a method returns, so the
+/// caller writes nothing of its own.
 pub trait HomeSurrogateAuthority: Send + Sync {
     /// The bound surrogate of each of `pks` in `key`, bound at the home when
     /// a key has none. The answers are in `pks` order.

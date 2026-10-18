@@ -120,7 +120,7 @@ pub async fn read_on_vshard(
             let payloads = outcome.payloads;
             Payload::from_vec(match payloads.len() {
                 1 => payloads.into_iter().next().unwrap_or_default(),
-                _ => merge_msgpack_arrays(&payloads),
+                _ => merge_msgpack_arrays(&payloads)?,
             })
         }
         RouteDecision::LeaderUnknown { vshard_id } => {

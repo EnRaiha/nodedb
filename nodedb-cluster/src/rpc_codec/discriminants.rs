@@ -167,7 +167,7 @@ pub const RPC_FRAME_REFUSAL: u8 = 58;
 /// reason, so the sender learns the peer is up and refused this request.
 pub const RPC_REQUEST_REFUSAL: u8 = 59;
 
-// VShardMessageType discriminants for distributed array ops (u16, range 80-89).
+// VShardMessageType discriminants for distributed array ops (u16, range 80-93).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared
 // here so external code can reference them without importing the full enum.
 pub const VSHARD_ARRAY_SHARD_SLICE_REQ: u16 = 80;
@@ -180,3 +180,7 @@ pub const VSHARD_ARRAY_SHARD_DELETE_REQ: u16 = 86;
 pub const VSHARD_ARRAY_SHARD_DELETE_RESP: u16 = 87;
 pub const VSHARD_ARRAY_SHARD_SURROGATE_BITMAP_REQ: u16 = 88;
 pub const VSHARD_ARRAY_SHARD_SURROGATE_BITMAP_RESP: u16 = 89;
+pub const VSHARD_ARRAY_SHARD_ELEMENTWISE_REQ: u16 = 90;
+pub const VSHARD_ARRAY_SHARD_ELEMENTWISE_RESP: u16 = 91;
+pub const VSHARD_ARRAY_SHARD_MAINT_REQ: u16 = 92;
+pub const VSHARD_ARRAY_SHARD_MAINT_RESP: u16 = 93;

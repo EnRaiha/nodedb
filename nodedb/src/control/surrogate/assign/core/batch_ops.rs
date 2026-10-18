@@ -8,9 +8,8 @@
 //! commits durably once, so N keys cost one durable sync. The WAL bind records
 //! follow the commit under the same lock.
 
-use std::collections::HashMap;
-
 use nodedb_types::{CollectionKey, Surrogate, TenantId};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::types::SurrogateAssigner;
 use crate::control::security::catalog::surrogate_pk_batch::BatchBinding;
@@ -21,8 +20,10 @@ impl SurrogateAssigner {
     ///
     /// - A key already bound keeps its binding (no allocation).
     /// - A key repeated in `pks` gets one surrogate.
-    /// - Every other key draws a fresh surrogate. All new bindings commit in
-    ///   one catalog transaction under one registry write lock.
+    /// - Every other key draws a fresh surrogate. The pass draws one
+    ///   contiguous range for all of them, in first-seen order. All new
+    ///   bindings commit in one catalog transaction under one registry write
+    ///   lock.
     ///
     /// Only a node that is the keys' home binds this way. A cluster node whose
     /// reserved batch runs empty commits what it drew, awaits the refill loop's
@@ -61,35 +62,28 @@ impl SurrogateAssigner {
         out: &mut [Option<Surrogate>],
     ) -> crate::Result<bool> {
         let registry = self.registry_write()?;
-        let catalog = self.credential_store.catalog();
         let missing: Vec<usize> = (0..out.len()).filter(|&i| out[i].is_none()).collect();
-        let missing_pks: Vec<&[u8]> = missing.iter().map(|&i| pks[i]).collect();
-        // Re-read under the lock: another assigner can have bound a key
-        // between the caller's read and the lock acquisition.
-        let reread = catalog.get_surrogates_for_pks(key, tenant_id, &missing_pks)?;
-        let mut drawn: HashMap<&[u8], Surrogate> = HashMap::new();
-        let mut rows: Vec<(&[u8], Surrogate)> = Vec::new();
-        let mut complete = true;
-        for (&index, hit) in missing.iter().zip(reread) {
-            if let Some(bound) = hit {
-                out[index] = Some(bound);
-                continue;
-            }
-            let pk = pks[index];
-            if drawn.contains_key(pk) {
-                continue;
-            }
-            match self.alloc_locked(&registry)? {
-                Some(surrogate) => {
-                    drawn.insert(pk, surrogate);
-                    rows.push((pk, surrogate));
-                }
-                None => {
-                    complete = false;
-                    break;
-                }
-            }
-        }
+        // Each distinct unbound key once, in first-seen order.
+        let mut seen: FxHashSet<&[u8]> =
+            FxHashSet::with_capacity_and_hasher(missing.len(), Default::default());
+        let unbound: Vec<&[u8]> = missing
+            .iter()
+            .map(|&i| pks[i])
+            .filter(|pk| seen.insert(*pk))
+            .collect();
+        // One contiguous draw for every unbound key. A key another assigner
+        // bound since the caller's read keeps that binding: the commit below
+        // is first-wins, so its drawn value goes unused.
+        let drawn = self.alloc_range_locked(&registry, unbound.len())?;
+        let rows: Vec<(&[u8], Surrogate)> = match drawn {
+            Some(range) => unbound
+                .iter()
+                .copied()
+                .zip(range.map(Surrogate::new))
+                .collect(),
+            None => Vec::new(),
+        };
+        let complete = rows.len() == unbound.len();
         if !complete {
             self.refill_notify.notify_one();
         }
@@ -102,7 +96,7 @@ impl SurrogateAssigner {
         if hwm.is_some() {
             self.finish_committed_flush(&registry)?;
         }
-        let winners: HashMap<&[u8], Surrogate> = rows
+        let winners: FxHashMap<&[u8], Surrogate> = rows
             .iter()
             .zip(&bound)
             .map(|(&(pk, _), binding)| (pk, binding.surrogate))
@@ -260,6 +254,93 @@ mod tests {
             .expect("assign");
         assert_eq!(out[0], first);
         assert_ne!(out[1], first);
+    }
+
+    #[tokio::test]
+    async fn unbound_keys_draw_one_contiguous_range() {
+        let (_dir, assigner) = open();
+        let pks: Vec<Vec<u8>> = (0..64).map(|i| format!("k{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = pks.iter().map(Vec::as_slice).collect();
+        let out = assigner
+            .assign_bound_many(users(), T0, &refs)
+            .await
+            .expect("assign");
+        let values: Vec<u32> = out.iter().map(|s| s.as_u32()).collect();
+        let first = values[0];
+        let expected: Vec<u32> = (first..first + 64).collect();
+        assert_eq!(values, expected, "keys take the range in pks order");
+        assert_eq!(assigner.current_hwm(), first + 63);
+    }
+
+    #[tokio::test]
+    async fn a_second_batch_of_the_same_keys_reuses_every_binding() {
+        let (_dir, assigner) = open();
+        let pks: [&[u8]; 3] = [b"a", b"b", b"c"];
+        let first = assigner
+            .assign_bound_many(users(), T0, &pks)
+            .await
+            .expect("assign");
+        let hwm = assigner.current_hwm();
+        let again = assigner
+            .assign_bound_many(users(), T0, &pks)
+            .await
+            .expect("assign");
+        assert_eq!(first, again);
+        assert_eq!(assigner.current_hwm(), hwm, "bound keys draw nothing");
+    }
+
+    /// A load chunk that rewrites half of an earlier chunk's coordinates keeps
+    /// their surrogates, draws a range for the rest, and leaves every reverse
+    /// row pointing at its key.
+    #[tokio::test]
+    async fn a_later_overlapping_chunk_keeps_every_earlier_surrogate() {
+        let (_dir, assigner) = open();
+        let pks: Vec<Vec<u8>> = (0..450u32).map(|i| i.to_be_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = pks.iter().map(Vec::as_slice).collect();
+        let first = assigner
+            .assign_bound_many(users(), T0, &refs[..300])
+            .await
+            .expect("first chunk");
+        let hwm = assigner.current_hwm();
+        let second = assigner
+            .assign_bound_many(users(), T0, &refs[150..])
+            .await
+            .expect("second chunk");
+        assert_eq!(
+            &second[..150],
+            &first[150..],
+            "overwritten cells keep identity"
+        );
+        let drawn: Vec<u32> = second[150..].iter().map(|s| s.as_u32()).collect();
+        assert_eq!(drawn, (hwm + 1..=hwm + 150).collect::<Vec<_>>());
+        let catalog = assigner.credential_store.catalog();
+        for (pk, surrogate) in refs[150..].iter().zip(&second) {
+            assert_eq!(
+                catalog
+                    .get_pk_for_surrogate(users(), T0, *surrogate)
+                    .expect("rev"),
+                Some(pk.to_vec())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mixed_batch_reuses_bound_keys_and_draws_a_range_for_the_rest() {
+        let (_dir, assigner) = open();
+        let a = assigner.assign(users(), T0, b"a").await.expect("assign");
+        let c = assigner.assign(users(), T0, b"c").await.expect("assign");
+        let hwm = assigner.current_hwm();
+        let pks: [&[u8]; 6] = [b"a", b"x", b"c", b"y", b"x", b"z"];
+        let out = assigner
+            .assign_bound_many(users(), T0, &pks)
+            .await
+            .expect("assign");
+        assert_eq!(out[0], a);
+        assert_eq!(out[2], c);
+        assert_eq!(out[1], out[4], "a repeated key gets one surrogate");
+        let drawn = [out[1].as_u32(), out[3].as_u32(), out[5].as_u32()];
+        assert_eq!(drawn, [hwm + 1, hwm + 2, hwm + 3]);
+        assert_eq!(assigner.current_hwm(), hwm + 3);
     }
 
     #[tokio::test]

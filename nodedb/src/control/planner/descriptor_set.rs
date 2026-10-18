@@ -42,6 +42,9 @@ pub struct DescriptorVersionSet {
     permission_tree_version: u64,
     /// The tenant's RLS policy-store version observed at plan-build time.
     rls_version: u64,
+    /// The redaction policy-store version the plan's column reads were
+    /// checked against.
+    redaction_version: u64,
 }
 
 impl DescriptorVersionSet {
@@ -65,6 +68,16 @@ impl DescriptorVersionSet {
 
     pub fn rls_version(&self) -> u64 {
         self.rls_version
+    }
+
+    /// Record the redaction policy-store version this plan was checked
+    /// against.
+    pub fn set_redaction_version(&mut self, version: u64) {
+        self.redaction_version = version;
+    }
+
+    pub fn redaction_version(&self) -> u64 {
+        self.redaction_version
     }
 
     /// Record a descriptor read at the given version. O(log n)
@@ -114,21 +127,25 @@ impl DescriptorVersionSet {
     /// Used by the plan cache on every hit — a cached plan is
     /// only reusable while every descriptor it was built
     /// against still exists at the same version, AND the
-    /// tenant's permission-tree and RLS policy state has not
-    /// changed since the plan was built.
-    pub fn all_fresh<F>(
-        &self,
-        current: F,
-        current_permission_tree_version: u64,
-        current_rls_version: u64,
-    ) -> bool
+    /// tenant's permission-tree, RLS, and redaction policy state has
+    /// not changed since the plan was built.
+    pub fn all_fresh<F>(&self, current: F, policies: PolicyVersions) -> bool
     where
         F: Fn(&DescriptorId) -> Option<u64>,
     {
-        self.permission_tree_version == current_permission_tree_version
-            && self.rls_version == current_rls_version
+        self.permission_tree_version == policies.permission_tree
+            && self.rls_version == policies.rls
+            && self.redaction_version == policies.redaction
             && self.entries.iter().all(|(id, v)| current(id) == Some(*v))
     }
+}
+
+/// The policy-store versions a cached plan is compared against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyVersions {
+    pub permission_tree: u64,
+    pub rls: u64,
+    pub redaction: u64,
 }
 
 /// Total-order comparison for `DescriptorId` since the cluster
@@ -195,6 +212,14 @@ mod tests {
         assert_eq!(entries, vec![(3, 1), (9, 2)]);
     }
 
+    fn policies(permission_tree: u64, rls: u64, redaction: u64) -> PolicyVersions {
+        PolicyVersions {
+            permission_tree,
+            rls,
+            redaction,
+        }
+    }
+
     #[test]
     fn all_fresh_true_when_versions_match() {
         let mut set = DescriptorVersionSet::new();
@@ -205,7 +230,7 @@ mod tests {
             "b" => Some(2),
             _ => None,
         };
-        assert!(set.all_fresh(lookup, 0, 0));
+        assert!(set.all_fresh(lookup, policies(0, 0, 0)));
     }
 
     #[test]
@@ -218,7 +243,7 @@ mod tests {
             "b" => Some(3), // bumped
             _ => None,
         };
-        assert!(!set.all_fresh(lookup, 0, 0));
+        assert!(!set.all_fresh(lookup, policies(0, 0, 0)));
     }
 
     #[test]
@@ -226,14 +251,14 @@ mod tests {
         let mut set = DescriptorVersionSet::new();
         set.record(id("a"), 1);
         let lookup = |_: &DescriptorId| None;
-        assert!(!set.all_fresh(lookup, 0, 0));
+        assert!(!set.all_fresh(lookup, policies(0, 0, 0)));
     }
 
     #[test]
     fn empty_set_is_always_fresh() {
         let set = DescriptorVersionSet::new();
         let lookup = |_: &DescriptorId| None;
-        assert!(set.all_fresh(lookup, 0, 0));
+        assert!(set.all_fresh(lookup, policies(0, 0, 0)));
     }
 
     #[test]
@@ -241,9 +266,9 @@ mod tests {
         let mut set = DescriptorVersionSet::new();
         set.set_permission_tree_version(3);
         let lookup = |_: &DescriptorId| None;
-        assert!(set.all_fresh(lookup, 3, 0));
+        assert!(set.all_fresh(lookup, policies(3, 0, 0)));
         assert!(
-            !set.all_fresh(lookup, 4, 0),
+            !set.all_fresh(lookup, policies(4, 0, 0)),
             "a revoked grant bumps the tenant's permission version, so a stale stamp must not read as fresh"
         );
     }
@@ -253,8 +278,18 @@ mod tests {
         let mut set = DescriptorVersionSet::new();
         set.set_rls_version(5);
         let lookup = |_: &DescriptorId| None;
-        assert!(set.all_fresh(lookup, 0, 5));
-        assert!(!set.all_fresh(lookup, 0, 6));
+        assert!(set.all_fresh(lookup, policies(0, 5, 0)));
+        assert!(!set.all_fresh(lookup, policies(0, 6, 0)));
+    }
+
+    /// A redaction policy change must re-check the plan's column reads.
+    #[test]
+    fn all_fresh_false_on_redaction_version_mismatch() {
+        let mut set = DescriptorVersionSet::new();
+        set.set_redaction_version(2);
+        let lookup = |_: &DescriptorId| None;
+        assert!(set.all_fresh(lookup, policies(0, 0, 2)));
+        assert!(!set.all_fresh(lookup, policies(0, 0, 3)));
     }
 
     #[test]

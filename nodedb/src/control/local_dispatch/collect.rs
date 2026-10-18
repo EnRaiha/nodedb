@@ -10,16 +10,27 @@ use crate::types::RequestId;
 
 #[derive(Debug)]
 pub(crate) enum DispatchCollectError {
-    OverBudget { bytes: usize },
+    OverBudget {
+        bytes: usize,
+    },
     ChannelClosed,
+    /// The final frame arrived, but a streamed chunk is not a msgpack row
+    /// array, so the chunks do not merge into one payload. `response` is the
+    /// final frame with an empty payload. Its status and write set stay as
+    /// the core sent them.
+    Unmergeable {
+        response: Box<Response>,
+        error: crate::Error,
+    },
 }
 
 /// Drain a dispatched request's bounded response channel, enforcing a
 /// total-payload byte ceiling across streamed partials.
 ///
 /// Returns the final Response (non-streaming: pass-through; streaming:
-/// concatenated payload) or an error if the channel closed without a
-/// final chunk or if the accumulated payload would exceed the ceiling.
+/// merged payload) or an error if the channel closed without a final chunk,
+/// if the accumulated payload would exceed the ceiling, or if a streamed
+/// chunk is not a msgpack row array.
 pub(crate) async fn collect_bounded_response(
     rx: &mut crate::control::ResponseReceiver,
     max_result_bytes: usize,
@@ -68,14 +79,21 @@ pub(crate) async fn collect_bounded_response(
         }
     }
 
-    match final_response_meta {
-        Some(meta) => Ok(Response {
-            payload: Payload::from_vec(
-                crate::control::server::payload_merge::merge_msgpack_arrays(&chunks),
-            ),
+    let Some(meta) = final_response_meta else {
+        return Err(DispatchCollectError::ChannelClosed);
+    };
+    match crate::control::server::payload_merge::merge_msgpack_arrays(&chunks) {
+        Ok(merged) => Ok(Response {
+            payload: Payload::from_vec(merged),
             ..meta
         }),
-        None => Err(DispatchCollectError::ChannelClosed),
+        Err(error) => Err(DispatchCollectError::Unmergeable {
+            response: Box::new(Response {
+                payload: Payload::empty(),
+                ..meta
+            }),
+            error,
+        }),
     }
 }
 
@@ -141,6 +159,7 @@ pub(crate) async fn collect_under_deadline(
         Ok(Err(DispatchCollectError::ChannelClosed)) => Err(crate::Error::Dispatch {
             detail: format!("{context} channel closed"),
         }),
+        Ok(Err(DispatchCollectError::Unmergeable { error, .. })) => Err(error),
     }
 }
 
@@ -243,11 +262,53 @@ mod collect_budget_tests {
         tx.send(final_rows(500)).await.unwrap();
         drop(tx);
         let resp = collect_bounded_response(&mut rx, 1 << 20).await.unwrap();
-        let elements = extract_msgpack_elements(resp.payload.as_ref());
+        let elements = extract_msgpack_elements(resp.payload.as_ref()).unwrap();
         assert_eq!(
             elements.len(),
             2500,
             "streamed chunks must merge into one array of all rows, not just the first chunk"
+        );
+    }
+
+    /// A streamed chunk that is not a row array does not merge: the collect
+    /// reports the codec error and keeps the final frame's metadata.
+    #[tokio::test]
+    async fn streaming_a_non_array_chunk_is_unmergeable() {
+        let (tx, rx) = mpsc::channel(4);
+        let mut rx = crate::control::ResponseReceiver::from_channel(rx);
+        tx.send(partial_bytes(4)).await.unwrap();
+        tx.send(final_rows(2)).await.unwrap();
+        drop(tx);
+        match collect_bounded_response(&mut rx, 1024).await {
+            Err(DispatchCollectError::Unmergeable { response, error }) => {
+                assert!(matches!(error, crate::Error::Codec { .. }), "{error:?}");
+                assert_eq!(response.status, Status::Ok);
+                assert!(response.payload.is_empty());
+            }
+            other => panic!("expected an unmergeable collect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deadline_collect_reports_an_unmergeable_chunk_as_its_error() {
+        let (tx, rx) = mpsc::channel(4);
+        let mut rx = crate::control::ResponseReceiver::from_channel(rx);
+        tx.send(partial_bytes(4)).await.unwrap();
+        tx.send(final_rows(2)).await.unwrap();
+        drop(tx);
+        let result = collect_under_deadline(
+            &mut rx,
+            DeadlineCollect {
+                request_id: RequestId::new(7),
+                deadline: Instant::now() + std::time::Duration::from_secs(30),
+                max_result_bytes: 1024,
+                context: "gather on core 0",
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(crate::Error::Codec { .. })),
+            "got {result:?}"
         );
     }
 
@@ -261,7 +322,7 @@ mod collect_budget_tests {
         let err = collect_bounded_response(&mut rx, 1000).await.unwrap_err();
         match err {
             DispatchCollectError::OverBudget { bytes } => assert!(bytes > 1000),
-            DispatchCollectError::ChannelClosed => panic!("expected OverBudget, got ChannelClosed"),
+            other => panic!("expected OverBudget, got {other:?}"),
         }
     }
 

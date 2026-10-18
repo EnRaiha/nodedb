@@ -22,7 +22,7 @@ use super::{
 ///
 /// - Root-level `Gather` → gather all vShards, return `Resolved::Gathered`.
 /// - `Broadcast` nested inside a `HashJoin` input → gather the child, embed
-///   the `merged_array` as `ProviderScan{None, rows}`, return `Resolved::Plan`.
+///   its rows as `ProviderScan{None, rows}`, return `Resolved::Plan`.
 /// - Root-level `Shuffle` wrapping a `HashJoin` → orchestrate a cross-node
 ///   grace hash join, return `Resolved::Gathered`. `Shuffle` as a join input is
 ///   a typed error.
@@ -187,6 +187,7 @@ pub(super) async fn resolve_exchange(
             sub_aggregates,
             grouping_sets,
             sort_keys,
+            group_key_aliases,
         }) => {
             aggregate_input_arm::resolve_aggregate_input(
                 state,
@@ -204,6 +205,7 @@ pub(super) async fn resolve_exchange(
                     sub_aggregates,
                     grouping_sets,
                     sort_keys,
+                    group_key_aliases,
                 },
             )
             .await

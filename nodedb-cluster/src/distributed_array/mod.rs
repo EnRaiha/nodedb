@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub mod agg_number;
 pub mod coordinator;
+pub mod group_key;
 pub mod handler;
 pub mod local_executor;
 pub mod merge;
@@ -11,13 +13,15 @@ pub mod rpc;
 pub mod scatter;
 pub mod wire;
 
+pub use agg_number::ArrayAggNumber;
 pub use coordinator::{
-    ArrayCoordinator, ArrayWriteCoordParams, CoordAggResult, CoordSliceResult, coord_delete,
-    coord_put, coord_put_partitioned,
+    ArrayCoordinator, ArrayWriteCoordParams, CoordAggResult, CoordElementwiseResult,
+    CoordSliceResult, coord_delete, coord_put, coord_put_partitioned,
 };
+pub use group_key::ArrayAggGroupKey;
 pub use handler::handle_array_shard_rpc;
 pub use local_executor::{
-    ArrayAggExec, ArrayLocalExecutor, ArrayShardWriteOutcome, ArraySliceExec,
+    ArrayAggExec, ArrayElementwiseExec, ArrayLocalExecutor, ArrayShardWriteOutcome, ArraySliceExec,
 };
 pub use merge::{
     ArrayAggPartial, any_truncated_before_horizon_agg, any_truncated_before_horizon_slice,
@@ -27,6 +31,7 @@ pub use routing::{array_vshard_for_tile, array_vshards_for_slice};
 pub use rpc::ShardRpcDispatch;
 pub use wire::{
     ArrayShardAggReq, ArrayShardAggResp, ArrayShardDeleteReq, ArrayShardDeleteResp,
-    ArrayShardPutReq, ArrayShardPutResp, ArrayShardSliceReq, ArrayShardSliceResp,
-    ArrayShardSurrogateBitmapReq, ArrayShardSurrogateBitmapResp,
+    ArrayShardElementwiseReq, ArrayShardElementwiseResp, ArrayShardMaintOp, ArrayShardMaintReq,
+    ArrayShardMaintResp, ArrayShardPutReq, ArrayShardPutResp, ArrayShardSliceReq,
+    ArrayShardSliceResp, ArrayShardSurrogateBitmapReq, ArrayShardSurrogateBitmapResp,
 };

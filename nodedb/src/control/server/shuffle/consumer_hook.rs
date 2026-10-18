@@ -246,6 +246,9 @@ impl RegistryShuffleConsumer {
                 code: 0,
                 message: "shuffle consume response channel closed".into(),
             }),
+            Ok(Err(DispatchCollectError::Unmergeable { error, .. })) => {
+                Err(execution_error_to_typed(error))
+            }
             Err(_) => {
                 self.state.tracker.cancel(&request_id);
                 Err(TypedClusterError::DeadlineExceeded {

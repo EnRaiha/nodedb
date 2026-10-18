@@ -9,50 +9,94 @@
 //! a separate trailing array that the decoder silently ignores (truncating the
 //! result to the first chunk).
 //!
+//! [`merge_msgpack_arrays`] takes only whole msgpack arrays. A relational
+//! read also answers a point read's one row as a bare msgpack map, which
+//! [`payload_rows`] and [`merge_payload_rows`] read as one row. A payload of
+//! any other shape is a typed error: wrapping it as one element will hand
+//! the caller rows that no core produced.
+//!
 //! Used by both `local_dispatch::collect_bounded_response` (the per-request
-//! bounded collector) and `exchange::gather` (the cross-core/vShard gather).
+//! bounded collector) and `exchange::gather_outcome` (the cross-core/vShard
+//! gather).
 
 use nodedb_query::msgpack_scan;
 
 /// Extract individual msgpack elements from one msgpack-array payload.
 ///
-/// If the payload is not a valid msgpack array, it is returned as a single
-/// element with a warning logged (matching the gather fallback).
-pub(crate) fn extract_msgpack_elements(payload: &[u8]) -> Vec<Vec<u8>> {
+/// An empty payload holds no elements. A payload that is not one whole
+/// msgpack array is a `Codec` error: a non-array header, an element that
+/// does not decode, or bytes after the last element.
+pub(crate) fn extract_msgpack_elements(payload: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
     if payload.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let Some((count, mut pos)) = msgpack_scan::array_header(payload, 0) else {
-        tracing::warn!(
-            payload_len = payload.len(),
-            "payload_merge: payload is not a msgpack array; treating as single element"
-        );
-        return vec![payload.to_vec()];
+        return Err(crate::Error::Codec {
+            detail: format!(
+                "payload_merge: a {}-byte payload starting with byte 0x{:02x} is not a \
+                 msgpack array; only a row-array payload can merge into rows",
+                payload.len(),
+                payload[0]
+            ),
+        });
     };
 
-    let mut rows = Vec::with_capacity(count);
-    for _ in 0..count {
-        if pos >= payload.len() {
-            break;
-        }
+    // Every element takes at least one byte, so the header cannot reserve
+    // more elements than the payload has bytes left.
+    let mut rows = Vec::with_capacity(count.min(payload.len() - pos));
+    for index in 0..count {
         let start = pos;
-        match msgpack_scan::skip_value(payload, pos) {
-            Some(next) => {
-                rows.push(payload[start..next].to_vec());
-                pos = next;
-            }
-            None => {
-                tracing::warn!(
-                    pos,
-                    payload_len = payload.len(),
-                    "payload_merge: could not skip msgpack element; stopping early"
-                );
-                break;
-            }
-        }
+        let Some(next) = msgpack_scan::skip_value(payload, pos) else {
+            return Err(crate::Error::Codec {
+                detail: format!(
+                    "payload_merge: element {index} of a {count}-element msgpack array does \
+                     not decode at offset {start} of a {}-byte payload",
+                    payload.len()
+                ),
+            });
+        };
+        rows.push(payload[start..next].to_vec());
+        pos = next;
     }
-    rows
+    if pos != payload.len() {
+        return Err(crate::Error::Codec {
+            detail: format!(
+                "payload_merge: {} bytes follow the {count}-element msgpack array in a \
+                 {}-byte payload; a payload must hold exactly one array",
+                payload.len() - pos,
+                payload.len()
+            ),
+        });
+    }
+    Ok(rows)
+}
+
+/// The rows one relational response payload holds, each as its raw msgpack
+/// bytes.
+///
+/// A scan answers a msgpack array of rows. A point read answers its one row
+/// as a bare msgpack map, and that map is the payload's one row. An empty
+/// payload holds no rows. Any other payload is a `Codec` error from
+/// [`extract_msgpack_elements`].
+pub(crate) fn payload_rows(payload: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
+    let single_row = msgpack_scan::map_header(payload, 0).is_some()
+        && msgpack_scan::skip_value(payload, 0) == Some(payload.len());
+    if single_row {
+        return Ok(vec![payload.to_vec()]);
+    }
+    extract_msgpack_elements(payload)
+}
+
+/// Merge the rows of several relational response payloads into one msgpack
+/// array, in order. Each payload holds its rows in a shape [`payload_rows`]
+/// reads.
+pub(crate) fn merge_payload_rows(payloads: &[Vec<u8>]) -> crate::Result<Vec<u8>> {
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    for payload in payloads {
+        rows.extend(payload_rows(payload)?);
+    }
+    Ok(encode_msgpack_array(&rows))
 }
 
 /// Encode a list of pre-extracted msgpack elements into a single msgpack array.
@@ -79,12 +123,14 @@ pub(crate) fn encode_msgpack_array(rows: &[Vec<u8>]) -> Vec<u8> {
 
 /// Merge several standalone msgpack-array payloads into one msgpack array
 /// containing every element from every input array, in order.
-pub(crate) fn merge_msgpack_arrays(payloads: &[Vec<u8>]) -> Vec<u8> {
+///
+/// Fails with the first payload [`extract_msgpack_elements`] refuses.
+pub(crate) fn merge_msgpack_arrays(payloads: &[Vec<u8>]) -> crate::Result<Vec<u8>> {
     let mut elements: Vec<Vec<u8>> = Vec::new();
     for payload in payloads {
-        elements.extend(extract_msgpack_elements(payload));
+        elements.extend(extract_msgpack_elements(payload)?);
     }
-    encode_msgpack_array(&elements)
+    Ok(encode_msgpack_array(&elements))
 }
 
 #[cfg(test)]
@@ -98,6 +144,10 @@ mod tests {
         encode_msgpack_array(&rows)
     }
 
+    fn is_codec_error(result: crate::Result<Vec<Vec<u8>>>) -> bool {
+        matches!(result, Err(crate::Error::Codec { .. }))
+    }
+
     #[test]
     fn merge_concatenates_all_elements() {
         let chunks = vec![
@@ -105,8 +155,8 @@ mod tests {
             int_array(1000, 1000),
             int_array(2000, 500),
         ];
-        let merged = merge_msgpack_arrays(&chunks);
-        let elements = extract_msgpack_elements(&merged);
+        let merged = merge_msgpack_arrays(&chunks).expect("merge");
+        let elements = extract_msgpack_elements(&merged).expect("extract");
         assert_eq!(
             elements.len(),
             2500,
@@ -117,13 +167,118 @@ mod tests {
     #[test]
     fn single_array_round_trips() {
         let one = int_array(0, 3);
-        let merged = merge_msgpack_arrays(std::slice::from_ref(&one));
-        assert_eq!(extract_msgpack_elements(&merged).len(), 3);
+        let merged = merge_msgpack_arrays(std::slice::from_ref(&one)).expect("merge");
+        assert_eq!(extract_msgpack_elements(&merged).expect("extract").len(), 3);
     }
 
     #[test]
     fn empty_input_is_empty_array() {
-        let merged = merge_msgpack_arrays(&[]);
-        assert_eq!(extract_msgpack_elements(&merged).len(), 0);
+        let merged = merge_msgpack_arrays(&[]).expect("merge");
+        assert_eq!(extract_msgpack_elements(&merged).expect("extract").len(), 0);
+    }
+
+    #[test]
+    fn an_empty_payload_holds_no_elements() {
+        assert!(extract_msgpack_elements(&[]).expect("extract").is_empty());
+    }
+
+    /// A msgpack map, such as an array slice envelope, is not a row array.
+    #[test]
+    fn a_map_payload_is_refused() {
+        // fixmap of 1: "k" => 1.
+        assert!(is_codec_error(extract_msgpack_elements(&[
+            0x81, 0xa1, b'k', 1
+        ])));
+    }
+
+    /// Bytes that are not msgpack at all, such as a raw little-endian LSN,
+    /// are refused rather than wrapped as one element.
+    #[test]
+    fn raw_bytes_are_refused() {
+        assert!(is_codec_error(extract_msgpack_elements(
+            &42u64.to_le_bytes()
+        )));
+    }
+
+    /// A header that claims more elements than the payload holds is refused,
+    /// never cut short at the bytes that are there.
+    #[test]
+    fn a_truncated_array_is_refused() {
+        let mut payload = int_array(0, 3);
+        payload.pop();
+        assert!(is_codec_error(extract_msgpack_elements(&payload)));
+    }
+
+    /// Two arrays back to back are two payloads, not one.
+    #[test]
+    fn bytes_after_the_array_are_refused() {
+        let mut payload = int_array(0, 2);
+        payload.extend_from_slice(&int_array(2, 2));
+        assert!(is_codec_error(extract_msgpack_elements(&payload)));
+    }
+
+    #[test]
+    fn a_non_array_payload_fails_the_merge() {
+        let chunks = vec![int_array(0, 2), vec![0x81, 0xa1, b'k', 1]];
+        assert!(matches!(
+            merge_msgpack_arrays(&chunks),
+            Err(crate::Error::Codec { .. })
+        ));
+    }
+
+    /// fixmap of 1: "k" => `value`.
+    fn map_row(value: u8) -> Vec<u8> {
+        vec![0x81, 0xa1, b'k', value]
+    }
+
+    #[test]
+    fn a_row_array_holds_its_rows() {
+        let payload = encode_msgpack_array(&[map_row(1), map_row(2)]);
+        assert_eq!(
+            payload_rows(&payload).expect("rows"),
+            vec![map_row(1), map_row(2)]
+        );
+    }
+
+    #[test]
+    fn a_point_read_map_is_one_row() {
+        assert_eq!(payload_rows(&map_row(3)).expect("rows"), vec![map_row(3)]);
+    }
+
+    #[test]
+    fn an_empty_payload_holds_no_rows() {
+        assert!(payload_rows(&[]).expect("rows").is_empty());
+    }
+
+    /// A map followed by more bytes is not one row.
+    #[test]
+    fn a_map_with_trailing_bytes_is_not_a_row() {
+        let mut payload = map_row(1);
+        payload.push(0x01);
+        assert!(is_codec_error(payload_rows(&payload)));
+    }
+
+    #[test]
+    fn a_scalar_payload_holds_no_rows() {
+        assert!(is_codec_error(payload_rows(&[0x2a])));
+    }
+
+    #[test]
+    fn row_payloads_merge_point_reads_and_scans_in_order() {
+        let payloads = vec![encode_msgpack_array(&[map_row(1)]), map_row(2), Vec::new()];
+        let merged = merge_payload_rows(&payloads).expect("merge");
+        assert_eq!(
+            extract_msgpack_elements(&merged).expect("extract"),
+            vec![map_row(1), map_row(2)]
+        );
+    }
+
+    #[test]
+    fn a_scalar_payload_fails_the_row_merge() {
+        let payloads = vec![encode_msgpack_array(&[map_row(1)]), vec![0x2a]];
+        assert!(matches!(
+            merge_payload_rows(&payloads),
+            Err(crate::Error::Codec { .. })
+        ));
     }
 }

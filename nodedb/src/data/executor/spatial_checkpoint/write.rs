@@ -216,7 +216,10 @@ mod tests {
 
     fn seed_one_entry(core: &mut CoreLoop) {
         let (db, tid, coll, field) = key();
-        let mut rtree = RTree::new(test_rtree_memory(db, tid));
+        let mut rtree = RTree::new(
+            test_rtree_memory(db, tid),
+            nodedb_types::geometry::Srid::Wgs84,
+        );
         rtree.insert(RTreeEntry {
             id: 1,
             bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0),
@@ -313,7 +316,10 @@ mod tests {
         // Geometry with no doc_map entries at all: the shape a columnar-family
         // index takes before any document row maps into it.
         let (db, tid, _, _) = key();
-        let mut rtree = RTree::new(test_rtree_memory(db, tid));
+        let mut rtree = RTree::new(
+            test_rtree_memory(db, tid),
+            nodedb_types::geometry::Srid::Wgs84,
+        );
         rtree.insert(RTreeEntry {
             id: 1,
             bbox: BoundingBox::new(0.0, 0.0, 1.0, 1.0),

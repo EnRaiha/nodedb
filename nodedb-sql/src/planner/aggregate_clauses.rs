@@ -85,7 +85,7 @@ pub fn plan_aggregate_clauses(
         functions,
         scope,
     )?;
-    let group_by_aliases = group_by_output_aliases(&select.projection, &group_by);
+    let group_by_aliases = group_by_output_aliases(&select.projection, &group_by, scope);
 
     Ok(AggregateClauses {
         group_by,

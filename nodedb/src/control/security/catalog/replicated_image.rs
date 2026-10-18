@@ -13,6 +13,7 @@
 //! Every other bootstrap table stays out of the image. Each one is written
 //! only by this node, or travels with a data-group snapshot:
 //! - `audit_log`: this node's audit trail, numbered by a node-local sequence.
+//! - `audit_dml_positions`: the index of this node's `audit_log` DML rows.
 //! - `blacklist`, `orgs`, `org_members`, `scopes`: written only by the node
 //!   that ran the statement. Group 0 never applies them.
 //! - `lockout_state`: this node's failed-login counters.

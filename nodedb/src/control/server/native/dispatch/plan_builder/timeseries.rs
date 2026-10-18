@@ -50,6 +50,7 @@ pub(crate) async fn build_scan(
         valid_at_ms: None,
         having: Vec::new(),
         tiering: None,
+        output_columns: Vec::new(),
     }))
 }
 

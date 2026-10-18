@@ -105,6 +105,9 @@ pub struct ArrayShardAggReq {
     /// Each shard folds only its own overlay cells into its partial, so the
     /// coordinator's merge counts every staged cell exactly once.
     pub txn_id: Option<u64>,
+    /// Zerompk encoding of `nodedb_array::query::ArrayRegion`, forwarded from
+    /// `ArrayOp::Aggregate::region_msgpack`. Empty = the whole array.
+    pub region_msgpack: Vec<u8>,
 }
 
 /// Gather response: shard returns partial aggregate(s) for merge.
@@ -119,6 +122,81 @@ pub struct ArrayShardAggResp {
     /// The write versions the shard read observed (see
     /// [`ArrayShardSliceResp::read_versions`]).
     pub read_versions: Vec<nodedb_types::ShardVersion>,
+}
+
+/// Scatter request: coordinator asks a shard to pair the cells of two arrays
+/// it owns and apply a binary op to each pair.
+///
+/// A cell routes by its tile key, and the tile key is a function of the
+/// schema's dims and tile extents alone. Two arrays with one schema hash and
+/// one `prefix_bits` therefore place every coordinate on the same shard, so
+/// each shard pairs its own cells and no cell crosses shards.
+#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct ArrayShardElementwiseReq {
+    /// Zerompk encoding of the left `nodedb_array::types::ArrayId`.
+    pub left_id_msgpack: Vec<u8>,
+    /// Zerompk encoding of the right `nodedb_array::types::ArrayId`.
+    pub right_id_msgpack: Vec<u8>,
+    /// Zerompk encoding of `ArrayBinaryOp` (c_enum, 1 byte on wire).
+    pub op_msgpack: Vec<u8>,
+    pub attr_idx: u32,
+    /// The bucket this shard owns. The shard pairs only cells whose tile key
+    /// falls in it, so vShards that share one Data Plane emit no row twice.
+    /// `None` pairs every cell.
+    pub shard_bucket: Option<nodedb_types::ShardBucket>,
+    /// Bitemporal system-time cutoff for both operands. `None` = live read.
+    pub system_as_of: Option<i64>,
+    /// Bitemporal valid-time point for both operands. `None` = no
+    /// valid-time filter.
+    pub valid_at_ms: Option<i64>,
+    /// The reading transaction's id, for read-your-own-writes against the
+    /// shard's staging overlay (see [`ArrayShardSliceReq::txn_id`]).
+    pub txn_id: Option<u64>,
+}
+
+/// Gather response: shard returns its paired rows.
+#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct ArrayShardElementwiseResp {
+    pub shard_id: u32,
+    /// One element per output cell, each the native-msgpack encoding of one
+    /// `{"coords", "attrs"}` row.
+    pub rows_msgpack: Vec<Vec<u8>>,
+    /// Whether the system-time cutoff predates this shard's retained history
+    /// (see [`ArrayShardSliceResp::truncated_before_horizon`]).
+    pub truncated_before_horizon: bool,
+    /// The write versions the shard read observed (see
+    /// [`ArrayShardSliceResp::read_versions`]).
+    pub read_versions: Vec<nodedb_types::ShardVersion>,
+}
+
+/// The maintenance a shard runs on its local copy of an array.
+#[derive(Debug, Clone, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub enum ArrayShardMaintOp {
+    /// Flush the memtable to a segment.
+    Flush,
+    /// Merge segments. `audit_retain_ms` is the array's audit-retention
+    /// horizon from the catalog; `None` keeps every version.
+    Compact { audit_retain_ms: Option<i64> },
+}
+
+/// Scatter request: coordinator asks a shard to flush or compact an array.
+///
+/// A core holds the tiles of every bucket its vShards own, so the request
+/// goes to every primary vShard. A core that two vShards share runs it
+/// twice; the second run finds nothing left to do.
+#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct ArrayShardMaintReq {
+    pub array_id_msgpack: Vec<u8>,
+    pub op: ArrayShardMaintOp,
+}
+
+/// Acknowledgement: shard ran the maintenance.
+#[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+pub struct ArrayShardMaintResp {
+    pub shard_id: u32,
+    /// The count the Data Plane handler answered with: `1` for a flush, the
+    /// number of segments merged for a compaction.
+    pub affected: u64,
 }
 
 /// Scatter request: coordinator forwards a cell write to the owning shard.
@@ -152,7 +230,8 @@ pub struct ArrayShardPutResp {
 
 /// Scatter request: coordinator asks a shard to delete cells by exact coords.
 ///
-/// `coords_msgpack` is a zerompk encoding of `Vec<Vec<CoordValue>>`.
+/// `coords_msgpack` is a zerompk encoding of
+/// `Vec<nodedb::engine::array::wal::ArrayDeleteCell>`.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct ArrayShardDeleteReq {
     pub array_id_msgpack: Vec<u8>,

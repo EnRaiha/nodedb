@@ -76,24 +76,9 @@ pub(super) async fn try_string(
         return Some(inspect_audit::export_audit_log(state, identity, &parts));
     }
     if upper.starts_with("SHOW AUDIT IN DATABASE") {
-        // SHOW AUDIT IN DATABASE <name> [LIMIT <n>]
-        // parts: ["SHOW", "AUDIT", "IN", "DATABASE", "<name>", ...]
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        let db_name = if parts.len() >= 5 {
-            parts[4]
-        } else {
-            return Some(Err(DdlError::new(
-                "42601",
-                "syntax: SHOW AUDIT IN DATABASE <name> [LIMIT <n>]",
-            )));
-        };
-        let limit = if parts.len() >= 7 && parts[5].eq_ignore_ascii_case("LIMIT") {
-            parts[6].parse::<usize>().unwrap_or(100)
-        } else {
-            100
-        };
         return Some(inspect_audit::show_audit_in_database(
-            state, identity, db_name, limit,
+            state, identity, &parts,
         ));
     }
     if upper.starts_with("SHOW AUDIT WHERE") {

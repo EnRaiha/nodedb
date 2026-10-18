@@ -63,10 +63,17 @@ pub(in crate::data::executor) struct GraphNeighborsMultiArgs<'a> {
 /// One `NeighborsMulti` row: `(frontier node, label, neighbour, properties)`.
 type NeighborRow = (String, String, String, Option<nodedb_types::NativeCell>);
 
-/// The rows of one `NeighborsMulti` hop, and whether `max_results` cut it.
-struct NeighborRows {
-    rows: Vec<NeighborRow>,
-    truncated: bool,
+/// The error for a `NeighborsMulti` hop whose rows outgrow its `max_results`.
+///
+/// The hop answers in one terminal frame, so it has no partial result to
+/// report. A cut hop is refused rather than answered short.
+fn neighbor_rows_over_cap(cap: usize) -> crate::Error {
+    crate::Error::ExecutionLimitExceeded {
+        detail: format!(
+            "graph neighbors hop produced more than max_results ({cap}) rows on one core; \
+             narrow the frontier or raise the walk's visit cap"
+        ),
+    }
 }
 
 impl CoreLoop {
@@ -235,7 +242,7 @@ impl CoreLoop {
             with_properties = args.with_properties,
             "graph neighbors multi"
         );
-        let NeighborRows { rows, truncated } = match self.collect_neighbor_rows(task, tid, &args) {
+        let rows = match self.collect_neighbor_rows(task, tid, &args) {
             Ok(rows) => rows,
             Err(error) => return self.response_error(task, error),
         };
@@ -253,14 +260,11 @@ impl CoreLoop {
         if let Some(ref m) = self.metrics {
             m.record_graph_traversal();
         }
+        // The answer is always one terminal frame: a gather drains `Partial`
+        // frames until a terminal one arrives, so a lone `Partial` frame
+        // leaves it waiting until the statement's deadline.
         match super::super::response_codec::encode(&entries) {
-            Ok(payload) => {
-                if truncated {
-                    self.response_partial(task, payload)
-                } else {
-                    self.response_with_payload(task, payload)
-                }
-            }
+            Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => {
                 warn!(
                     core = self.core_id,
@@ -274,7 +278,8 @@ impl CoreLoop {
     }
 
     /// The rows of one `NeighborsMulti` hop. A row counts against
-    /// `max_results` only once the edge predicate admits it.
+    /// `max_results` only once the edge predicate admits it. A hop with more
+    /// rows than `max_results` is an `ExecutionLimitExceeded` error.
     ///
     /// A request with a `txn_id` merges that transaction's staged edge
     /// writes on this core: a staged tombstone drops an edge, a staged put
@@ -285,7 +290,7 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
         args: &GraphNeighborsMultiArgs<'_>,
-    ) -> crate::Result<NeighborRows> {
+    ) -> crate::Result<Vec<NeighborRow>> {
         let cap: usize = if args.max_results == 0 {
             usize::MAX
         } else {
@@ -311,10 +316,7 @@ impl CoreLoop {
                 with_properties: args.with_properties,
             },
         )?;
-        let mut out = NeighborRows {
-            rows: Vec::with_capacity(args.node_ids.len().min(cap) * 4),
-            truncated: false,
-        };
+        let mut out: Vec<NeighborRow> = Vec::with_capacity(args.node_ids.len().min(cap) * 4);
         let partition = self.csr_partition(database_id.as_u64(), tid);
         let durable = |node: &str, direction| match (partition, args.collection) {
             (Some(partition), Some(collection)) => {
@@ -331,11 +333,10 @@ impl CoreLoop {
             graph_edge_predicate::HopPasses::Unoriented => {
                 for raw_src in args.node_ids {
                     for (label, node) in durable(raw_src, args.direction) {
-                        if out.rows.len() >= cap {
-                            out.truncated = true;
-                            return Ok(out);
+                        if out.len() >= cap {
+                            return Err(neighbor_rows_over_cap(cap));
                         }
-                        out.rows.push((raw_src.clone(), label, node, None));
+                        out.push((raw_src.clone(), label, node, None));
                     }
                 }
                 return Ok(out);
@@ -376,14 +377,159 @@ impl CoreLoop {
                             }
                         }
                     };
-                    if out.rows.len() >= cap {
-                        out.truncated = true;
-                        return Ok(out);
+                    if out.len() >= cap {
+                        return Err(neighbor_rows_over_cap(cap));
                     }
-                    out.rows.push((raw_src.clone(), label, node, properties));
+                    out.push((raw_src.clone(), label, node, properties));
                 }
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
+    use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
+    use nodedb_types::Surrogate;
+
+    use super::*;
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request, Status};
+    use crate::control::server::payload_merge::extract_msgpack_elements;
+    use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TraceId, VShardId};
+
+    /// A core and the bridge ends it needs to stay open.
+    struct Harness {
+        core: CoreLoop,
+        _requests: Producer<BridgeRequest>,
+        _responses: Consumer<BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn harness() -> Harness {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (requests, request_rx) = RingBuffer::channel::<BridgeRequest>(8);
+        let (response_tx, responses) = RingBuffer::channel::<BridgeResponse>(8);
+        let core = CoreLoop::open(
+            0,
+            request_rx,
+            response_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+            crate::data::executor::core_loop::test_governor(),
+        )
+        .expect("open core");
+        Harness {
+            core,
+            _requests: requests,
+            _responses: responses,
+            _dir: dir,
+        }
+    }
+
+    fn task(lsn: u64) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Graph(GraphOp::Neighbors {
+                node_id: "a".to_string(),
+                edge_labels: Vec::new(),
+                direction: Direction::Out,
+                rls_filters: Vec::new(),
+                collection: None,
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: Some(Lsn::new(lsn)),
+            resolved_now_ms: None,
+            commit_hlc: None,
+            entry_version: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        })
+    }
+
+    /// A core holding the edges `a -KNOWS-> b` and `a -KNOWS-> c`, each with
+    /// the property map `{"w": 1}`.
+    fn two_edges() -> Harness {
+        let mut h = harness();
+        let properties = nodedb_types::json_msgpack::json_to_msgpack(&serde_json::json!({"w": 1}))
+            .expect("encode properties");
+        for (lsn, dst, surrogate) in [(10, "b", 2), (11, "c", 3)] {
+            let put = h.core.execute_edge_put(
+                &task(lsn),
+                EdgePutParams {
+                    tid: 1,
+                    collection: "knows",
+                    src_id: "a",
+                    label: "KNOWS",
+                    dst_id: dst,
+                    properties: &properties,
+                    src_surrogate: Surrogate::new(1),
+                    dst_surrogate: Surrogate::new(surrogate),
+                },
+            );
+            assert_eq!(put.status, Status::Ok, "{:?}", put.error_code);
+        }
+        h
+    }
+
+    /// One `NeighborsMulti` hop from `a`. A named collection returns each
+    /// edge's properties, which takes the oriented row path. No collection
+    /// takes the durable CSR path.
+    fn hop(h: &Harness, collection: Option<&str>, max_results: u32) -> Response {
+        let nodes = vec!["a".to_string()];
+        h.core.execute_graph_neighbors_multi(
+            &task(20),
+            1,
+            GraphNeighborsMultiArgs {
+                node_ids: &nodes,
+                edge_labels: &[],
+                direction: Direction::Out,
+                max_results,
+                collection,
+                edge_predicate: &[],
+                with_properties: collection.is_some(),
+            },
+        )
+    }
+
+    /// A hop within its cap answers every row in one terminal frame.
+    #[test]
+    fn a_hop_within_its_cap_answers_one_terminal_frame() {
+        let h = two_edges();
+        for collection in [None, Some("knows")] {
+            let resp = hop(&h, collection, 10);
+            assert!(!resp.partial, "a hop answer is a terminal frame");
+            assert_eq!(resp.status, Status::Ok, "{:?}", resp.error_code);
+            let rows = extract_msgpack_elements(resp.payload.as_ref()).expect("rows");
+            assert_eq!(rows.len(), 2, "both edges of `a`");
+        }
+    }
+
+    /// A hop that outgrows its cap is refused in one terminal frame. A
+    /// lone `Partial` frame leaves the gather waiting for a terminal one.
+    #[test]
+    fn a_hop_past_its_cap_is_refused_in_one_terminal_frame() {
+        let h = two_edges();
+        for collection in [None, Some("knows")] {
+            let resp = hop(&h, collection, 1);
+            assert!(!resp.partial, "a cut hop still ends in a terminal frame");
+            assert_eq!(resp.status, Status::Error);
+            assert!(resp.payload.is_empty());
+        }
     }
 }

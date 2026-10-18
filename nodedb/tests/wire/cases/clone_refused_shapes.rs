@@ -127,8 +127,9 @@ async fn join_over_shadowed_clone_is_refused() {
     assert_eq!(rows.len(), 1, "join must return the matching row: {rows:?}");
 }
 
-/// Vector ANN search (`VectorOp::Search`). Graph `RagFusion` — the only graph
-/// op that names a collection — refuses through the identical default arm.
+/// Vector ANN search (`VectorOp::Search`). Every graph op that names a
+/// collection (`RagFusion`, a scoped traversal) refuses through the identical
+/// default arm.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn vector_search_over_shadowed_clone_is_refused() {
     let server = TestServer::start().await;

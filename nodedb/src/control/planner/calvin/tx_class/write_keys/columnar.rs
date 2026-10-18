@@ -86,7 +86,6 @@ pub(super) fn add_array_keys(keys: &mut WriteKeys, op: &ArrayOp) -> crate::Resul
         | ArrayOp::RekeyArray { .. }
         | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::SurrogateBitmapScan { .. } => Err(not_a_write("an array read or DDL op")),

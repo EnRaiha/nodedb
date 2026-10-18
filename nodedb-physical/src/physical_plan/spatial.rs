@@ -2,7 +2,7 @@
 
 //! Spatial engine operations dispatched to the Data Plane.
 
-use nodedb_types::{QualifiedCollection, Surrogate, SurrogateBitmap, geometry::Geometry};
+use nodedb_types::{QualifiedCollection, Surrogate, SurrogateBitmap, geometry::SridGeometry};
 
 /// Spatial predicate type for R-tree index scan.
 #[derive(
@@ -50,8 +50,9 @@ pub enum SpatialOp {
         field: String,
         /// Stable global surrogate for the row, assigned on the Control Plane.
         surrogate: Surrogate,
-        /// Typed geometry, deserialised on the Control Plane from wire bytes.
-        geometry: Geometry,
+        /// Typed geometry and its SRID, deserialised on the Control Plane
+        /// from wire bytes.
+        geometry: SridGeometry,
         /// Sync provenance: identifies the originating peer and sequence for idempotency.
         #[serde(default)]
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
@@ -76,8 +77,9 @@ pub enum SpatialOp {
         collection: QualifiedCollection,
         field: String,
         predicate: SpatialPredicate,
-        /// Typed query geometry, parsed and validated on the Control Plane.
-        query_geometry: Geometry,
+        /// Typed query geometry and its SRID, parsed and validated on the
+        /// Control Plane. An SRID other than the index's fails the scan.
+        query_geometry: SridGeometry,
         /// Distance threshold in meters (for ST_DWithin). 0 for non-distance predicates.
         distance_meters: f64,
         /// Additional attribute filters applied after spatial candidates.

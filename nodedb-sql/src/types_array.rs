@@ -23,6 +23,61 @@ pub enum ArrayAttrType {
     Float64,
     String,
     Bytes,
+    UInt8,
+    Int16,
+    UInt16,
+    Int32,
+    UInt32,
+    Float32,
+}
+
+impl ArrayAttrType {
+    /// Whether the type holds integers.
+    pub fn is_integer(self) -> bool {
+        match self {
+            ArrayAttrType::Int64
+            | ArrayAttrType::UInt8
+            | ArrayAttrType::Int16
+            | ArrayAttrType::UInt16
+            | ArrayAttrType::Int32
+            | ArrayAttrType::UInt32 => true,
+            ArrayAttrType::Float64
+            | ArrayAttrType::Float32
+            | ArrayAttrType::String
+            | ArrayAttrType::Bytes => false,
+        }
+    }
+
+    /// Whether the type holds floats.
+    pub fn is_float(self) -> bool {
+        match self {
+            ArrayAttrType::Float64 | ArrayAttrType::Float32 => true,
+            ArrayAttrType::Int64
+            | ArrayAttrType::UInt8
+            | ArrayAttrType::Int16
+            | ArrayAttrType::UInt16
+            | ArrayAttrType::Int32
+            | ArrayAttrType::UInt32
+            | ArrayAttrType::String
+            | ArrayAttrType::Bytes => false,
+        }
+    }
+
+    /// The canonical DDL name of the type.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ArrayAttrType::Int64 => "INT64",
+            ArrayAttrType::Float64 => "FLOAT64",
+            ArrayAttrType::String => "STRING",
+            ArrayAttrType::Bytes => "BYTES",
+            ArrayAttrType::UInt8 => "UINT8",
+            ArrayAttrType::Int16 => "INT16",
+            ArrayAttrType::UInt16 => "UINT16",
+            ArrayAttrType::Int32 => "INT32",
+            ArrayAttrType::UInt32 => "UINT32",
+            ArrayAttrType::Float32 => "FLOAT32",
+        }
+    }
 }
 
 /// Cell-order strategy AST mirror.
@@ -119,6 +174,18 @@ pub struct ArraySliceAst {
     pub dim_ranges: Vec<NamedDimRange>,
 }
 
+/// `ARRAY_AGG(...)` polygon zone over two numeric dims.
+///
+/// `polygons` holds one entry per member polygon: its exterior ring, then
+/// its holes. Each ring is closed and lists `[x, y]` positions, `x` on
+/// `x_dim` and `y` on `y_dim`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArrayZoneAst {
+    pub polygons: Vec<Vec<Vec<[f64; 2]>>>,
+    pub x_dim: String,
+    pub y_dim: String,
+}
+
 /// Reducer carried on `SqlPlan::ArrayAgg`. Mirrors
 /// `crate::bridge::physical_plan::ArrayReducer` without the bridge dep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +209,17 @@ impl ArrayReducerAst {
             "max" => Some(ArrayReducerAst::Max),
             "mean" | "avg" => Some(ArrayReducerAst::Mean),
             _ => None,
+        }
+    }
+
+    /// The uppercase SQL name of the reducer.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            ArrayReducerAst::Sum => "SUM",
+            ArrayReducerAst::Count => "COUNT",
+            ArrayReducerAst::Min => "MIN",
+            ArrayReducerAst::Max => "MAX",
+            ArrayReducerAst::Mean => "MEAN",
         }
     }
 }

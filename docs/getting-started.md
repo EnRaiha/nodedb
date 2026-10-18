@@ -726,16 +726,20 @@ An env override still wins over an expanded value for the same field.
 ### With the `ndb` CLI
 
 ```bash
-./target/release/ndb
+./target/release/ndb -w
 ```
+
+`ndb` connects to `127.0.0.1:6433` as user `nodedb`. The server runs in password mode by default, and `ndb` sends no password unless given `-w`, which prompts for it. Set `NDB_PASSWORD` to skip the prompt. `NDB_USER` and `NDB_DATABASE` set the user and database.
 
 You get a full TUI with syntax highlighting, tab completion, and history search. See the [CLI guide](cli.md) for details.
 
 ### With psql
 
 ```bash
-psql -h localhost -p 6432
+psql -h localhost -p 6432 -U nodedb -d default
 ```
+
+The server starts in password mode with the superuser `nodedb`. Set `NODEDB_SUPERUSER_PASSWORD` before the first start, or read the generated password from `<data_dir>/.superuser_password`. `-d default` names the built-in database. Without it, psql asks for a database named after the user, and the server refuses the connection with `3D000`.
 
 NodeDB speaks PostgreSQL's wire protocol, so standard tools like `psql`, ORMs, and BI tools work out of the box.
 

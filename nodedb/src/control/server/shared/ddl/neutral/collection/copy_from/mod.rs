@@ -1,20 +1,33 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Handler for `COPY <collection> FROM '<path>'` bulk import.
+//! Handlers for `COPY ... FROM` bulk import.
 //!
-//! Supports NDJSON, JSON array, and CSV formats. Format is auto-detected from
-//! the file extension when not explicitly specified via WITH clause.
+//! `COPY <collection> FROM '<path>'` reads NDJSON, JSON array, or CSV. The
+//! format is detected from the file extension when the WITH clause names
+//! none. `COPY <array> FROM STDIN` and `COPY <array> FROM '<path>.csv'` load
+//! an array through `array_load`.
 //!
-//! Engine routing:
-//! - Document (schemaless/strict), Columnar, KV: supported.
-//! - Timeseries: rejected (use ILP or INSERT with time_key column directly).
-//! - Spatial: rejected (use INSERT with geometry column directly).
-//! - Vector primary: supported (documents with embedding fields import normally).
-//! - Array: tracked separately; COPY is not the Array ingest path.
+//! Each engine's `EngineRules::plan_bulk_load` decides how it loads:
+//! - Document (schemaless/strict), Columnar, KV, vector primary: one INSERT
+//!   per row.
+//! - Timeseries: refused (use ILP or INSERT with time_key column directly).
+//! - Spatial: refused (use INSERT with geometry column directly).
+//! - Array: typed cell chunks of about 4 MiB.
+//!
+//! Transactions: outside a transaction block each document row and each
+//! array chunk commits on its own, so a refused row stops the load and
+//! leaves the rows before it committed. An array load streams, so its
+//! memory stays at a few chunks whatever the input size. Inside a block
+//! every row and chunk stages into the transaction, and a refusal aborts
+//! the block, so the load commits or rolls back whole. Inside a block an
+//! array chunk that takes the staged redo past the 64 MiB WAL record cap is
+//! refused with `54000` before it stages.
 
+pub mod array_load;
 mod csv_import;
 mod entry;
 mod import_ctx;
 mod json_import;
 
+pub(crate) use array_load::{ArrayLoadCtx, ArrayLoader, LoadInput, TextFormat};
 pub use entry::{CopyFromOptions, copy_from_file};

@@ -311,9 +311,14 @@ fn collect_sources(
                 }
                 return;
             }
-            // Every remaining relational op reads at most the single
-            // collection `extract_collection` reports, resolved below.
-            _ => {}
+            // Each reads at most the single collection `extract_collection`
+            // reports, resolved below.
+            QueryOp::PartialAggregate { .. }
+            | QueryOp::ShuffleJoinConsume { .. }
+            | QueryOp::ShuffleAggregateConsume { .. }
+            | QueryOp::FacetCounts { .. }
+            | QueryOp::RecursiveScan { .. }
+            | QueryOp::RecursiveValue { .. } => {}
         }
     }
 
@@ -557,6 +562,39 @@ mod tests {
         let store = store_with_mask("users", "support", "ssn");
         let redaction = QueryRedaction::new(TenantId::new(1), vec!["support".to_string()], joined);
         assert!(redaction.field_has_rule(&store, "ssn"));
+    }
+
+    /// Every similarity search is a source of its collection, so a rule on
+    /// that collection masks its rows and refuses its filters.
+    #[test]
+    fn a_similarity_search_is_a_source_of_its_collection() {
+        use nodedb_physical::physical_plan::VectorOp;
+
+        let docs = || QualifiedCollection::new(DatabaseId::DEFAULT, "docs");
+        let plans = [
+            PhysicalPlan::Vector(VectorOp::SparseSearch {
+                collection: docs(),
+                field_name: "terms".into(),
+                query_entries: vec![(1, 1.0)],
+                top_k: 1,
+                filters: Vec::new(),
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
+                collection: docs(),
+                field_name: "tokens".into(),
+                query_vector: vec![0.0],
+                top_k: 1,
+                ef_search: 2,
+                mode: "max_sim".into(),
+            }),
+        ];
+        for plan in plans {
+            assert_eq!(
+                plan_source_collections(&plan, DatabaseId::DEFAULT),
+                vec![(String::new(), docs().as_str().to_string())],
+                "{plan:?}"
+            );
+        }
     }
 
     /// A masked column of a provider relation is rewritten in a SELECT

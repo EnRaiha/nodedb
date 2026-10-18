@@ -10,7 +10,8 @@
 //!
 //! The router uses at most [`VShardId::BITS`] bucket bits. Bucket `b` of `R`
 //! routing bits owns the vShards `[b * stride, (b + 1) * stride)`, with
-//! `stride = VShardId::COUNT >> R`. Its primary vShard is `b * stride`.
+//! `stride = VShardId::COUNT >> R`. Its primary vShard is the one
+//! [`bucket_to_vshard`] picks inside that range.
 
 use serde::{Deserialize, Serialize};
 
@@ -93,8 +94,20 @@ pub fn routing_bits(prefix_bits: u8) -> Result<u8, PrefixBitsOutOfRange> {
 
 /// The primary vShard of `bucket` at `bits` routing bits. `bits` comes from
 /// [`routing_bits`], so it is at most [`VShardId::BITS`].
+///
+/// A Data Plane core owns `vshard % num_cores`. A primary of `bucket * stride`
+/// alone is a multiple of `stride`, so every primary lands on few cores. The
+/// offset inside the stride is the bucket's top bits. The low bits of a
+/// primary then hold the bucket's low bits and its top bits, and a
+/// power-of-two core count up to `2^bits` owns an equal share of primaries.
+/// The offset stays below `stride`, so `vshard >> (VShardId::BITS - bits)`
+/// recovers the bucket.
 pub const fn bucket_to_vshard(bucket: u32, bits: u8) -> u32 {
-    bucket << (VShardId::BITS - bits) as u32
+    let stride_bits = (VShardId::BITS - bits) as u32;
+    let bits = bits as u32;
+    let top_shift = bits.saturating_sub(stride_bits);
+    let offset = (bucket >> top_shift) & ((1u32 << stride_bits) - 1);
+    (bucket << stride_bits) | offset
 }
 
 /// The primary vShard that owns the tile with key `tile_key`.
@@ -167,10 +180,13 @@ mod tests {
 
     #[test]
     fn tile_routing_uses_the_mixed_bucket() {
-        // prefix_bits=8: stride=4, so the vShard is the mixed bucket times 4.
+        // prefix_bits=8: stride=4, so the vShard is the mixed bucket times 4
+        // plus the bucket's top two bits.
         for key in [0u64, 1, 2, 0x0100_0000_0000_0000, u64::MAX] {
             let vshard = array_vshard_for_tile(key, 8).unwrap();
-            assert_eq!(vshard, prefix_bucket(key, 8) * 4, "key={key:#x}");
+            let bucket = prefix_bucket(key, 8);
+            assert_eq!(vshard, bucket * 4 + (bucket >> 6), "key={key:#x}");
+            assert_eq!(vshard >> 2, bucket, "key={key:#x}");
         }
         // prefix_bits=10: stride=1, so the vShard is the mixed bucket.
         let key = 0x0040_0000_0000_0000;
@@ -222,10 +238,60 @@ mod tests {
     fn bucket_to_vshard_strides() {
         assert_eq!(VShardId::COUNT, 1 << VShardId::BITS);
         assert_eq!(VShardId::BITS, 10);
-        assert_eq!(bucket_to_vshard(1, 1), 512);
+        assert_eq!(bucket_to_vshard(0, 1), 0);
+        assert_eq!(bucket_to_vshard(1, 1), 513);
         assert_eq!(bucket_to_vshard(1, 8), 4);
+        assert_eq!(bucket_to_vshard(255, 8), 1023);
+        assert_eq!(bucket_to_vshard(64, 8), 257);
         assert_eq!(bucket_to_vshard(1, 10), 1);
         assert_eq!(routing_bits(16), Ok(10));
+    }
+
+    /// Every bucket's primary sits in the bucket's own stride, and the shift
+    /// recovers the bucket.
+    #[test]
+    fn the_shift_recovers_the_bucket_of_every_primary() {
+        for prefix_bits in 1u8..=MAX_PREFIX_BITS {
+            let bits = routing_bits(prefix_bits).unwrap();
+            let shift = u32::from(VShardId::BITS - bits);
+            for bucket in 0u32..(1 << bits) {
+                let vshard = bucket_to_vshard(bucket, bits);
+                assert!(vshard < VShardId::COUNT, "bits={bits} bucket={bucket}");
+                assert_eq!(vshard >> shift, bucket, "bits={bits} bucket={bucket}");
+            }
+        }
+    }
+
+    /// A core owns `vshard % num_cores`. With the default `prefix_bits`, a
+    /// 4-core and an 8-core node own an equal share of the primaries.
+    #[test]
+    fn default_prefix_bits_put_primaries_on_every_core() {
+        let bits = routing_bits(8).unwrap();
+        for num_cores in [2u32, 4, 8, 16] {
+            let mut per_core = vec![0u32; num_cores as usize];
+            for bucket in 0u32..(1 << bits) {
+                per_core[(bucket_to_vshard(bucket, bits) % num_cores) as usize] += 1;
+            }
+            let share = (1u32 << bits) / num_cores;
+            assert!(
+                per_core.iter().all(|&n| n == share),
+                "{num_cores} cores: primaries per core {per_core:?}"
+            );
+        }
+    }
+
+    /// Every routing granularity spreads its primaries over as many cores as
+    /// it has buckets, up to eight.
+    #[test]
+    fn every_prefix_bits_spreads_over_the_cores() {
+        for prefix_bits in 1u8..=MAX_PREFIX_BITS {
+            let bits = routing_bits(prefix_bits).unwrap();
+            let num_cores = (1u32 << bits).min(8);
+            let cores: std::collections::BTreeSet<u32> = (0u32..(1 << bits))
+                .map(|bucket| bucket_to_vshard(bucket, bits) % num_cores)
+                .collect();
+            assert_eq!(cores.len() as u32, num_cores, "bits={bits}");
+        }
     }
 
     #[test]

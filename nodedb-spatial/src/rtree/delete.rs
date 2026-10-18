@@ -2,13 +2,15 @@
 
 //! R-tree entry deletion with underflow handling.
 
+use nodedb_types::BboxSpace;
+
 use super::node::{EntryId, NodeKind, RTreeEntry};
 use super::tree::{RTree, collect_entries_owned};
 
 impl RTree {
     /// Delete an entry by ID. Returns true if found and removed.
     pub fn delete(&mut self, id: EntryId) -> bool {
-        let removed = delete_entry(&mut self.nodes, self.root, id);
+        let removed = delete_entry(&mut self.nodes, self.root, id, self.space);
         if let Some(orphans) = removed {
             self.len -= 1;
             for entry in orphans {
@@ -27,6 +29,7 @@ fn delete_entry(
     nodes: &mut Vec<super::node::Node>,
     node_idx: usize,
     id: EntryId,
+    space: BboxSpace,
 ) -> Option<Vec<RTreeEntry>> {
     let is_leaf = nodes[node_idx].is_leaf();
 
@@ -37,7 +40,7 @@ fn delete_entry(
                 if let NodeKind::Leaf { entries } = &mut nodes[node_idx].kind {
                     entries.remove(pos);
                 }
-                nodes[node_idx].recompute_bbox();
+                nodes[node_idx].recompute_bbox(space);
                 return Some(Vec::new());
             }
         }
@@ -52,7 +55,7 @@ fn delete_entry(
     };
 
     for child_idx in child_indices {
-        if let Some(mut orphans) = delete_entry(nodes, child_idx, id) {
+        if let Some(mut orphans) = delete_entry(nodes, child_idx, id, space) {
             // Update child bbox in parent.
             let child_bbox = nodes[child_idx].bbox;
             if let NodeKind::Internal { children } = &mut nodes[node_idx].kind {
@@ -63,7 +66,7 @@ fn delete_entry(
                     }
                 }
             }
-            nodes[node_idx].recompute_bbox();
+            nodes[node_idx].recompute_bbox(space);
 
             // Check underflow.
             if nodes[child_idx].is_underflow() {
@@ -72,7 +75,7 @@ fn delete_entry(
                 if let NodeKind::Internal { children } = &mut nodes[node_idx].kind {
                     children.retain(|c| c.node_idx != child_idx);
                 }
-                nodes[node_idx].recompute_bbox();
+                nodes[node_idx].recompute_bbox(space);
                 orphans.extend(collected);
             }
 

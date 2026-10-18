@@ -3,49 +3,142 @@
 //! Append-only in-memory `AuditLog`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use nodedb_types::DatabaseId;
 
 use crate::types::TenantId;
 
 use super::auth::AuditAuth;
-use super::entry::{AuditEntry, hash_entry, now_us};
+use super::entry::AuditEntry;
 use super::event::AuditEvent;
+use super::export_sink::AuditExportSink;
+use super::flush_control::{AuditFlushControl, BACKPRESSURE_MULTIPLE};
 use super::level::AuditLevel;
+use super::wal_sink::AuditWalSink;
+
+/// One audit event to record, borrowed from the caller.
+pub struct AuditRecordInput<'a> {
+    pub event: AuditEvent,
+    pub tenant_id: Option<TenantId>,
+    pub database_id: Option<DatabaseId>,
+    pub source: &'a str,
+    pub detail: &'a str,
+    pub auth: &'a AuditAuth,
+}
 
 /// Append-only audit log.
 ///
-/// Entries are immutable once appended. The log supports bounded in-memory
-/// retention with overflow to the WAL or a dedicated audit segment file.
+/// Entries are immutable once appended.
+/// A record call allocates seqs, chains, and appends to the WAL sink under the lock.
+/// So WAL order equals seq order.
+/// Its entries wait in `staged` until the WAL sync covers them, and only then are published.
+/// Readers, flushes and export see published entries only, so they never see a non-durable entry.
+/// The buffer holds every published entry until a flush commits it to the catalog.
+/// The buffer never drops an entry to stay under its bound.
+/// At `flush_bound` entries the log requests an early flush.
+/// At `BACKPRESSURE_MULTIPLE * flush_bound` a recorder that can wait waits for a flush.
 ///
 /// Lives on the Control Plane (Send + Sync).
 pub struct AuditLog {
-    entries: VecDeque<AuditEntry>,
+    pub(super) entries: VecDeque<AuditEntry>,
+    /// Entries appended to the WAL sink and not yet published, in seq order.
+    pub(super) staged: VecDeque<AuditEntry>,
     /// Separate auth event stream for login/logout/MFA/deactivation.
-    auth_events: VecDeque<AuditEntry>,
-    /// Maximum entries retained in memory.
-    max_entries: usize,
-    /// Next sequence number.
-    next_seq: u64,
-    /// Total entries ever recorded (including evicted).
-    total_entries: u64,
-    /// Hash of the last recorded entry (for chain continuity).
-    last_hash: String,
+    pub(super) auth_events: VecDeque<AuditEntry>,
+    /// Buffer length that requests an early flush.
+    pub(super) flush_bound: usize,
+    /// Next sequence number to allocate.
+    pub(super) next_seq: u64,
+    /// Total entries ever published.
+    pub(super) total_entries: u64,
+    /// Hash of the last allocated entry, staged or published (for chain continuity).
+    pub(super) staged_hash: String,
+    /// Seq of the last published entry.
+    pub(super) published_seq: u64,
+    /// Hash of the last published entry.
+    pub(super) published_hash: String,
     /// Current audit level (controls which events are recorded).
     level: AuditLevel,
+    /// Early-flush signal and flush serialization, shared with the flush task.
+    pub(super) flush_control: Arc<AuditFlushControl>,
+    /// Durable append target. `None` only in a log built with no WAL.
+    pub(super) wal_sink: Option<Arc<dyn AuditWalSink>>,
+    /// `(seq, WAL position)` of each staged or buffered entry the WAL sink took, in seq order.
+    pub(super) wal_positions: VecDeque<(u64, u64)>,
+    /// Export target, such as the SIEM exporter.
+    pub(super) export_sink: Option<Arc<dyn AuditExportSink>>,
+    /// Entries published for export since the last [`Self::take_export_pending`].
+    pub(super) export_pending: Vec<AuditEntry>,
 }
 
 impl AuditLog {
-    pub fn new(max_entries: usize) -> Self {
+    pub fn new(flush_bound: usize) -> Self {
         Self {
-            entries: VecDeque::with_capacity(max_entries.min(10_000)),
+            entries: VecDeque::with_capacity(flush_bound.min(10_000)),
+            staged: VecDeque::new(),
             auth_events: VecDeque::with_capacity(1_000),
-            max_entries,
+            flush_bound: flush_bound.max(1),
             next_seq: 1,
             total_entries: 0,
-            last_hash: String::new(),
+            staged_hash: String::new(),
+            published_seq: 0,
+            published_hash: String::new(),
             level: AuditLevel::default(),
+            flush_control: Arc::new(AuditFlushControl::default()),
+            wal_sink: None,
+            wal_positions: VecDeque::new(),
+            export_sink: None,
+            export_pending: Vec::new(),
         }
+    }
+
+    /// Append every entry recorded from now on to `sink` before the record call returns.
+    pub fn set_wal_sink(&mut self, sink: Arc<dyn AuditWalSink>) {
+        self.wal_sink = Some(sink);
+    }
+
+    /// The durable append target, when one is set.
+    pub fn wal_sink(&self) -> Option<Arc<dyn AuditWalSink>> {
+        self.wal_sink.clone()
+    }
+
+    /// Hand every entry recorded from now on to `sink`, while the sink is active.
+    pub fn set_export_sink(&mut self, sink: Arc<dyn AuditExportSink>) {
+        self.export_sink = Some(sink);
+    }
+
+    /// Move out the entries waiting for export, with the sink they go to.
+    ///
+    /// [`AuditLogGuard`](super::guard::AuditLogGuard) calls this on drop and exports after it unlocks.
+    pub fn take_export_pending(&mut self) -> (Vec<AuditEntry>, Option<Arc<dyn AuditExportSink>>) {
+        if self.export_pending.is_empty() {
+            return (Vec::new(), None);
+        }
+        (
+            std::mem::take(&mut self.export_pending),
+            self.export_sink.clone(),
+        )
+    }
+
+    /// The early-flush signal and flush serialization for this log.
+    pub fn flush_control(&self) -> Arc<AuditFlushControl> {
+        Arc::clone(&self.flush_control)
+    }
+
+    /// Set the buffer length that requests an early flush. A value of 0 counts as 1.
+    pub fn set_flush_bound(&mut self, flush_bound: usize) {
+        self.flush_bound = flush_bound.max(1);
+    }
+
+    /// Whether the buffer is past the point where a recorder that can wait waits for a flush.
+    pub fn needs_backpressure(&self) -> bool {
+        self.entries.len() >= self.flush_bound.saturating_mul(BACKPRESSURE_MULTIPLE)
+    }
+
+    /// The seq of the last published entry, or 0 when nothing is published.
+    pub fn last_seq(&self) -> u64 {
+        self.published_seq
     }
 
     /// Set the audit level.
@@ -61,11 +154,13 @@ impl AuditLog {
     /// Set the next sequence number (used on startup to resume from catalog).
     pub fn set_next_seq(&mut self, seq: u64) {
         self.next_seq = seq;
+        self.published_seq = seq.saturating_sub(1);
     }
 
     /// Set the last hash (used on startup to continue the chain from catalog).
     pub fn set_last_hash(&mut self, hash: String) {
-        self.last_hash = hash;
+        self.published_hash.clone_from(&hash);
+        self.staged_hash = hash;
     }
 
     /// Record an audit event with hash chain (legacy — no auth context).
@@ -105,7 +200,10 @@ impl AuditLog {
         )
     }
 
-    /// Record an audit event with auth context enrichment.
+    /// Record an audit event with auth context enrichment (best-effort durability).
+    ///
+    /// A WAL sink error is logged and reported, and the entry stays buffered.
+    /// Use [`Self::record_with_auth_durable`] when the caller must abort on that error.
     pub fn record_with_auth(
         &mut self,
         event: AuditEvent,
@@ -115,40 +213,39 @@ impl AuditLog {
         detail: &str,
         auth: &AuditAuth,
     ) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let prev_hash = self.last_hash.clone();
+        match self.record_with_auth_durable(event, tenant_id, database_id, source, detail, auth) {
+            Ok(seq) => seq,
+            Err(e) => {
+                let seq = self.last_seq();
+                tracing::error!(error = %e, seq, "audit WAL append failed, entry is buffered only");
+                crate::diag::audit_wal_append_failed(&e, seq);
+                seq
+            }
+        }
+    }
 
-        let entry = AuditEntry {
-            seq,
-            timestamp_us: now_us(),
-            event: event.clone(),
+    /// Record an audit event and append it to the WAL sink.
+    ///
+    /// The entry is buffered even when the WAL append fails.
+    /// The error tells the caller that the entry is not crash-safe.
+    pub fn record_with_auth_durable(
+        &mut self,
+        event: AuditEvent,
+        tenant_id: Option<TenantId>,
+        database_id: Option<DatabaseId>,
+        source: &str,
+        detail: &str,
+        auth: &AuditAuth,
+    ) -> crate::Result<u64> {
+        let seqs = self.record_batch_durable([AuditRecordInput {
+            event,
             tenant_id,
             database_id,
-            auth_user_id: auth.user_id.clone(),
-            auth_user_name: auth.user_name.clone(),
-            session_id: auth.session_id.clone(),
-            source: source.to_string(),
-            detail: detail.to_string(),
-            prev_hash,
-        };
-
-        self.last_hash = hash_entry(&entry);
-
-        // Route auth events to the separate auth_events stream.
-        if event.is_auth_event() {
-            if self.auth_events.len() >= 10_000 {
-                self.auth_events.pop_front();
-            }
-            self.auth_events.push_back(entry.clone());
-        }
-
-        if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
-        }
-        self.entries.push_back(entry);
-        self.total_entries += 1;
-        seq
+            source,
+            detail,
+            auth,
+        }])?;
+        Ok(seqs.first().copied().unwrap_or_else(|| self.last_seq()))
     }
 
     /// Filter in-memory entries by database id.
@@ -207,67 +304,49 @@ impl AuditLog {
         &self.auth_events
     }
 
-    /// Append a pre-built `AuditCheckpoint` entry directly to the log.
+    /// Copy the buffered entries for a persistence pass.
     ///
-    /// Used by the retention pruner to link the surviving chain head back to
-    /// the last deleted entry via the checkpoint's `prev_hash`. The entry
-    /// is assumed to have a correct `prev_hash`; no re-computation is done
-    /// here — the caller owns the chain at this point.
-    pub fn push_checkpoint(&mut self, entry: AuditEntry) {
-        self.last_hash = hash_entry(&entry);
-        if self.entries.len() >= self.max_entries {
+    /// The entries stay buffered until [`Self::evict_persisted`] runs.
+    /// A reader that locks the log between the copy and the eviction still sees them.
+    pub fn snapshot_for_persistence(&self) -> Vec<AuditEntry> {
+        self.entries.iter().cloned().collect()
+    }
+
+    /// Remove buffered entries with `seq <= through_seq`.
+    ///
+    /// The caller must call this only after those entries are committed to the catalog.
+    /// Buffered seqs ascend from front to back, so eviction stops at the first higher seq.
+    /// Returns the highest WAL position among the evicted entries.
+    /// Every WAL record at or below it is in the catalog, so the WAL can drop through it.
+    pub fn evict_persisted(&mut self, through_seq: u64) -> Option<u64> {
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.seq <= through_seq)
+        {
             self.entries.pop_front();
         }
-        self.entries.push_back(entry);
-        self.total_entries += 1;
-        self.next_seq = self.next_seq.max(
-            self.entries
-                .back()
-                .map(|e| e.seq + 1)
-                .unwrap_or(self.next_seq),
-        );
-    }
-
-    /// Allocate the next sequence number without recording an entry.
-    /// Used by the retention pruner to build the checkpoint entry before push.
-    pub fn allocate_seq(&mut self) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        seq
-    }
-
-    /// Get the current last hash (for checkpoint `prev_hash` construction).
-    pub fn current_last_hash(&self) -> &str {
-        &self.last_hash
-    }
-
-    /// Drain entries for persistence (WAL or segment file).
-    pub fn drain_for_persistence(&mut self) -> Vec<AuditEntry> {
-        self.entries.drain(..).collect()
-    }
-
-    /// Get the current last hash (for chain continuity on restart).
-    pub fn last_hash(&self) -> &str {
-        &self.last_hash
-    }
-
-    /// Verify the hash chain integrity of in-memory entries.
-    /// Returns Ok(()) if chain is valid, Err with the broken sequence number.
-    pub fn verify_chain(&self) -> Result<(), u64> {
-        let mut expected_prev = String::new();
-        for entry in &self.entries {
-            if entry.prev_hash != expected_prev {
-                return Err(entry.seq);
+        let mut committed_position = None;
+        while let Some(&(seq, position)) = self.wal_positions.front() {
+            if seq > through_seq {
+                break;
             }
-            expected_prev = hash_entry(entry);
+            committed_position = Some(position);
+            self.wal_positions.pop_front();
         }
-        Ok(())
+        committed_position
+    }
+
+    /// The hash of the last published entry, the tail a chain reader checks against.
+    pub fn last_hash(&self) -> &str {
+        &self.published_hash
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::security::audit::entry::hash_entry;
 
     #[test]
     fn empty_log() {
@@ -337,20 +416,225 @@ mod tests {
     }
 
     #[test]
-    fn bounded_eviction() {
+    fn bound_requests_flush_and_never_drops() {
         let mut log = AuditLog::new(3);
-        for i in 0..5 {
+        let total = 3 * BACKPRESSURE_MULTIPLE + 1;
+        for i in 0..total {
             log.record(AuditEvent::AuthSuccess, None, "src", &format!("entry-{i}"));
         }
 
-        assert_eq!(log.len(), 3);
-        assert_eq!(log.total_recorded(), 5);
-        // Oldest entries evicted.
-        assert_eq!(log.all()[0].detail, "entry-2");
+        assert_eq!(
+            log.len(),
+            total,
+            "the buffer must keep every unpersisted entry"
+        );
+        assert_eq!(log.total_recorded(), total as u64);
+        assert_eq!(log.all()[0].detail, "entry-0");
+        assert!(log.needs_backpressure());
+        assert!(
+            log.flush_control().take_flush_request(),
+            "reaching the bound must request a flush"
+        );
+
+        let through_seq = log.last_seq();
+        log.evict_persisted(through_seq);
+        assert!(!log.needs_backpressure());
+    }
+
+    /// Captures every appended seq, and fails the append for one chosen seq.
+    struct RecordingSink {
+        appended: std::sync::Mutex<Vec<u64>>,
+        fail_seq: u64,
+    }
+
+    impl AuditWalSink for RecordingSink {
+        fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>> {
+            if entries.iter().any(|entry| entry.seq == self.fail_seq) {
+                return Err(crate::Error::Internal {
+                    detail: "injected audit WAL error".into(),
+                });
+            }
+            self.appended
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(entries.iter().map(|entry| entry.seq));
+            // The position is the seq times 10, so a test can tell the two apart.
+            Ok(entries.iter().map(|entry| entry.seq * 10).collect())
+        }
+
+        fn sync_through(&self, _position: u64) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn truncate_through(&self, _position: u64) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Counts `sync_through` calls, one per sync.
+    #[derive(Default)]
+    struct SyncCountingSink {
+        syncs: std::sync::atomic::AtomicUsize,
+        appended: std::sync::atomic::AtomicUsize,
+        panic_on_append: bool,
+    }
+
+    impl AuditWalSink for SyncCountingSink {
+        fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>> {
+            if self.panic_on_append {
+                panic!("injected audit WAL panic");
+            }
+            self.appended
+                .fetch_add(entries.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(entries.iter().map(|entry| entry.seq).collect())
+        }
+
+        fn sync_through(&self, _position: u64) -> crate::Result<()> {
+            self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn truncate_through(&self, _position: u64) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn batch_inputs<'a>(
+        details: &'a [String],
+        auth: &'a AuditAuth,
+    ) -> impl Iterator<Item = AuditRecordInput<'a>> {
+        details.iter().map(move |detail| AuditRecordInput {
+            event: AuditEvent::DmlAudit,
+            tenant_id: None,
+            database_id: None,
+            source: "batch",
+            detail,
+            auth,
+        })
     }
 
     #[test]
-    fn drain_for_persistence() {
+    fn a_64_entry_batch_issues_one_sync() {
+        let sink = Arc::new(SyncCountingSink::default());
+        let mut log = AuditLog::new(1_000);
+        log.set_wal_sink(Arc::clone(&sink) as Arc<dyn AuditWalSink>);
+        let details: Vec<String> = (0..64).map(|i| format!("dml-{i}")).collect();
+        let auth = AuditAuth::default();
+
+        let seqs = log
+            .record_batch_durable(batch_inputs(&details, &auth))
+            .expect("record batch");
+
+        assert_eq!(
+            seqs,
+            (1..=64).collect::<Vec<u64>>(),
+            "seq order follows input order"
+        );
+        assert_eq!(sink.syncs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(sink.appended.load(std::sync::atomic::Ordering::SeqCst), 64);
+        let entries = log.all();
+        for pair in entries.iter().collect::<Vec<_>>().windows(2) {
+            assert_eq!(
+                pair[1].prev_hash,
+                hash_entry(pair[0]),
+                "the batch stays chained"
+            );
+        }
+        assert_eq!(log.last_hash(), hash_entry(&entries[63]));
+    }
+
+    #[test]
+    fn a_sink_panic_leaves_the_log_untouched() {
+        let mut log = AuditLog::new(1_000);
+        log.record(AuditEvent::AdminAction, None, "src", "before");
+        let (last_seq, last_hash) = (log.last_seq(), log.last_hash().to_string());
+        log.set_wal_sink(Arc::new(SyncCountingSink {
+            panic_on_append: true,
+            ..SyncCountingSink::default()
+        }) as Arc<dyn AuditWalSink>);
+        let details: Vec<String> = (0..3).map(|i| format!("dml-{i}")).collect();
+        let auth = AuditAuth::default();
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.record_batch_durable(batch_inputs(&details, &auth))
+        }));
+
+        assert!(outcome.is_err(), "the sink panic must propagate");
+        assert_eq!(log.len(), 1, "no entry of the batch is buffered");
+        assert_eq!(log.last_seq(), last_seq, "no seq of the batch is consumed");
+        assert_eq!(log.last_hash(), last_hash);
+    }
+
+    #[test]
+    fn eviction_reports_the_highest_committed_wal_position() {
+        let sink = Arc::new(RecordingSink {
+            appended: std::sync::Mutex::new(Vec::new()),
+            fail_seq: u64::MAX,
+        });
+        let mut log = AuditLog::new(100);
+        log.set_wal_sink(Arc::clone(&sink) as Arc<dyn AuditWalSink>);
+        for detail in ["a", "b", "c"] {
+            log.record(AuditEvent::AdminAction, None, "src", detail);
+        }
+        assert_eq!(log.evict_persisted(2), Some(20));
+        assert_eq!(log.evict_persisted(2), None, "nothing new is committed");
+        assert_eq!(log.evict_persisted(3), Some(30));
+    }
+
+    #[test]
+    fn every_record_method_appends_to_the_wal_sink() {
+        let sink = Arc::new(RecordingSink {
+            appended: std::sync::Mutex::new(Vec::new()),
+            fail_seq: u64::MAX,
+        });
+        let mut log = AuditLog::new(100);
+        log.set_wal_sink(Arc::clone(&sink) as Arc<dyn AuditWalSink>);
+        log.record(AuditEvent::AdminAction, None, "src", "record");
+        log.record_with_database(AuditEvent::DatabaseCreated, None, None, "src", "db");
+        log.record_with_auth(
+            AuditEvent::AuthzDenied,
+            None,
+            None,
+            "src",
+            "auth",
+            &AuditAuth::default(),
+        );
+        let durable = log.record_with_auth_durable(
+            AuditEvent::DdlChange,
+            None,
+            None,
+            "src",
+            "durable",
+            &AuditAuth::default(),
+        );
+        assert_eq!(durable.ok(), Some(4));
+        assert_eq!(*sink.appended.lock().unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn wal_error_keeps_the_entry_buffered_and_reaches_a_durable_caller() {
+        let sink = Arc::new(RecordingSink {
+            appended: std::sync::Mutex::new(Vec::new()),
+            fail_seq: 2,
+        });
+        let mut log = AuditLog::new(100);
+        log.set_wal_sink(Arc::clone(&sink) as Arc<dyn AuditWalSink>);
+        log.record(AuditEvent::AdminAction, None, "src", "one");
+        let failed = log.record_with_auth_durable(
+            AuditEvent::AdminAction,
+            None,
+            None,
+            "src",
+            "two",
+            &AuditAuth::default(),
+        );
+        assert!(failed.is_err(), "the WAL error must reach a durable caller");
+        assert_eq!(log.len(), 2, "the entry must stay buffered");
+        assert_eq!(*sink.appended.lock().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn snapshot_keeps_entries_until_evicted() {
         let mut log = AuditLog::new(100);
         log.record(
             AuditEvent::SnapshotBegin,
@@ -360,8 +644,23 @@ mod tests {
         );
         log.record(AuditEvent::SnapshotEnd, None, "node-1", "snapshot done");
 
-        let drained = log.drain_for_persistence();
-        assert_eq!(drained.len(), 2);
+        let snapshot = log.snapshot_for_persistence();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(log.len(), 2, "a snapshot must not remove buffered entries");
+
+        // An entry recorded after the snapshot must survive eviction of the snapshot.
+        log.record(AuditEvent::AdminAction, None, "node-1", "late entry");
+        let through_seq = snapshot.last().map(|e| e.seq).expect("non-empty snapshot");
+        log.evict_persisted(through_seq);
+
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.all()[0].detail, "late entry");
+    }
+
+    #[test]
+    fn evict_persisted_on_empty_log_is_noop() {
+        let mut log = AuditLog::new(100);
+        log.evict_persisted(u64::MAX);
         assert!(log.is_empty());
     }
 
@@ -427,91 +726,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_chain_succeeds_with_mixed_events() {
+    fn appends_link_each_entry_to_its_predecessor() {
         let mut log = AuditLog::new(100);
         log.record(AuditEvent::AuthSuccess, None, "src", "login");
         log.record(AuditEvent::DdlChange, None, "src", "alter");
         log.record(AuditEvent::AdminAction, None, "src", "op");
-        assert!(
-            log.verify_chain().is_ok(),
-            "chain must be valid after normal appends"
-        );
-    }
-
-    #[test]
-    fn verify_chain_succeeds_after_audit_checkpoint() {
-        let mut log = AuditLog::new(100);
-        // Simulate three regular entries.
-        log.record(AuditEvent::AuthSuccess, None, "src", "e1");
-        log.record(AuditEvent::AuthFailure, None, "src", "e2");
-        log.record(AuditEvent::AdminAction, None, "src", "e3");
-
-        // Simulate what the pruner does: take hash of last-deleted entry as
-        // the checkpoint's prev_hash, emit the checkpoint, continue the chain.
-        // Here we pretend entries 1 and 2 were pruned; the last deleted hash
-        // was whatever e2's hash was. We simulate by draining and re-seeding.
-        let last_e2_hash = {
-            let entries = log.all();
-            // entry at index 1 is seq=2 (e2). Its hash was set as last_hash
-            // after e2 was appended, before e3 was appended.
-            // Reconstruct it from entry 2 (e3's prev_hash = hash(e2)).
-            entries[2].prev_hash.clone()
-        };
-
-        let seq = log.allocate_seq();
-        let checkpoint = AuditEntry {
-            seq,
-            timestamp_us: 1_000_000,
-            event: AuditEvent::AuditCheckpoint,
-            tenant_id: None,
-            database_id: None,
-            auth_user_id: String::new(),
-            auth_user_name: String::new(),
-            session_id: String::new(),
-            source: "retention".to_string(),
-            detail: "pruned_count=2 oldest_kept_seq=3".to_string(),
-            prev_hash: last_e2_hash,
-        };
-
-        // Push the checkpoint. Chain: e1 → e2 → e3 → checkpoint → ...
-        // Note: verify_chain on the in-memory log works on the entries slice,
-        // so all four must chain correctly.
-        // Since the checkpoint's prev_hash skips to e2's hash (simulating the
-        // gap), it won't verify against e3 in the same slice. This is the
-        // expected behaviour: verify_chain on a trimmed view (e.g. post-drain)
-        // that starts from the checkpoint.
-        let mut log2 = AuditLog::new(100);
-        log2.record(AuditEvent::AuditCheckpoint, None, "retention", "simulated");
-        log2.record(AuditEvent::AuthSuccess, None, "src", "post-checkpoint");
-        assert!(
-            log2.verify_chain().is_ok(),
-            "chain after checkpoint must be valid"
-        );
-        // Also verify the checkpoint variant itself is correctly pushed.
-        log2.push_checkpoint(checkpoint);
-    }
-
-    #[test]
-    fn push_checkpoint_advances_next_seq() {
-        let mut log = AuditLog::new(100);
-        log.record(AuditEvent::AuthSuccess, None, "src", "e1");
-        let seq = log.allocate_seq(); // seq = 2
-        let chk = AuditEntry {
-            seq,
-            timestamp_us: 0,
-            event: AuditEvent::AuditCheckpoint,
-            tenant_id: None,
-            database_id: None,
-            auth_user_id: String::new(),
-            auth_user_name: String::new(),
-            session_id: String::new(),
-            source: "retention".to_string(),
-            detail: String::new(),
-            prev_hash: log.last_hash().to_string(),
-        };
-        log.push_checkpoint(chk);
-        // next_seq must be at least 3 after pushing seq=2.
-        let next = log.allocate_seq();
-        assert!(next >= 3, "next_seq must be > checkpoint seq");
+        let entries = log.all();
+        assert!(entries[0].prev_hash.is_empty());
+        assert_eq!(entries[1].prev_hash, hash_entry(&entries[0]));
+        assert_eq!(entries[2].prev_hash, hash_entry(&entries[1]));
+        assert_eq!(log.last_hash(), hash_entry(&entries[2]));
+        assert_eq!(log.last_seq(), 3);
     }
 }

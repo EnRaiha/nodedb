@@ -154,7 +154,7 @@ pub async fn match_query(
         gate.auth(),
         &state.redaction,
     )
-    .map_err(|e| DdlError::new("0A000", e.to_string()))?;
+    .map_err(|e| DdlError::new("42501", e.to_string()))?;
 
     // Single-node mode: keep the direct path byte-identical — broadcast the `Match`
     // plan with `cluster_mode = false` to all local cores. The Data Plane emits

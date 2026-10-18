@@ -86,6 +86,44 @@ pub fn tile_overlaps_slice(
     true
 }
 
+/// True if a tile's per-dim MBR lies inside every constrained dim range, so
+/// every cell of the tile passes the slice. A bound of another type than
+/// its range never lies inside it.
+pub fn tile_within_slice(
+    dim_mins: &[DomainBound],
+    dim_maxs: &[DomainBound],
+    slice: &Slice,
+) -> bool {
+    for (i, range) in slice.dim_ranges.iter().enumerate() {
+        let Some(r) = range else { continue };
+        let (Some(tile_min), Some(tile_max)) = (dim_mins.get(i), dim_maxs.get(i)) else {
+            return false;
+        };
+        let same_type = [tile_min, tile_max, &r.hi]
+            .iter()
+            .all(|b| std::mem::discriminant(*b) == std::mem::discriminant(&r.lo));
+        if !same_type || bound_lt(tile_min, &r.lo) || bound_lt(&r.hi, tile_max) {
+            return false;
+        }
+    }
+    true
+}
+
+/// [`slice_sparse`] over an owned tile. A tile of live rows only whose MBR
+/// lies inside the slice is returned as it is, with no rebuild.
+pub fn slice_sparse_owned(
+    schema: &ArraySchema,
+    tile: SparseTile,
+    slice: &Slice,
+) -> ArrayResult<SparseTile> {
+    use crate::tile::sparse_tile::RowKind;
+    let all_live = tile.row_kinds.iter().all(|&k| k == RowKind::Live.as_u8());
+    if all_live && tile_within_slice(&tile.mbr.dim_mins, &tile.mbr.dim_maxs, slice) {
+        return Ok(tile);
+    }
+    slice_sparse(schema, &tile, slice)
+}
+
 /// Filter cells in `tile` to those whose coords pass every dim range.
 /// Result is a freshly-built [`SparseTile`] — dictionaries shrink to
 /// surviving values, MBR/attr_stats are recomputed.
@@ -93,6 +131,17 @@ pub fn slice_sparse(
     schema: &ArraySchema,
     tile: &SparseTile,
     slice: &Slice,
+) -> ArrayResult<SparseTile> {
+    filter_sparse(schema, tile, |coord| cell_in_slice(coord, slice))
+}
+
+/// Keep the live cells of `tile` whose coordinate passes `keep`. Result is a
+/// freshly-built [`SparseTile`] — dictionaries shrink to surviving values,
+/// MBR/attr_stats are recomputed. Sentinel rows never survive.
+pub fn filter_sparse(
+    schema: &ArraySchema,
+    tile: &SparseTile,
+    keep: impl Fn(&[CoordValue]) -> bool,
 ) -> ArrayResult<SparseTile> {
     use crate::tile::sparse_tile::RowKind;
     let mut b = SparseTileBuilder::new(schema);
@@ -108,7 +157,7 @@ pub fn slice_sparse(
             .iter()
             .map(|d| d.values[d.indices[row] as usize].clone())
             .collect();
-        if !cell_in_slice(&coord, slice) {
+        if !keep(&coord) {
             live_idx += 1;
             continue;
         }
@@ -139,7 +188,8 @@ pub fn slice_sparse(
     Ok(b.build())
 }
 
-fn cell_in_slice(coord: &[CoordValue], slice: &Slice) -> bool {
+/// True if `coord` passes every constrained dim range of `slice`.
+pub(crate) fn cell_in_slice(coord: &[CoordValue], slice: &Slice) -> bool {
     for (i, range) in slice.dim_ranges.iter().enumerate() {
         let Some(r) = range else { continue };
         let Some(c) = coord.get(i) else {
@@ -277,5 +327,30 @@ mod tests {
             None,
         ]);
         assert!(tile_overlaps_slice(&mins, &maxs, &sl));
+    }
+
+    #[test]
+    fn mbr_within_needs_both_bounds_inside() {
+        let mins = vec![DomainBound::Int64(5), DomainBound::Int64(0)];
+        let maxs = vec![DomainBound::Int64(9), DomainBound::Int64(9)];
+        let inside = Slice::new(vec![
+            Some(DimRange::new(DomainBound::Int64(5), DomainBound::Int64(9))),
+            None,
+        ]);
+        assert!(tile_within_slice(&mins, &maxs, &inside));
+        assert!(tile_within_slice(&mins, &maxs, &Slice::default()));
+        let partial = Slice::new(vec![
+            Some(DimRange::new(DomainBound::Int64(6), DomainBound::Int64(20))),
+            None,
+        ]);
+        assert!(!tile_within_slice(&mins, &maxs, &partial));
+        let other_type = Slice::new(vec![
+            Some(DimRange::new(
+                DomainBound::Float64(0.0),
+                DomainBound::Float64(100.0),
+            )),
+            None,
+        ]);
+        assert!(!tile_within_slice(&mins, &maxs, &other_type));
     }
 }

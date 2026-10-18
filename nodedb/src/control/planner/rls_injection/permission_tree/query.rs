@@ -273,6 +273,7 @@ mod tests {
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
             sort_keys: Vec::new(),
+            group_key_aliases: Vec::new(),
         });
         assert!(apply(&mut plan, &cache).is_ok());
         match &plan {

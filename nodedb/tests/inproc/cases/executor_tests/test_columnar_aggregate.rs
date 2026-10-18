@@ -73,6 +73,7 @@ fn aggregate_count_reads_plain_columnar_engine_rows() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );
@@ -153,6 +154,7 @@ fn columnar_having_uses_canonical_key_but_output_keeps_user_alias() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );
@@ -301,6 +303,7 @@ fn aggregate_group_by_does_not_require_full_materialization() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );

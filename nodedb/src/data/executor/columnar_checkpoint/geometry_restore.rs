@@ -145,8 +145,10 @@ impl CoreLoop {
         );
 
         let indexed = docs.len();
-        // Boot-time rebuild: nothing to roll back, so the delta is dropped.
-        let _ = self.index_columnar_geometry_columns(&task, &schema, collection, &docs);
+        // Boot-time rebuild: nothing to roll back, so the delta is dropped. A
+        // restored row set in mixed SRIDs refuses the restore, as an
+        // unreadable row does.
+        self.index_columnar_geometry_columns(&task, &schema, collection, &docs)?;
         Ok(indexed)
     }
 

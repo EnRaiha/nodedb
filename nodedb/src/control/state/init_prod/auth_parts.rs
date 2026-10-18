@@ -16,7 +16,7 @@ pub(super) struct AuthParts {
     pub(super) metering_config: MeteringConfig,
     pub(super) rate_limit_config: RateLimitConfig,
     pub(super) http_client: Arc<reqwest::Client>,
-    pub(super) siem: crate::control::security::siem::SiemExporter,
+    pub(super) siem: Arc<crate::control::security::siem::SiemExporter>,
     pub(super) risk_scorer: crate::control::security::risk::RiskScorer,
     pub(super) escalation: crate::control::security::escalation::EscalationEngine,
     pub(super) tls_policy: crate::control::security::tls_policy::TlsPolicy,
@@ -29,6 +29,7 @@ pub(super) struct AuthParts {
 pub(super) fn build(
     auth_config: &crate::config::auth::AuthConfig,
     credentials: &CredentialStore,
+    audit: &std::sync::Mutex<crate::control::security::audit::AuditLog>,
 ) -> crate::Result<AuthParts> {
     // `auth_config.metering` is `None` unless the operator configured a
     // `[metering]` section; fall back to `MeteringConfig::default()` so
@@ -56,9 +57,13 @@ pub(super) fn build(
     // process-wide HTTP client rather than building its own pool.
     let siem_config = auth_config.siem.clone().unwrap_or_default();
     let http_client = Arc::new(reqwest::Client::new());
-    let siem = crate::control::security::siem::SiemExporter::with_client(
+    let siem = Arc::new(crate::control::security::siem::SiemExporter::with_client(
         siem_config,
         Arc::clone(&http_client),
+    ));
+    // Every recorded audit entry reaches the exporter, whichever path recorded it.
+    crate::control::security::audit::lock_audit_log(audit).set_export_sink(
+        Arc::clone(&siem) as Arc<dyn crate::control::security::audit::AuditExportSink>
     );
 
     // `auth_config.risk` is `None` unless the operator configured an

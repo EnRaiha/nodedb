@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 
 use nodedb_types::Surrogate;
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::SridGeometry;
 
 use crate::control::server::dispatch_utils::RecordOwner;
 use crate::types::{DatabaseId, TenantId, VShardId};
@@ -32,7 +32,7 @@ pub struct SpatialInsertTarget {
     pub collection: String,
     pub field: String,
     pub surrogate: Surrogate,
-    pub geometry: Geometry,
+    pub geometry: SridGeometry,
 }
 
 /// Encapsulates async Data Plane dispatch for spatial insert/delete.
@@ -380,7 +380,7 @@ mod tests {
     }
 
     fn make_point_geometry_bytes() -> Vec<u8> {
-        let geom = nodedb_types::geometry::Geometry::point(10.0, 20.0);
+        let geom = SridGeometry::wgs84(nodedb_types::geometry::Geometry::point(10.0, 20.0));
         zerompk::to_msgpack_vec(&geom).unwrap()
     }
 

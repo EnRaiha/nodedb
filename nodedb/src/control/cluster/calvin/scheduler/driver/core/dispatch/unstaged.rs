@@ -96,7 +96,7 @@ impl Scheduler {
         self.propose_sequencer_entry(
             txn_id,
             SchedulerProposal::Vote {
-                abort: Some(reason),
+                abort: Some(reason.into()),
             },
         );
         // The verdict can be stored already: on replay, or when a peer's
@@ -116,7 +116,7 @@ mod tests {
 
     use nodedb_cluster::calvin::types::SchedulerInput;
     use nodedb_cluster::calvin::{
-        AttemptOutcome, CalvinCompletionRegistry, ParticipantVote, SequencerEntry,
+        AbortCause, AttemptOutcome, CalvinCompletionRegistry, ParticipantVote, SequencerEntry,
     };
 
     use super::*;
@@ -171,12 +171,13 @@ mod tests {
                 position,
                 vshard,
                 reason,
+                refusal,
             } = entry
             {
                 registry.note_vote(
                     nodedb_cluster::calvin::TxnId::new(epoch, position),
                     vshard,
-                    ParticipantVote::Abort(reason),
+                    ParticipantVote::Abort(AbortCause { reason, refusal }),
                 );
             }
         }
@@ -230,16 +231,17 @@ mod tests {
             position: 0,
             vshard: REJECTING,
             reason: AbortReason::PlanRejected,
+            refusal: None,
         }));
         let verdicts = registry.drain_unproposed_verdicts();
         assert_eq!(
             verdicts,
             vec![(
                 cluster_txn,
-                nodedb_cluster::calvin::VerdictOutcome::Abort(AbortReason::PlanRejected)
+                nodedb_cluster::calvin::VerdictOutcome::Abort(AbortReason::PlanRejected.into())
             )]
         );
-        registry.note_verdict(cluster_txn, verdicts[0].1);
+        registry.note_verdict(cluster_txn, verdicts[0].1.clone());
 
         for (scheduler, vshard) in [(&mut rejecting, REJECTING), (&mut peer, PEER)] {
             scheduler.resume_on_verdict(txn_id, false);
@@ -260,9 +262,7 @@ mod tests {
         );
         assert_eq!(
             outcome.await.expect("outcome fires"),
-            AttemptOutcome::Aborted {
-                reason: AbortReason::PlanRejected
-            }
+            AttemptOutcome::Aborted(AbortReason::PlanRejected.into())
         );
     }
 
@@ -274,7 +274,7 @@ mod tests {
         let txn_id = TxnId::new(32, 0);
         registry.note_verdict(
             nodedb_cluster::calvin::TxnId::new(32, 0),
-            nodedb_cluster::calvin::VerdictOutcome::Abort(AbortReason::PlanRejected),
+            nodedb_cluster::calvin::VerdictOutcome::Abort(AbortReason::PlanRejected.into()),
         );
 
         scheduler.dispatch_txn(undecodable_txn(32, 0), txn_id, txn_id);

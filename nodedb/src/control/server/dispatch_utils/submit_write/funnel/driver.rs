@@ -218,12 +218,13 @@ pub(crate) async fn enqueue_write(
             return Err(error);
         }
     };
-    let (admission, admission_guard, order_guard) = match admitted {
+    let (admission, admission_guard, order_guard, unscheduled) = match admitted {
         AdmissionOutcome::Proceed {
             admission,
             admission_guard,
             order_guard,
-        } => (admission, admission_guard, order_guard),
+            unscheduled,
+        } => (admission, admission_guard, order_guard, unscheduled),
         AdmissionOutcome::RouteToCalvin => {
             // The scheduler journals the write in its own sequenced record.
             // The scheduler applies the write from its own records, so
@@ -407,6 +408,7 @@ pub(crate) async fn enqueue_write(
         HeldGuards {
             _admission: admission_guard,
             _order: order_guard,
+            _unscheduled: unscheduled,
             _write_order: write_order,
         },
         post_apply.is_some(),

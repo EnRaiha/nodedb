@@ -11,11 +11,11 @@
 //! `RecordType::ArrayDelete` sub-record the autocommit array path produces,
 //! reusing its version-tagged encoders (`engine::array::wal`):
 //!
-//! * `Put` → `RecordType::ArrayPut`. The plan's `cells_msgpack` is decoded into
-//!   `Vec<ArrayPutCell>` and re-encoded via [`encode_put_with_version`] as an
-//!   [`ArrayPutPayload`] — byte-identical to the autocommit `ArrayOp::Put` arm.
-//! * `Delete` → `RecordType::ArrayDelete`, via [`encode_delete_with_version`]
-//!   over an [`ArrayDeletePayload`].
+//! * `Put` → `RecordType::ArrayPut`. The plan's `cells_msgpack` is spliced
+//!   into the versioned payload by [`encode_put_spliced`], never decoded. The
+//!   record is byte-identical to the autocommit `ArrayOp::Put` arm.
+//! * `Delete` → `RecordType::ArrayDelete`, via [`encode_delete_spliced`] over
+//!   the plan's `coords_msgpack`.
 //!
 //! ## Ops that emit nothing / raise a typed error
 //!
@@ -33,10 +33,7 @@
 use nodedb_physical::physical_plan::ArrayOp;
 use nodedb_wal::record::RecordType;
 
-use crate::engine::array::wal::{
-    ArrayDeleteCell, ArrayDeletePayload, ArrayPutCell, ArrayPutPayload, encode_delete_with_version,
-    encode_put_with_version,
-};
+use crate::engine::array::wal::{encode_delete_spliced, encode_put_spliced};
 use crate::wal::RedoSubRecord;
 
 /// Append the redo sub-record for a single array plan op to `ops`.
@@ -52,22 +49,12 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
             provenance,
             ..
         } => {
-            let cells = zerompk::from_msgpack::<Vec<ArrayPutCell>>(cells_msgpack).map_err(|e| {
+            let bytes = encode_put_spliced(array_id, cells_msgpack, provenance).map_err(|e| {
                 crate::Error::Serialization {
                     format: "msgpack".into(),
-                    detail: format!("array resolve put decode cells: {e}"),
+                    detail: format!("array resolve put encode: {e}"),
                 }
             })?;
-            let payload = ArrayPutPayload {
-                array_id: array_id.clone(),
-                cells,
-                provenance: provenance.clone(),
-            };
-            let bytes =
-                encode_put_with_version(&payload).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("array resolve put encode: {e}"),
-                })?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::ArrayPut as u32,
                 payload: bytes,
@@ -80,22 +67,12 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
             provenance,
             ..
         } => {
-            let cells =
-                zerompk::from_msgpack::<Vec<ArrayDeleteCell>>(coords_msgpack).map_err(|e| {
+            let bytes =
+                encode_delete_spliced(array_id, coords_msgpack, provenance).map_err(|e| {
                     crate::Error::Serialization {
                         format: "msgpack".into(),
-                        detail: format!("array resolve delete decode cells: {e}"),
+                        detail: format!("array resolve delete encode: {e}"),
                     }
-                })?;
-            let payload = ArrayDeletePayload {
-                array_id: array_id.clone(),
-                cells,
-                provenance: provenance.clone(),
-            };
-            let bytes =
-                encode_delete_with_version(&payload).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("array resolve delete encode: {e}"),
                 })?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::ArrayDelete as u32,
@@ -109,7 +86,6 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
         // re-derived on replay, so neither carries a redo sub-record.
         ArrayOp::Slice { .. }
         | ArrayOp::SurrogateBitmapScan { .. }
-        | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::Flush { .. }

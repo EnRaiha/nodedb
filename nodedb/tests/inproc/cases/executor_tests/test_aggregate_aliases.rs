@@ -90,6 +90,7 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
             sub_group_by: Vec::new(),
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
+            group_key_aliases: Vec::new(),
             sort_keys: Vec::new(),
         }),
     );
@@ -140,6 +141,7 @@ fn computed_group_count_plan(function: &str) -> PhysicalPlan {
         sub_group_by: Vec::new(),
         sub_aggregates: Vec::new(),
         grouping_sets: Vec::new(),
+        group_key_aliases: Vec::new(),
         sort_keys: Vec::new(),
     })
 }
@@ -170,6 +172,7 @@ fn grouped_count_shape_plan(
         sub_group_by: Vec::new(),
         sub_aggregates: Vec::new(),
         grouping_sets: Vec::new(),
+        group_key_aliases: Vec::new(),
         sort_keys,
     })
 }

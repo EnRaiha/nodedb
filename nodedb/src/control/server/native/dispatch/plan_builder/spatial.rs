@@ -21,12 +21,13 @@ pub(crate) async fn build_scan(
             detail: "missing 'query_geometry'".to_string(),
         })?;
 
-    let geometry: nodedb_types::geometry::Geometry =
+    // GeoJSON, with the optional `crs` member naming a supported SRID.
+    let geometry: nodedb_types::geometry::SridGeometry =
         crate::util::bounded_json::from_slice(raw_bytes).map_err(|e| crate::Error::BadRequest {
             detail: format!("invalid query geometry: {e}"),
         })?;
 
-    let issues = nodedb_spatial::validate::validate_geometry(&geometry);
+    let issues = nodedb_spatial::validate::validate_geometry(&geometry.geometry);
     if !issues.is_empty() {
         return Err(crate::Error::BadRequest {
             detail: format!("invalid query geometry: {}", issues.join("; ")),

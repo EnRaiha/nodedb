@@ -165,6 +165,23 @@ pub trait SqlCatalog {
         self.get_collection(database_id, name)
     }
 
+    /// The designated time-key column of timeseries collection `name`.
+    ///
+    /// The native grouped timeseries scan buckets by this column only. The
+    /// default reads it from the declared columns by the DDL rule: the one
+    /// `TIME_KEY` column, else the one timestamp column. A catalog that
+    /// stores the designation overrides this. `None` when the collection is
+    /// unknown or no column is designated.
+    fn timeseries_time_key(
+        &self,
+        database_id: DatabaseId,
+        name: &str,
+    ) -> Result<Option<String>, SqlCatalogError> {
+        Ok(self.get_collection(database_id, name)?.and_then(|info| {
+            crate::ddl_ast::collection_type::designated::designated_time_key(&info.columns)
+        }))
+    }
+
     /// Look up an array by name. Returns `None` if no array with that
     /// name is registered. The default implementation returns `None` so
     /// that catalog adapters predating array support compile without

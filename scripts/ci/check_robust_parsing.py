@@ -17,7 +17,7 @@ APPROVED_CAPACITY_HELPERS = {
     ("nodedb-array/src/codec/limits.rs", "checked_capacity"),
     ("nodedb-codec/src/bounds.rs", "checked_capacity"),
     ("nodedb-codec/src/bounds.rs", "decoded_len"),
-    ("nodedb-spatial/src/wkb.rs", "checked_wkb_capacity"),
+    ("nodedb-spatial/src/wkb/read.rs", "checked_wkb_capacity"),
     ("nodedb-types/src/backup_envelope/read.rs", "checked_section_capacity"),
     ("nodedb-types/src/decode_bounds.rs", "checked_decode_capacity"),
 }
@@ -249,7 +249,7 @@ def self_test() -> None:
     assert violations("nodedb/src/wire/x.rs", 'fn decode(bytes: &[u8], n: usize) { let v = Vec::with_capacity(n); }')
     assert violations("nodedb/src/wire/x.rs", 'fn from_bytes(bytes: &[u8], n: usize) { let v = HashMap::with_capacity(n); }')
     assert not violations("nodedb/src/wire/x.rs", 'fn decode(bytes: &[u8]) { let v = Vec::with_capacity(bytes.len() / 4); }')
-    assert not violations("nodedb-spatial/src/wkb.rs", 'fn checked_wkb_capacity() -> usize { 1 }\nfn read(bytes: &[u8]) { let n = checked_wkb_capacity(); let v = Vec::with_capacity(n); }')
+    assert not violations("nodedb-spatial/src/wkb/read.rs", 'fn checked_wkb_capacity() -> usize { 1 }\nfn read(bytes: &[u8]) { let n = checked_wkb_capacity(); let v = Vec::with_capacity(n); }')
     print("OK: robust-parsing gate self-tests passed.")
 
 

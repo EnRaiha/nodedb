@@ -26,7 +26,9 @@ use super::types::{SqlExpr, WHOLE_ROW_COLUMN};
 /// - a function argument it cannot compute on: vectors of different
 ///   dimensions, an argument of the wrong type, a malformed JSONPath.
 ///   SQLSTATE `22000`. A `NULL` argument stays `NULL` instead;
-/// - an exact integer SUM past the `Decimal` range, SQLSTATE `22000`.
+/// - an exact integer SUM past the `Decimal` range, SQLSTATE `22000`;
+/// - a geometry SRID fault: an unsupported SRID, operands in different
+///   SRIDs, or a coordinate outside a projection's domain. SQLSTATE `22000`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
     #[error("division by zero")]
@@ -66,6 +68,25 @@ pub enum EvalError {
     /// An exact integer aggregate total lies outside the `Decimal` range.
     #[error("{function}(): integer total out of range")]
     NumericOverflow { function: &'static str },
+    /// An SRID argument, or an SRID a geometry declares, is outside the
+    /// supported set. SQLSTATE `22000`.
+    #[error(
+        "{function}(): unsupported SRID {srid}; supported: {}",
+        nodedb_types::geometry::SUPPORTED_SRID_CODES
+    )]
+    UnsupportedSrid { function: &'static str, srid: i64 },
+    /// Two geometry operands are in different SRIDs. No implicit transform
+    /// runs. SQLSTATE `22000`.
+    #[error("{function}(): operands have different SRIDs {left} and {right}; use ST_Transform")]
+    MixedSrid {
+        function: &'static str,
+        left: u32,
+        right: u32,
+    },
+    /// A coordinate lies outside the region the target projection is
+    /// defined on. SQLSTATE `22000`.
+    #[error("{function}(): coordinate is outside the domain of SRID {srid}")]
+    ProjectionDomain { function: &'static str, srid: u32 },
 }
 
 /// Row scope for `SqlExpr::eval_scope`: how `Column(..)` and `OldColumn(..)`

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Typed DDL arms for `MiscStmt` (COPY FROM/TO file) and the `ClusterStmt`
+//! Typed DDL arms for `MiscStmt` (COPY FROM file or STDIN, COPY TO file) and the `ClusterStmt`
 //! `AlterRaftGroup` variant.
 
 use nodedb_sql::ddl_ast::statement::{ClusterStmt, MiscStmt, NodedbStatement};
@@ -11,13 +11,14 @@ use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::bulk;
 use super::super::cluster;
 use super::super::collection;
 
 pub(super) async fn try_typed(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    _sql: &str,
+    sql: &str,
     database_id: DatabaseId,
     stmt: &NodedbStatement,
     txn_ctx: &DmlTxnCtx<'_>,
@@ -46,6 +47,14 @@ pub(super) async fn try_typed(
             )
             .await,
         ),
+
+        // `COPY <name> FROM STDIN` needs the pgwire COPY sub-protocol, which
+        // opens an array load before the router runs. Every statement that
+        // reaches here has no stream to read.
+        NodedbStatement::Misc(MiscStmt::CopyFromStdin { .. }) => {
+            let parts: Vec<&str> = sql.split_whitespace().collect();
+            Some(bulk::copy_from(state, identity, &parts).await)
+        }
 
         // `COPY <source> TO '<path>' [WITH (...)]` bulk export.
         NodedbStatement::Misc(MiscStmt::CopyToFile {

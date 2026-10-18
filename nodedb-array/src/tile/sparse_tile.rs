@@ -8,6 +8,7 @@
 //! that have many repeats per tile.
 
 use nodedb_types::{OPEN_UPPER, Surrogate};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::mbr::{MbrBuilder, TileMBR};
@@ -76,15 +77,6 @@ impl DimDict {
         Self {
             values: Vec::new(),
             indices: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, v: &CoordValue) {
-        if let Some(idx) = self.values.iter().position(|x| x == v) {
-            self.indices.push(idx as u32);
-        } else {
-            self.indices.push(self.values.len() as u32);
-            self.values.push(v.clone());
         }
     }
 
@@ -300,12 +292,16 @@ pub struct SparseTileBuilder<'a> {
     valid_until_ms: Vec<i64>,
     row_kinds: Vec<u8>,
     mbr: MbrBuilder,
+    /// Per dim: dictionary value → its index in `dim_dicts`, so a row's
+    /// dictionary lookup costs one hash, not a scan of the dictionary.
+    dim_index: Vec<FxHashMap<CoordValue, u32>>,
 }
 
 impl<'a> SparseTileBuilder<'a> {
     pub fn new(schema: &'a ArraySchema) -> Self {
         Self {
             schema,
+            dim_index: (0..schema.arity()).map(|_| FxHashMap::default()).collect(),
             dim_dicts: (0..schema.arity()).map(|_| DimDict::new()).collect(),
             attr_cols: (0..schema.attrs.len()).map(|_| Vec::new()).collect(),
             surrogates: Vec::new(),
@@ -371,7 +367,7 @@ impl<'a> SparseTileBuilder<'a> {
             });
         }
         for (i, c) in coord.iter().enumerate() {
-            self.dim_dicts[i].push(c);
+            self.push_dim(i, c);
         }
         // For sentinel rows `attrs` is empty — no entries added to attr_cols.
         // For live rows, every attr col gets one entry.
@@ -387,6 +383,64 @@ impl<'a> SparseTileBuilder<'a> {
         if kind == RowKind::Live {
             self.mbr.fold(coord, attrs);
         }
+        Ok(())
+    }
+
+    fn push_dim(&mut self, dim: usize, value: &CoordValue) {
+        let dict = &mut self.dim_dicts[dim];
+        let index = *self.dim_index[dim].entry(value.clone()).or_insert_with(|| {
+            dict.values.push(value.clone());
+            (dict.values.len() - 1) as u32
+        });
+        dict.indices.push(index);
+    }
+
+    /// Push live row `row` of the stored tile `tile`, whose coordinate is
+    /// `coord`, reading its attrs, surrogate and valid time from the tile's
+    /// own columns. `live_row` is the row's index in the attr columns.
+    pub fn push_tile_row(
+        &mut self,
+        tile: &SparseTile,
+        row: usize,
+        live_row: usize,
+        coord: &[CoordValue],
+    ) -> ArrayResult<()> {
+        let corrupt = |detail: String| ArrayError::SegmentCorruption { detail };
+        if coord.len() != self.schema.arity() {
+            return Err(ArrayError::CoordArityMismatch {
+                array: self.schema.name.clone(),
+                expected: self.schema.arity(),
+                got: coord.len(),
+            });
+        }
+        if tile.attr_cols.len() != self.schema.attrs.len()
+            || tile.attr_cols.iter().any(|col| col.len() <= live_row)
+        {
+            return Err(corrupt(format!(
+                "tile live row {live_row} is missing from an attr column of array '{}'",
+                self.schema.name
+            )));
+        }
+        let surrogate = tile.live_surrogate(row)?;
+        let valid_from_ms = *tile
+            .valid_from_ms
+            .get(row)
+            .ok_or_else(|| corrupt(format!("tile row {row} has no valid_from_ms")))?;
+        let valid_until_ms = *tile
+            .valid_until_ms
+            .get(row)
+            .ok_or_else(|| corrupt(format!("tile row {row} has no valid_until_ms")))?;
+        for (i, c) in coord.iter().enumerate() {
+            self.push_dim(i, c);
+        }
+        for (out, col) in self.attr_cols.iter_mut().zip(&tile.attr_cols) {
+            out.push(col[live_row].clone());
+        }
+        self.surrogates.push(Some(surrogate));
+        self.valid_from_ms.push(valid_from_ms);
+        self.valid_until_ms.push(valid_until_ms);
+        self.row_kinds.push(RowKind::Live.as_u8());
+        self.mbr.fold_with(coord, |i| &tile.attr_cols[i][live_row]);
         Ok(())
     }
 

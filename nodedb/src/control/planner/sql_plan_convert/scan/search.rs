@@ -96,6 +96,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_sparse_search(
             field_name: p.field.to_string(),
             query_entries: p.query_entries.to_vec(),
             top_k: *p.top_k,
+            filters: serialize_filters(p.filters)?,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -133,7 +134,6 @@ fn build_array_prefilter_plan(
     tenant_id: TenantId,
     ctx: &super::super::convert::ConvertContext,
 ) -> crate::Result<PhysicalPlan> {
-    use nodedb_array::query::slice::{DimRange, Slice};
     use nodedb_array::schema::ArraySchema;
     use nodedb_array::types::ArrayId;
 
@@ -161,24 +161,12 @@ fn build_array_prefilter_plan(
             detail: format!("array schema decode: {e}"),
         })?;
 
-    let mut dim_ranges: Vec<Option<DimRange>> = vec![None; schema.dims.len()];
-    for r in &prefilter.slice.dim_ranges {
-        let idx = schema
-            .dims
-            .iter()
-            .position(|d| d.name == r.dim)
-            .ok_or_else(|| crate::Error::PlanError {
-                detail: format!(
-                    "array prefilter: array '{}' has no dim '{}'",
-                    prefilter.array_name, r.dim
-                ),
-            })?;
-        let dtype = schema.dims[idx].dtype;
-        let lo = super::super::array_fn_convert::helpers::coerce_bound(&r.lo, dtype, &r.dim)?;
-        let hi = super::super::array_fn_convert::helpers::coerce_bound(&r.hi, dtype, &r.dim)?;
-        dim_ranges[idx] = Some(DimRange::new(lo, hi));
-    }
-    let slice = Slice::new(dim_ranges);
+    let slice = super::super::array_fn_convert::helpers::resolve_slice(
+        "array prefilter",
+        &prefilter.array_name,
+        &prefilter.slice,
+        &schema,
+    )?;
     let slice_msgpack =
         zerompk::to_msgpack_vec(&slice).map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),

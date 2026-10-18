@@ -16,6 +16,8 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::config::auth::AuthMode;
 use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::server::pgwire::types::error_map::error_to_pg;
+use crate::control::server::pgwire::types::error_to_sqlstate;
 use crate::control::server::pgwire::types::wire_type::{TEXT_RESULTS, pg_type};
 use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
 use crate::control::server::shared::returning;
@@ -161,16 +163,24 @@ impl NodeDbQueryParser {
         }
     }
 
+    /// Plan `sql` as Execute plans it and authorize the planned tasks.
+    ///
+    /// The outer error is a refusal Parse always reports: authorization or
+    /// the permission view. The inner result is the planning outcome. The
+    /// caller decides whether a planning error reports at Parse.
     async fn authorize_plannable_sql(
         &self,
         sql: &str,
         identity: &crate::control::security::identity::AuthenticatedIdentity,
         database_id: crate::types::DatabaseId,
         emitter: &ArcAuditEmitter,
-    ) -> PgWireResult<bool> {
-        let (sql_without_returning, _) = match returning::strip_returning(sql) {
+    ) -> PgWireResult<Result<(), crate::Error>> {
+        // Execute strips a per-query `ON DENY` clause and then `RETURNING`
+        // before it plans, so Parse does too.
+        let (sql_without_on_deny, _) = crate::control::server::session_auth::extract_on_deny(sql);
+        let (sql_without_returning, _) = match returning::strip_returning(&sql_without_on_deny) {
             Ok(parts) => parts,
-            Err(_) => return Ok(false),
+            Err(error) => return Ok(Err(error)),
         };
         let sql_for_planning = substitute_placeholders_with_null(&sql_without_returning);
         let query_ctx =
@@ -203,7 +213,7 @@ impl NodeDbQueryParser {
                 &self.state.permission_cache,
             ),
         };
-        let Ok((tasks, _)) = query_ctx
+        let tasks = match query_ctx
             .plan_sql_with_rls_metadata(crate::control::planner::context::PlanSqlWithRlsParams {
                 sql: &sql_for_planning,
                 tenant_id: identity.tenant_id,
@@ -211,8 +221,9 @@ impl NodeDbQueryParser {
                 sec: &security,
             })
             .await
-        else {
-            return Ok(false);
+        {
+            Ok((tasks, _)) => tasks,
+            Err(error) => return Ok(Err(error)),
         };
 
         // Parse/Describe is metadata-only: authorize the original task set,
@@ -225,7 +236,7 @@ impl NodeDbQueryParser {
             emitter,
         )
         .map_err(pgwire_authorization_error)?;
-        Ok(true)
+        Ok(Ok(()))
     }
 
     /// The tenant-scoped catalog a single Parse message resolves against, so a
@@ -265,9 +276,12 @@ impl NodeDbQueryParser {
         // pass below and survives that pass failing.
         let param_types = Self::param_types_with_inference(sql, client_types, catalog);
 
-        // Strip RETURNING from DML before planning. The item text is kept so
-        // the result fields for Describe are built from the resolved clause.
-        let (sql_stripped, returning_items) = match returning::strip_returning(sql) {
+        // Strip a per-query `ON DENY` clause, then RETURNING, before planning,
+        // as Execute does. The RETURNING item text is kept so the result
+        // fields for Describe are built from the resolved clause.
+        let (sql_without_on_deny, _) = crate::control::server::session_auth::extract_on_deny(sql);
+        let (sql_stripped, returning_items) = match returning::strip_returning(&sql_without_on_deny)
+        {
             Ok(pair) => pair,
             Err(_) => return (param_types, Vec::new()),
         };
@@ -398,9 +412,24 @@ impl QueryParser for NodeDbQueryParser {
             }));
         }
 
-        let can_infer_schema = self
+        // A DSL or NodeDB DDL statement has no plan at Parse: Execute routes
+        // it to its own dispatcher. Any other statement plans at Execute as it
+        // plans here, so a parse-analysis error reports now, as in PostgreSQL.
+        let can_infer_schema = match self
             .authorize_plannable_sql(sql, &identity, database_id, &emitter)
-            .await?;
+            .await?
+        {
+            Ok(()) => true,
+            Err(error) => {
+                let state = error_to_sqlstate(&error).1;
+                if !is_dsl_statement(sql)
+                    && super::parse_refusal::reported_at_parse(state, count_placeholders(sql) > 0)
+                {
+                    return Err(error_to_pg(&error));
+                }
+                false
+            }
+        };
         // One catalog per Parse, shared by parameter-type inference and schema
         // planning. The unplannable branch still needs it: inference resolves
         // `WHERE col = $1` from the catalog whether or not the statement as a

@@ -3506,7 +3506,7 @@ mod tests {
     // directly, mirroring the vector/columnar plan-driven tests above.
 
     use nodedb_physical::physical_plan::SpatialOp;
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, SridGeometry};
 
     fn spatial_prov(seq: u64) -> SyncProvenance {
         SyncProvenance {
@@ -3517,15 +3517,15 @@ mod tests {
         }
     }
 
-    fn spatial_point(x: f64, y: f64) -> Geometry {
-        Geometry::point(x, y)
+    fn spatial_point(x: f64, y: f64) -> SridGeometry {
+        SridGeometry::wgs84(Geometry::point(x, y))
     }
 
     fn spatial_insert_plan(
         collection: &str,
         field: &str,
         surrogate: u32,
-        geometry: Geometry,
+        geometry: SridGeometry,
         seq: u64,
     ) -> PhysicalPlan {
         PhysicalPlan::Spatial(SpatialOp::Insert {

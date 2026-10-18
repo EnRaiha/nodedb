@@ -56,6 +56,7 @@ impl TestClusterNode {
                 valid_at_ms: None,
                 having: Vec::new(),
                 tiering: None,
+                output_columns: Vec::new(),
             }),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
             priority: Priority::Normal,

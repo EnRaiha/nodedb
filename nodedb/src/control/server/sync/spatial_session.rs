@@ -7,7 +7,7 @@
 
 use tracing::{debug, error};
 
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::SridGeometry;
 use nodedb_types::sync::wire::AckStatus;
 
 use super::session::SyncSession;
@@ -42,8 +42,8 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::SpatialInsertAck, &ack);
         }
 
-        // Deserialise the geometry from MessagePack bytes.
-        let geometry: Geometry = match zerompk::from_msgpack(&msg.geometry_bytes) {
+        // Deserialise the geometry and its SRID from MessagePack bytes.
+        let geometry: SridGeometry = match zerompk::from_msgpack(&msg.geometry_bytes) {
             Ok(g) => g,
             Err(e) => {
                 error!(

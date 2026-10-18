@@ -18,9 +18,8 @@
 use crate::error::{Result, SqlError};
 use crate::planner::qualified_name;
 use crate::types::{
-    ArrayProjectPlan, ArraySlicePlan, DocumentIndexLookupPlan, HybridSearchPlan,
-    HybridSearchTriplePlan, LateralLoopPlan, LateralTopKPlan, RangeScanPlan, RecursiveScanPlan,
-    TextSearchPlan, TimeseriesScanPlan,
+    DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, LateralLoopPlan,
+    LateralTopKPlan, RangeScanPlan, RecursiveScanPlan, TextSearchPlan, TimeseriesScanPlan,
 };
 use crate::types::{Projection, SortKey, SqlExpr, SqlPlan};
 
@@ -61,26 +60,6 @@ fn retain_sort_columns(input: &mut SqlPlan, sort_keys: &[SortKey]) -> Result<Vec
         return Ok(Vec::new());
     }
     let variant = input.variant_name();
-
-    // An array body narrows to named attributes rather than a SELECT list, so
-    // a sort column it does not already emit cannot be added back.
-    if let SqlPlan::ArraySlice(ArraySlicePlan {
-        attr_projection, ..
-    })
-    | SqlPlan::ArrayProject(ArrayProjectPlan {
-        attr_projection, ..
-    }) = input
-        && !attr_projection.is_empty()
-        && let Some(missing) = first_missing_attr(attr_projection, sort_keys)
-    {
-        return Err(SqlError::Unsupported {
-            detail: format!(
-                "ORDER BY '{missing}' over a {variant} plan that projects only \
-                 [{}]; add the column to the attribute list",
-                attr_projection.join(", ")
-            ),
-        });
-    }
 
     let Some(projection) = body_projection_mut(input) else {
         // No SELECT-list projection to narrow rows with — every column the
@@ -144,20 +123,6 @@ fn projects_column(projection: &[Projection], table: Option<&str>, name: &str) -
 /// The column name without its table qualifier.
 fn bare(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
-}
-
-/// The first sort-key name an array body's attribute list does not emit.
-fn first_missing_attr(attrs: &[String], sort_keys: &[SortKey]) -> Option<String> {
-    sort_keys.iter().find_map(|key| match &key.expr {
-        SqlExpr::Column { name, .. } => {
-            if attrs.iter().any(|a| a.eq_ignore_ascii_case(name)) {
-                None
-            } else {
-                Some(name.clone())
-            }
-        }
-        _ => None,
-    })
 }
 
 /// The SELECT-list projection a plan narrows its rows with, when it has one.

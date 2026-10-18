@@ -6,6 +6,7 @@
 //! search patterns (vector, text, hybrid, spatial) directly from the AST
 //! instead of reverse-engineering an optimizer's output.
 
+mod array_from;
 mod comma_lateral;
 mod cte_catalog;
 mod derived_from;

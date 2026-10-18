@@ -4,8 +4,8 @@
 
 use nodedb_types::protocol::{AuthMethod as ProtoAuth, NativeResponse};
 
+use crate::control::security::bearer::VerifiedBearer;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::jwks::registry::VerifiedJwtClaims;
 use crate::control::state::SharedState;
 
 /// Result of a native-protocol authentication attempt.
@@ -16,12 +16,13 @@ use crate::control::state::SharedState;
 /// groups, permissions, metadata) via `AuthContext::from_verified_jwt`
 /// without re-deriving authority from the token: authority always comes from
 /// `identity`, never from the claims.
+/// It also carries the session id the login's `AuthSuccess` entry recorded.
 pub(crate) struct NativeAuthOutcome {
     pub(crate) identity: AuthenticatedIdentity,
     /// Non-empty when the account is in a password grace period or
     /// `must_change_password` is set.
     pub(crate) warning: Option<String>,
-    pub(crate) verified_jwt: Option<VerifiedJwtClaims>,
+    pub(crate) verified_jwt: Option<VerifiedBearer>,
 }
 
 /// Authenticate a native protocol client.
@@ -36,22 +37,20 @@ pub(crate) async fn handle_auth(
     peer_addr: &str,
 ) -> crate::Result<NativeAuthOutcome> {
     if let ProtoAuth::OidcBearer { token, .. } = auth {
-        let (identity, verified_jwt) =
-            crate::control::security::oidc::verify_bearer_token(state, token).await?;
-        state.audit_record(
-            crate::control::security::audit::AuditEvent::AuthSuccess,
-            Some(identity.tenant_id),
+        // The session id exists before verification, so the `AuthSuccess` entry and
+        // `$auth.session_id` carry the same id.
+        let session_id = crate::control::security::auth_context::generate_session_id()?;
+        let (identity, claims) = crate::control::security::oidc::verify_bearer_token(
+            state,
+            token,
             peer_addr,
-            &format!(
-                "OIDC bearer login: sub={} method=oidc_bearer",
-                identity.username
-            ),
-        );
-        state.auth_metrics.record_auth_success("oidc_bearer");
+            &session_id,
+        )
+        .await?;
         return Ok(NativeAuthOutcome {
             identity,
             warning: None,
-            verified_jwt: Some(verified_jwt),
+            verified_jwt: Some(VerifiedBearer { claims, session_id }),
         });
     }
 

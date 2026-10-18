@@ -218,24 +218,29 @@ Then Alice's session is bound to the `prod` database. She cannot query other dat
 OIDC authentication events appear in the audit log:
 
 ```sql
-SHOW AUDIT WHERE event_type = 'AuthSuccess' AND provider = 'okta';
+SHOW AUDIT WHERE event_type = 'auth_success';
 ```
 
-**Audit entry includes:**
+`SHOW AUDIT WHERE` filters on `event_type` only, with the snake_case event name. It does not filter on other fields.
 
-| Field         | Value                               |
-| ------------- | ----------------------------------- |
-| `event_type`  | `AuthSuccess`                       |
-| `provider`    | OIDC provider name                  |
-| `jwt_subject` | JWT `sub` claim (e.g. user's email) |
-| `auth_method` | `OidcBearer`                        |
-| `timestamp`   | Login time                          |
+Every accepted bearer login records an `auth_success` entry. The entry carries `auth_user_id`, `auth_user_name` and `session_id`. Its detail reads:
 
-**Failed OIDC attempts:**
+```
+bearer login accepted: method=<oidc_bearer|jwt_bearer> provider="<name>" sub="<sub>"
+```
+
+**Failed attempts:**
 
 ```sql
-SHOW AUDIT WHERE event_type = 'AuthFailure' AND auth_method = 'OidcBearer';
--- Returns: invalid signature, missing kid, expired token, audience mismatch, etc.
+SHOW AUDIT WHERE event_type = 'auth_failure';
 ```
+
+Every refusal records an `auth_failure` entry. Its detail reads:
+
+```
+bearer login refused: method=<oidc_bearer|jwt_bearer> provider=<name> sub=<sub> reason="<reason>"
+```
+
+The audit log never holds the token. A bearer refusal does not count toward account lockout or the login rate limit.
 
 [Back to security](README.md)

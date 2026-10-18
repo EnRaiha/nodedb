@@ -101,7 +101,7 @@ mod tests {
     use super::*;
 
     use nodedb_types::Surrogate;
-    use nodedb_types::geometry::Geometry;
+    use nodedb_types::geometry::{Geometry, SridGeometry};
     use nodedb_types::sync::wire::SyncProvenance;
     use nodedb_types::{DatabaseId, QualifiedCollection};
 
@@ -114,8 +114,8 @@ mod tests {
         }
     }
 
-    fn point(x: f64, y: f64) -> Geometry {
-        Geometry::point(x, y)
+    fn point(x: f64, y: f64) -> SridGeometry {
+        SridGeometry::wgs84(Geometry::point(x, y))
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
             .expect("decode SpatialPutPayload");
         assert_eq!(decoded.collection, "places");
         assert_eq!(decoded.field, "loc");
-        let geom: Geometry =
+        let geom: SridGeometry =
             zerompk::from_msgpack(&decoded.geometry_bytes).expect("decode geometry");
         assert_eq!(geom, point(10.0, 20.0));
     }

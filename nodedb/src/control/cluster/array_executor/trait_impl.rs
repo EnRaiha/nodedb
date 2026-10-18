@@ -9,10 +9,11 @@
 
 use async_trait::async_trait;
 use nodedb_cluster::distributed_array::wire::{
-    ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardPutReq,
+    ArrayShardAggReq, ArrayShardDeleteReq, ArrayShardElementwiseReq, ArrayShardMaintReq,
+    ArrayShardPutReq,
 };
 use nodedb_cluster::distributed_array::{
-    ArrayAggExec, ArrayLocalExecutor, ArrayShardWriteOutcome, ArraySliceExec,
+    ArrayAggExec, ArrayElementwiseExec, ArrayLocalExecutor, ArrayShardWriteOutcome, ArraySliceExec,
 };
 use nodedb_cluster::error::Result;
 
@@ -30,6 +31,18 @@ impl ArrayLocalExecutor for DataPlaneArrayExecutor {
 
     async fn exec_agg(&self, local_vshard_id: u32, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
         self.agg(local_vshard_id, req).await
+    }
+
+    async fn exec_elementwise(
+        &self,
+        local_vshard_id: u32,
+        req: &ArrayShardElementwiseReq,
+    ) -> Result<ArrayElementwiseExec> {
+        self.elementwise(local_vshard_id, req).await
+    }
+
+    async fn exec_maint(&self, local_vshard_id: u32, req: &ArrayShardMaintReq) -> Result<u64> {
+        self.maint(local_vshard_id, req).await
     }
 
     async fn exec_put(

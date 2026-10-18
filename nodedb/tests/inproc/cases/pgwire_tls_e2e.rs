@@ -118,10 +118,10 @@ fn ssl_request() -> [u8; 8] {
     [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f]
 }
 
-/// Build a pgwire v3 StartupMessage for `user=nodedb, database=nodedb`.
+/// Build a pgwire v3 StartupMessage for `user=nodedb, database=default`.
 fn startup_message() -> Vec<u8> {
     let mut params: Vec<u8> = Vec::new();
-    for (k, v) in &[("user", "nodedb"), ("database", "nodedb")] {
+    for (k, v) in &[("user", "nodedb"), ("database", "default")] {
         params.extend_from_slice(k.as_bytes());
         params.push(0);
         params.extend_from_slice(v.as_bytes());

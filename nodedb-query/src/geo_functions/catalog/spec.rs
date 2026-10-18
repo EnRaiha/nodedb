@@ -16,6 +16,8 @@ pub enum GeoArgShape {
     Geometry2,
     /// `(geom1, geom2, distance_m)`
     Geometry2Distance,
+    /// `(geom, srid)`
+    GeometrySrid,
     /// `(geom, distance_m [, segments])`
     GeometryBuffer,
     /// `(lng, lat)`
@@ -51,7 +53,7 @@ impl GeoArgShape {
         match self {
             Self::Geometry1 | Self::Text1 => (1, 1),
             Self::TextSrid | Self::BytesSrid => (1, 2),
-            Self::Geometry2 | Self::LngLat => (2, 2),
+            Self::Geometry2 | Self::LngLat | Self::GeometrySrid => (2, 2),
             Self::GeometryBuffer | Self::LngLatZ | Self::LngLatPrecision => (2, 3),
             Self::Geometry2Distance | Self::LatLngResolution => (3, 3),
             Self::Circle => (3, 4),

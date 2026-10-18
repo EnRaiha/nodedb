@@ -368,7 +368,7 @@ impl CoreLoop {
             value,
             wal_lsn,
         } = put;
-        self.apply_point_put_spatial(database_id, tid, collection, storage_key, value, undo);
+        self.apply_point_put_spatial(database_id, tid, collection, storage_key, value, undo)?;
         self.apply_point_put_vector_indexes(
             crate::data::executor::handlers::point::apply_put::VectorIndexPutParams {
                 database_id,

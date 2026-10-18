@@ -86,6 +86,27 @@ pub(crate) fn resolve_time_key(columns: &[(String, String)]) -> Result<String, S
     }
 }
 
+/// The time-key column [`resolve_time_key`] designates over planner columns.
+///
+/// Each column offers its declared type text. A column with no declared text
+/// offers `TIMESTAMP` when its type is a timestamp, else nothing. `None` when
+/// the rule designates no column, or the declarations are ambiguous.
+pub(crate) fn designated_time_key(columns: &[crate::types::ColumnInfo]) -> Option<String> {
+    use crate::types_expr::SqlDataType;
+    let declared: Vec<(String, String)> = columns
+        .iter()
+        .map(|c| {
+            let text = match (&c.raw_type, &c.data_type) {
+                (Some(raw), _) => raw.clone(),
+                (None, SqlDataType::Timestamp | SqlDataType::Timestamptz) => "TIMESTAMP".into(),
+                (None, _) => String::new(),
+            };
+            (c.name.clone(), text)
+        })
+        .collect();
+    resolve_time_key(&declared).ok()
+}
+
 /// Find the geometry column from the column list.
 ///
 /// Matches columns whose type_str contains `SPATIAL_INDEX` modifier or whose

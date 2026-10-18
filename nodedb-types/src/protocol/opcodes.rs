@@ -154,6 +154,11 @@ pub enum OpCode {
     CrdtListInsert = 0x99,
     CrdtListDelete = 0x9A,
     CrdtListMove = 0x9B,
+
+    // ── Array bulk load ──────────────────────────────────────────
+    /// Load cells into an array: `collection` names it, and `payload` holds a
+    /// zerompk [`ArrayPutBatch`](super::array_batch::ArrayPutBatch).
+    ArrayPutBatch = 0x9C,
 }
 
 impl OpCode {
@@ -198,6 +203,7 @@ impl OpCode {
                 | OpCode::CrdtListInsert
                 | OpCode::CrdtListDelete
                 | OpCode::CrdtListMove
+                | OpCode::ArrayPutBatch
         )
     }
 }
@@ -297,6 +303,7 @@ impl TryFrom<u8> for OpCode {
             0x99 => Ok(OpCode::CrdtListInsert),
             0x9A => Ok(OpCode::CrdtListDelete),
             0x9B => Ok(OpCode::CrdtListMove),
+            0x9C => Ok(OpCode::ArrayPutBatch),
             other => Err(UnknownOpCode(other)),
         }
     }
@@ -373,6 +380,13 @@ mod tests {
         assert_eq!(u8::from(OpCode::CrdtListInsert), 0x99);
         assert_eq!(u8::from(OpCode::CrdtListDelete), 0x9A);
         assert_eq!(u8::from(OpCode::CrdtListMove), 0x9B);
+    }
+
+    #[test]
+    fn array_put_batch_opcode_roundtrips_and_is_a_write() {
+        assert_eq!(OpCode::try_from(0x9C), Ok(OpCode::ArrayPutBatch));
+        assert_eq!(u8::from(OpCode::ArrayPutBatch), 0x9C);
+        assert!(OpCode::ArrayPutBatch.is_write());
     }
 
     #[test]

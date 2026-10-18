@@ -89,9 +89,11 @@ pub(crate) fn is_unclassified_failure(e: &Error) -> bool {
         | Error::UndefinedColumn { .. }
         | Error::TextColumn { .. }
         | Error::AmbiguousColumn { .. }
+        | Error::UngroupedColumn { .. }
         | Error::UnknownStrictField { .. }
         | Error::DivisionByZero
         | Error::DataException { .. }
+        | Error::MixedSrid { .. }
         | Error::NumericValueOutOfRange { .. }
         | Error::InvalidTextRepresentation { .. }
         | Error::DatatypeMismatch { .. }

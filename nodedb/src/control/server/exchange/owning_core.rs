@@ -12,11 +12,10 @@
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::local_dispatch::reject_data_plane_error;
 use crate::control::server::dispatch_utils::dispatch_routed_read_to_data_plane;
-use crate::control::server::payload_merge::{encode_msgpack_array, extract_msgpack_elements};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
 
-use super::gather::GatherOutcome;
+use super::gather_outcome::GatherOutcome;
 
 /// Dispatch `plan` to the single Data-Plane core that owns `vshard_id` and
 /// gather the one bounded response into a [`GatherOutcome`].
@@ -30,9 +29,10 @@ use super::gather::GatherOutcome;
 /// `read_versions` and exactly one `shard_watermarks` entry keyed to the
 /// collection's vShard — matching the cluster `dispatch_local` path so an
 /// in-transaction read records the same OCC read-set entry the write-set uses
-/// (writes home to the same `CollectionKey` vShard). Aggregate
-/// finalization (`finalize_aggregate`) is a passthrough over the merged array,
-/// so one complete aggregate row in yields one row out.
+/// (writes home to the same `CollectionKey` vShard). The outcome holds the
+/// core's payload as the core wrote it. Aggregate finalization
+/// (`finalize_aggregate`) is a passthrough over the merged array, so one
+/// complete aggregate row in yields one row out.
 pub async fn gather_single_owning_core(
     state: &SharedState,
     tenant_id: TenantId,
@@ -52,13 +52,14 @@ pub async fn gather_single_owning_core(
         txn_id,
     )
     .await?;
-    let payload_bytes: &[u8] = resp.payload.as_ref();
-    let all_elements = extract_msgpack_elements(payload_bytes);
-    let merged_array = encode_msgpack_array(&all_elements);
+    let payloads = if resp.payload.is_empty() {
+        Vec::new()
+    } else {
+        vec![resp.payload.to_vec()]
+    };
 
     Ok(GatherOutcome {
-        raw: payload_bytes.to_vec(),
-        merged_array,
+        payloads,
         watermark_lsn: resp.watermark_lsn,
         read_versions: resp.read_versions.clone(),
         shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],

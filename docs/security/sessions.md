@@ -171,7 +171,7 @@ login_lockout_duration_secs = 900  # Lock for 15 minutes
 **Audit:**
 
 ```sql
-SHOW AUDIT WHERE event_type = 'LockoutTriggered';
+SHOW AUDIT WHERE event_type = 'lockout_triggered';
 -- Returns: username, ip, locked_until (timestamp)
 ```
 
@@ -209,7 +209,7 @@ login_attempts_per_user_per_min = 10
 **Audit:**
 
 ```sql
-SHOW AUDIT WHERE event_type = 'LoginRateLimited';
+SHOW AUDIT WHERE event_type = 'login_rate_limited';
 -- Returns: username, ip, timestamp
 ```
 

@@ -16,10 +16,11 @@ use crate::control::state::SharedState;
 use crate::control::surrogate::HomeSurrogateAuthority;
 use crate::types::TraceId;
 
-use super::resolve::{assign_surrogates_routed, lookup_surrogates_routed};
+use super::unbound::{assign_unbound_routed, lookup_unbound_routed};
 
 /// Resolves keys through `surrogate_exchange`, at the leader of each key's
-/// collection home.
+/// collection home. The assigner reads this node's catalog before it asks,
+/// so the exchange runs no local read of its own.
 pub struct RoutedHomeAuthority {
     state: Weak<SharedState>,
 }
@@ -45,7 +46,7 @@ impl HomeSurrogateAuthority for RoutedHomeAuthority {
     ) -> BoxFuture<'a, crate::Result<Vec<Surrogate>>> {
         async move {
             let state = self.state()?;
-            assign_surrogates_routed(&state, key, tenant_id, pks, TraceId::ZERO).await
+            assign_unbound_routed(&state, key, tenant_id, pks, TraceId::ZERO).await
         }
         .boxed()
     }
@@ -58,7 +59,7 @@ impl HomeSurrogateAuthority for RoutedHomeAuthority {
     ) -> BoxFuture<'a, crate::Result<Vec<Option<Surrogate>>>> {
         async move {
             let state = self.state()?;
-            lookup_surrogates_routed(&state, key, tenant_id, pks, TraceId::ZERO).await
+            lookup_unbound_routed(&state, key, tenant_id, pks, TraceId::ZERO).await
         }
         .boxed()
     }

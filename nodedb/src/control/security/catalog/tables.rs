@@ -23,6 +23,12 @@ pub(super) const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("_
 pub(super) const AUDIT_LOG: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("_system.audit_log");
 
+/// Table: DML audit position index.
+/// Key: event core (u32 BE) | event LSN (u64 BE) | audit seq (u64 BE). Value: empty.
+/// It holds one row per `DmlAudit` entry whose detail names an event key.
+pub(super) const AUDIT_DML_POSITIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("_system.audit_dml_positions");
+
 /// Table: role_name -> MessagePack-serialized custom role record.
 pub(super) const ROLES: TableDefinition<&str, &[u8]> = TableDefinition::new("_system.roles");
 
@@ -109,46 +115,32 @@ pub(super) const ARRAYS: TableDefinition<&str, &[u8]> = TableDefinition::new("_s
 
 // ── Surrogate PK map ──────────────────────────────────────────────────
 
-/// Table (legacy): `(collection, encoded_pk_bytes)` -> `Surrogate` (u32 LE).
-/// Used only by the idempotent migration that prefixes rows with database_id.
-pub(super) const SURROGATE_PK_LEGACY: TableDefinition<(&str, &[u8]), u32> =
-    TableDefinition::new("_system.surrogate_pk");
-
-/// Table (legacy, v2): `(database_id: u64, collection, encoded_pk_bytes)` ->
-/// `Surrogate` (u32 LE). Database-scoped but tenant-blind. Read only by the
-/// idempotent migration that re-keys rows with `tenant_id` prepended.
-pub(super) const SURROGATE_PK_V2: TableDefinition<(u64, &str, &[u8]), u32> =
-    TableDefinition::new("_system.surrogate_pk_v2");
-
-/// Table: `(database_id: u64, tenant_id: u64, collection, encoded_pk_bytes)` ->
-/// `Surrogate` (u32 LE).
+/// Table: `(database_id, tenant_id, collection)` -> surrogate scope id.
 ///
-/// Forward direction of the PK ↔ Surrogate map with database + tenant scoping
-/// prepended. Every successful `assign_surrogate(database_id, tenant_id,
-/// collection, pk)` writes both the forward and reverse rows atomically in one
-/// redb txn.
-pub(super) const SURROGATE_PK_V3: TableDefinition<(u64, u64, &str, &[u8]), u32> =
-    TableDefinition::new("_system.surrogate_pk_v3");
+/// A scope id names one collection's PK map. The map tables key by the id,
+/// so a key compare reads no collection name.
+pub(super) const SURROGATE_SCOPES: TableDefinition<(u64, u64, &str), u64> =
+    TableDefinition::new("_system.surrogate_scopes");
 
-/// Table (legacy): `(collection, surrogate)` -> encoded pk bytes.
-/// Used only by the idempotent migration that prefixes rows with database_id.
-#[cfg(test)]
-pub(super) const SURROGATE_PK_REV_LEGACY: TableDefinition<(&str, u32), &[u8]> =
-    TableDefinition::new("_system.surrogate_pk_rev");
+/// Singleton table: the next unused surrogate scope id. Ids start at 1.
+pub(super) const SURROGATE_SCOPE_SEQ: TableDefinition<(), u64> =
+    TableDefinition::new("_system.surrogate_scope_seq");
 
-/// Table (legacy, v2): `(database_id: u64, collection, surrogate)` -> encoded pk
-/// bytes. Reverse direction of `_system.surrogate_pk_v2`. Read only by the
-/// idempotent migration that re-keys rows with `tenant_id` prepended.
-pub(super) const SURROGATE_PK_REV_V2: TableDefinition<(u64, &str, u32), &[u8]> =
-    TableDefinition::new("_system.surrogate_pk_rev_v2");
-
-/// Table: `(database_id: u64, tenant_id: u64, collection, surrogate)` -> encoded
-/// pk bytes.
+/// Table: `scope_id` (8 bytes big-endian) followed by the encoded pk bytes ->
+/// `Surrogate` (u32).
 ///
-/// Reverse direction of `_system.surrogate_pk_v3`. Scoped per `(database_id,
-/// tenant_id)`.
-pub(super) const SURROGATE_PK_REV_V3: TableDefinition<(u64, u64, &str, u32), &[u8]> =
-    TableDefinition::new("_system.surrogate_pk_rev_v3");
+/// Forward direction of the PK ↔ Surrogate map. The key is one byte string,
+/// so a compare is one `memcmp`, and one scope's rows are one key range.
+/// Every binding writes the forward and the reverse row in one redb txn.
+pub(super) const SURROGATE_PK: TableDefinition<&[u8], u32> =
+    TableDefinition::new("_system.surrogate_pk_v4");
+
+/// Table: `(scope_id << 32) | surrogate` -> encoded pk bytes.
+///
+/// Reverse direction of `_system.surrogate_pk_v4`. One scope's rows are one
+/// key range, in surrogate order.
+pub(super) const SURROGATE_PK_REV: TableDefinition<u128, &[u8]> =
+    TableDefinition::new("_system.surrogate_pk_rev_v4");
 
 // ── Event Plane ───────────────────────────────────────────────────────
 

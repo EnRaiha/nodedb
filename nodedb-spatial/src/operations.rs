@@ -5,35 +5,65 @@
 //! ST_Buffer, ST_Envelope, ST_Union — produce new geometries from existing ones.
 
 use nodedb_types::geometry::Geometry;
-use nodedb_types::{BoundingBox, geometry_bbox};
+use nodedb_types::{BboxSpace, BoundingBox, geometry_bbox_in};
 
-/// ST_Buffer(geom, distance_meters) → Polygon.
+/// Metres per degree of latitude (WGS 84 meridian average).
+const METRES_PER_DEGREE_LAT: f64 = 110_540.0;
+
+/// Metres per degree of longitude at the equator (WGS 84).
+const METRES_PER_DEGREE_LNG_EQUATOR: f64 = 111_320.0;
+
+/// Floor on cos(latitude) so a buffer near a pole stays finite.
+const MIN_COS_LAT: f64 = 0.001;
+
+/// Floor on a vector length before normalising it, so a degenerate edge
+/// does not divide by zero.
+const MIN_VECTOR_LEN: f64 = 1e-12;
+
+/// ST_Buffer(geom, distance_meters) → Polygon, in geographic space.
 ///
-/// Expands geometry by distance using equirectangular approximation.
-/// - Point → 32-sided circle polygon
+/// Same as `st_buffer_in(geom, distance_meters, segments, BboxSpace::Geographic)`.
+pub fn st_buffer(geom: &Geometry, distance_meters: f64, segments: usize) -> Geometry {
+    st_buffer_in(geom, distance_meters, segments, BboxSpace::Geographic)
+}
+
+/// ST_Buffer(geom, distance_meters) → Polygon, in `space`.
+///
+/// - Point → `segments`-sided circle polygon
 /// - LineString → buffered corridor (parallel offset + end caps)
 /// - Polygon → expanded polygon (vertex offset outward)
 ///
-/// Meter-to-degree conversion: `Δlng = meters / (111320 * cos(lat))`,
-/// `Δlat = meters / 110540`. Accurate to <0.5% for ±70° latitude.
-pub fn st_buffer(geom: &Geometry, distance_meters: f64, segments: usize) -> Geometry {
+/// Geographic space converts metres to degrees by equirectangular
+/// approximation: `Δlng = meters / (111320 * cos(lat))`,
+/// `Δlat = meters / 110540`, accurate to <0.5% within ±70° latitude.
+/// Planar space adds metres directly.
+pub fn st_buffer_in(
+    geom: &Geometry,
+    distance_meters: f64,
+    segments: usize,
+    space: BboxSpace,
+) -> Geometry {
     let segments = segments.max(4);
 
     match geom {
-        Geometry::Point { coordinates } => {
-            buffer_point(coordinates[0], coordinates[1], distance_meters, segments)
-        }
+        Geometry::Point { coordinates } => buffer_point(
+            coordinates[0],
+            coordinates[1],
+            distance_meters,
+            segments,
+            space,
+        ),
         Geometry::LineString { coordinates } => {
-            buffer_linestring(coordinates, distance_meters, segments)
+            buffer_linestring(coordinates, distance_meters, segments, space)
         }
-        Geometry::Polygon { coordinates } => buffer_polygon(coordinates, distance_meters, segments),
+        Geometry::Polygon { coordinates } => buffer_polygon(coordinates, distance_meters, space),
         // Multi* types: buffer each component and collect.
         Geometry::MultiPoint { coordinates } => {
             let polys: Vec<Vec<Vec<[f64; 2]>>> = coordinates
                 .iter()
                 .map(|pt| {
                     if let Geometry::Polygon { coordinates: rings } =
-                        buffer_point(pt[0], pt[1], distance_meters, segments)
+                        buffer_point(pt[0], pt[1], distance_meters, segments, space)
                     {
                         rings
                     } else {
@@ -45,15 +75,32 @@ pub fn st_buffer(geom: &Geometry, distance_meters: f64, segments: usize) -> Geom
         }
         _ => {
             // For unsupported types, fall back to buffering the bbox.
-            let bb = geometry_bbox(geom).expand_meters(distance_meters);
+            let bb = geometry_bbox_in(geom, space).expand_meters_in(distance_meters, space);
             bbox_to_polygon(&bb)
         }
     }
 }
 
-/// ST_Envelope(geom) → Polygon — bounding box as a polygon.
+/// Coordinate deltas `(dlng, dlat)` that `meters` spans at latitude `lat`.
+fn metre_deltas(meters: f64, lat: f64, space: BboxSpace) -> (f64, f64) {
+    match space {
+        BboxSpace::Geographic => (
+            meters / (METRES_PER_DEGREE_LNG_EQUATOR * lat.to_radians().cos().max(MIN_COS_LAT)),
+            meters / METRES_PER_DEGREE_LAT,
+        ),
+        BboxSpace::Planar => (meters, meters),
+    }
+}
+
+/// ST_Envelope(geom) → Polygon — bounding box as a polygon, in geographic
+/// space.
 pub fn st_envelope(geom: &Geometry) -> Geometry {
-    let bb = geometry_bbox(geom);
+    st_envelope_in(geom, BboxSpace::Geographic)
+}
+
+/// ST_Envelope(geom) → Polygon — bounding box as a polygon, in `space`.
+pub fn st_envelope_in(geom: &Geometry, space: BboxSpace) -> Geometry {
+    let bb = geometry_bbox_in(geom, space);
     bbox_to_polygon(&bb)
 }
 
@@ -107,9 +154,8 @@ pub fn st_union(a: &Geometry, b: &Geometry) -> Geometry {
 // ── Buffer helpers ──
 
 /// Buffer a point into an approximate circle polygon.
-fn buffer_point(lng: f64, lat: f64, meters: f64, segments: usize) -> Geometry {
-    let dlat = meters / 110_540.0;
-    let dlng = meters / (111_320.0 * lat.to_radians().cos().max(0.001));
+fn buffer_point(lng: f64, lat: f64, meters: f64, segments: usize, space: BboxSpace) -> Geometry {
+    let (dlng, dlat) = metre_deltas(meters, lat, space);
 
     let mut ring = Vec::with_capacity(segments + 1);
     for i in 0..segments {
@@ -125,14 +171,19 @@ fn buffer_point(lng: f64, lat: f64, meters: f64, segments: usize) -> Geometry {
 }
 
 /// Buffer a linestring by creating a corridor (parallel offset on both sides + end caps).
-fn buffer_linestring(line: &[[f64; 2]], meters: f64, segments: usize) -> Geometry {
+fn buffer_linestring(
+    line: &[[f64; 2]],
+    meters: f64,
+    segments: usize,
+    space: BboxSpace,
+) -> Geometry {
     if line.is_empty() {
         return Geometry::Polygon {
             coordinates: vec![vec![]],
         };
     }
     if line.len() == 1 {
-        return buffer_point(line[0][0], line[0][1], meters, segments);
+        return buffer_point(line[0][0], line[0][1], meters, segments, space);
     }
 
     // Build the offset polygon: left side forward, right side backward, with
@@ -141,7 +192,7 @@ fn buffer_linestring(line: &[[f64; 2]], meters: f64, segments: usize) -> Geometr
     let mut right_side = Vec::new();
 
     for i in 0..line.len() - 1 {
-        let (nl, nr) = offset_segment(line[i], line[i + 1], meters);
+        let (nl, nr) = offset_segment(line[i], line[i + 1], meters, space);
         left_side.push(nl.0);
         left_side.push(nl.1);
         right_side.push(nr.0);
@@ -159,8 +210,7 @@ fn buffer_linestring(line: &[[f64; 2]], meters: f64, segments: usize) -> Geometr
     for i in 0..=cap_segments {
         let angle = end_dir - std::f64::consts::FRAC_PI_2
             + std::f64::consts::PI * (i as f64) / (cap_segments as f64);
-        let dlat = meters / 110_540.0;
-        let dlng = meters / (111_320.0 * last[1].to_radians().cos().max(0.001));
+        let (dlng, dlat) = metre_deltas(meters, last[1], space);
         ring.push([last[0] + dlng * angle.cos(), last[1] + dlat * angle.sin()]);
     }
 
@@ -176,8 +226,7 @@ fn buffer_linestring(line: &[[f64; 2]], meters: f64, segments: usize) -> Geometr
         let angle = start_dir
             + std::f64::consts::FRAC_PI_2
             + std::f64::consts::PI * (i as f64) / (cap_segments as f64);
-        let dlat = meters / 110_540.0;
-        let dlng = meters / (111_320.0 * first[1].to_radians().cos().max(0.001));
+        let (dlng, dlat) = metre_deltas(meters, first[1], space);
         ring.push([first[0] + dlng * angle.cos(), first[1] + dlat * angle.sin()]);
     }
 
@@ -192,7 +241,7 @@ fn buffer_linestring(line: &[[f64; 2]], meters: f64, segments: usize) -> Geometr
 }
 
 /// Buffer a polygon by offsetting each vertex outward.
-fn buffer_polygon(rings: &[Vec<[f64; 2]>], meters: f64, _segments: usize) -> Geometry {
+fn buffer_polygon(rings: &[Vec<[f64; 2]>], meters: f64, space: BboxSpace) -> Geometry {
     let mut new_rings = Vec::with_capacity(rings.len());
 
     for (ring_idx, ring) in rings.iter().enumerate() {
@@ -223,11 +272,10 @@ fn buffer_polygon(rings: &[Vec<[f64; 2]>], meters: f64, _segments: usize) -> Geo
             let bisect = [(n1[0] + n2[0]) / 2.0, (n1[1] + n2[1]) / 2.0];
             let len = (bisect[0] * bisect[0] + bisect[1] * bisect[1])
                 .sqrt()
-                .max(1e-12);
+                .max(MIN_VECTOR_LEN);
             let unit = [bisect[0] / len, bisect[1] / len];
 
-            let dlat = offset_m / 110_540.0;
-            let dlng = offset_m / (111_320.0 * curr[1].to_radians().cos().max(0.001));
+            let (dlng, dlat) = metre_deltas(offset_m, curr[1], space);
 
             new_ring.push([curr[0] + unit[0] * dlng, curr[1] + unit[1] * dlat]);
         }
@@ -248,11 +296,9 @@ fn buffer_polygon(rings: &[Vec<[f64; 2]>], meters: f64, _segments: usize) -> Geo
 /// A pair of offset segments: (left_segment, right_segment).
 type OffsetPair = (([f64; 2], [f64; 2]), ([f64; 2], [f64; 2]));
 
-fn offset_segment(a: [f64; 2], b: [f64; 2], meters: f64) -> OffsetPair {
+fn offset_segment(a: [f64; 2], b: [f64; 2], meters: f64, space: BboxSpace) -> OffsetPair {
     let normal = edge_outward_normal(a, b);
-    let dlat = meters / 110_540.0;
-    let mid_lat = ((a[1] + b[1]) / 2.0).to_radians().cos().max(0.001);
-    let dlng = meters / (111_320.0 * mid_lat);
+    let (dlng, dlat) = metre_deltas(meters, (a[1] + b[1]) / 2.0, space);
 
     let left = (
         [a[0] + normal[0] * dlng, a[1] + normal[1] * dlat],
@@ -273,7 +319,7 @@ fn offset_segment(a: [f64; 2], b: [f64; 2], meters: f64) -> OffsetPair {
 fn edge_outward_normal(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
-    let len = (dx * dx + dy * dy).sqrt().max(1e-12);
+    let len = (dx * dx + dy * dy).sqrt().max(MIN_VECTOR_LEN);
     // Right normal: (dy, -dx) normalized — outward for CCW rings.
     [dy / len, -dx / len]
 }
@@ -299,6 +345,24 @@ fn bbox_to_polygon(bb: &BoundingBox) -> Geometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodedb_types::geometry_bbox;
+
+    #[test]
+    fn planar_buffer_point_is_a_metre_circle() {
+        let circle = st_buffer_in(
+            &Geometry::point(500_000.0, 100_000.0),
+            250.0,
+            16,
+            BboxSpace::Planar,
+        );
+        let Geometry::Polygon { coordinates } = &circle else {
+            panic!("expected Polygon");
+        };
+        for pt in &coordinates[0][..16] {
+            let d = (pt[0] - 500_000.0).hypot(pt[1] - 100_000.0);
+            assert!((d - 250.0).abs() < 1e-6, "d={d}");
+        }
+    }
 
     #[test]
     fn buffer_point_circle() {

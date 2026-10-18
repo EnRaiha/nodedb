@@ -251,8 +251,10 @@ pub(crate) async fn execute_plan_all_local_cores(
 /// itself, and wrapping it as an array element hands the requesting node a
 /// different value than a local read returns.
 ///
-/// Every other plan fans across all local cores, and their row arrays merge
-/// into one.
+/// Every other plan fans across all local cores and answers in the shape a
+/// single core produces (`GatherOutcome::single_core_shape`): one payload as
+/// is, several merged as row arrays. Two or more payloads that are not row
+/// arrays fail the merge.
 async fn generic_gather(
     state: &SharedState,
     tenant_id: TenantId,
@@ -280,7 +282,7 @@ async fn generic_gather(
     }
     let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await?;
     Ok(NodeLevelResult {
-        payload: outcome.merged_array,
+        payload: outcome.single_core_shape()?,
         watermark_lsn: outcome.watermark_lsn,
         read_versions: outcome.read_versions,
         not_found: false,

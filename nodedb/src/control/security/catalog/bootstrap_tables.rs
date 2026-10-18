@@ -13,12 +13,10 @@
 //! unit test re-opens every entry read-only against a freshly-bootstrapped
 //! catalog to keep the registry and the init path in lockstep.
 //!
-//! Migration-only tables (`_system.collections`, `_system.surrogate_pk`,
-//! `_system.surrogate_pk_rev`, `_system.surrogate_pk_v2`,
-//! `_system.surrogate_pk_rev_v2` — superseded key layouts) are intentionally
-//! absent: they are read only by the idempotent migration path, which already
-//! tolerates their absence, and materialising empty copies on every fresh
-//! server misrepresents the catalog state.
+//! Migration-only tables (`_system.collections`, a superseded key layout) are
+//! intentionally absent: they are read only by the idempotent migration path,
+//! which already tolerates their absence, and materialising empty copies on
+//! every fresh server misrepresents the catalog state.
 
 use redb::{ReadTransaction, TableError, WriteTransaction};
 
@@ -63,6 +61,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "tenants" => TENANTS,
     "tenant_id_hwm" => super::tenant_id_hwm::TENANT_ID_HWM,
     "audit_log" => AUDIT_LOG,
+    "audit_dml_positions" => AUDIT_DML_POSITIONS,
     "blacklist" => BLACKLIST,
     "auth_users" => AUTH_USERS,
     "lockout_state" => super::lockout::LOCKOUT_STATE_TABLE,
@@ -99,8 +98,10 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "index_registry" => INDEX_REGISTRY,
     "checkpoints" => CHECKPOINTS,
     // ── Surrogate identity map ──
-    "surrogate_pk_v3" => SURROGATE_PK_V3,
-    "surrogate_pk_rev_v3" => SURROGATE_PK_REV_V3,
+    "surrogate_scopes" => SURROGATE_SCOPES,
+    "surrogate_scope_seq" => SURROGATE_SCOPE_SEQ,
+    "surrogate_pk_v4" => SURROGATE_PK,
+    "surrogate_pk_rev_v4" => SURROGATE_PK_REV,
     "surrogate_hwm" => super::surrogate_hwm::SURROGATE_HWM,
     "surrogate_reserve_index" => super::surrogate_hwm::SURROGATE_RESERVE_INDEX,
     // ── Sync producer registry ──

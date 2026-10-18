@@ -206,13 +206,17 @@ impl CoreLoop {
                 field_name,
                 query_entries,
                 top_k,
+                filters,
             } => self.execute_sparse_search(
                 task,
                 tid,
-                collection.as_str(),
-                field_name,
-                query_entries,
-                *top_k,
+                crate::data::executor::handlers::vector_sparse::SparseSearchParams {
+                    collection: collection.as_str(),
+                    field_name,
+                    query_entries,
+                    top_k: *top_k,
+                    filters,
+                },
             ),
 
             VectorOp::SparseDelete {

@@ -14,6 +14,7 @@
 //! [`SurrogateRegistry`]'s static mode — never inferred here from live
 //! topology.
 
+use std::ops::RangeInclusive;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -22,7 +23,9 @@ use tokio::sync::oneshot;
 
 use nodedb_types::Surrogate;
 
-use super::super::registry::{RESERVE_BATCH_SIZE, SurrogateRegistry, SurrogateRegistryMode};
+use super::super::registry::{
+    RESERVE_BATCH_SIZE, SurrogateAllocError, SurrogateRegistry, SurrogateRegistryMode,
+};
 use super::core::SurrogateAssigner;
 use crate::control::state::SharedState;
 
@@ -65,6 +68,37 @@ impl SurrogateAssigner {
                 Ok(Some(s))
             }
             SurrogateRegistryMode::Cluster(cluster) => Ok(cluster.try_alloc_reserved()),
+        }
+    }
+
+    /// Allocate up to `n` contiguous surrogates under the write guard, as an
+    /// inclusive range, dispatching on the registry's static mode.
+    ///
+    /// - `Local`: one `alloc(n)`, so the range holds exactly `n` values.
+    /// - `Cluster`: `try_alloc_reserved_range`. The range is shorter than `n`
+    ///   when the reserved batch holds fewer, and `None` when it is empty.
+    ///   The caller binds what it drew, drops the lock, and awaits
+    ///   `await_reserved_batch` for the rest.
+    ///
+    /// Each value is one the per-key [`Self::alloc_locked`] path issues too:
+    /// above every earlier draw and never issued twice.
+    pub(super) fn alloc_range_locked(
+        &self,
+        registry: &SurrogateRegistry,
+        n: usize,
+    ) -> crate::Result<Option<RangeInclusive<u32>>> {
+        if n == 0 {
+            return Ok(None);
+        }
+        // More keys than the u32 space holds can never be drawn.
+        let n = u32::try_from(n).map_err(|_| SurrogateAllocError::Exhausted)?;
+        match registry.mode() {
+            SurrogateRegistryMode::Local(local) => {
+                let range = local.alloc(n)?;
+                registry.record_allocs(u64::from(n));
+                Ok(Some(range.start().as_u32()..=range.end().as_u32()))
+            }
+            SurrogateRegistryMode::Cluster(cluster) => Ok(cluster.try_alloc_reserved_range(n)),
         }
     }
 

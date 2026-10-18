@@ -159,6 +159,7 @@ fn clause_error(clause: &str, owner: &str, error: &SqlError) -> DdlError {
         }
         SqlError::UnknownColumn { .. } => sqlstate::UNDEFINED_COLUMN,
         SqlError::AmbiguousColumn { .. } => sqlstate::AMBIGUOUS_COLUMN,
+        SqlError::UngroupedColumn { .. } => sqlstate::GROUPING_ERROR,
         SqlError::TextColumn { fault, .. } => fault.sqlstate(),
         SqlError::UndefinedObject { .. } => sqlstate::UNDEFINED_OBJECT,
         SqlError::ObjectNotInPrerequisiteState { .. } => sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,

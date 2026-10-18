@@ -3,6 +3,7 @@
 //! Shared coercion helpers for array coordinate and attribute literals.
 
 use nodedb_array::schema::{ArraySchema, AttrType as EngineAttrType, DimType as EngineDimType};
+use nodedb_array::types::cell_value::NarrowError;
 use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_sql::types_array::{ArrayAttrLiteral, ArrayCoordLiteral};
@@ -61,6 +62,18 @@ pub(super) fn coerce_attrs(
     let mut out = Vec::with_capacity(attrs.len());
     for (i, a) in attrs.iter().enumerate() {
         let spec = &schema.attrs[i];
+        // A value past the attr's width is SQLSTATE 22003. A literal of a
+        // kind the attr never holds is a plan error.
+        let narrow = |r: Result<CellValue, NarrowError>| -> crate::Result<CellValue> {
+            r.map_err(|e| {
+                let detail = format!("attr `{}`: {e}", spec.name);
+                if e.is_out_of_range() {
+                    crate::Error::NumericValueOutOfRange { detail }
+                } else {
+                    crate::Error::PlanError { detail }
+                }
+            })
+        };
         let v = match (a, spec.dtype) {
             (ArrayAttrLiteral::Null, _) if spec.nullable => CellValue::Null,
             (ArrayAttrLiteral::Null, _) => {
@@ -68,12 +81,13 @@ pub(super) fn coerce_attrs(
                     detail: format!("attr `{}` is NOT NULL", spec.name),
                 });
             }
-            (ArrayAttrLiteral::Int64(n), EngineAttrType::Int64) => CellValue::Int64(*n),
-            (ArrayAttrLiteral::Int64(n), EngineAttrType::Float64) => CellValue::Float64(*n as f64),
-            (ArrayAttrLiteral::Float64(f), EngineAttrType::Float64) => CellValue::Float64(*f),
+            (ArrayAttrLiteral::Int64(n), dtype) => narrow(CellValue::from_int_literal(*n, dtype))?,
+            (ArrayAttrLiteral::Float64(f), dtype) => {
+                narrow(CellValue::from_float_literal(*f, dtype))?
+            }
             (ArrayAttrLiteral::String(s), EngineAttrType::String) => CellValue::String(s.clone()),
             (ArrayAttrLiteral::Bytes(b), EngineAttrType::Bytes) => CellValue::Bytes(b.clone()),
-            (got, want) => {
+            (got @ (ArrayAttrLiteral::String(_) | ArrayAttrLiteral::Bytes(_)), want) => {
                 return Err(crate::Error::PlanError {
                     detail: format!(
                         "attr literal for `{}`: got {got:?}, expected attr type {want:?}",
@@ -85,4 +99,57 @@ pub(super) fn coerce_attrs(
         out.push(v);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_array::schema::{ArraySchemaBuilder, AttrSpec, DimSpec};
+    use nodedb_array::types::domain::{Domain, DomainBound};
+
+    fn schema() -> ArraySchema {
+        ArraySchemaBuilder::new("scene")
+            .dim(DimSpec::new(
+                "y",
+                EngineDimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(15)),
+            ))
+            .attr(AttrSpec::new("b1", EngineAttrType::UInt16, true))
+            .attr(AttrSpec::new("ndvi", EngineAttrType::Float32, true))
+            .tile_extents(vec![16])
+            .build()
+            .expect("schema")
+    }
+
+    #[test]
+    fn literals_narrow_to_the_declared_type() {
+        let cells = coerce_attrs(
+            &[
+                ArrayAttrLiteral::Int64(65535),
+                ArrayAttrLiteral::Float64(0.1),
+            ],
+            &schema(),
+        )
+        .expect("in range");
+        assert_eq!(
+            cells,
+            vec![CellValue::UInt16(65535), CellValue::Float32(0.1)]
+        );
+    }
+
+    #[test]
+    fn a_value_past_the_width_is_22003() {
+        let err = coerce_attrs(
+            &[ArrayAttrLiteral::Int64(65536), ArrayAttrLiteral::Null],
+            &schema(),
+        )
+        .expect_err("past UINT16");
+        assert!(matches!(err, crate::Error::NumericValueOutOfRange { .. }));
+        let err = coerce_attrs(
+            &[ArrayAttrLiteral::Float64(1.5), ArrayAttrLiteral::Null],
+            &schema(),
+        )
+        .expect_err("float into UINT16");
+        assert!(matches!(err, crate::Error::PlanError { .. }));
+    }
 }

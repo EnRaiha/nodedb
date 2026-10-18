@@ -65,7 +65,7 @@ pub(crate) async fn handle_graph_match(
         ctx.auth_context(),
         &ctx.state.redaction,
     ) {
-        return error_to_native_with_sqlstate(seq, "0A000", &error);
+        return error_to_native_with_sqlstate(seq, "42501", &error);
     }
 
     // Stamp the active transaction id so MATCH reads resolve this connection's

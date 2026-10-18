@@ -9,6 +9,8 @@
 use nodedb_types::NodeDbError;
 use thiserror::Error;
 
+use crate::types::cell_value::NarrowError;
+
 /// Crate-internal result alias.
 pub type ArrayResult<T> = std::result::Result<T, ArrayError>;
 
@@ -59,6 +61,19 @@ pub enum ArrayError {
         attr: String,
         detail: String,
     },
+
+    /// A literal does not fit its attribute's declared type.
+    #[error("attribute '{attr}' on '{array}': {source}")]
+    Narrow {
+        array: String,
+        attr: String,
+        source: NarrowError,
+    },
+
+    /// Integer arithmetic over cells left the `i64` range, such as an
+    /// exact `SUM` or an elementwise product. SQLSTATE `22003`.
+    #[error("numeric value out of range: {detail}")]
+    NumericOverflow { detail: String },
 
     #[error("segment corruption: {detail}")]
     SegmentCorruption { detail: String },
@@ -136,8 +151,10 @@ impl ArrayError {
             | ArrayError::InvalidTileExtents { array, .. }
             | ArrayError::CoordArityMismatch { array, .. }
             | ArrayError::CoordOutOfDomain { array, .. }
-            | ArrayError::CellTypeMismatch { array, .. } => array,
-            ArrayError::SegmentCorruption { .. }
+            | ArrayError::CellTypeMismatch { array, .. }
+            | ArrayError::Narrow { array, .. } => array,
+            ArrayError::NumericOverflow { .. }
+            | ArrayError::SegmentCorruption { .. }
             | ArrayError::UnsupportedFormat { .. }
             | ArrayError::UnsupportedSegmentFormat { .. }
             | ArrayError::InvalidReplicaId { .. }

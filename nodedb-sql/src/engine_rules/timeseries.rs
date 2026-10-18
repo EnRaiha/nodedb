@@ -67,6 +67,8 @@ impl EngineRules for TimeseriesRules {
             sort_keys: p.sort_keys,
             tiered: p.has_auto_tier,
             temporal: p.temporal,
+            output: Vec::new(),
+            group_keys: Vec::new(),
         }))
     }
 
@@ -115,6 +117,16 @@ impl EngineRules for TimeseriesRules {
         }])
     }
 
+    fn plan_bulk_load(&self, p: BulkLoadParams) -> Result<BulkLoadPlan> {
+        Err(SqlError::Unsupported {
+            detail: format!(
+                "COPY: collection '{}' uses the timeseries engine; \
+                 use ILP or INSERT with explicit time column instead",
+                p.collection
+            ),
+        })
+    }
+
     fn plan_aggregate(&self, p: AggregateParams) -> Result<SqlPlan> {
         if p.temporal.is_temporal() && !p.bitemporal {
             return Err(SqlError::Unsupported {
@@ -144,6 +156,8 @@ impl EngineRules for TimeseriesRules {
                 sort_keys: Vec::new(),
                 tiered: p.has_auto_tier,
                 temporal: p.temporal,
+                output: Vec::new(),
+                group_keys: Vec::new(),
             });
             return Ok(SqlPlan::Aggregate {
                 input: Box::new(input),
@@ -173,6 +187,10 @@ impl EngineRules for TimeseriesRules {
             sort_keys: Vec::new(),
             tiered: p.has_auto_tier,
             temporal: p.temporal,
+            // The SELECT-list order and aliases are attached by the caller,
+            // which holds the projection.
+            output: Vec::new(),
+            group_keys: p.group_by,
         }))
     }
 

@@ -204,6 +204,7 @@ mod tests {
             sub_aggregates: Vec::new(),
             grouping_sets: Vec::new(),
             sort_keys: Vec::new(),
+            group_key_aliases: Vec::new(),
         });
         let orders = vec![AuthorizationRequirement::collection(
             "orders",

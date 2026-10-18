@@ -23,3 +23,6 @@ tokio-postgres = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 sonic-rs = { workspace = true }
+# The array load measurement installs jemalloc and reads its counters.
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }

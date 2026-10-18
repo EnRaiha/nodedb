@@ -196,7 +196,7 @@ mod tests {
                 applied_lsn: shard_req.wal_lsn,
                 // The shard's cell count, as the Data Plane's `{"inserted": n}`
                 // would report for a batch with no conflicts.
-                affected: zerompk::from_msgpack::<Vec<Vec<u8>>>(&shard_req.cells_msgpack)
+                affected: zerompk::from_msgpack::<Vec<u64>>(&shard_req.cells_msgpack)
                     .unwrap()
                     .len() as u64,
             };
@@ -236,7 +236,7 @@ mod tests {
                 applied_lsn: shard_req.wal_lsn,
                 // The shard's coordinate count, as the Data Plane's
                 // `{"deleted": n}` would report when every cell exists.
-                affected: zerompk::from_msgpack::<Vec<Vec<u8>>>(&shard_req.coords_msgpack)
+                affected: zerompk::from_msgpack::<Vec<u64>>(&shard_req.coords_msgpack)
                     .unwrap()
                     .len() as u64,
             };
@@ -346,7 +346,8 @@ mod tests {
         let p0 = 0x0000_0000_0000_0000u64;
         let p1 = 0x0040_0000_0000_0000u64;
 
-        let coords = vec![(p0, vec![0xAAu8]), (p1, vec![0xBBu8]), (p0, vec![0xCCu8])];
+        // Each coord is one msgpack value: a positive fixint.
+        let coords = vec![(p0, vec![0x0Au8]), (p1, vec![0x0Bu8]), (p0, vec![0x0Cu8])];
 
         let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(DeleteEchoDispatch);
         let mut resps = coord_delete(&write_params(), vec![], 10, 55, &coords, &dispatch, &cb())

@@ -7,14 +7,14 @@
 //! runs Data-Plane-side at the apply handler.
 
 use nodedb_types::Surrogate;
-use nodedb_types::geometry::Geometry;
+use nodedb_types::geometry::SridGeometry;
 use nodedb_types::sync::wire::SyncProvenance;
 
 use crate::types::{DatabaseId, TenantId, VShardId};
 use crate::wal::manager::WalAppender;
 
 /// Build a `SpatialPutPayload` from raw op fields, msgpack-encoding the
-/// geometry.
+/// geometry with its SRID.
 ///
 /// This is the ONE builder for the shape: both the autocommit WAL append
 /// and the transaction-resolve serializer call it so
@@ -25,7 +25,7 @@ pub(crate) fn encode_spatial_put_payload(
     collection: &str,
     field: &str,
     surrogate: Surrogate,
-    geometry: &Geometry,
+    geometry: &SridGeometry,
     provenance: &SyncProvenance,
 ) -> crate::Result<nodedb_wal::record::SpatialPutPayload> {
     let doc_id = crate::engine::document::store::StorageKey::for_surrogate(surrogate).to_string();
@@ -59,7 +59,7 @@ pub(crate) fn encode_spatial_delete_payload(
 
 /// Append a spatial put (insert) to the WAL and return the assigned LSN.
 ///
-/// The `payload` carries provenance and the msgpack-encoded `Geometry`
+/// The `payload` carries provenance and the msgpack-encoded `SridGeometry`
 /// (identical to what `SpatialInsertMsg.geometry_bytes` carries).
 pub fn wal_append_spatial_put(
     wal: WalAppender<'_>,

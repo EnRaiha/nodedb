@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ArrayOp::Slice` and `ArrayOp::Project` handlers.
+//! `ArrayOp::Slice` handler.
 //!
-//! Both are read-only fan-outs over the engine's tile scan. Slice
-//! prunes by per-dim coord ranges and (optionally) projects an attribute
-//! subset; Project is a pure attribute projection over every cell.
+//! A read-only fan-out over the engine's tile scan. Slice prunes by
+//! per-dim coord ranges and (optionally) projects an attribute subset.
+//! `ARRAY_PROJECT` plans to a slice over the whole domain.
 //!
 //! Decoded slice payloads ride as zerompk bytes — matching the
-//! contract documented on `ArrayOp::Slice::slice_msgpack`.
+//! contract documented on `ArrayOp::Slice::slice_msgpack`. Each emitted
+//! row is the named map `slice_row::named_cell_row` builds.
 
 use nodedb_array::query::project::{Projection, project_sparse};
-use nodedb_array::query::slice::{Slice, slice_sparse, tile_overlaps_slice};
-use nodedb_array::segment::{MbrQueryPredicate, TilePayload};
-use nodedb_array::tile::sparse_tile::SparseTile;
+use nodedb_array::query::region::ArrayRegion;
+use nodedb_array::query::slice::{Slice, slice_sparse_owned, tile_overlaps_slice};
 use nodedb_array::types::ArrayId;
 use nodedb_types::array_route::shard_bucket_admits;
-use nodedb_types::{ArrayCell, ShardBucket, SurrogateBitmap, SystemTimeScope, Value};
+use nodedb_types::{ShardBucket, SurrogateBitmap, SystemTimeScope, Value};
 
 /// Slice parameters bundled to avoid exceeding the 7-argument limit.
 pub(in crate::data::executor) struct SliceParams<'a> {
@@ -45,7 +45,8 @@ use crate::data::executor::handlers::transaction::overlay::ArrayOverlayMergePara
 use crate::data::executor::task::ExecutionTask;
 
 use super::convert::{cell_value_to_value, coord_value_to_value, sparse_tile_to_array_cells};
-use super::encode::encode_value_rows;
+use super::encode::encode_slice_rows;
+use super::slice_row::named_cell_row;
 
 impl CoreLoop {
     pub(in crate::data::executor) fn dispatch_array_slice(
@@ -114,7 +115,7 @@ impl CoreLoop {
                         );
                     }
                 };
-                let mut versions = match store.scan_tiles_all_versions(valid_at_ms) {
+                let mut versions = match store.scan_tiles_all_versions(valid_at_ms, shard_bucket) {
                     Ok(v) => v,
                     Err(e) => {
                         return self.response_error(
@@ -145,7 +146,7 @@ impl CoreLoop {
                 });
 
                 // Collect rows.
-                let mut rows: Vec<Value> = Vec::new();
+                let mut rows: Vec<Vec<u8>> = Vec::new();
                 'av_outer: for (_, coord, sys_ms, payload) in versions {
                     // Apply cell_filter via surrogate.
                     if let Some(f) = cell_filter
@@ -166,11 +167,17 @@ impl CoreLoop {
                     } else {
                         all_attrs
                     };
-                    rows.push(Value::ArrayCell(ArrayCell {
-                        coords,
-                        attrs,
-                        system_time: Some(sys_ms),
-                    }));
+                    match named_cell_row(&schema, coords, attrs, proj.as_ref(), Some(sys_ms)) {
+                        Ok(row) => rows.push(row),
+                        Err(e) => {
+                            return self.response_error(
+                                task,
+                                ErrorCode::Internal {
+                                    detail: format!("array audit-log row: {e}"),
+                                },
+                            );
+                        }
+                    }
                     if cap > 0 && rows.len() >= cap {
                         break 'av_outer;
                     }
@@ -197,18 +204,21 @@ impl CoreLoop {
                         );
                     }
                 };
-                let (mut resolved_tiles, truncated_before_horizon) =
-                    match store.scan_tiles_at(cutoff, valid_at_ms) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: format!("array bitemporal scan: {e}"),
-                                },
-                            );
-                        }
-                    };
+                // The slice prunes whole prefixes by footer MBR before decode.
+                let region = ArrayRegion::new(slice.clone(), None);
+                let (mut resolved_tiles, truncated_before_horizon) = match store
+                    .scan_shard_tiles_at(cutoff, valid_at_ms, shard_bucket, Some(&region))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("array bitemporal scan: {e}"),
+                            },
+                        );
+                    }
+                };
                 // Read-your-own-writes: a live read inside a transaction sees
                 // that transaction's staged cells. `AsOf` is a snapshot of
                 // committed history and skips the overlay.
@@ -231,7 +241,7 @@ impl CoreLoop {
                     );
                 }
 
-                let mut rows: Vec<Value> = Vec::new();
+                let mut rows: Vec<Vec<u8>> = Vec::new();
                 'outer: for (hp, sparse) in resolved_tiles {
                     if !shard_bucket_admits(shard_bucket, hp) {
                         continue;
@@ -239,7 +249,7 @@ impl CoreLoop {
                     if !tile_overlaps_slice(&sparse.mbr.dim_mins, &sparse.mbr.dim_maxs, &slice) {
                         continue;
                     }
-                    let filtered = match slice_sparse(&schema, &sparse, &slice) {
+                    let filtered = match slice_sparse_owned(&schema, sparse, &slice) {
                         Ok(t) => t,
                         Err(e) => {
                             return self.response_error(
@@ -286,7 +296,18 @@ impl CoreLoop {
                                 continue;
                             }
                         }
-                        rows.push(Value::ArrayCell(cell));
+                        match named_cell_row(&schema, cell.coords, cell.attrs, proj.as_ref(), None)
+                        {
+                            Ok(row) => rows.push(row),
+                            Err(e) => {
+                                return self.response_error(
+                                    task,
+                                    ErrorCode::Internal {
+                                        detail: format!("array slice row: {e}"),
+                                    },
+                                );
+                            }
+                        }
                         if cap > 0 && rows.len() >= cap {
                             break 'outer;
                         }
@@ -344,144 +365,6 @@ fn domain_bound_to_coord_value(
     }
 }
 
-/// Encode the slice result rows into an `ArraySliceResponse` and return a `Response`.
-fn encode_slice_rows(
-    core: &mut crate::data::executor::core_loop::CoreLoop,
-    task: &crate::data::executor::task::ExecutionTask,
-    rows: Vec<Value>,
-    truncated_before_horizon: bool,
-) -> crate::bridge::envelope::Response {
-    let rows_msgpack = {
-        let mut buf: Vec<u8> = Vec::with_capacity(rows.len() * 64);
-        let n = rows.len();
-        if n < 16 {
-            buf.push(0x90 | n as u8);
-        } else if n <= u16::MAX as usize {
-            buf.push(0xDC);
-            buf.extend_from_slice(&(n as u16).to_be_bytes());
-        } else {
-            buf.push(0xDD);
-            buf.extend_from_slice(&(n as u32).to_be_bytes());
-        }
-        for row in &rows {
-            match nodedb_types::value_to_msgpack(row) {
-                Ok(b) => buf.extend_from_slice(&b),
-                Err(e) => {
-                    return core.response_error(
-                        task,
-                        crate::bridge::envelope::ErrorCode::Internal {
-                            detail: format!("array response encode: {e}"),
-                        },
-                    );
-                }
-            }
-        }
-        buf
-    };
-    let resp = crate::data::executor::response_codec::ArraySliceResponse {
-        rows_msgpack,
-        truncated_before_horizon,
-    };
-    match zerompk::to_msgpack_vec(&resp) {
-        Ok(bytes) => core.response_with_payload(task, bytes),
-        Err(e) => core.response_error(
-            task,
-            crate::bridge::envelope::ErrorCode::Internal {
-                detail: format!("array slice response encode: {e}"),
-            },
-        ),
-    }
-}
-
-impl CoreLoop {
-    pub(in crate::data::executor) fn dispatch_array_project(
-        &mut self,
-        task: &ExecutionTask,
-        array_id: &ArrayId,
-        attr_indices: &[u32],
-    ) -> Response {
-        if let Err(resp) = self.ensure_array_open(task, array_id) {
-            return resp;
-        }
-        let schema = match self.array_engine.store(array_id) {
-            Ok(store) => store.schema().clone(),
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Unsupported {
-                        detail: format!("array '{}' not open: {e}", array_id.name),
-                    },
-                );
-            }
-        };
-
-        let mut tiles = match self
-            .array_engine
-            .scan_tiles(array_id, &MbrQueryPredicate::default())
-        {
-            Ok(t) => t,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("array project scan: {e}"),
-                    },
-                );
-            }
-        };
-        // Read-your-own-writes for a same-transaction read.
-        if let Err(e) = self.merge_array_overlay_payloads(
-            ArrayOverlayMergeParams {
-                txn_id: task.request.txn_id,
-                array_id,
-                schema: &schema,
-                valid_at_ms: None,
-            },
-            &mut tiles,
-        ) {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: format!("array project overlay merge: {e}"),
-                },
-            );
-        }
-
-        let proj = Projection::new(attr_indices.iter().map(|&i| i as usize).collect());
-
-        let mut rows: Vec<Value> = Vec::new();
-        for tile in tiles {
-            let sparse: SparseTile = match tile {
-                TilePayload::Sparse(s) => s,
-                TilePayload::Dense(_) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Unsupported {
-                            detail: "dense tile payload in project".to_string(),
-                        },
-                    );
-                }
-            };
-            let projected = match project_sparse(&sparse, &proj) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("array project: {e}"),
-                        },
-                    );
-                }
-            };
-            for cell in sparse_tile_to_array_cells(&schema, &projected) {
-                rows.push(Value::ArrayCell(cell));
-            }
-        }
-
-        encode_value_rows(self, task, &rows)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -496,7 +379,6 @@ mod tests {
     use nodedb_array::types::coord::value::CoordValue;
     use nodedb_array::types::domain::{Domain, DomainBound};
     use nodedb_bridge::buffer::{Consumer, Producer, RingBuffer};
-    use nodedb_types::{ArrayCell, Value};
 
     use nodedb_types::{Surrogate, SurrogateBitmap};
 
@@ -654,58 +536,28 @@ mod tests {
         }
     }
 
-    fn decode_slice_rows(bytes: &[u8]) -> Vec<Value> {
+    /// The named rows of a slice response, one `{x, y, v}` map per cell.
+    fn decode_slice_rows(bytes: &[u8]) -> Vec<serde_json::Map<String, serde_json::Value>> {
         // Slice responses are wrapped in `ArraySliceResponse { rows_msgpack, truncated_before_horizon }`.
         use crate::data::executor::response_codec::ArraySliceResponse;
         let envelope: ArraySliceResponse =
             zerompk::from_msgpack(bytes).expect("ArraySliceResponse envelope decode");
         let json = nodedb_types::msgpack_to_json_string(&envelope.rows_msgpack)
             .expect("slice rows msgpack→json");
-        let arr: serde_json::Value = serde_json::from_str(&json).expect("slice rows json parse");
-        let arr = arr.as_array().expect("slice rows are an array").clone();
-        arr.into_iter().map(json_to_value).collect()
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("slice rows json parse");
+        rows.into_iter()
+            .map(|row| match row {
+                serde_json::Value::Object(map) => map,
+                other => panic!("slice row is not a map: {other}"),
+            })
+            .collect()
     }
 
-    fn json_to_value(v: serde_json::Value) -> Value {
-        match v {
-            serde_json::Value::Object(map)
-                if map.contains_key("coords") && map.contains_key("attrs") =>
-            {
-                let coords = map["coords"]
-                    .as_array()
-                    .expect("coords array")
-                    .iter()
-                    .cloned()
-                    .map(json_to_value)
-                    .collect();
-                let attrs = map["attrs"]
-                    .as_array()
-                    .expect("attrs array")
-                    .iter()
-                    .cloned()
-                    .map(json_to_value)
-                    .collect();
-                Value::ArrayCell(ArrayCell {
-                    coords,
-                    attrs,
-                    system_time: None,
-                })
-            }
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Value::Integer(i)
-                } else if let Some(f) = n.as_f64() {
-                    Value::Float(f)
-                } else {
-                    Value::Null
-                }
-            }
-            serde_json::Value::String(s) => Value::String(s),
-            serde_json::Value::Bool(b) => Value::Bool(b),
-            serde_json::Value::Null => Value::Null,
-            serde_json::Value::Array(a) => Value::Array(a.into_iter().map(json_to_value).collect()),
-            serde_json::Value::Object(_) => Value::Null,
-        }
+    fn row_v(row: &serde_json::Map<String, serde_json::Value>) -> f64 {
+        row.get("v")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| panic!("row has no float `v`: {row:?}"))
     }
 
     #[test]
@@ -745,16 +597,13 @@ mod tests {
         assert_eq!(r.status, Status::Ok, "slice failed: {r:?}");
         let rows = decode_slice_rows(r.payload.as_ref());
         assert_eq!(rows.len(), 2, "expected two cells, got {rows:?}");
-        let mut sums = 0.0;
-        for v in rows {
-            match v {
-                Value::ArrayCell(ArrayCell { attrs, .. }) => match &attrs[0] {
-                    Value::Float(f) => sums += f,
-                    other => panic!("attr not Float: {other:?}"),
-                },
-                other => panic!("row not ArrayCell: {other:?}"),
-            }
-        }
+        let mut coords: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|row| (row["x"].as_i64().expect("x"), row["y"].as_i64().expect("y")))
+            .collect();
+        coords.sort();
+        assert_eq!(coords, vec![(5, 5), (7, 7)]);
+        let sums: f64 = rows.iter().map(row_v).sum();
         assert!((sums - 7.0).abs() < 1e-9);
     }
 
@@ -796,8 +645,7 @@ mod tests {
         });
         assert_eq!(r.status, Status::Ok, "all-versions slice failed: {r:?}");
 
-        // Read rows as raw JSON: `json_to_value` drops the injected `_ts_system`
-        // column, so inspect the envelope directly.
+        // Read the envelope directly to check the horizon flag too.
         use crate::data::executor::response_codec::ArraySliceResponse;
         let env: ArraySliceResponse =
             zerompk::from_msgpack(r.payload.as_ref()).expect("ArraySliceResponse envelope");
@@ -817,11 +665,9 @@ mod tests {
                     .and_then(|v| v.as_i64())
                     .expect("_ts_system column present on audit-log rows");
                 let v = row
-                    .get("attrs")
-                    .and_then(|a| a.as_array())
-                    .and_then(|a| a.first())
+                    .get("v")
                     .and_then(|v| v.as_f64())
-                    .expect("attr value");
+                    .expect("attr `v` value");
                 (ts, v)
             })
             .collect();
@@ -870,16 +716,7 @@ mod tests {
         assert_eq!(r.status, Status::Ok, "slice+filter failed: {r:?}");
         let rows = decode_slice_rows(r.payload.as_ref());
         assert_eq!(rows.len(), 2, "expected 2 cells, got {rows:?}");
-        let mut total = 0.0;
-        for v in rows {
-            match v {
-                Value::ArrayCell(ArrayCell { attrs, .. }) => match &attrs[0] {
-                    Value::Float(f) => total += f,
-                    other => panic!("attr not Float: {other:?}"),
-                },
-                other => panic!("row not ArrayCell: {other:?}"),
-            }
-        }
+        let total: f64 = rows.iter().map(row_v).sum();
         // 10.0 + 30.0 = 40.0; 20.0 must have been excluded.
         assert!((total - 40.0).abs() < 1e-9, "total got {total}");
     }
@@ -895,7 +732,11 @@ mod tests {
             .unwrap()
     }
 
-    fn slice_in_bucket(h: &mut Harness, aid: &ArrayId, bucket: Option<ShardBucket>) -> Vec<Value> {
+    fn slice_in_bucket(
+        h: &mut Harness,
+        aid: &ArrayId,
+        bucket: Option<ShardBucket>,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
         let slice = ArraySlice::new(vec![None, None]);
         let r = h.send(ArrayOp::Slice {
             array_id: aid.clone(),
@@ -911,11 +752,11 @@ mod tests {
         decode_slice_rows(r.payload.as_ref())
     }
 
-    fn row_coords(row: &Value) -> Vec<Value> {
-        match row {
-            Value::ArrayCell(ArrayCell { coords, .. }) => coords.clone(),
-            other => panic!("row not ArrayCell: {other:?}"),
-        }
+    fn row_coords(row: &serde_json::Map<String, serde_json::Value>) -> (i64, i64) {
+        (
+            row["x"].as_i64().expect("x coord"),
+            row["y"].as_i64().expect("y coord"),
+        )
     }
 
     /// Over every bucket, the shard filter returns each cell exactly once.
