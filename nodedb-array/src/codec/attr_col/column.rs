@@ -11,7 +11,7 @@
 // non-null value of a column has one type: the schema check at write time
 // holds a stored column to its attr's declared type.
 
-use crate::codec::limits::{MAX_COLUMN_ENTRIES, check_decoded_size};
+use crate::codec::limits::{MAX_COLUMN_ENTRIES, checked_capacity};
 use crate::error::{ArrayError, ArrayResult};
 use crate::schema::attr_spec::AttrType;
 use crate::types::cell_value::value::CellValue;
@@ -106,7 +106,9 @@ pub fn encode_attr_col(values: &[CellValue]) -> ArrayResult<Vec<u8>> {
     Ok(out)
 }
 
-pub fn decode_attr_col(data: &[u8]) -> ArrayResult<Vec<CellValue>> {
+/// Decode an attr column of `rows` rows. A column that holds another row count
+/// is corrupt and is refused before any allocation.
+pub fn decode_attr_col(data: &[u8], rows: usize) -> ArrayResult<Vec<CellValue>> {
     let Some((&tag, rest)) = data.split_first() else {
         return Err(ArrayError::SegmentCorruption {
             detail: "attr col: empty payload".into(),
@@ -117,8 +119,13 @@ pub fn decode_attr_col(data: &[u8]) -> ArrayResult<Vec<CellValue>> {
             detail: "attr col: truncated count".into(),
         });
     };
-    let count = u32::from_le_bytes(*count_bytes) as usize;
-    check_decoded_size(count, MAX_COLUMN_ENTRIES, "attr_col count")?;
+    let stored = u32::from_le_bytes(*count_bytes) as usize;
+    if stored != rows {
+        return Err(ArrayError::SegmentCorruption {
+            detail: format!("attr col holds {stored} rows, its tile holds {rows}"),
+        });
+    }
+    let count = checked_capacity(stored, MAX_COLUMN_ENTRIES, rows, 0, "attr_col count")?;
     let mut pos = 5;
     let Some(dtype) = type_of(tag)? else {
         if data.len() != pos {
@@ -129,7 +136,7 @@ pub fn decode_attr_col(data: &[u8]) -> ArrayResult<Vec<CellValue>> {
         return Ok(vec![CellValue::Null; count]);
     };
     let validity = decode_validity(data, &mut pos, count)?;
-    let present = validity.iter().filter(|p| **p).count();
+    let present = (0..count).filter(|&row| validity.is_present(row)).count();
     if present == 0 {
         return Err(ArrayError::SegmentCorruption {
             detail: format!("attr col {}: no value under a typed tag", dtype.sql_name()),
@@ -149,8 +156,8 @@ pub fn decode_attr_col(data: &[u8]) -> ArrayResult<Vec<CellValue>> {
     };
     let mut values = values.into_iter();
     let mut out = Vec::with_capacity(count);
-    for row_present in validity {
-        if row_present {
+    for row in 0..count {
+        if validity.is_present(row) {
             out.push(values.next().ok_or_else(|| ArrayError::SegmentCorruption {
                 detail: "attr col: fewer values than the validity holds".into(),
             })?);
@@ -166,7 +173,7 @@ mod tests {
     use super::*;
 
     fn round_trip(values: &[CellValue]) -> Vec<CellValue> {
-        decode_attr_col(&encode_attr_col(values).expect("encode")).expect("decode")
+        decode_attr_col(&encode_attr_col(values).expect("encode"), values.len()).expect("decode")
     }
 
     fn with_nulls(values: Vec<CellValue>) -> Vec<CellValue> {
@@ -274,7 +281,7 @@ mod tests {
         data.extend_from_slice(&(MAX_COLUMN_ENTRIES as u32).to_le_bytes());
         data.push(0);
         assert!(matches!(
-            decode_attr_col(&data),
+            decode_attr_col(&data, MAX_COLUMN_ENTRIES),
             Err(ArrayError::SegmentCorruption { .. })
         ));
     }
@@ -286,13 +293,23 @@ mod tests {
         data.push(0);
         data.extend_from_slice(&nodedb_codec::fastlanes::encode(&[300]).unwrap());
         assert!(matches!(
-            decode_attr_col(&data),
+            decode_attr_col(&data, 1),
             Err(ArrayError::SegmentCorruption { .. })
         ));
     }
 
     #[test]
     fn an_unknown_tag_is_corruption() {
-        assert!(decode_attr_col(&[0xEE, 0, 0, 0, 0]).is_err());
+        assert!(decode_attr_col(&[0xEE, 0, 0, 0, 0], 0).is_err());
+    }
+
+    #[test]
+    fn a_row_count_that_differs_from_the_tile_is_refused() {
+        let mut data = vec![TAG_NULL_ONLY];
+        data.extend_from_slice(&8_000_000u32.to_le_bytes());
+        assert!(matches!(
+            decode_attr_col(&data, 3),
+            Err(ArrayError::SegmentCorruption { .. })
+        ));
     }
 }

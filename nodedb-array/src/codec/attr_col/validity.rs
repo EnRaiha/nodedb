@@ -27,13 +27,33 @@ pub(super) fn encode_validity(values: &[CellValue], out: &mut Vec<u8>) {
     out.extend_from_slice(&bitmap);
 }
 
-/// Read the validity section of a `count`-row column at `*pos`. Returns one
-/// flag per row, `true` where the row holds a value.
-pub(super) fn decode_validity(
-    data: &[u8],
+/// Which rows of a decoded column hold a value.
+pub(super) enum Validity<'a> {
+    /// Every row holds a value.
+    AllPresent,
+    /// Bit `row` of the borrowed bitmap is set when that row holds a value.
+    Bitmap(&'a [u8]),
+}
+
+impl Validity<'_> {
+    /// Whether `row` holds a value. A row past the bitmap holds none.
+    pub(super) fn is_present(&self, row: usize) -> bool {
+        match self {
+            Self::AllPresent => true,
+            Self::Bitmap(bits) => bits
+                .get(row / 8)
+                .is_some_and(|byte| byte & (1 << (row % 8)) != 0),
+        }
+    }
+}
+
+/// Read the validity section of a `count`-row column at `*pos`. The bitmap is
+/// borrowed from `data`, so a hostile count allocates nothing here.
+pub(super) fn decode_validity<'a>(
+    data: &'a [u8],
     pos: &mut usize,
     count: usize,
-) -> ArrayResult<Vec<bool>> {
+) -> ArrayResult<Validity<'a>> {
     let has_nulls = *data
         .get(*pos)
         .ok_or_else(|| ArrayError::SegmentCorruption {
@@ -41,18 +61,21 @@ pub(super) fn decode_validity(
         })?;
     *pos += 1;
     match has_nulls {
-        0 => Ok(vec![true; count]),
+        0 => Ok(Validity::AllPresent),
         1 => {
             let len = count.div_ceil(8);
-            let bitmap =
-                data.get(*pos..*pos + len)
-                    .ok_or_else(|| ArrayError::SegmentCorruption {
-                        detail: format!("attr col: validity bitmap needs {len} bytes"),
-                    })?;
-            *pos += len;
-            Ok((0..count)
-                .map(|i| bitmap[i / 8] & (1 << (i % 8)) != 0)
-                .collect())
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| ArrayError::SegmentCorruption {
+                    detail: "attr col: validity bitmap length overflows".into(),
+                })?;
+            let bits = data
+                .get(*pos..end)
+                .ok_or_else(|| ArrayError::SegmentCorruption {
+                    detail: format!("attr col: validity bitmap needs {len} bytes"),
+                })?;
+            *pos = end;
+            Ok(Validity::Bitmap(bits))
         }
         other => Err(ArrayError::SegmentCorruption {
             detail: format!("attr col: validity flag {other} is neither 0 nor 1"),
@@ -70,10 +93,8 @@ mod tests {
         encode_validity(&[CellValue::Int64(1), CellValue::Int64(2)], &mut out);
         assert_eq!(out, vec![0]);
         let mut pos = 0;
-        assert_eq!(
-            decode_validity(&out, &mut pos, 2).unwrap(),
-            vec![true, true]
-        );
+        let validity = decode_validity(&out, &mut pos, 2).unwrap();
+        assert!(matches!(validity, Validity::AllPresent));
         assert_eq!(pos, 1);
     }
 
@@ -92,7 +113,10 @@ mod tests {
         encode_validity(&values, &mut out);
         assert_eq!(out.len(), 1 + 2);
         let mut pos = 0;
-        let flags = decode_validity(&out, &mut pos, values.len()).unwrap();
+        let validity = decode_validity(&out, &mut pos, values.len()).unwrap();
+        let flags: Vec<bool> = (0..values.len())
+            .map(|row| validity.is_present(row))
+            .collect();
         let want: Vec<bool> = values.iter().map(|v| !v.is_null()).collect();
         assert_eq!(flags, want);
     }

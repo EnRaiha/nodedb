@@ -183,10 +183,15 @@ fn decode_structural(body: &[u8], stored_mbr: Option<TileMBR>) -> ArrayResult<Sp
         "attr_count",
     )?;
 
+    // An attr column holds one value per live row.
+    let live_rows = row_kinds
+        .iter()
+        .filter(|&&kind| kind == RowKind::Live.as_u8())
+        .count();
     let mut attr_cols = Vec::with_capacity(attr_capacity);
     for _ in 0..attr_count {
         let col_bytes = read_framed(body, &mut pos)?;
-        let col = decode_attr_col(col_bytes)?;
+        let col = decode_attr_col(col_bytes, live_rows)?;
         attr_cols.push(col);
     }
 
