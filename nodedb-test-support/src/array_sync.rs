@@ -39,6 +39,7 @@ pub fn simple_schema(name: &str) -> ArraySchema {
         tile_extents: vec![10],
         cell_order: CellOrder::RowMajor,
         tile_order: TileOrder::RowMajor,
+        georef: None,
     }
 }
 

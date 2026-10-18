@@ -35,6 +35,11 @@ use nodedb_cluster::DescriptorId;
 pub struct DescriptorVersionSet {
     /// Sorted by `(kind, database_id, tenant_id, name)`.
     entries: Vec<(DescriptorId, u64)>,
+    /// Descriptors the plan read without a lease, at their catalog content
+    /// version. Same order. An array is one: its lease version is fixed,
+    /// so only this entry changes when an ALTER changes the schema a plan
+    /// embeds. Lease admission never sees these.
+    unleased: Vec<(DescriptorId, u64)>,
     /// The tenant's permission-tree version observed at plan-build time.
     /// `0` when no permission cache was consulted. Compared in
     /// [`Self::all_fresh`] alongside the descriptor entries so a revoked
@@ -91,18 +96,14 @@ impl DescriptorVersionSet {
     /// snapshots, which is a planning bug. In release builds
     /// the later value wins.
     pub fn record(&mut self, id: DescriptorId, version: u64) {
-        match self.entries.binary_search_by(|(k, _)| cmp_id(k, &id)) {
-            Ok(idx) => {
-                debug_assert_eq!(
-                    self.entries[idx].1, version,
-                    "planner observed two versions of the same descriptor in one plan"
-                );
-                self.entries[idx].1 = version;
-            }
-            Err(idx) => {
-                self.entries.insert(idx, (id, version));
-            }
-        }
+        insert_sorted(&mut self.entries, id, version);
+    }
+
+    /// Record a descriptor read without a lease at its content `version`.
+    /// Same ordering and duplicate rules as [`Self::record`]. Only the
+    /// freshness check reads it.
+    pub fn record_unleased(&mut self, id: DescriptorId, version: u64) {
+        insert_sorted(&mut self.unleased, id, version);
     }
 
     /// Iterate `(id, version)` pairs in stable order.
@@ -136,7 +137,32 @@ impl DescriptorVersionSet {
         self.permission_tree_version == policies.permission_tree
             && self.rls_version == policies.rls
             && self.redaction_version == policies.redaction
-            && self.entries.iter().all(|(id, v)| current(id) == Some(*v))
+            && self
+                .entries
+                .iter()
+                .chain(&self.unleased)
+                .all(|(id, v)| current(id) == Some(*v))
+    }
+}
+
+/// Insert `(id, version)` into the sorted `entries`. A repeat of the same
+/// `id` keeps one entry.
+///
+/// Panics in debug builds if `id` repeats with a different version: the
+/// planner read the same descriptor twice under different catalog snapshots,
+/// which is a planning bug. In release builds the later value wins.
+fn insert_sorted(entries: &mut Vec<(DescriptorId, u64)>, id: DescriptorId, version: u64) {
+    match entries.binary_search_by(|(k, _)| cmp_id(k, &id)) {
+        Ok(idx) => {
+            debug_assert_eq!(
+                entries[idx].1, version,
+                "planner observed two versions of the same descriptor in one plan"
+            );
+            entries[idx].1 = version;
+        }
+        Err(idx) => {
+            entries.insert(idx, (id, version));
+        }
     }
 }
 
@@ -244,6 +270,17 @@ mod tests {
             _ => None,
         };
         assert!(!set.all_fresh(lookup, policies(0, 0, 0)));
+    }
+
+    #[test]
+    fn unleased_entries_gate_freshness_but_not_iteration() {
+        let array = DescriptorId::new(0, 1, DescriptorKind::Array, "scene".to_string());
+        let mut set = DescriptorVersionSet::new();
+        set.record_unleased(array.clone(), 7);
+        assert!(set.is_empty(), "lease admission iterates no unleased entry");
+        assert!(set.all_fresh(|_| Some(7), policies(0, 0, 0)));
+        assert!(!set.all_fresh(|_| Some(8), policies(0, 0, 0)));
+        assert!(!set.all_fresh(|_| None, policies(0, 0, 0)));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! The result type is [`DdlResult`] / [`DdlError`] throughout.
 
 use nodedb_types::DatabaseId;
-use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
 use sonic_rs;
 
@@ -15,6 +15,9 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::redaction::RedactionStore;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::redaction::{QueryRedaction, redact_decoded_value};
+use crate::control::server::shared::ddl::neutral::collection::server_path::{
+    require_superuser, validate_path,
+};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 use crate::types::TraceId;
@@ -49,7 +52,8 @@ pub async fn copy_to_file(
         header,
     } = options;
 
-    validate_path(path)?;
+    require_superuser(identity, "COPY ... TO '<path>'")?;
+    validate_path(path, "COPY TO")?;
 
     // Resolve format (caller has already auto-detected from extension).
     let resolved_format = format.ok_or_else(|| {
@@ -76,9 +80,10 @@ pub async fn copy_to_file(
     // Serialize to the requested format.
     let bytes = serialize_rows(&rows, resolved_format, delimiter.unwrap_or(','), header)?;
 
-    // Atomic write: temp file → rename.
+    // Atomic write: temp file → rename. The temp file must not exist yet,
+    // so a planted symlink or FIFO at that name is never followed.
     let tmp_path = format!("{path}.tmp");
-    tokio::fs::write(&tmp_path, &bytes).await.map_err(|e| {
+    write_new_file(&tmp_path, &bytes).await.map_err(|e| {
         ddl_err(
             "58030",
             format!("COPY TO: cannot write to '{tmp_path}': {e}"),
@@ -237,31 +242,25 @@ fn extract_json_rows(
     Ok(())
 }
 
-/// Reject paths with `..` segments and non-absolute paths.
-fn validate_path(path: &str) -> Result<(), DdlError> {
-    if !path.starts_with('/') {
-        return Err(ddl_err(
-            "42601",
-            format!(
-                "COPY TO: path '{path}' is not absolute; \
-                 only absolute server-side paths are accepted"
-            ),
-        ));
+/// Create `path`, which must not exist, and write `bytes` to it. A failed
+/// write removes the file it created.
+async fn write_new_file(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    let written = match file.write_all(bytes).await {
+        Ok(()) => file.flush().await,
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        drop(file);
+        // The write error is the one reported. A failed removal leaves a
+        // temp file the next COPY TO to this path refuses with its name.
+        let _ = tokio::fs::remove_file(path).await;
     }
-    let p = Path::new(path);
-    for component in p.components() {
-        use std::path::Component;
-        if matches!(component, Component::ParentDir) {
-            return Err(ddl_err(
-                "42501",
-                format!(
-                    "COPY TO: path '{path}' contains '..'; \
-                     directory traversal is not permitted"
-                ),
-            ));
-        }
-    }
-    Ok(())
+    written
 }
 
 #[cfg(test)]

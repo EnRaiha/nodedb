@@ -307,7 +307,7 @@ pub enum MetaOp {
         cutoff_system_ms: i64,
     },
 
-    /// Alter the bitemporal retention policy of an array.
+    /// Alter the bitemporal retention policy or the georef of an array.
     ///
     /// All real work (catalog rewrite + registry update) is done on the
     /// Control Plane before this op is emitted. The Data Plane handler
@@ -325,6 +325,9 @@ pub enum MetaOp {
         array_id: String,
         audit_retain_ms: Option<Option<i64>>,
         minimum_audit_retain_ms: Option<Option<u64>>,
+        /// Re-encoded `ArraySchema` with the new georef. `None` = schema
+        /// unchanged. Its content hash must equal the stored `schema_hash`.
+        schema_msgpack: Option<Vec<u8>>,
     },
 
     /// Apply retention to continuous aggregate buckets managed by

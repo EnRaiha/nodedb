@@ -364,6 +364,7 @@ mod tests {
             tile_extents: vec![10],
             cell_order: CellOrder::RowMajor,
             tile_order: TileOrder::RowMajor,
+            georef: None,
         }
     }
 

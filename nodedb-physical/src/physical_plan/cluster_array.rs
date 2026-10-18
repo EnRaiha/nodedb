@@ -59,6 +59,9 @@ pub enum ClusterArrayOp {
         system_time: SystemTimeScope,
         /// Bitemporal valid-time point. `None` = no valid-time filter.
         valid_at_ms: Option<i64>,
+        /// zerompk-encoded `nodedb_array::query::PolygonZone`, forwarded to
+        /// every shard. Empty = no zone.
+        zone_msgpack: Vec<u8>,
     },
 
     /// Fan-out an aggregate across all target vShards and reduce partials.

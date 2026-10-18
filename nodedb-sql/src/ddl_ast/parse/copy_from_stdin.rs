@@ -7,15 +7,17 @@
 //! STDIN` is the restore shape, which the backup detector owns, so it
 //! returns `None`.
 
-use super::clause::{ClauseCursor, Tok, tokenize};
-use super::copy_from::{copy_collection_name, parse_bool_value, parse_delimiter_value};
+use super::clause::{ClauseCursor, Tok, Token, tokenize};
+use super::copy_from::copy_collection_name;
+use super::copy_options::{parse_bool_value, parse_delimiter_value};
 use crate::ddl_ast::statement::{CopyStdinFormat, MiscStmt, NodedbStatement};
 use crate::error::SqlError;
 
 /// Parse a `COPY ... FROM STDIN` statement. `None` when the copied relation
 /// is more than one name token, or the options are not this grammar's (a
 /// `FORMAT json`, say): such a statement keeps the refusal the bulk-import
-/// router gives it.
+/// router gives it. `FORMAT geotiff` is refused here with `0A000`, naming
+/// the server-path form.
 pub(super) fn try_parse(sql: &str) -> Option<Result<NodedbStatement, SqlError>> {
     let toks = tokenize(sql);
     // `COPY`, the name, then `FROM`.
@@ -26,8 +28,33 @@ pub(super) fn try_parse(sql: &str) -> Option<Result<NodedbStatement, SqlError>> 
     if !one_name {
         return None;
     }
+    // Checked before the options parse, so any other option in the list
+    // still gets this refusal.
+    if names_geotiff(&toks) {
+        return Some(Err(SqlError::FeatureNotSupported {
+            detail: "COPY FROM STDIN does not read GeoTIFF; load the file from a server \
+                     path with COPY <array> FROM '<path>.tif' WITH (FORMAT geotiff)"
+                .to_string(),
+        }));
+    }
     let mut c = ClauseCursor::new(sql, &toks, "COPY");
     parse_stdin(&mut c).ok().map(Ok)
+}
+
+/// True when the tokens hold `FORMAT [=] geotiff`, bare or quoted.
+fn names_geotiff(toks: &[Token<'_>]) -> bool {
+    let is_geotiff = |tok: Option<&Token<'_>>| match tok.map(|t| &t.tok) {
+        Some(Tok::Word(w)) => w.eq_ignore_ascii_case("geotiff"),
+        Some(Tok::Str(s)) => s.trim().eq_ignore_ascii_case("geotiff"),
+        _ => false,
+    };
+    toks.iter().enumerate().any(|(i, t)| {
+        matches!(&t.tok, Tok::Word(w) if w.eq_ignore_ascii_case("FORMAT"))
+            && match toks.get(i + 1).map(|t| &t.tok) {
+                Some(Tok::Punct('=')) => is_geotiff(toks.get(i + 2)),
+                _ => is_geotiff(toks.get(i + 1)),
+            }
+    })
 }
 
 fn parse_stdin(c: &mut ClauseCursor<'_, '_>) -> Result<NodedbStatement, SqlError> {
@@ -138,6 +165,25 @@ mod tests {
     fn another_grammars_options_are_not_parsed() {
         assert!(parse("COPY scene FROM STDIN WITH (FORMAT json)").is_none());
         assert!(parse("COPY scene FROM STDIN WITH (BOGUS 1)").is_none());
+    }
+
+    #[test]
+    fn geotiff_over_stdin_is_refused_naming_the_server_path_form() {
+        for sql in [
+            "COPY scene FROM STDIN WITH (FORMAT geotiff)",
+            "COPY scene FROM STDIN WITH (FORMAT 'GeoTIFF', HEADER)",
+            "COPY scene FROM STDIN WITH (BANDS (a, b), FORMAT = geotiff)",
+        ] {
+            let refusal = parse(sql)
+                .expect("expected Some")
+                .expect_err("expected Err");
+            match refusal {
+                SqlError::FeatureNotSupported { detail } => {
+                    assert!(detail.contains("FROM '<path>.tif'"), "{detail}");
+                }
+                other => panic!("expected FeatureNotSupported, got {other:?}"),
+            }
+        }
     }
 
     #[test]

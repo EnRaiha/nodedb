@@ -313,6 +313,21 @@ impl SqlCatalog for OriginCatalog {
                 name,
             )?
         };
+        // A plan built from this view (its georef, attrs, schema hash) is
+        // cached against the array's version, so an ALTER, DROP, or
+        // re-CREATE stops it matching.
+        self.recorded_versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_unleased(
+                DescriptorId::new(
+                    self.database_id.as_u64(),
+                    self.tenant_id,
+                    DescriptorKind::Array,
+                    entry.name.clone(),
+                ),
+                entry.catalog_version(),
+            );
         let schema: ArraySchema = zerompk::from_msgpack(&entry.schema_msgpack).ok()?;
 
         let dims = schema
@@ -355,11 +370,13 @@ impl SqlCatalog for OriginCatalog {
             }
         }
 
+        let georef = crate::control::array_catalog::georef::georef_ast(&schema);
         Some(ArrayCatalogView {
             name: schema.name,
             dims,
             attrs,
             tile_extents,
+            georef,
         })
     }
 }

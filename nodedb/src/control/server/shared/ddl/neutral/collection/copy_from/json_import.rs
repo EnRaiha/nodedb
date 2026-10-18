@@ -20,7 +20,8 @@ fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError::new(sqlstate, message)
 }
 
-/// Import from an NDJSON file (one JSON object per non-empty line).
+/// Import NDJSON `bytes`, read from `path` (one JSON object per non-empty
+/// line).
 ///
 /// Parse-then-insert: all rows are parsed before any INSERT is issued so that
 /// a JSON parse error on any line prevents rows from being partially written.
@@ -28,12 +29,9 @@ pub(super) async fn import_ndjson(
     ctx: &ImportCtx<'_>,
     collection: &str,
     path: &str,
+    bytes: &[u8],
 ) -> Result<usize, DdlError> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| ddl_err("58030", format!("COPY: cannot read '{path}': {e}")))?;
-
-    let content = std::str::from_utf8(&bytes).map_err(|e| {
+    let content = std::str::from_utf8(bytes).map_err(|e| {
         ddl_err(
             "22021",
             format!("COPY: file '{path}' is not valid UTF-8: {e}"),
@@ -75,7 +73,7 @@ pub(super) async fn import_ndjson(
     Ok(parsed.len())
 }
 
-/// Import from a JSON array file (`[{...}, {...}, ...]`).
+/// Import JSON array `bytes`, read from `path` (`[{...}, {...}, ...]`).
 ///
 /// Parse-then-insert: all rows are deserialized before any INSERT so that
 /// a malformed array prevents partial writes.
@@ -83,12 +81,9 @@ pub(super) async fn import_json_array(
     ctx: &ImportCtx<'_>,
     collection: &str,
     path: &str,
+    bytes: &[u8],
 ) -> Result<usize, DdlError> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| ddl_err("58030", format!("COPY: cannot read '{path}': {e}")))?;
-
-    let array: Vec<serde_json::Value> = sonic_rs::from_slice(&bytes).map_err(|e| {
+    let array: Vec<serde_json::Value> = sonic_rs::from_slice(bytes).map_err(|e| {
         ddl_err(
             "22P02",
             format!("COPY: file '{path}' is not a valid JSON array: {e}"),

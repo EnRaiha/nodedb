@@ -53,6 +53,7 @@ mod cluster_array_body_read;
 mod cluster_array_cell_raft_replication;
 mod cluster_array_project_elementwise;
 mod cluster_array_region_agg;
+mod cluster_array_slice_zone;
 mod cluster_array_ws_rpc;
 mod cluster_backup_remote_cut;
 mod cluster_backup_restore;

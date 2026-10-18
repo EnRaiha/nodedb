@@ -3,8 +3,8 @@
 //! Typed AST returned by the array-statement parser.
 
 use crate::types_array::{
-    ArrayAttrAst, ArrayCellOrderAst, ArrayCoordLiteral, ArrayDimAst, ArrayInsertRow,
-    ArrayTileOrderAst,
+    ArrayAttrAst, ArrayCellOrderAst, ArrayCoordLiteral, ArrayDimAst, ArrayGeorefAlter,
+    ArrayGeorefAst, ArrayInsertRow, ArrayTileOrderAst,
 };
 
 /// Top-level array-statement AST. One variant per surface command.
@@ -17,17 +17,26 @@ pub enum ArrayStatement {
     Alter(AlterArrayAst),
 }
 
-/// `ALTER ARRAY <name> SET ( key = value [, key = value]* )`
+/// `ALTER ARRAY <name> SET ( key = value [, key = value]* )`,
+/// `ALTER ARRAY <name> SET GEOREF (...)`, or `ALTER ARRAY <name> DROP GEOREF`.
 ///
-/// Supported keys:
+/// Supported SET keys:
 /// - `audit_retain_ms`         — `NULL` or non-negative integer.
 /// - `minimum_audit_retain_ms` — non-negative integer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlterArrayAst {
     pub name: String,
+    pub action: AlterArrayAction,
+}
+
+/// The one change an `ALTER ARRAY` statement makes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterArrayAction {
     /// Key-value pairs from the SET clause. Values are either integer
     /// literals or NULL (represented as `None`).
-    pub set: Vec<(String, Option<i64>)>,
+    SetOptions(Vec<(String, Option<i64>)>),
+    /// `SET GEOREF (...)` or `DROP GEOREF`.
+    Georef(ArrayGeorefAlter),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +47,8 @@ pub struct CreateArrayAst {
     pub tile_extents: Vec<i64>,
     pub cell_order: ArrayCellOrderAst,
     pub tile_order: ArrayTileOrderAst,
+    /// Optional `GEOREF (...)` clause.
+    pub georef: Option<ArrayGeorefAst>,
     /// Number of Hilbert-prefix bits used for vShard routing.
     /// Accepted via optional `WITH (prefix_bits = N)` clause; default 8.
     pub prefix_bits: u8,

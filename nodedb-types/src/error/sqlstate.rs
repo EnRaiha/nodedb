@@ -77,6 +77,10 @@ pub const INVALID_LIMIT_VALUE: &str = "2201W";
 /// parse as the number an operation reads, e.g. `INCR` on `"abc"`)
 pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
 
+/// `22P04` — `bad_copy_file_format` (a `COPY` input file that does not
+/// decode as its format, e.g. a truncated or corrupt GeoTIFF)
+pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
+
 /// `22023` — `invalid_parameter_value` (a `SET` value the parameter's own
 /// grammar refuses, e.g. `SET statement_timeout = 'later'`)
 pub const INVALID_PARAMETER_VALUE: &str = "22023";
@@ -418,6 +422,7 @@ mod tests {
             DIVISION_BY_ZERO,
             INVALID_LIMIT_VALUE,
             INVALID_TEXT_REPRESENTATION,
+            BAD_COPY_FILE_FORMAT,
             INTEGRITY_CONSTRAINT_VIOLATION,
             GENERATED_ALWAYS,
             NOT_NULL_VIOLATION,
@@ -511,6 +516,7 @@ mod tests {
         assert_eq!(GROUPING_ERROR, "42803");
         assert_eq!(UNDEFINED_TABLE, "42P01");
         assert_eq!(INSUFFICIENT_PRIVILEGE, "42501");
+        assert_eq!(BAD_COPY_FILE_FORMAT, "22P04");
         assert_eq!(QUERY_CANCELED.0, "57014");
         assert_eq!(INTERNAL_ERROR, "XX000");
         assert_eq!(FEATURE_NOT_SUPPORTED, "0A000");

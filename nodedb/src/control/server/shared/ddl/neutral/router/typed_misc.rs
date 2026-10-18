@@ -31,6 +31,7 @@ pub(super) async fn try_typed(
             format,
             delimiter,
             header,
+            raster,
         }) => Some(
             collection::copy_from_file(
                 state,
@@ -41,6 +42,7 @@ pub(super) async fn try_typed(
                     format: format.as_ref(),
                     delimiter: *delimiter,
                     header: *header,
+                    raster,
                 },
                 database_id,
                 txn_ctx,

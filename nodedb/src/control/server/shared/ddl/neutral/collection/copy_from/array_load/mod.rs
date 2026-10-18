@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod decode;
 pub mod dispatch;
 pub mod loader;
+pub mod raster;
 pub mod records;
 pub mod router;
 pub mod source;

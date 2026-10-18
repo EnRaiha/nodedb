@@ -262,10 +262,12 @@ pub fn code_for_sqlstate(sqlstate_str: &str) -> ErrorCode {
         // non-retriable client error.
         sqlstate::GROUPING_ERROR => ErrorCode::BAD_REQUEST,
         sqlstate::DATA_EXCEPTION => ErrorCode::DATA_EXCEPTION,
-        // A bad parameter value, text representation, datetime format or
-        // datetime range is a data exception: class `22`, the class the code
-        // renders back.
-        "22023" | "22P02" | "22007" | "22008" => ErrorCode::DATA_EXCEPTION,
+        // A bad parameter value, text representation, datetime format,
+        // datetime range or COPY file format is a data exception: class
+        // `22`, the class the code renders back.
+        "22023" | "22P02" | "22007" | "22008" | sqlstate::BAD_COPY_FILE_FORMAT => {
+            ErrorCode::DATA_EXCEPTION
+        }
         sqlstate::NUMERIC_VALUE_OUT_OF_RANGE => ErrorCode::OVERFLOW,
         sqlstate::DIVISION_BY_ZERO => ErrorCode::DIVISION_BY_ZERO,
         sqlstate::INVALID_LIMIT_VALUE => ErrorCode::INVALID_LIMIT_VALUE,

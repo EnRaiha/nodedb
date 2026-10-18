@@ -3,8 +3,7 @@
 //! ARRAY_SLICE → PhysicalPlan::Array(ArrayOp::Slice) or ClusterArray(Slice).
 
 use nodedb_array::types::ArrayId;
-use nodedb_sql::temporal::TemporalScope;
-use nodedb_sql::types_array::ArraySliceAst;
+use nodedb_sql::ArraySliceVisitArgs;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
@@ -12,22 +11,39 @@ use nodedb_physical::physical_plan::{ArrayOp, ClusterArrayOp};
 
 use super::super::convert::ConvertContext;
 use super::helpers::{decode_schema, load_entry, resolve_attr_indices, resolve_slice};
+use super::region::lower_zone;
 use super::tile_keys::compute_slice_tile_keys;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 pub(crate) fn convert_slice(
-    name: &str,
-    slice_ast: &ArraySliceAst,
-    attr_projection: &[String],
-    limit: u32,
-    temporal: TemporalScope,
+    args: ArraySliceVisitArgs<'_>,
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let ArraySliceVisitArgs {
+        name,
+        slice: slice_ast,
+        attr_projection,
+        limit,
+        zone,
+        temporal,
+    } = args;
     let entry = load_entry(name, tenant_id, ctx)?;
     let schema = decode_schema(&entry)?;
 
-    let slice = resolve_slice("ARRAY_SLICE", name, slice_ast, &schema)?;
+    let mut slice = resolve_slice("ARRAY_SLICE", name, slice_ast, &schema)?;
+    // A zone narrows the box before it is encoded, so pruning and the
+    // cluster fan-out both see the zone's extent.
+    let zone_msgpack = match zone {
+        None => Vec::new(),
+        Some(zone) => {
+            let lowered = lower_zone("ARRAY_SLICE", name, zone, &schema, &mut slice)?;
+            zerompk::to_msgpack_vec(&lowered).map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("array slice zone encode: {e}"),
+            })?
+        }
+    };
     let slice_msgpack =
         zerompk::to_msgpack_vec(&slice).map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),
@@ -35,7 +51,7 @@ pub(crate) fn convert_slice(
         })?;
 
     let (system_time, valid_at_ms) =
-        super::helpers::resolve_array_temporal_scope(temporal, "ARRAY_SLICE")?;
+        super::helpers::resolve_array_temporal_scope(*temporal, "ARRAY_SLICE")?;
     let attr_indices = resolve_attr_indices(name, attr_projection, &schema)?;
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = ctx.collection_key(name).vshard();
@@ -58,6 +74,7 @@ pub(crate) fn convert_slice(
             prefix_bits: entry.prefix_bits,
             system_time,
             valid_at_ms,
+            zone_msgpack,
         })
     } else {
         PhysicalPlan::Array(ArrayOp::Slice {
@@ -69,6 +86,7 @@ pub(crate) fn convert_slice(
             shard_bucket: None,
             system_time,
             valid_at_ms,
+            zone_msgpack,
         })
     };
 
@@ -90,6 +108,8 @@ mod tests {
         ArraySchema, ArraySchemaBuilder, AttrSpec, AttrType, DimSpec, DimType,
     };
     use nodedb_array::types::domain::{Domain, DomainBound};
+    use nodedb_sql::temporal::TemporalScope;
+    use nodedb_sql::types_array::ArraySliceAst;
 
     fn make_schema() -> (Vec<u8>, ArraySchema) {
         let schema = ArraySchemaBuilder::new("test_arr")
@@ -155,20 +175,27 @@ mod tests {
         (ctx, handle)
     }
 
+    fn whole_slice(ctx: &ConvertContext) -> Vec<PhysicalTask> {
+        let slice_ast = ArraySliceAst { dim_ranges: vec![] };
+        convert_slice(
+            ArraySliceVisitArgs {
+                name: "test_arr",
+                slice: &slice_ast,
+                attr_projection: &[],
+                limit: 100,
+                zone: None,
+                temporal: &TemporalScope::default(),
+            },
+            TenantId::new(1),
+            ctx,
+        )
+        .expect("convert")
+    }
+
     #[test]
     fn single_node_emits_local_array() {
         let (ctx, _handle) = make_ctx(false);
-        let slice_ast = ArraySliceAst { dim_ranges: vec![] };
-        let tasks = convert_slice(
-            "test_arr",
-            &slice_ast,
-            &[],
-            100,
-            TemporalScope::default(),
-            TenantId::new(1),
-            &ctx,
-        )
-        .expect("convert");
+        let tasks = whole_slice(&ctx);
         assert_eq!(tasks.len(), 1);
         assert!(
             matches!(&tasks[0].plan, PhysicalPlan::Array(ArrayOp::Slice { .. })),
@@ -180,17 +207,7 @@ mod tests {
     #[test]
     fn cluster_mode_emits_cluster_array() {
         let (ctx, _handle) = make_ctx(true);
-        let slice_ast = ArraySliceAst { dim_ranges: vec![] };
-        let tasks = convert_slice(
-            "test_arr",
-            &slice_ast,
-            &[],
-            100,
-            TemporalScope::default(),
-            TenantId::new(1),
-            &ctx,
-        )
-        .expect("convert");
+        let tasks = whole_slice(&ctx);
         assert_eq!(tasks.len(), 1);
         assert!(
             matches!(

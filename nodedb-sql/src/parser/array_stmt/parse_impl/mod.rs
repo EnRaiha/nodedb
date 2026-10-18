@@ -7,6 +7,7 @@ mod core;
 mod create;
 mod delete_stmt;
 mod drop;
+mod georef;
 mod insert;
 
 pub(in crate::parser::array_stmt::parse) use core::Parser;

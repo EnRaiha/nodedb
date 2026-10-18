@@ -24,7 +24,8 @@ pub use coord::{
 };
 pub use error::{ArrayError, ArrayResult};
 pub use schema::{
-    ArraySchema, ArraySchemaBuilder, AttrSpec, CellOrder, DimSpec, DimType, TileOrder,
+    ArrayGeoref, ArraySchema, ArraySchemaBuilder, AttrSpec, CellOrder, DimSpec, DimType,
+    GeoTransform, TileOrder,
 };
 pub use segment::{
     FOOTER_MAGIC, FORMAT_VERSION, HEADER_MAGIC, HilbertPackedRTree, MbrQueryPredicate,

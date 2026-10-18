@@ -11,10 +11,12 @@
 use crate::types::{AlterArrayPlan, CreateArrayPlan};
 use std::collections::HashSet;
 
+use crate::catalog::SqlCatalog;
 use crate::error::{Result, SqlError};
-use crate::parser::array_stmt::{AlterArrayAst, CreateArrayAst, DropArrayAst};
+use crate::parser::array_stmt::{AlterArrayAction, AlterArrayAst, CreateArrayAst, DropArrayAst};
+use crate::planner::array_georef::check_georef;
 use crate::types::SqlPlan;
-use crate::types_array::{ArrayDimType, ArrayDomainBound};
+use crate::types_array::{ArrayDimType, ArrayDomainBound, ArrayGeorefAlter};
 
 pub fn plan_create_array(ast: &CreateArrayAst) -> Result<SqlPlan> {
     if ast.name.is_empty() {
@@ -103,6 +105,9 @@ pub fn plan_create_array(ast: &CreateArrayAst) -> Result<SqlPlan> {
             ),
         });
     }
+    if let Some(georef) = &ast.georef {
+        check_georef(&ast.name, georef, &ast.dims)?;
+    }
     Ok(SqlPlan::CreateArray(CreateArrayPlan {
         name: ast.name.clone(),
         dims: ast.dims.clone(),
@@ -110,47 +115,88 @@ pub fn plan_create_array(ast: &CreateArrayAst) -> Result<SqlPlan> {
         tile_extents: ast.tile_extents.clone(),
         cell_order: ast.cell_order,
         tile_order: ast.tile_order,
+        georef: ast.georef.clone(),
         prefix_bits: ast.prefix_bits,
         audit_retain_ms: ast.audit_retain_ms,
         minimum_audit_retain_ms: ast.minimum_audit_retain_ms,
     }))
 }
 
-pub fn plan_alter_array(ast: &AlterArrayAst) -> Result<SqlPlan> {
+pub fn plan_alter_array(ast: &AlterArrayAst, catalog: &dyn SqlCatalog) -> Result<SqlPlan> {
     if ast.name.is_empty() {
         return Err(SqlError::Parse {
             detail: "ALTER ARRAY: array name must not be empty".into(),
         });
     }
-    if ast.set.is_empty() {
+    match &ast.action {
+        AlterArrayAction::SetOptions(set) => plan_alter_options(&ast.name, set),
+        AlterArrayAction::Georef(change) => plan_alter_georef(&ast.name, change, catalog),
+    }
+}
+
+/// `ALTER ARRAY <name> SET GEOREF (...)` or `DROP GEOREF`, checked against
+/// the array's current dims and georef.
+fn plan_alter_georef(
+    name: &str,
+    change: &ArrayGeorefAlter,
+    catalog: &dyn SqlCatalog,
+) -> Result<SqlPlan> {
+    let view = catalog
+        .lookup_array(name)
+        .ok_or_else(|| SqlError::UnknownTable {
+            name: name.to_string(),
+        })?;
+    match change {
+        ArrayGeorefAlter::Set(georef) => check_georef(name, georef, &view.dims)?,
+        ArrayGeorefAlter::Drop => {
+            if view.georef.is_none() {
+                return Err(SqlError::ObjectNotInPrerequisiteState {
+                    object: format!("array '{name}'"),
+                    detail: format!("ALTER ARRAY {name} DROP GEOREF: the array has no GEOREF"),
+                });
+            }
+        }
+    }
+    Ok(SqlPlan::AlterArray(AlterArrayPlan {
+        name: name.to_string(),
+        audit_retain_ms: None,
+        minimum_audit_retain_ms: None,
+        georef: Some(change.clone()),
+    }))
+}
+
+/// `ALTER ARRAY <name> SET (key = value, ...)`.
+fn plan_alter_options(name: &str, set: &[(String, Option<i64>)]) -> Result<SqlPlan> {
+    if set.is_empty() {
         return Err(SqlError::Parse {
-            detail: format!("ALTER ARRAY {}: SET clause is empty", ast.name),
+            detail: format!("ALTER ARRAY {name}: SET clause is empty"),
         });
     }
 
     let mut audit_retain_ms: Option<Option<i64>> = None;
     let mut minimum_audit_retain_ms: Option<u64> = None;
 
-    for (key, value) in &ast.set {
+    for (key, value) in set {
+        if value.is_some_and(|v| v < 0) {
+            return Err(SqlError::Parse {
+                detail: format!("ALTER ARRAY {name}: {key} must not be negative"),
+            });
+        }
         match key.as_str() {
             "audit_retain_ms" => {
                 audit_retain_ms = Some(*value);
             }
             "minimum_audit_retain_ms" => {
                 let n = value.ok_or_else(|| SqlError::Parse {
-                    detail: format!(
-                        "ALTER ARRAY {}: minimum_audit_retain_ms cannot be NULL",
-                        ast.name
-                    ),
+                    detail: format!("ALTER ARRAY {name}: minimum_audit_retain_ms cannot be NULL"),
                 })?;
                 minimum_audit_retain_ms = Some(n as u64);
             }
             other => {
                 return Err(SqlError::Parse {
                     detail: format!(
-                        "ALTER ARRAY {}: unknown SET key `{other}`; \
-                         expected `audit_retain_ms` or `minimum_audit_retain_ms`",
-                        ast.name
+                        "ALTER ARRAY {name}: unknown SET key `{other}`; \
+                         expected `audit_retain_ms` or `minimum_audit_retain_ms`"
                     ),
                 });
             }
@@ -158,9 +204,10 @@ pub fn plan_alter_array(ast: &AlterArrayAst) -> Result<SqlPlan> {
     }
 
     Ok(SqlPlan::AlterArray(AlterArrayPlan {
-        name: ast.name.clone(),
+        name: name.to_string(),
         audit_retain_ms,
         minimum_audit_retain_ms,
+        georef: None,
     }))
 }
 
@@ -216,7 +263,8 @@ fn domain_lo_le_hi(lo: &ArrayDomainBound, hi: &ArrayDomainBound) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types_array::{ArrayAttrAst, ArrayAttrType, ArrayDimAst};
+    use crate::catalog::ArrayCatalogView;
+    use crate::types_array::{ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayGeorefAst};
 
     fn ok_ast() -> CreateArrayAst {
         CreateArrayAst {
@@ -235,9 +283,192 @@ mod tests {
             tile_extents: vec![4],
             cell_order: Default::default(),
             tile_order: Default::default(),
+            georef: None,
             prefix_bits: 8,
             audit_retain_ms: None,
             minimum_audit_retain_ms: None,
+        }
+    }
+
+    fn int_dim(name: &str) -> ArrayDimAst {
+        ArrayDimAst {
+            name: name.into(),
+            dtype: ArrayDimType::Int64,
+            lo: ArrayDomainBound::Int64(0),
+            hi: ArrayDomainBound::Int64(1023),
+        }
+    }
+
+    fn georef(x: &str, y: &str, transform: Option<[f64; 6]>) -> ArrayGeorefAst {
+        ArrayGeorefAst {
+            srid: 32647,
+            x_dim: x.into(),
+            y_dim: y.into(),
+            transform,
+        }
+    }
+
+    const GT: [f64; 6] = [600_000.0, 10.0, 0.0, 700_000.0, 0.0, -10.0];
+
+    fn raster_ast(georef: Option<ArrayGeorefAst>) -> CreateArrayAst {
+        CreateArrayAst {
+            dims: vec![int_dim("row"), int_dim("col")],
+            tile_extents: vec![256, 256],
+            georef,
+            ..ok_ast()
+        }
+    }
+
+    #[test]
+    fn create_carries_georef() {
+        let g = georef("col", "row", Some(GT));
+        let SqlPlan::CreateArray(plan) = plan_create_array(&raster_ast(Some(g.clone()))).unwrap()
+        else {
+            panic!("expected CreateArray");
+        };
+        assert_eq!(plan.georef, Some(g));
+    }
+
+    #[test]
+    fn create_refuses_bad_georef_with_sqlstate_class() {
+        let err = plan_create_array(&raster_ast(Some(georef("col", "lat", None)))).unwrap_err();
+        assert!(matches!(err, SqlError::UnknownColumn { .. }), "{err:?}");
+        let mut srid = georef("col", "row", None);
+        srid.srid = 2154;
+        let err = plan_create_array(&raster_ast(Some(srid))).unwrap_err();
+        assert!(matches!(err, SqlError::DataException { .. }), "{err:?}");
+        let singular = georef("col", "row", Some([0.0, 1.0, 1.0, 0.0, 1.0, 1.0]));
+        let err = plan_create_array(&raster_ast(Some(singular))).unwrap_err();
+        assert!(matches!(err, SqlError::DataException { .. }), "{err:?}");
+    }
+
+    struct Catalog(Option<ArrayCatalogView>);
+
+    impl SqlCatalog for Catalog {
+        fn get_collection(
+            &self,
+            _: nodedb_types::DatabaseId,
+            _: &str,
+        ) -> std::result::Result<
+            Option<crate::types::CollectionInfo>,
+            crate::catalog::SqlCatalogError,
+        > {
+            Ok(None)
+        }
+        fn lookup_array(&self, _: &str) -> Option<ArrayCatalogView> {
+            self.0.clone()
+        }
+    }
+
+    fn view(georef: Option<ArrayGeorefAst>) -> ArrayCatalogView {
+        ArrayCatalogView {
+            name: "scene".into(),
+            dims: vec![int_dim("row"), int_dim("col")],
+            attrs: ok_ast().attrs,
+            tile_extents: vec![256, 256],
+            georef,
+        }
+    }
+
+    fn alter(action: AlterArrayAction, catalog: &Catalog) -> Result<SqlPlan> {
+        plan_alter_array(
+            &AlterArrayAst {
+                name: "scene".into(),
+                action,
+            },
+            catalog,
+        )
+    }
+
+    #[test]
+    fn alter_set_georef_plans_the_change() {
+        let g = georef("col", "row", Some(GT));
+        let change = ArrayGeorefAlter::Set(g);
+        let SqlPlan::AlterArray(plan) = alter(
+            AlterArrayAction::Georef(change.clone()),
+            &Catalog(Some(view(None))),
+        )
+        .unwrap() else {
+            panic!("expected AlterArray");
+        };
+        assert_eq!(plan.georef, Some(change));
+        assert_eq!(plan.audit_retain_ms, None);
+        assert_eq!(plan.minimum_audit_retain_ms, None);
+    }
+
+    #[test]
+    fn alter_set_georef_refusals() {
+        let catalog = Catalog(Some(view(None)));
+        let unknown = ArrayGeorefAlter::Set(georef("col", "lat", None));
+        let err = alter(AlterArrayAction::Georef(unknown), &catalog).unwrap_err();
+        assert!(matches!(err, SqlError::UnknownColumn { .. }), "{err:?}");
+        let mut inf = GT;
+        inf[5] = f64::NEG_INFINITY;
+        let bad = ArrayGeorefAlter::Set(georef("col", "row", Some(inf)));
+        let err = alter(AlterArrayAction::Georef(bad), &catalog).unwrap_err();
+        assert!(matches!(err, SqlError::DataException { .. }), "{err:?}");
+        let missing = alter(
+            AlterArrayAction::Georef(ArrayGeorefAlter::Drop),
+            &Catalog(None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing, SqlError::UnknownTable { .. }),
+            "{missing:?}"
+        );
+    }
+
+    #[test]
+    fn alter_drop_georef_needs_a_georef() {
+        let err = alter(
+            AlterArrayAction::Georef(ArrayGeorefAlter::Drop),
+            &Catalog(Some(view(None))),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SqlError::ObjectNotInPrerequisiteState { .. }),
+            "{err:?}"
+        );
+        let plan = alter(
+            AlterArrayAction::Georef(ArrayGeorefAlter::Drop),
+            &Catalog(Some(view(Some(georef("col", "row", None))))),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            SqlPlan::AlterArray(AlterArrayPlan {
+                georef: Some(ArrayGeorefAlter::Drop),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn alter_options_keep_georef_unchanged() {
+        let plan = alter(
+            AlterArrayAction::SetOptions(vec![("audit_retain_ms".into(), Some(5))]),
+            &Catalog(None),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            SqlPlan::AlterArray(AlterArrayPlan {
+                georef: None,
+                audit_retain_ms: Some(Some(5)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn alter_options_refuse_negative_values() {
+        for key in ["audit_retain_ms", "minimum_audit_retain_ms"] {
+            let err = alter(
+                AlterArrayAction::SetOptions(vec![(key.into(), Some(-1))]),
+                &Catalog(None),
+            )
+            .expect_err("negative refused");
+            assert!(matches!(err, SqlError::Parse { .. }), "{key}: {err:?}");
         }
     }
 

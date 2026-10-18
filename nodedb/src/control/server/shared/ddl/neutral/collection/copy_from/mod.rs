@@ -4,8 +4,9 @@
 //!
 //! `COPY <collection> FROM '<path>'` reads NDJSON, JSON array, or CSV. The
 //! format is detected from the file extension when the WITH clause names
-//! none. `COPY <array> FROM STDIN` and `COPY <array> FROM '<path>.csv'` load
-//! an array through `array_load`.
+//! none. A server path needs superuser, and the path must open as a regular
+//! file. `COPY <array> FROM STDIN`, `COPY <array> FROM '<path>.csv'` and
+//! `COPY <array> FROM '<path>.tif'` load an array through `array_load`.
 //!
 //! Each engine's `EngineRules::plan_bulk_load` decides how it loads:
 //! - Document (schemaless/strict), Columnar, KV, vector primary: one INSERT
@@ -28,6 +29,7 @@ mod csv_import;
 mod entry;
 mod import_ctx;
 mod json_import;
+mod source_file;
 
 pub(crate) use array_load::{ArrayLoadCtx, ArrayLoader, LoadInput, TextFormat};
 pub use entry::{CopyFromOptions, copy_from_file};

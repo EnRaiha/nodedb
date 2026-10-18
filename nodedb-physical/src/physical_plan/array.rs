@@ -167,6 +167,9 @@ pub enum ArrayOp {
         /// returned if `valid_from_ms <= vt < valid_until_ms`. `None` =
         /// no valid-time filter.
         valid_at_ms: Option<i64>,
+        /// zerompk-encoded `nodedb_array::query::PolygonZone`. Only cells
+        /// inside it are returned. Empty = no zone.
+        zone_msgpack: Vec<u8>,
     },
 
     /// Reduce one attribute column. `group_by_dim < 0` means no
@@ -334,6 +337,7 @@ mod tests {
             shard_bucket: None,
             system_time: SystemTimeScope::AllVersions,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         };
         let bytes = zerompk::to_msgpack_vec(&op).unwrap();
         let back: ArrayOp = zerompk::from_msgpack(&bytes).unwrap();
@@ -362,6 +366,7 @@ mod tests {
             shard_bucket: None,
             system_time: SystemTimeScope::AsOf(1_700_000_000_000),
             valid_at_ms: Some(1_600_000_000_000),
+            zone_msgpack: vec![4, 5, 6],
         };
         let bytes = zerompk::to_msgpack_vec(&op).unwrap();
         let back: ArrayOp = zerompk::from_msgpack(&bytes).unwrap();

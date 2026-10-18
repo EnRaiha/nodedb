@@ -167,7 +167,8 @@ fn clause_error(clause: &str, owner: &str, error: &SqlError) -> DdlError {
         SqlError::SequencePerRowUnsupported { .. }
         | SqlError::SearchFunctionOutsideSearch { .. }
         | SqlError::UnsupportedConstraint { .. }
-        | SqlError::ConflictingEngineClause { .. } => sqlstate::FEATURE_NOT_SUPPORTED,
+        | SqlError::ConflictingEngineClause { .. }
+        | SqlError::FeatureNotSupported { .. } => sqlstate::FEATURE_NOT_SUPPORTED,
         SqlError::RetryableSchemaChanged { .. } => sqlstate::SERIALIZATION_FAILURE,
         SqlError::RecursionDepthExceeded { .. } => sqlstate::PROGRAM_LIMIT_EXCEEDED,
         SqlError::Parse { .. }

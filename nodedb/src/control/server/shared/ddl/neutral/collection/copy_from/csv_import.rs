@@ -27,22 +27,20 @@ pub(super) struct CsvOptions {
     pub(super) has_header: bool,
 }
 
-/// Import from a CSV file (header row → column names; each subsequent row → INSERT).
+/// Import CSV `bytes`, read from `path` (header row → column names; each
+/// subsequent row → INSERT).
 pub(super) async fn import_csv(
     ctx: &ImportCtx<'_>,
     collection: &str,
     path: &str,
+    bytes: &[u8],
     opts: CsvOptions,
 ) -> Result<usize, DdlError> {
     let CsvOptions {
         delimiter,
         has_header,
     } = opts;
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| ddl_err("58030", format!("COPY: cannot read '{path}': {e}")))?;
-
-    let content = std::str::from_utf8(&bytes).map_err(|e| {
+    let content = std::str::from_utf8(bytes).map_err(|e| {
         ddl_err(
             "22021",
             format!("COPY: file '{path}' is not valid UTF-8: {e}"),

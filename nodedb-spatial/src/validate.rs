@@ -135,7 +135,7 @@ fn validate_recursive(geom: &Geometry, issues: &mut Vec<String>) {
 }
 
 /// Signed area of a ring (Shoelace formula). Positive = CCW, Negative = CW.
-fn signed_area(ring: &[[f64; 2]]) -> f64 {
+pub(crate) fn signed_area(ring: &[[f64; 2]]) -> f64 {
     let n = ring.len();
     if n < 3 {
         return 0.0;

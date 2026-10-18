@@ -105,8 +105,11 @@ impl ArrayEngine {
         schema: Arc<ArraySchema>,
         schema_hash: u64,
     ) -> ArrayEngineResult<()> {
-        if let Some(existing) = self.arrays.get(&id) {
+        if let Some(existing) = self.arrays.get_mut(&id) {
             if existing.schema_hash() == schema_hash {
+                // An equal hash means equal content. Only the georef can
+                // differ, so the open store adopts the new schema in place.
+                existing.adopt_schema(schema);
                 return Ok(());
             }
             return Err(ArrayEngineError::SchemaMismatch {
@@ -327,6 +330,40 @@ mod tests {
             1,
             "idempotent re-open must preserve memtable contents"
         );
+    }
+
+    /// A reopen with the same hash adopts the new schema, which differs only
+    /// in its georef, and keeps the flushed segments readable.
+    #[test]
+    fn open_array_same_hash_adopts_a_georef_change() {
+        use crate::engine::array::test_support::put_one;
+        use nodedb_array::schema::{ArrayGeoref, GeoTransform};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(aid(), schema(), 0xC0FFEE).unwrap();
+        put_one(&mut e, 1, 1, 7, 1);
+        e.flush(&aid(), crate::types::replay_stamp::ReplayStamp::through(2))
+            .unwrap();
+
+        let georef = ArrayGeoref {
+            srid: nodedb_types::geometry::Srid::Utm47N,
+            x_dim: 0,
+            y_dim: 1,
+            transform: Some(GeoTransform([600_000.0, 10.0, 0.0, 700_000.0, 0.0, -10.0])),
+        };
+        let geo = Arc::new(
+            (*schema())
+                .clone()
+                .with_georef(Some(georef.clone()))
+                .unwrap(),
+        );
+        e.open_array(aid(), geo, 0xC0FFEE).unwrap();
+        let store = e.store(&aid()).unwrap();
+        assert_eq!(store.schema().georef, Some(georef));
+        assert_eq!(store.manifest().segments.len(), 1);
+        assert_eq!(store.segments.len(), 1);
     }
 
     #[test]

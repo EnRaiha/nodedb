@@ -18,6 +18,7 @@ pub mod h3;
 pub mod hybrid;
 pub mod measures;
 pub mod operations;
+pub mod orient;
 pub mod persist;
 pub mod planar;
 pub mod predicates;
@@ -39,6 +40,7 @@ pub use h3::{
 pub use hybrid::{SpatialPreFilterResult, bitmap_contains, ids_to_bitmap, spatial_prefilter};
 pub use measures::{st_area, st_centroid, st_centroid_in};
 pub use operations::{st_buffer, st_buffer_in, st_envelope, st_envelope_in, st_union};
+pub use orient::orient_rings;
 pub use persist::{
     RTreeCheckpointError, SpatialIndexMeta, SpatialIndexType, deserialize_meta, meta_storage_key,
     rtree_storage_key, serialize_meta,
@@ -52,4 +54,4 @@ pub use predicates::{
 pub use rtree::{RTree, RTreeEntry, SridMismatch};
 pub use validate::{is_valid, validate_geometry};
 pub use wkb::{geometry_from_wkb, geometry_to_ewkb, geometry_to_wkb};
-pub use wkt::{geometry_from_wkt, geometry_to_wkt};
+pub use wkt::{Ewkt, geometry_from_ewkt, geometry_from_wkt, geometry_to_wkt};

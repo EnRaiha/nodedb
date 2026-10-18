@@ -42,6 +42,23 @@ pub fn continuous_aggregate_of_key(key: &str, database_id: u64, tenant_id: u64) 
         .strip_prefix(&format!("{database_id}:{tenant_id}:"))
 }
 
+/// Prefix for the synthetic entry carrying an array's catalog version.
+const ARRAY_VERSION_KEY_PREFIX: &str = "\0__array::";
+
+/// The synthetic pseudo-collection key an array's catalog version is folded
+/// into the set under, so a plan over the array stops matching once the
+/// array is altered, dropped, or re-created.
+pub fn array_version_key(database_id: u64, tenant_id: u64, name: &str) -> String {
+    format!("{ARRAY_VERSION_KEY_PREFIX}{database_id}:{tenant_id}:{name}")
+}
+
+/// The array name an [`array_version_key`] names, when `key` is one of
+/// `database_id` / `tenant_id`.
+pub fn array_of_key(key: &str, database_id: u64, tenant_id: u64) -> Option<&str> {
+    key.strip_prefix(ARRAY_VERSION_KEY_PREFIX)?
+        .strip_prefix(&format!("{database_id}:{tenant_id}:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +71,17 @@ mod tests {
         );
         assert_ne!(rls_version_key(1), rls_version_key(2));
         assert_ne!(permission_tree_version_key(1), rls_version_key(1));
+    }
+
+    #[test]
+    fn array_key_round_trips_only_in_its_scope() {
+        let key = array_version_key(7, 3, "scene");
+        assert_eq!(array_of_key(&key, 7, 3), Some("scene"));
+        assert_eq!(array_of_key(&key, 7, 4), None);
+        assert_eq!(array_of_key(&key, 8, 3), None);
+        assert_eq!(
+            array_of_key(&continuous_aggregate_version_key(7, 3, "scene"), 7, 3),
+            None
+        );
     }
 }

@@ -368,7 +368,7 @@ fn coord_text(coord: &ArrayCoordLiteral) -> String {
     }
 }
 
-fn bound_text(bound: &ArrayDomainBound) -> String {
+pub(super) fn bound_text(bound: &ArrayDomainBound) -> String {
     match bound {
         ArrayDomainBound::Int64(v) | ArrayDomainBound::TimestampMs(v) => v.to_string(),
         ArrayDomainBound::Float64(v) => v.to_string(),
@@ -384,6 +384,7 @@ mod tests {
     fn view() -> ArrayCatalogView {
         ArrayCatalogView {
             name: "scene".into(),
+            georef: None,
             dims: vec![ArrayDimAst {
                 name: "y".into(),
                 dtype: ArrayDimType::Int64,
@@ -467,6 +468,7 @@ mod tests {
         };
         ArrayCatalogView {
             name: "scene".into(),
+            georef: None,
             dims: vec![ArrayDimAst {
                 name: "y".into(),
                 dtype: ArrayDimType::Int64,

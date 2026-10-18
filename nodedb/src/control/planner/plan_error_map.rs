@@ -90,11 +90,10 @@ pub(crate) fn map_plan_error(
         // Refusals of a constraint or clause NodeDB does not implement. The
         // DDL router renders both as `0A000`, so the planner path does too.
         nodedb_sql::SqlError::UnsupportedConstraint { .. }
-        | nodedb_sql::SqlError::ConflictingEngineClause { .. } => {
-            crate::Error::FeatureNotSupported {
-                detail: error.to_string(),
-            }
-        }
+        | nodedb_sql::SqlError::ConflictingEngineClause { .. }
+        | nodedb_sql::SqlError::FeatureNotSupported { .. } => crate::Error::FeatureNotSupported {
+            detail: error.to_string(),
+        },
         // A value out of range for its type is `22003`
         // (numeric_value_out_of_range), the SQLSTATE PostgreSQL and the DDL
         // DEFAULT gate give it.

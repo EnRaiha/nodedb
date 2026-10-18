@@ -9,14 +9,20 @@
 //! of [`nodedb_types::geometry::point_in_polygon`]: a point on a minimum
 //! edge is inside, a point on a maximum edge is outside.
 //!
+//! A zone with a [`ZoneFrame`] is drawn in an SRID. Its cells map into
+//! that SRID before the ray cast, and its frame's dim box bounds pruning.
+//!
 //! Two entry points:
 //! * [`ArrayRegion::tile_may_contain`] — MBR-only check. A `false` proves
 //!   the tile holds no live cell in the region, so no payload is decoded.
-//! * [`filter_region_owned`] — per-cell filter of one tile.
+//! * [`filter_region_owned`] — per-cell filter of one tile, through a
+//!   [`PreparedRegion`] built once per scan.
 
+use nodedb_spatial::crs::Transformer;
 use nodedb_types::geometry::point_in_polygon;
 
 use super::slice::{Slice, cell_in_slice, filter_sparse, slice_sparse_owned, tile_overlaps_slice};
+use super::zone_frame::ZoneFrame;
 use crate::error::ArrayResult;
 use crate::schema::ArraySchema;
 use crate::tile::mbr::TileMBR;
@@ -75,23 +81,27 @@ pub struct PolygonZone {
     pub x_dim: u32,
     pub y_dim: u32,
     pub polygons: Vec<ZonePolygon>,
+    /// `None`: the polygons are drawn in dim coordinates. `Some`: they are
+    /// drawn in the frame's zone SRID.
+    pub frame: Option<ZoneFrame>,
 }
 
 impl PolygonZone {
-    fn contains(&self, coord: &[CoordValue]) -> bool {
-        let (Some(x), Some(y)) = (
-            coord.get(self.x_dim as usize).and_then(coord_to_f64),
-            coord.get(self.y_dim as usize).and_then(coord_to_f64),
-        ) else {
-            return false;
-        };
-        self.polygons.iter().any(|p| p.contains(x, y))
+    /// The zone ready for per-cell tests. Build it once per scan.
+    pub fn prepare(&self) -> PreparedZone<'_> {
+        PreparedZone {
+            zone: self,
+            frame: self.frame.as_ref().map(|f| (f, f.cell_transformer())),
+        }
     }
 
-    /// False only when no member polygon's bounding box meets the MBR's
-    /// `x_dim` × `y_dim` rectangle. A bound that is not numeric proves
-    /// nothing, so the tile stays in.
-    fn may_overlap(&self, mbr: &TileMBR) -> bool {
+    /// False only when the zone's dim extent misses the MBR's `x_dim` ×
+    /// `y_dim` rectangle. A bound that is not numeric proves nothing, so the
+    /// tile stays in.
+    ///
+    /// The dim extent is the frame's dim box, or each member polygon's
+    /// bounding box when the zone has no frame.
+    pub fn may_overlap(&self, mbr: &TileMBR) -> bool {
         let bound = |dims: &[DomainBound], dim: u32| dims.get(dim as usize).and_then(bound_to_f64);
         let (Some(tx0), Some(ty0), Some(tx1), Some(ty1)) = (
             bound(&mbr.dim_mins, self.x_dim),
@@ -101,10 +111,42 @@ impl PolygonZone {
         ) else {
             return true;
         };
-        self.polygons
-            .iter()
-            .filter_map(ZonePolygon::bbox)
-            .any(|[px0, py0, px1, py1]| px0 <= tx1 && tx0 <= px1 && py0 <= ty1 && ty0 <= py1)
+        let meets =
+            |[px0, py0, px1, py1]: [f64; 4]| px0 <= tx1 && tx0 <= px1 && py0 <= ty1 && ty0 <= py1;
+        match &self.frame {
+            Some(frame) => meets(frame.dim_bbox),
+            None => self
+                .polygons
+                .iter()
+                .filter_map(ZonePolygon::bbox)
+                .any(meets),
+        }
+    }
+}
+
+/// A [`PolygonZone`] with its cell-to-zone transformer built.
+pub struct PreparedZone<'a> {
+    zone: &'a PolygonZone,
+    frame: Option<(&'a ZoneFrame, Transformer)>,
+}
+
+impl PreparedZone<'_> {
+    /// True if the cell at `coord` lies in the zone.
+    ///
+    /// With a frame, the cell centre maps into the zone SRID first. A cell
+    /// the projection cannot map is outside.
+    pub fn contains(&self, coord: &[CoordValue]) -> bool {
+        let (Some(x), Some(y)) = (
+            coord.get(self.zone.x_dim as usize),
+            coord.get(self.zone.y_dim as usize),
+        ) else {
+            return false;
+        };
+        let point = match &self.frame {
+            Some((frame, transformer)) => frame.cell_to_zone(transformer, x, y),
+            None => coord_to_f64(x).zip(coord_to_f64(y)).map(|(x, y)| [x, y]),
+        };
+        point.is_some_and(|[x, y]| self.zone.polygons.iter().any(|p| p.contains(x, y)))
     }
 }
 
@@ -136,9 +178,31 @@ impl ArrayRegion {
             && self.zone.as_ref().is_none_or(|z| z.may_overlap(mbr))
     }
 
+    /// The region ready for per-cell tests. Build it once per scan.
+    pub fn prepare(&self) -> PreparedRegion<'_> {
+        PreparedRegion {
+            region: self,
+            zone: self.zone.as_ref().map(PolygonZone::prepare),
+        }
+    }
+}
+
+/// An [`ArrayRegion`] with its zone prepared.
+pub struct PreparedRegion<'a> {
+    region: &'a ArrayRegion,
+    zone: Option<PreparedZone<'a>>,
+}
+
+impl PreparedRegion<'_> {
+    /// The region this was prepared from.
+    pub fn region(&self) -> &ArrayRegion {
+        self.region
+    }
+
     /// True if the cell at `coord` lies in the region.
     pub fn contains(&self, coord: &[CoordValue]) -> bool {
-        cell_in_slice(coord, &self.slice) && self.zone.as_ref().is_none_or(|z| z.contains(coord))
+        cell_in_slice(coord, &self.region.slice)
+            && self.zone.as_ref().is_none_or(|z| z.contains(coord))
     }
 }
 
@@ -147,18 +211,19 @@ impl ArrayRegion {
 pub fn filter_region_owned(
     schema: &ArraySchema,
     tile: SparseTile,
-    region: &ArrayRegion,
+    region: &PreparedRegion<'_>,
 ) -> ArrayResult<SparseTile> {
-    if !region.tile_may_contain(&tile.mbr) {
+    if !region.region.tile_may_contain(&tile.mbr) {
         return Ok(SparseTile::empty(schema));
     }
     match &region.zone {
-        None => slice_sparse_owned(schema, tile, &region.slice),
+        None => slice_sparse_owned(schema, tile, &region.region.slice),
         Some(_) => filter_sparse(schema, &tile, |coord| region.contains(coord)),
     }
 }
 
-fn coord_to_f64(c: &CoordValue) -> Option<f64> {
+/// A numeric coordinate as `f64`. `None` for a timestamp or string.
+pub(crate) fn coord_to_f64(c: &CoordValue) -> Option<f64> {
     match c {
         CoordValue::Int64(v) => Some(*v as f64),
         CoordValue::Float64(v) => Some(*v),
@@ -184,6 +249,7 @@ mod tests {
     use crate::tile::sparse_tile::SparseTileBuilder;
     use crate::types::cell_value::value::CellValue;
     use crate::types::domain::Domain;
+    use nodedb_types::geometry::Srid;
 
     fn schema() -> ArraySchema {
         ArraySchemaBuilder::new("g")
@@ -227,12 +293,108 @@ mod tests {
                 x_dim: 0,
                 y_dim: 1,
                 polygons,
+                frame: None,
             }),
         )
     }
 
+    /// One-off membership for tests. A scan prepares the region once.
+    trait Contains {
+        fn contains(&self, coord: &[CoordValue]) -> bool;
+    }
+
+    impl Contains for ArrayRegion {
+        fn contains(&self, coord: &[CoordValue]) -> bool {
+            self.prepare().contains(coord)
+        }
+    }
+
     fn at(x: f64, y: f64) -> [CoordValue; 2] {
         [CoordValue::Float64(x), CoordValue::Float64(y)]
+    }
+
+    /// A zone drawn in `zone_srid` over a world-mode array in `array_srid`.
+    fn framed(array_srid: Srid, zone_srid: Srid, polygons: Vec<ZonePolygon>) -> ArrayRegion {
+        ArrayRegion::new(
+            Slice::default(),
+            Some(PolygonZone {
+                x_dim: 0,
+                y_dim: 1,
+                polygons,
+                frame: Some(ZoneFrame {
+                    transform: None,
+                    array_srid,
+                    zone_srid,
+                    dim_bbox: [-180.0, -90.0, 180.0, 90.0],
+                }),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_framed_zone_keeps_the_edge_and_hole_rules() {
+        let r = framed(
+            Srid::Wgs84,
+            Srid::Wgs84,
+            vec![ZonePolygon {
+                exterior: square(0.0, 10.0),
+                holes: vec![square(4.0, 6.0)],
+            }],
+        );
+        assert!(r.contains(&at(0.0, 2.0)), "min x edge");
+        assert!(r.contains(&at(2.0, 0.0)), "min y edge");
+        assert!(!r.contains(&at(10.0, 2.0)), "max x edge");
+        assert!(!r.contains(&at(2.0, 10.0)), "max y edge");
+        assert!(r.contains(&at(2.0, 2.0)));
+        assert!(!r.contains(&at(5.0, 5.0)), "inside the hole");
+        assert!(
+            !r.contains(&at(4.0, 5.0)),
+            "on the hole's min edge, so in the hole"
+        );
+        assert!(
+            r.contains(&at(6.0, 5.0)),
+            "on the hole's max edge, so outside it"
+        );
+    }
+
+    #[test]
+    fn a_cell_the_projection_cannot_map_is_outside() {
+        let r = framed(
+            Srid::Wgs84,
+            Srid::Utm47N,
+            vec![ZonePolygon {
+                exterior: square(-1.0e7, 1.0e7),
+                holes: Vec::new(),
+            }],
+        );
+        assert!(r.contains(&at(99.5, 6.0)), "inside the UTM 47N domain");
+        assert!(
+            !r.contains(&at(150.0, 6.0)),
+            "51° from the central meridian"
+        );
+        assert!(!r.contains(&[CoordValue::Float64(f64::NAN), CoordValue::Float64(6.0)]));
+    }
+
+    #[test]
+    fn a_framed_zone_prunes_by_its_dim_box() {
+        let mut r = framed(
+            Srid::Wgs84,
+            Srid::Wgs84,
+            vec![ZonePolygon {
+                exterior: square(0.0, 50.0),
+                holes: Vec::new(),
+            }],
+        );
+        if let Some(zone) = r.zone.as_mut()
+            && let Some(frame) = zone.frame.as_mut()
+        {
+            frame.dim_bbox = [0.0, 0.0, 4.0, 4.0];
+        }
+        assert!(r.tile_may_contain(&tile(&[(1.0, 1.0)]).mbr));
+        assert!(
+            !r.tile_may_contain(&tile(&[(20.0, 20.0)]).mbr),
+            "the dim box prunes, not the polygon's own box"
+        );
     }
 
     #[test]
@@ -311,11 +473,13 @@ mod tests {
             exterior: square(0.0, 4.0),
             holes: Vec::new(),
         }]);
+        let r = r.prepare();
         let out = filter_region_owned(&s, tile(&[(1.0, 1.0), (0.0, 3.0), (4.0, 1.0)]), &r).unwrap();
         assert_eq!(out.nnz(), 2);
         let pruned = filter_region_owned(&s, tile(&[(6.0, 6.0)]), &r).unwrap();
         assert_eq!(pruned.nnz(), 0);
-        let whole = filter_region_owned(&s, tile(&[(6.0, 6.0)]), &ArrayRegion::default()).unwrap();
+        let whole = ArrayRegion::default();
+        let whole = filter_region_owned(&s, tile(&[(6.0, 6.0)]), &whole.prepare()).unwrap();
         assert_eq!(whole.nnz(), 1);
     }
 

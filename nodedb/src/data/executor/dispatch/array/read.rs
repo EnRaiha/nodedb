@@ -11,8 +11,8 @@
 //! row is the named map `slice_row::named_cell_row` builds.
 
 use nodedb_array::query::project::{Projection, project_sparse};
-use nodedb_array::query::region::ArrayRegion;
-use nodedb_array::query::slice::{Slice, slice_sparse_owned, tile_overlaps_slice};
+use nodedb_array::query::region::{ArrayRegion, PolygonZone};
+use nodedb_array::query::slice::{Slice, filter_sparse, slice_sparse_owned};
 use nodedb_array::types::ArrayId;
 use nodedb_types::array_route::shard_bucket_admits;
 use nodedb_types::{ShardBucket, SurrogateBitmap, SystemTimeScope, Value};
@@ -37,6 +37,8 @@ pub(in crate::data::executor) struct SliceParams<'a> {
     pub system_time: SystemTimeScope,
     /// Bitemporal valid-time point. `None` = no valid-time filter.
     pub valid_at_ms: Option<i64>,
+    /// zerompk-encoded [`PolygonZone`]. Empty = no zone.
+    pub zone_msgpack: &'a [u8],
 }
 
 use crate::bridge::envelope::{ErrorCode, Response};
@@ -63,6 +65,7 @@ impl CoreLoop {
             shard_bucket,
             system_time,
             valid_at_ms,
+            zone_msgpack,
         } = p;
 
         if let Err(resp) = self.ensure_array_open(task, array_id) {
@@ -79,6 +82,25 @@ impl CoreLoop {
                 );
             }
         };
+        let zone: Option<PolygonZone> = if zone_msgpack.is_empty() {
+            None
+        } else {
+            match zerompk::from_msgpack(zone_msgpack) {
+                Ok(z) => Some(z),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("array slice zone decode: {e}"),
+                        },
+                    );
+                }
+            }
+        };
+        // The slice box and the zone prune together. The zone's transformer
+        // is built once for the whole scan.
+        let region = ArrayRegion::new(slice.clone(), zone);
+        let zone = region.zone.as_ref().map(PolygonZone::prepare);
 
         let schema = match self.array_engine.store(array_id) {
             Ok(store) => store.schema().clone(),
@@ -127,13 +149,14 @@ impl CoreLoop {
                     }
                 };
 
-                // Apply the shard bucket and slice coord filters.
+                // Apply the shard bucket, slice coord and zone filters.
                 versions.retain(|(hp, coord, _sys_ms, _payload)| {
                     if !shard_bucket_admits(shard_bucket, *hp) {
                         return false;
                     }
                     // Check coord against slice predicate dim-by-dim.
                     slice_coord_matches(coord, &slice)
+                        && zone.as_ref().is_none_or(|z| z.contains(coord))
                 });
 
                 // Sort ascending by system_from_ms, ties by coord lexicographic order.
@@ -204,8 +227,7 @@ impl CoreLoop {
                         );
                     }
                 };
-                // The slice prunes whole prefixes by footer MBR before decode.
-                let region = ArrayRegion::new(slice.clone(), None);
+                // The region prunes whole prefixes by footer MBR before decode.
                 let (mut resolved_tiles, truncated_before_horizon) = match store
                     .scan_shard_tiles_at(cutoff, valid_at_ms, shard_bucket, Some(&region))
                 {
@@ -246,10 +268,16 @@ impl CoreLoop {
                     if !shard_bucket_admits(shard_bucket, hp) {
                         continue;
                     }
-                    if !tile_overlaps_slice(&sparse.mbr.dim_mins, &sparse.mbr.dim_maxs, &slice) {
+                    if !region.tile_may_contain(&sparse.mbr) {
                         continue;
                     }
-                    let filtered = match slice_sparse_owned(&schema, sparse, &slice) {
+                    let sliced = slice_sparse_owned(&schema, sparse, &slice);
+                    let filtered = match (sliced, zone.as_ref()) {
+                        (Ok(t), None) => Ok(t),
+                        (Ok(t), Some(z)) => filter_sparse(&schema, &t, |c| z.contains(c)),
+                        (Err(e), _) => Err(e),
+                    };
+                    let filtered = match filtered {
                         Ok(t) => t,
                         Err(e) => {
                             return self.response_error(
@@ -593,6 +621,7 @@ mod tests {
             shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "slice failed: {r:?}");
         let rows = decode_slice_rows(r.payload.as_ref());
@@ -642,6 +671,7 @@ mod tests {
             shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::AllVersions,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "all-versions slice failed: {r:?}");
 
@@ -712,6 +742,7 @@ mod tests {
             shard_bucket: None,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "slice+filter failed: {r:?}");
         let rows = decode_slice_rows(r.payload.as_ref());
@@ -747,9 +778,127 @@ mod tests {
             shard_bucket: bucket,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         });
         assert_eq!(r.status, Status::Ok, "slice failed: {r:?}");
         decode_slice_rows(r.payload.as_ref())
+    }
+
+    /// A pixel-mode schema over [`schema_2d_f64`]: 1-degree pixels from
+    /// (100°E, 8°N), x the column, y the row, in WGS 84.
+    fn georef_schema(name: &str) -> ArraySchema {
+        schema_2d_f64(name)
+            .with_georef(Some(nodedb_array::schema::ArrayGeoref {
+                srid: nodedb_types::geometry::Srid::Wgs84,
+                x_dim: 0,
+                y_dim: 1,
+                transform: Some(nodedb_array::schema::GeoTransform([
+                    100.0, 1.0, 0.0, 8.0, 0.0, -1.0,
+                ])),
+            }))
+            .unwrap()
+    }
+
+    /// A 4326 zone from 101°E to 103°E and 5°N to 7°N, framed over `schema`.
+    /// It holds the pixels with x in 1..=2 and y in 1..=2.
+    fn lon_lat_zone(schema: &ArraySchema) -> Vec<u8> {
+        use nodedb_array::query::region::ZonePolygon;
+        use nodedb_array::query::zone_frame::build_zone_frame;
+        let polygons = vec![ZonePolygon {
+            exterior: vec![
+                [101.0, 5.0],
+                [103.0, 5.0],
+                [103.0, 7.0],
+                [101.0, 7.0],
+                [101.0, 5.0],
+            ],
+            holes: Vec::new(),
+        }];
+        let frame = build_zone_frame(schema, nodedb_types::geometry::Srid::Wgs84, &polygons)
+            .expect("frame");
+        zerompk::to_msgpack_vec(&PolygonZone {
+            x_dim: 0,
+            y_dim: 1,
+            polygons,
+            frame: Some(frame),
+        })
+        .unwrap()
+    }
+
+    fn sorted_coords(rows: &[serde_json::Map<String, serde_json::Value>]) -> Vec<(i64, i64)> {
+        let mut coords: Vec<(i64, i64)> = rows.iter().map(row_coords).collect();
+        coords.sort();
+        coords
+    }
+
+    #[test]
+    fn slice_with_a_zone_returns_only_the_cells_inside_it() {
+        let mut h = Harness::new();
+        let s = georef_schema("t6_zone");
+        let aid = ArrayId::new(TenantId::new(1), "t6_zone");
+        h.open(&aid, &s, 0xD1);
+        let cells: Vec<ArrayPutCell> = (0..5)
+            .flat_map(|x| (0..5).map(move |y| cell(x, y, (x * 5 + y) as f64)))
+            .collect();
+        h.put(&aid, cells, 1);
+        h.flush(&aid);
+
+        let slice = ArraySlice::new(vec![None, None]);
+        let r = h.send(ArrayOp::Slice {
+            array_id: aid.clone(),
+            slice_msgpack: zerompk::to_msgpack_vec(&slice).unwrap(),
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: None,
+            shard_bucket: None,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            zone_msgpack: lon_lat_zone(&s),
+        });
+        assert_eq!(r.status, Status::Ok, "zone slice failed: {r:?}");
+        let rows = decode_slice_rows(r.payload.as_ref());
+        assert_eq!(
+            sorted_coords(&rows),
+            vec![(1, 1), (1, 2), (2, 1), (2, 2)],
+            "pixel centres 101.5..102.5°E, 5.5..6.5°N"
+        );
+    }
+
+    #[test]
+    fn slice_all_versions_with_a_zone_keeps_only_the_cells_inside_it() {
+        let mut h = Harness::new();
+        let s = georef_schema("t6_zone_av");
+        let aid = ArrayId::new(TenantId::new(1), "t6_zone_av");
+        h.open(&aid, &s, 0xD2);
+        let at = |x: i64, y: i64, v: f64, sys: i64| ArrayPutCell {
+            system_from_ms: sys,
+            ..cell(x, y, v)
+        };
+        h.put(&aid, vec![at(1, 1, 1.0, 100), at(4, 4, 9.0, 100)], 1);
+        h.flush(&aid);
+        h.put(&aid, vec![at(1, 1, 2.0, 200), at(4, 4, 8.0, 200)], 2);
+        h.flush(&aid);
+
+        let slice = ArraySlice::new(vec![None, None]);
+        let r = h.send(ArrayOp::Slice {
+            array_id: aid.clone(),
+            slice_msgpack: zerompk::to_msgpack_vec(&slice).unwrap(),
+            attr_projection: vec![],
+            limit: 0,
+            cell_filter: None,
+            shard_bucket: None,
+            system_time: nodedb_types::SystemTimeScope::AllVersions,
+            valid_at_ms: None,
+            zone_msgpack: lon_lat_zone(&s),
+        });
+        assert_eq!(r.status, Status::Ok, "zone audit slice failed: {r:?}");
+        let rows = decode_slice_rows(r.payload.as_ref());
+        let got: Vec<((i64, i64), f64)> = rows.iter().map(|r| (row_coords(r), row_v(r))).collect();
+        assert_eq!(
+            got,
+            vec![((1, 1), 1.0), ((1, 1), 2.0)],
+            "both versions of the cell inside the zone, none of the cell outside it"
+        );
     }
 
     fn row_coords(row: &serde_json::Map<String, serde_json::Value>) -> (i64, i64) {

@@ -10,7 +10,7 @@ use super::helpers::{
     collect_args, expect_string_array, expect_string_literal, expect_u32, is_null_literal,
     parse_slice_arg, require_array_name,
 };
-use super::zone::parse_zone_args;
+use super::zone::parse_optional_zone;
 use crate::error::{Result, SqlError};
 use crate::resolver::array_tvf::check_agg_reducer;
 use crate::temporal::TemporalScope;
@@ -115,12 +115,18 @@ fn plan_slice(
     catalog: &dyn SqlCatalog,
     temporal: TemporalScope,
 ) -> Result<ArraySlicePlan> {
-    if args.len() < 2 || args.len() > 4 {
+    if !(2..=6).contains(&args.len()) {
         return Err(SqlError::Unsupported {
             detail: format!(
-                "ARRAY_SLICE expects 2..=4 args (name, slice_obj, [attrs], [limit]); got {}",
+                "ARRAY_SLICE expects 2..=6 args (name, slice_obj, [attrs], [limit], \
+                 [zone_wkt, zone_dims]); got {}",
                 args.len()
             ),
+        });
+    }
+    if args.len() == 5 {
+        return Err(SqlError::Unsupported {
+            detail: "ARRAY_SLICE: zone_wkt needs zone_dims; pass both, or neither".into(),
         });
     }
     let name = require_array_name(args, 0, "ARRAY_SLICE", catalog)?;
@@ -132,15 +138,13 @@ fn plan_slice(
 
     let slice = parse_slice_arg(&args[1], "ARRAY_SLICE", &name, &view)?;
 
-    let attr_projection = if args.len() >= 3 {
-        match &args[2] {
-            ast::Expr::Value(v) if matches!(v.value, ast::Value::SingleQuotedString(ref s) if s == "*") => {
-                Vec::new()
-            }
-            _ => expect_string_array(&args[2], "ARRAY_SLICE attr projection")?,
+    let attr_projection = match args.get(2) {
+        None => Vec::new(),
+        Some(arg) if is_null_literal(arg) => Vec::new(),
+        Some(ast::Expr::Value(v)) if matches!(v.value, ast::Value::SingleQuotedString(ref s) if s == "*") => {
+            Vec::new()
         }
-    } else {
-        Vec::new()
+        Some(arg) => expect_string_array(arg, "ARRAY_SLICE attr projection")?,
     };
     // Validate attr names against the catalog.
     for attr in &attr_projection {
@@ -151,17 +155,18 @@ fn plan_slice(
         }
     }
 
-    let limit = if args.len() >= 4 {
-        expect_u32(&args[3], "ARRAY_SLICE limit")?
-    } else {
-        0
+    let limit = match args.get(3) {
+        Some(arg) if !is_null_literal(arg) => expect_u32(arg, "ARRAY_SLICE limit")?,
+        _ => 0,
     };
+    let zone = parse_optional_zone("ARRAY_SLICE", args, 4, &name, &view)?;
 
     Ok(ArraySlicePlan {
         name,
         slice,
         attr_projection,
         limit,
+        zone,
         temporal,
     })
 }
@@ -203,6 +208,7 @@ fn plan_project(
         slice: ArraySliceAst::default(),
         attr_projection,
         limit: 0,
+        zone: None,
         temporal,
     })
 }
@@ -267,10 +273,7 @@ fn plan_agg(
         _ => ArraySliceAst::default(),
     };
 
-    let zone = match (args.get(5), args.get(6)) {
-        (Some(wkt), Some(dims)) => Some(parse_zone_args(wkt, dims, &name, &view)?),
-        _ => None,
-    };
+    let zone = parse_optional_zone("ARRAY_AGG", args, 5, &name, &view)?;
 
     Ok(ArrayAggPlan {
         name,
@@ -315,6 +318,16 @@ fn plan_elementwise(
             ),
         });
     }
+    // The schema hash excludes the georef, so this is the only check that
+    // the two arrays place their cells in the same world frame.
+    if lview.georef != rview.georef {
+        return Err(SqlError::DataException {
+            detail: format!(
+                "ARRAY_ELEMENTWISE: arrays '{left}' and '{right}' must have equal GEOREF \
+                 (SRID, X and Y dims, and TRANSFORM)"
+            ),
+        });
+    }
     let op_str = expect_string_literal(&args[2], "ARRAY_ELEMENTWISE op")?;
     let op = ArrayBinaryOpAst::parse(&op_str).ok_or_else(|| SqlError::Unsupported {
         detail: format!("ARRAY_ELEMENTWISE: unknown op '{op_str}' (want add/sub/mul/div)"),
@@ -343,7 +356,8 @@ mod tests {
     use crate::types::{ArrayAggPlan, ArrayElementwisePlan, ArraySlicePlan};
     use crate::types::{CollectionInfo, SqlCatalog, SqlPlan};
     use crate::types_array::{
-        ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound, ArrayReducerAst,
+        ArrayAttrAst, ArrayAttrType, ArrayDimAst, ArrayDimType, ArrayDomainBound, ArrayGeorefAst,
+        ArrayReducerAst,
     };
 
     struct StubCatalog {
@@ -399,6 +413,7 @@ mod tests {
                 },
             ],
             tile_extents: vec![1, 1_000_000],
+            georef: None,
         }
     }
 
@@ -718,5 +733,63 @@ mod tests {
         assert!(
             plan_one("SELECT * FROM ARRAY_ELEMENTWISE('left', 'right', 'wat', 'qual')").is_err()
         );
+    }
+
+    fn georef(srid: u32, transform: Option<[f64; 6]>) -> Option<ArrayGeorefAst> {
+        Some(ArrayGeorefAst {
+            srid,
+            x_dim: "pos".into(),
+            y_dim: "chrom".into(),
+            transform,
+        })
+    }
+
+    fn elementwise_with(
+        left: Option<ArrayGeorefAst>,
+        right: Option<ArrayGeorefAst>,
+    ) -> Result<SqlPlan> {
+        let catalog = StubCatalog {
+            view: Some(ArrayCatalogView {
+                georef: left,
+                ..view()
+            }),
+            right_view: Some(ArrayCatalogView {
+                georef: right,
+                ..view()
+            }),
+        };
+        let stmts = parse_sql("SELECT * FROM ARRAY_ELEMENTWISE('left', 'right', 'add', 'qual')")?;
+        let sqlparser::ast::Statement::Query(q) = &stmts[0] else {
+            panic!("not a query");
+        };
+        crate::planner::select::plan_query(
+            q,
+            &catalog,
+            &FunctionRegistry::new(),
+            crate::TemporalScope::default(),
+        )
+    }
+
+    const GT: [f64; 6] = [600_000.0, 10.0, 0.0, 700_000.0, 0.0, -10.0];
+
+    #[test]
+    fn elementwise_equal_georefs_pass() {
+        assert!(elementwise_with(georef(32647, Some(GT)), georef(32647, Some(GT))).is_ok());
+        assert!(elementwise_with(georef(4326, None), georef(4326, None)).is_ok());
+    }
+
+    #[test]
+    fn elementwise_different_georefs_refused() {
+        let mut shifted = GT;
+        shifted[0] += 10.0;
+        for (left, right) in [
+            (georef(32647, Some(GT)), georef(32647, Some(shifted))),
+            (georef(32647, Some(GT)), georef(32648, Some(GT))),
+            (georef(32647, Some(GT)), None),
+            (None, georef(4326, None)),
+        ] {
+            let err = elementwise_with(left, right).unwrap_err();
+            assert!(matches!(err, SqlError::DataException { .. }), "{err:?}");
+        }
     }
 }

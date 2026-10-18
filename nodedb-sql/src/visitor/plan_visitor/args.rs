@@ -17,8 +17,8 @@ use crate::types::query::{
     AggregateExpr, EngineType, JoinType, Projection, SortKey, SpatialPredicate, WindowSpec,
 };
 use crate::types_array::{
-    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayReducerAst, ArraySliceAst,
-    ArrayTileOrderAst, ArrayZoneAst,
+    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayGeorefAlter, ArrayGeorefAst,
+    ArrayReducerAst, ArraySliceAst, ArrayTileOrderAst, ArrayZoneAst,
 };
 use crate::types_expr::{SqlExpr, SqlPayloadAtom, SqlValue};
 use nodedb_types::vector_distance::DistanceMetric;
@@ -259,9 +259,34 @@ pub struct CreateArrayVisitArgs<'a> {
     pub tile_extents: &'a [i64],
     pub cell_order: ArrayCellOrderAst,
     pub tile_order: ArrayTileOrderAst,
+    pub georef: Option<&'a ArrayGeorefAst>,
     pub prefix_bits: u8,
     pub audit_retain_ms: Option<u64>,
     pub minimum_audit_retain_ms: Option<u64>,
+}
+
+/// Parameters for [`super::trait_def::PlanVisitor::alter_array`].
+pub struct AlterArrayVisitArgs<'a> {
+    pub name: &'a str,
+    /// `None` = unchanged, `Some(None)` = unregister, `Some(Some(v))` = set.
+    pub audit_retain_ms: Option<Option<i64>>,
+    pub minimum_audit_retain_ms: Option<u64>,
+    /// Georef change. `None` = georef unchanged.
+    pub georef: Option<&'a ArrayGeorefAlter>,
+}
+
+/// Parameters for [`super::trait_def::PlanVisitor::array_slice`].
+pub struct ArraySliceVisitArgs<'a> {
+    pub name: &'a str,
+    /// Coordinate box the slice reads. No dim range = the whole array.
+    pub slice: &'a ArraySliceAst,
+    /// Attribute names. Empty = all attrs.
+    pub attr_projection: &'a [String],
+    /// 0 = unlimited.
+    pub limit: u32,
+    /// Polygon zone inside the box. `None` = the whole box.
+    pub zone: Option<&'a ArrayZoneAst>,
+    pub temporal: &'a TemporalScope,
 }
 
 /// Parameters for [`super::trait_def::PlanVisitor::array_agg`].

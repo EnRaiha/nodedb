@@ -245,6 +245,7 @@ mod tests {
             prefix_bits: 0,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         }
     }
 

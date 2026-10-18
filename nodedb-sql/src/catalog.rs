@@ -6,7 +6,7 @@ use nodedb_types::DatabaseId;
 use thiserror::Error;
 
 use crate::types::CollectionInfo;
-use crate::types_array::{ArrayAttrAst, ArrayDimAst};
+use crate::types_array::{ArrayAttrAst, ArrayDimAst, ArrayGeorefAst};
 
 /// Normalize the PostgreSQL identifier spelling accepted by `regclass` input.
 ///
@@ -273,4 +273,6 @@ pub struct ArrayCatalogView {
     pub dims: Vec<ArrayDimAst>,
     pub attrs: Vec<ArrayAttrAst>,
     pub tile_extents: Vec<i64>,
+    /// The array's georef, with its axes named by dim. `None` = no georef.
+    pub georef: Option<ArrayGeorefAst>,
 }

@@ -15,8 +15,8 @@ use nodedb_types::DatabaseId;
 ///
 /// Returns `None` if the descriptor has been dropped, the
 /// catalog is unavailable, or the descriptor kind is not
-/// currently tracked (only `Collection` goes through this
-/// path today; other kinds do not land in the plan cache).
+/// tracked. Planning records `Collection` and `Array`
+/// descriptors; other kinds do not land in the plan cache.
 pub(super) fn current_descriptor_version(
     state: &SharedState,
     tenant_id: u64,
@@ -34,6 +34,16 @@ pub(super) fn current_descriptor_version(
             .flatten()
             .filter(|c| c.is_active)
             .map(|c| c.descriptor_version.max(1)),
+        nodedb_cluster::DescriptorKind::Array => state
+            .array_catalog
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lookup_by_name_in_database(
+                nodedb_types::TenantId::new(tenant_id),
+                database_id,
+                &id.name,
+            )
+            .map(|entry| entry.catalog_version()),
         _ => None,
     }
 }

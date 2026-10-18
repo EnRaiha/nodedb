@@ -2,8 +2,8 @@
 
 //! Column reads of the document engine's operations.
 
+use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_plan::document::MergeActionOp;
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 
 use super::reads::{Clause, NodeReads};
 
@@ -103,36 +103,4 @@ pub(super) fn reads(op: &DocumentOp, out: &mut NodeReads) -> crate::Result<()> {
         | DocumentOp::ResolvedWrite { .. } => {}
     }
     Ok(())
-}
-
-/// The child plan `op` reads its rows from, if any.
-pub(super) fn child(op: &DocumentOp) -> Option<&PhysicalPlan> {
-    match op {
-        DocumentOp::InsertSelect { source, .. }
-        | DocumentOp::Merge { source, .. }
-        | DocumentOp::UpdateFromJoin { source, .. } => source.query_plan(),
-        DocumentOp::ResolveWrite(inner) => child(inner),
-        DocumentOp::PointGet { .. }
-        | DocumentOp::PointPut { .. }
-        | DocumentOp::PointInsert { .. }
-        | DocumentOp::PointDelete { .. }
-        | DocumentOp::PointUpdate { .. }
-        | DocumentOp::Scan { .. }
-        | DocumentOp::BatchInsert { .. }
-        | DocumentOp::RangeScan { .. }
-        | DocumentOp::Register { .. }
-        | DocumentOp::IndexLookup { .. }
-        | DocumentOp::IndexedFetch { .. }
-        | DocumentOp::DropIndex { .. }
-        | DocumentOp::BackfillIndex { .. }
-        | DocumentOp::Truncate { .. }
-        | DocumentOp::EstimateCount { .. }
-        | DocumentOp::Upsert { .. }
-        | DocumentOp::BatchUpsert { .. }
-        | DocumentOp::BulkUpdate { .. }
-        | DocumentOp::BulkDelete { .. }
-        | DocumentOp::MaterializeScan { .. }
-        | DocumentOp::ApplyBalanceDelta { .. }
-        | DocumentOp::ResolvedWrite { .. } => None,
-    }
 }

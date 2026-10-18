@@ -3,15 +3,37 @@
 //! `ALTER ARRAY` statement parsing.
 
 use crate::error::Result;
-use crate::parser::array_stmt::ast::AlterArrayAst;
+use crate::parser::array_stmt::ast::{AlterArrayAction, AlterArrayAst};
 use crate::parser::array_stmt::lexer::Tok;
+use crate::types_array::ArrayGeorefAlter;
 
 use super::core::Parser;
 
 impl<'a> Parser<'a> {
     pub(in crate::parser::array_stmt::parse) fn parse_alter(&mut self) -> Result<AlterArrayAst> {
         let name = self.expect_ident()?;
-        self.expect_kw("SET")?;
+        let action = if self.match_kw("DROP") {
+            self.expect_kw("GEOREF")?;
+            AlterArrayAction::Georef(ArrayGeorefAlter::Drop)
+        } else {
+            self.expect_kw("SET")?;
+            if self.match_kw("GEOREF") {
+                AlterArrayAction::Georef(ArrayGeorefAlter::Set(self.parse_georef()?))
+            } else {
+                AlterArrayAction::SetOptions(self.parse_set_options()?)
+            }
+        };
+        if !self.at_end() {
+            return Err(self.err(format!(
+                "trailing tokens after ALTER ARRAY: {:?}",
+                self.peek()
+            )));
+        }
+        Ok(AlterArrayAst { name, action })
+    }
+
+    /// Parse `( key = value [, key = value]* )` after `SET`.
+    fn parse_set_options(&mut self) -> Result<Vec<(String, Option<i64>)>> {
         self.expect(&Tok::LParen)?;
         let mut set = Vec::new();
         loop {
@@ -69,15 +91,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen)?;
-        if !self.at_end() {
-            return Err(self.err(format!(
-                "trailing tokens after ALTER ARRAY: {:?}",
-                self.peek()
-            )));
-        }
         if set.is_empty() {
             return Err(self.err("ALTER ARRAY SET (): at least one key is required"));
         }
-        Ok(AlterArrayAst { name, set })
+        Ok(set)
     }
 }

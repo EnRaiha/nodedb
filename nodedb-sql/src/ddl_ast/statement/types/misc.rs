@@ -2,7 +2,9 @@
 
 //! Miscellaneous DDL/DML statements.
 
-use crate::ddl_ast::statement::maintenance::{CopyFormat, CopyStdinFormat, CopyToSource};
+use crate::ddl_ast::statement::maintenance::{
+    CopyFormat, CopyRasterOptions, CopyStdinFormat, CopyToSource,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MiscStmt {
@@ -17,6 +19,7 @@ pub enum MiscStmt {
 
     // ── Bulk import ──────────────────────────────────────────────
     /// `COPY <collection> FROM '<path>' [WITH (FORMAT ..., DELIMITER ..., HEADER ...)]`
+    /// `COPY <array> FROM '<path>' WITH (FORMAT geotiff [, BANDS (...)] [, NODATA n] [, TIME '..'])`
     ///
     /// Server-side file-path bulk import. `CopyFromStdin` is the streaming
     /// form, and `CopyToFile` the export.
@@ -26,6 +29,8 @@ pub enum MiscStmt {
         format: Option<CopyFormat>,
         delimiter: Option<char>,
         header: bool,
+        /// GeoTIFF options. Empty unless `format` is `GeoTiff`.
+        raster: CopyRasterOptions,
     },
 
     /// `COPY <name> FROM STDIN [WITH (FORMAT csv|text, DELIMITER '<c>', HEADER [bool])]`

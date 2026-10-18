@@ -8,9 +8,9 @@
 //! satisfy the compiler that this match is exhaustive over the full
 //! `SqlPlan` enum without repeating their field lists.
 use super::args::{
-    ArrayAggVisitArgs, CreateArrayVisitArgs, LateralLoopVisitArgs, LateralTopKVisitArgs,
-    MergeVisitArgs, VectorPrimaryDeleteVisitArgs, VectorPrimaryInsertVisitArgs,
-    VectorPrimaryUpdateVisitArgs,
+    AlterArrayVisitArgs, ArrayAggVisitArgs, ArraySliceVisitArgs, CreateArrayVisitArgs,
+    LateralLoopVisitArgs, LateralTopKVisitArgs, MergeVisitArgs, VectorPrimaryDeleteVisitArgs,
+    VectorPrimaryInsertVisitArgs, VectorPrimaryUpdateVisitArgs,
 };
 use super::trait_def::PlanVisitor;
 use crate::types::SqlPlan;
@@ -56,6 +56,7 @@ pub(super) fn dispatch_rest<V: PlanVisitor>(
             tile_extents,
             cell_order,
             tile_order,
+            georef,
             prefix_bits,
             audit_retain_ms,
             minimum_audit_retain_ms,
@@ -66,6 +67,7 @@ pub(super) fn dispatch_rest<V: PlanVisitor>(
             tile_extents,
             cell_order: *cell_order,
             tile_order: *tile_order,
+            georef: georef.as_ref(),
             prefix_bits: *prefix_bits,
             audit_retain_ms: *audit_retain_ms,
             minimum_audit_retain_ms: *minimum_audit_retain_ms,
@@ -75,7 +77,13 @@ pub(super) fn dispatch_rest<V: PlanVisitor>(
             name,
             audit_retain_ms,
             minimum_audit_retain_ms,
-        }) => visitor.alter_array(name, *audit_retain_ms, *minimum_audit_retain_ms),
+            georef,
+        }) => visitor.alter_array(AlterArrayVisitArgs {
+            name,
+            audit_retain_ms: *audit_retain_ms,
+            minimum_audit_retain_ms: *minimum_audit_retain_ms,
+            georef: georef.as_ref(),
+        }),
         SqlPlan::InsertArray(InsertArrayPlan { name, rows }) => visitor.insert_array(name, rows),
         SqlPlan::DeleteArray(DeleteArrayPlan { name, coords }) => {
             visitor.delete_array(name, coords)
@@ -85,8 +93,16 @@ pub(super) fn dispatch_rest<V: PlanVisitor>(
             slice,
             attr_projection,
             limit,
+            zone,
             temporal,
-        }) => visitor.array_slice(name, slice, attr_projection, *limit, temporal),
+        }) => visitor.array_slice(ArraySliceVisitArgs {
+            name,
+            slice,
+            attr_projection,
+            limit: *limit,
+            zone: zone.as_ref(),
+            temporal,
+        }),
         SqlPlan::ArrayAgg(ArrayAggPlan {
             name,
             attr,

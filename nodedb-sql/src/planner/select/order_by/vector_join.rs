@@ -7,6 +7,7 @@
 //! from the array slice. This module isolates the AST inspection used by
 //! the trigger detector to recognise the fusion-eligible join shape.
 
+use crate::temporal::TemporalScope;
 use crate::types::ArraySlicePlan;
 use crate::types::SqlPlan;
 
@@ -27,27 +28,29 @@ pub(super) fn extract_vector_join_target(
     left: &SqlPlan,
     right: &SqlPlan,
 ) -> Option<VectorJoinTarget> {
-    match (left, right) {
-        (
-            SqlPlan::Scan { collection, .. },
-            SqlPlan::ArraySlice(ArraySlicePlan { name, slice, .. }),
-        ) => Some(VectorJoinTarget {
-            vector_collection: collection.clone(),
-            array_prefilter: Some(crate::types::ArrayPrefilter {
-                array_name: name.clone(),
-                slice: slice.clone(),
-            }),
-        }),
-        (
-            SqlPlan::ArraySlice(ArraySlicePlan { name, slice, .. }),
-            SqlPlan::Scan { collection, .. },
-        ) => Some(VectorJoinTarget {
-            vector_collection: collection.clone(),
-            array_prefilter: Some(crate::types::ArrayPrefilter {
-                array_name: name.clone(),
-                slice: slice.clone(),
-            }),
-        }),
-        _ => None,
+    let (collection, slice) = match (left, right) {
+        (SqlPlan::Scan { collection, .. }, SqlPlan::ArraySlice(slice))
+        | (SqlPlan::ArraySlice(slice), SqlPlan::Scan { collection, .. }) => (collection, slice),
+        _ => return None,
+    };
+    // The prefilter carries the array name and box only. A slice that a
+    // zone, row cap or temporal scope also bounds plans as a plain join.
+    let ArraySlicePlan {
+        name,
+        slice,
+        limit,
+        zone,
+        temporal,
+        ..
+    } = slice;
+    if zone.is_some() || *limit != 0 || *temporal != TemporalScope::default() {
+        return None;
     }
+    Some(VectorJoinTarget {
+        vector_collection: collection.clone(),
+        array_prefilter: Some(crate::types::ArrayPrefilter {
+            array_name: name.clone(),
+            slice: slice.clone(),
+        }),
+    })
 }

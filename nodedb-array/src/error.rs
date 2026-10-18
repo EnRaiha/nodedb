@@ -41,6 +41,15 @@ pub enum ArrayError {
     #[error("tile-extent vector rejected on '{array}': {detail}")]
     InvalidTileExtents { array: String, detail: String },
 
+    /// A georef names a missing or ill-typed dim, or carries a degenerate
+    /// transform.
+    #[error("georef rejected on '{array}': {detail}")]
+    InvalidGeoref { array: String, detail: String },
+
+    /// A zone with an SRID cannot be framed over the array's dims.
+    #[error(transparent)]
+    ZoneFrame(#[from] crate::query::zone_frame::ZoneFrameError),
+
     #[error("coordinate arity {got} does not match schema arity {expected} on '{array}'")]
     CoordArityMismatch {
         array: String,
@@ -149,10 +158,12 @@ impl ArrayError {
             | ArrayError::InvalidDim { array, .. }
             | ArrayError::InvalidAttr { array, .. }
             | ArrayError::InvalidTileExtents { array, .. }
+            | ArrayError::InvalidGeoref { array, .. }
             | ArrayError::CoordArityMismatch { array, .. }
             | ArrayError::CoordOutOfDomain { array, .. }
             | ArrayError::CellTypeMismatch { array, .. }
             | ArrayError::Narrow { array, .. } => array,
+            ArrayError::ZoneFrame(e) => e.array(),
             ArrayError::NumericOverflow { .. }
             | ArrayError::SegmentCorruption { .. }
             | ArrayError::UnsupportedFormat { .. }

@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use super::attr_spec::AttrSpec;
 use super::cell_order::{CellOrder, TileOrder};
 use super::dim_spec::DimSpec;
+use super::georef::ArrayGeoref;
+use super::validation;
+use crate::error::ArrayResult;
 
 /// Full array schema.
 #[derive(
@@ -35,9 +38,19 @@ pub struct ArraySchema {
     pub tile_extents: Vec<u64>,
     pub cell_order: CellOrder,
     pub tile_order: TileOrder,
+    /// Georeference of the array. Not part of [`Self::content_msgpack`], so
+    /// it never changes `schema_hash`.
+    pub georef: Option<ArrayGeoref>,
 }
 
 impl ArraySchema {
+    /// This schema with `georef` in place of its current one, validated
+    /// against the dims.
+    pub fn with_georef(self, georef: Option<ArrayGeoref>) -> ArrayResult<Self> {
+        validation::georef::check(&self.name, &self.dims, georef.as_ref())?;
+        Ok(Self { georef, ..self })
+    }
+
     pub fn arity(&self) -> usize {
         self.dims.len()
     }
@@ -103,6 +116,7 @@ mod tests {
             tile_extents: vec![4],
             cell_order: CellOrder::Hilbert,
             tile_order: TileOrder::Hilbert,
+            georef: None,
         };
         let a = mk("alpha");
         let b = mk("beta");
@@ -130,10 +144,68 @@ mod tests {
             tile_extents: vec![1, 1_000_000],
             cell_order: CellOrder::Hilbert,
             tile_order: TileOrder::Hilbert,
+            georef: None,
         };
         assert_eq!(s.arity(), 2);
         assert!(s.dim("chrom").is_some());
         assert!(s.attr("variant").is_some());
         assert!(s.dim("missing").is_none());
+    }
+
+    fn raster() -> ArraySchema {
+        let dim = |name: &str| {
+            DimSpec::new(
+                name,
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(1023)),
+            )
+        };
+        ArraySchema {
+            name: "scene".into(),
+            dims: vec![dim("row"), dim("col")],
+            attrs: vec![AttrSpec::new("b1", AttrType::UInt16, true)],
+            tile_extents: vec![256, 256],
+            cell_order: CellOrder::RowMajor,
+            tile_order: TileOrder::RowMajor,
+            georef: None,
+        }
+    }
+
+    fn pixel_georef() -> ArrayGeoref {
+        ArrayGeoref {
+            srid: nodedb_types::geometry::Srid::Utm47N,
+            x_dim: 1,
+            y_dim: 0,
+            transform: Some(super::super::georef::GeoTransform([
+                600_000.0, 10.0, 0.0, 700_000.0, 0.0, -10.0,
+            ])),
+        }
+    }
+
+    #[test]
+    fn content_msgpack_ignores_georef() {
+        let plain = raster();
+        let geo = raster().with_georef(Some(pixel_georef())).unwrap();
+        assert_ne!(plain, geo);
+        assert_eq!(plain.content_msgpack(), geo.content_msgpack());
+    }
+
+    #[test]
+    fn schema_with_georef_msgpack_round_trip() {
+        let geo = raster().with_georef(Some(pixel_georef())).unwrap();
+        let bytes = zerompk::to_msgpack_vec(&geo).unwrap();
+        let back: ArraySchema = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(back, geo);
+        assert_eq!(back.georef, Some(pixel_georef()));
+    }
+
+    #[test]
+    fn with_georef_validates_and_clears() {
+        let mut bad = pixel_georef();
+        bad.y_dim = 1;
+        assert!(raster().with_georef(Some(bad)).is_err());
+        let geo = raster().with_georef(Some(pixel_georef())).unwrap();
+        let cleared = geo.with_georef(None).unwrap();
+        assert_eq!(cleared, raster());
     }
 }
