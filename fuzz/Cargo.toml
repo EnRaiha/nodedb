@@ -17,6 +17,7 @@ tempfile = "3"
 nodedb-codec = { path = "../nodedb-codec" }
 nodedb-columnar = { path = "../nodedb-columnar" }
 nodedb-mem = { path = "../nodedb-mem" }
+nodedb-raster = { path = "../nodedb-raster" }
 nodedb-strict = { path = "../nodedb-strict" }
 nodedb-types = { path = "../nodedb-types" }
 nodedb-wal = { path = "../nodedb-wal" }
@@ -57,6 +58,14 @@ required-features = ["fuzzing"]
 [[bin]]
 name = "msgpack_document"
 path = "fuzz_targets/msgpack_document.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "geotiff_decoder"
+path = "fuzz_targets/geotiff_decoder.rs"
 test = false
 doc = false
 bench = false

@@ -19,6 +19,7 @@ members = [
   "nodedb-strict",
   "nodedb-columnar",
   "nodedb-array",
+  "nodedb-raster",
   "nodedb-sql",
   "nodedb-physical",
   "nodedb-test-support",
@@ -58,6 +59,7 @@ nodedb-fts = { path = "nodedb-fts", version = "0.7.0-dev" }
 nodedb-strict = { path = "nodedb-strict", version = "0.7.0-dev" }
 nodedb-columnar = { path = "nodedb-columnar", version = "0.7.0-dev" }
 nodedb-array = { path = "nodedb-array", version = "0.7.0-dev" }
+nodedb-raster = { path = "nodedb-raster", version = "0.7.0-dev" }
 nodedb-sql = { path = "nodedb-sql", version = "0.7.0-dev" }
 nodedb-physical = { path = "nodedb-physical", version = "0.7.0-dev" }
 nodedb-test-support = { path = "nodedb-test-support" }
@@ -93,6 +95,10 @@ libc = "0.2"
 
 # Checksums
 crc32c = "0.6"
+
+# GeoTIFF decoding with the deflate and LZW codecs only.
+# The raster reader refuses JPEG, fax and WebP compression.
+tiff = { version = "0.11.3", default-features = false, features = ["deflate", "lzw"] }
 
 # Crypto
 # Pinned to the digest 0.10 generation: `rsa` (JWT RS256) has no release on
