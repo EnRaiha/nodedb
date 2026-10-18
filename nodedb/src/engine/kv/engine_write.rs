@@ -701,14 +701,16 @@ mod tests {
         );
     }
 
+    /// Repeated PUTs of existing keys update in place: one entry per key, and
+    /// a read returns the last value. Throughput lives in the KV benchmark,
+    /// never in a unit test, where machine load decides the outcome.
     #[test]
-    fn raw_put_timing() {
+    fn updates_of_existing_keys_keep_one_entry_each() {
         let mut e = make_engine();
         let n = now();
         let keys: Vec<Vec<u8>> = (0..10_000u32).map(|i| i.to_be_bytes().to_vec()).collect();
         let value = [0u8; 64];
 
-        // Warmup: insert all keys once.
         for key in &keys {
             e.put(KvPutParams {
                 database_id: 0,
@@ -723,26 +725,33 @@ mod tests {
             .expect("a bound row writes");
         }
 
-        // Timed: 100K updates (keys already exist).
-        let iters = 100_000u64;
-        let start = std::time::Instant::now();
+        // 100K updates: every key is rewritten ten times, the last with its
+        // own index as the value.
+        let iters = 100_000u32;
         for i in 0..iters {
-            let key = &keys[(i as usize) % 10_000];
+            let key = &keys[(i as usize) % keys.len()];
+            let last = i >= iters - keys.len() as u32;
+            let updated = i.to_be_bytes();
             e.put(KvPutParams {
                 database_id: 0,
                 tenant_id: 1,
                 collection: "b",
                 key,
-                value: &value,
+                value: if last { &updated } else { &value },
                 ttl_ms: 0,
                 now_ms: n,
                 surrogate: row_surrogate(key),
             })
             .expect("a bound row writes");
         }
-        let elapsed = start.elapsed();
-        let ns_per_op = elapsed.as_nanos() / iters as u128;
-        // 691 ns/op measured — well under document's 12μs.
-        assert!(ns_per_op < 5_000, "PUT too slow: {ns_per_op} ns/op");
+        assert_eq!(e.collection_len(0, 1, "b"), keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            let expected = (iters - keys.len() as u32 + index as u32).to_be_bytes();
+            assert_eq!(
+                e.get(0, 1, "b", key, n),
+                Some(expected.to_vec()),
+                "key {index}"
+            );
+        }
     }
 }
