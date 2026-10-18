@@ -3,6 +3,7 @@
 pub mod abort_error;
 pub mod cross_shard_mode;
 pub mod dependent_recon;
+mod dependent_recon_bulks;
 pub mod dependent_recon_crdt;
 mod dependent_recon_finish;
 pub mod dependent_recon_node_edges;

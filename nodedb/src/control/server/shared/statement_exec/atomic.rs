@@ -41,7 +41,9 @@ use crate::control::server::shared::write_admission::all_writes_bufferable;
 use crate::control::trigger::statement_txn::in_block;
 
 use super::answer::StatementAnswer;
-use super::edge_recon::{CalvinApplied, EdgeRecon, try_edge_recon};
+use super::edge_recon::{
+    CalvinApplied, EdgeRecon, try_edge_recon, try_multi_shard_predicate_recon,
+};
 use super::error::StatementError;
 use super::task_loop::{PlannedStatement, StatementExec, run_implicit_statement};
 
@@ -144,6 +146,20 @@ pub(crate) async fn route_atomic_statement(
             }
             let cross_shard_mode = session.sessions.cross_shard_txn_mode(session.session_id);
             if !in_txn_block && cross_shard_mode == CrossShardTxnMode::Strict {
+                // A predicate write names the rows it matched only after the
+                // coordinator reads them, so it takes the same route as on
+                // pgwire.
+                let (tasks, authorized) =
+                    match try_multi_shard_predicate_recon(state, exec.identity, tasks, authorized)
+                        .await
+                        .map_err(StatementError::Error)?
+                    {
+                        EdgeRecon::Applied(applied) => {
+                            meter_applied(exec, &applied);
+                            return Ok(AtomicRoute::Calvin(applied));
+                        }
+                        EdgeRecon::NotFired(tasks, authorized) => (tasks, authorized),
+                    };
                 let plans = tasks.iter().map(|task| task.plan.clone()).collect();
                 let apply_result = dispatch_authorized_tasks_to_calvin(
                     state,

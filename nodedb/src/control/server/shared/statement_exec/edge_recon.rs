@@ -15,7 +15,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::planner::calvin::{
-    dispatch_authorized_dependent_edge_recon, plan_needs_implicit_edge_recon,
+    dispatch_authorized_dependent_edge_recon, is_edge_recon_plan, plan_needs_implicit_edge_recon,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::authorization::AuthorizedTaskSet;
@@ -65,6 +65,41 @@ pub(crate) async fn try_edge_recon(
     else {
         return Ok(EdgeRecon::NotFired(tasks, authorized));
     };
+    run_recon(state, identity, tasks, authorized, database_id).await
+}
+
+/// Route `tasks` through the OLLP/Calvin coordinator when one of them is a
+/// predicate write and the statement spans several vShards, outside a
+/// transaction block.
+///
+/// The caller has classified the statement as multi-shard. A predicate write
+/// that reaches Calvin must carry the rows it matched, which only the
+/// coordinator reads. A shipped balance of a materialized sum puts a
+/// single-collection write on two vShards, so the edge-bearing gate does not
+/// see it.
+pub(crate) async fn try_multi_shard_predicate_recon(
+    state: &Arc<SharedState>,
+    identity: &AuthenticatedIdentity,
+    tasks: Vec<PhysicalTask>,
+    authorized: AuthorizedTaskSet,
+) -> crate::Result<EdgeRecon> {
+    let Some(database_id) = tasks
+        .iter()
+        .find(|task| is_edge_recon_plan(&task.plan))
+        .map(|task| task.database_id)
+    else {
+        return Ok(EdgeRecon::NotFired(tasks, authorized));
+    };
+    run_recon(state, identity, tasks, authorized, database_id).await
+}
+
+async fn run_recon(
+    state: &Arc<SharedState>,
+    identity: &AuthenticatedIdentity,
+    tasks: Vec<PhysicalTask>,
+    authorized: AuthorizedTaskSet,
+    database_id: DatabaseId,
+) -> crate::Result<EdgeRecon> {
     // Captured before the coordinator consumes the tasks, so the answer can
     // shape a RETURNING dependent write's rows and read a plain write's
     // count from the applied response.
@@ -73,7 +108,7 @@ pub(crate) async fn try_edge_recon(
         state,
         authorized,
         identity,
-        tenant_id,
+        identity.tenant_id,
         database_id,
     )
     .await?;

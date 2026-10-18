@@ -196,6 +196,8 @@ mod pgwire_tenant_scoping;
 mod pgwire_txn_control_spellings;
 mod pgwire_txn_overlay_teardown_reclaim;
 mod point_get_after_miss_then_insert;
+mod predicate_write_sequence_http;
+mod predicate_write_two_statements_http;
 mod procedural_txn_visibility;
 mod procedure_e2e;
 mod query_function_authorization;

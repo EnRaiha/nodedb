@@ -90,7 +90,7 @@ pub enum RowIdentityRead<'a> {
 /// row's identity, in surrogate order, when the scan read it. `node_edges`
 /// holds the live edges incident on each matched row's node, when the caller
 /// read them. Edge order is irrelevant; surrogates remain sorted.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PreexecScan {
     pub surrogates: Vec<u32>,
     pub edges: Vec<ScannedEdge>,

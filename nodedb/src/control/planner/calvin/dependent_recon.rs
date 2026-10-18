@@ -19,6 +19,8 @@
 //!   [`DependentReconOutcome`]; each protocol synthesises its own command tags
 //!   from the original task list AFTER this returns `Ok`.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::Error;
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::planner::calvin::preexec::PreexecScan;
@@ -35,14 +37,12 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_physical::physical_plan::OllpPredictedEdge;
 
+use super::dependent_recon_bulks::{
+    BulkPrediction, BulkRecon, reconnoitre_all, with_bulk_predictions,
+};
 use super::dependent_recon_finish::finish_committed;
-use super::dependent_recon_node_edges::{
-    NodeDeletePlan, node_delete_tasks, planned_edge_deletes, reconnoitre,
-};
-use super::dependent_recon_plan::{inject_ollp_predicted_edges, inject_ollp_surrogates};
-use super::dependent_recon_predicate::{
-    EdgeLifecycle, classify_edge_lifecycle, extract_bulk_predicate_info,
-};
+use super::dependent_recon_node_edges::{NodeDeletePlan, node_delete_tasks, planned_edge_deletes};
+use super::dependent_recon_predicate::EdgeLifecycle;
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// Protocol-neutral result of [`dispatch_dependent_edge_recon`].
@@ -231,31 +231,29 @@ async fn dispatch_dependent_edge_recon_inner(
     // submits + awaits the assignment/completion via the local registry and, on
     // a `PredictionDrift` abort verdict, runs a FRESH pre-execution scan
     // (`rescan`) before resubmitting with the fresh prediction.
-    let dep_task = tasks
-        .iter()
-        .find(|t| is_dependent_predicate(&t.plan))
-        .ok_or_else(|| Error::Internal {
-            detail: "dependent-edge recon dispatch invoked without a dependent-predicate task"
+    let bulks = BulkRecon::of(&tasks)?;
+    if bulks.len() > 1 {
+        // A request of several predicate writes runs as an implicit
+        // transaction, so each reads the rows the one before it wrote.
+        return Err(Error::Internal {
+            detail: "dependent-edge recon dispatch invoked with several predicate writes"
                 .to_owned(),
-        })?;
+        });
+    }
+    let first = bulks.first().ok_or_else(|| Error::Internal {
+        detail: "dependent-edge recon dispatch invoked without a dependent-predicate task"
+            .to_owned(),
+    })?;
 
     let orc = orchestrator.ok_or(Error::SequencerUnavailable)?;
-    // Hoisted across the retry loop so both `submit` and `rescan` can borrow them.
-    let (dep_collection, dep_filter_bytes) = extract_bulk_predicate_info(&dep_task.plan);
-    let pred_class = predicate_class_for_filters(&dep_filter_bytes, &dep_collection);
+    // The first predicate write keys the backoff class and the collection whose
+    // matched rows the transaction locks by row.
+    let primary = first.collection.clone();
+    let pred_class = predicate_class_for_filters(&first.filters, &primary);
 
-    let edge_mode = classify_edge_lifecycle(&dep_task.plan)?;
-
-    // Initial reconnaissance — the first prediction the loop submits.
-    let initial_predicted = reconnoitre(
-        state,
-        tenant_id,
-        database_id,
-        &dep_collection,
-        dep_filter_bytes.clone(),
-        &edge_mode,
-    )
-    .await?;
+    // Initial reconnaissance, one scan per predicate write: the first
+    // prediction the loop submits.
+    let initial_predicted = reconnoitre_all(state, tenant_id, database_id, &bulks).await?;
 
     // One deadline for every attempt: the statement's.
     let deadline = StatementDeadline::of_statement(state).tokio_instant();
@@ -267,13 +265,11 @@ async fn dispatch_dependent_edge_recon_inner(
     // via `submit_calvin_routed_assign` (returning the leader-assigned
     // `RoutedAssignment`). This lets a non-leader coordinator drive the
     // dependent (OLLP) cross-shard write to completion.
-    let submit = |predicted: &PreexecScan| {
-        let surrogates = predicted.surrogates.clone();
-        let edges = predicted.edges.clone();
-        let node_edges = predicted.node_edges.clone();
+    let submit = |predicted: &Vec<PreexecScan>| {
+        let scans = predicted.clone();
         let tasks = &tasks;
-        let dep_collection = &dep_collection;
-        let edge_mode = &edge_mode;
+        let bulks = &bulks;
+        let primary = &primary;
         let user_roles = &user_roles;
         async move {
             // Implicit-edge reconciliation: a matched edge document
@@ -295,67 +291,82 @@ async fn dispatch_dependent_edge_recon_inner(
             // `OllpRetryRequired` on any divergence BEFORE writing. The
             // existing retry loop then re-scans and re-derives fresh edges.
             //
-            // `predicted_edges` mirrors the recon `edges` (which carry the
+            // Each predicate write carries the rows and edges of its own scan.
+            // `predicted_edges` mirrors a scan's `edges` (which carry the
             // surrogate of each edge doc) into the plan-carried wire type.
-            let predicted_edges: Vec<OllpPredictedEdge> =
-                edges.iter().map(OllpPredictedEdge::from).collect();
-
             let mut edge_tasks: Vec<PhysicalTask> = Vec::new();
             // Node-delete guards run before every other task of the
             // transaction, so each compares the edges the transaction found.
             let mut guard_tasks: Vec<PhysicalTask> = Vec::new();
-            match edge_mode {
-                EdgeLifecycle::Delete { .. } => {
-                    append_implicit_edge_delete_tasks(
-                        state,
-                        &mut edge_tasks,
-                        tenant_id,
-                        database_id,
-                        TraceId::ZERO,
-                        dep_collection,
-                        &edges,
-                    )
-                    .await
-                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
-                    // Each deleted row is a graph node: its incident edges in
-                    // this collection are tombstoned in this transaction.
-                    let (guards, deletes) = node_delete_tasks(
-                        state,
-                        tenant_id,
-                        database_id,
-                        NodeDeletePlan {
-                            collection: dep_collection,
-                            guarded: &node_edges,
-                            deleted: &node_edges,
-                            already_deleted: &planned_edge_deletes(&edge_tasks),
-                        },
-                    )
-                    .await
-                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
-                    guard_tasks = guards;
-                    edge_tasks.extend(deletes);
-                }
-                EdgeLifecycle::Update(overrides) => {
-                    append_implicit_edge_update_tasks(
-                        EdgeUpdateCtx {
+            // One guard per node, even when several writes reach the same node.
+            let mut guarded: BTreeSet<(String, String)> = BTreeSet::new();
+            let mut predictions: BTreeMap<usize, BulkPrediction> = BTreeMap::new();
+            for (bulk, scan) in bulks.iter().zip(&scans) {
+                let collection = &bulk.collection;
+                let predicted_edges: Vec<OllpPredictedEdge> =
+                    scan.edges.iter().map(OllpPredictedEdge::from).collect();
+                predictions.insert(bulk.index, (scan.surrogates.clone(), predicted_edges));
+                match &bulk.edge_mode {
+                    EdgeLifecycle::Delete { .. } => {
+                        append_implicit_edge_delete_tasks(
+                            state,
+                            &mut edge_tasks,
+                            tenant_id,
+                            database_id,
+                            TraceId::ZERO,
+                            collection,
+                            &scan.edges,
+                        )
+                        .await
+                        .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                        // Each deleted row is a graph node: its incident edges in
+                        // this collection are tombstoned in this transaction.
+                        let fresh: Vec<_> = scan
+                            .node_edges
+                            .iter()
+                            .filter(|n| guarded.insert((collection.clone(), n.node.clone())))
+                            .cloned()
+                            .collect();
+                        let (guards, deletes) = node_delete_tasks(
                             state,
                             tenant_id,
                             database_id,
-                            trace_id: TraceId::ZERO,
-                            collection: dep_collection,
-                        },
-                        &mut edge_tasks,
-                        &edges,
-                        &surrogates,
-                        overrides,
-                    )
-                    .await
-                    .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                            NodeDeletePlan {
+                                collection,
+                                guarded: &fresh,
+                                deleted: &scan.node_edges,
+                                already_deleted: &planned_edge_deletes(&edge_tasks),
+                            },
+                        )
+                        .await
+                        .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                        guard_tasks.extend(guards);
+                        edge_tasks.extend(deletes);
+                    }
+                    EdgeLifecycle::Update(overrides) => {
+                        append_implicit_edge_update_tasks(
+                            EdgeUpdateCtx {
+                                state,
+                                tenant_id,
+                                database_id,
+                                trace_id: TraceId::ZERO,
+                                collection,
+                            },
+                            &mut edge_tasks,
+                            &scan.edges,
+                            &scan.surrogates,
+                            overrides,
+                        )
+                        .await
+                        .map_err(|e| OllpError::Terminal(Box::new(e)))?;
+                    }
                 }
             }
 
+            // The edge tasks are appended after the predicate writes, so the
+            // predictions, keyed by position in `tasks`, reach only those.
             let mut submission_tasks: Vec<PhysicalTask> = guard_tasks;
-            submission_tasks.extend(tasks.iter().cloned());
+            submission_tasks.extend(with_bulk_predictions(tasks, &predictions));
             submission_tasks.extend(edge_tasks);
             if let Some(identity) = identity {
                 let emitter = crate::control::security::audit::ArcAuditEmitter(
@@ -380,26 +391,22 @@ async fn dispatch_dependent_edge_recon_inner(
                 pred_class,
                 tenant_id,
                 || {
-                    let modified_tasks: Vec<PhysicalTask> = submission_tasks
+                    // The rows the transaction locks by row are those matched
+                    // in the first write's collection. The other collections
+                    // keep their whole-collection lock.
+                    let rows: Vec<u32> = bulks
                         .iter()
-                        .map(|t| {
-                            let mut t = t.clone();
-                            // `inject_ollp_surrogates` / `_predicted_edges`
-                            // only touch the original BulkUpdate/BulkDelete
-                            // doc tasks (no-ops on any other plan); the
-                            // edge-delete tasks are appended AFTER, so they
-                            // are untouched. The tx_builder can run more than
-                            // once, so clone the predicted sets per task.
-                            inject_ollp_surrogates(&mut t.plan, surrogates.clone());
-                            inject_ollp_predicted_edges(&mut t.plan, predicted_edges.clone());
-                            t
-                        })
+                        .zip(&scans)
+                        .filter(|(bulk, _)| bulk.collection == *primary)
+                        .flat_map(|(_, scan)| scan.surrogates.iter().copied())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
                         .collect();
                     let mut tx_class = build_single_vshard_predicted_tx_class(
-                        &modified_tasks,
+                        &submission_tasks,
                         tenant_id,
-                        dep_collection,
-                        &surrogates,
+                        primary,
+                        &rows,
                         &[],
                     )
                     .map_err(|e| OllpError::Terminal(Box::new(e)))?;
@@ -421,16 +428,7 @@ async fn dispatch_dependent_edge_recon_inner(
     };
 
     // `rescan`: FRESH reconnaissance on each drift abort.
-    let rescan = || {
-        reconnoitre(
-            state,
-            tenant_id,
-            database_id,
-            &dep_collection,
-            dep_filter_bytes.clone(),
-            &edge_mode,
-        )
-    };
+    let rescan = || reconnoitre_all(state, tenant_id, database_id, &bulks);
 
     let (completed_txn, ack_results) = match run_dependent_with_retry(DependentRetryArgs {
         registry,
