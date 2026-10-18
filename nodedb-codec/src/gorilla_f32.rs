@@ -84,6 +84,7 @@ pub fn decode_f32(data: &[u8]) -> Result<Vec<f32>, CodecError> {
             ),
         });
     }
+    let count = crate::bounds::checked_capacity(count, size_of::<f32>(), "gorilla_f32 count")?;
     let mut reader = BitReader::new(body);
     let mut out = Vec::with_capacity(count);
     let mut prev = reader.read_bits(32)? as u32;
