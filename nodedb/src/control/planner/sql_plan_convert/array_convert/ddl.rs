@@ -13,11 +13,13 @@ use nodedb_array::schema::{
 use nodedb_array::types::ArrayId;
 use nodedb_array::types::domain::{Domain, DomainBound};
 use nodedb_sql::types_array::{
-    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayDimType, ArrayDomainBound, ArrayTileOrderAst,
+    ArrayAttrAst, ArrayCellOrderAst, ArrayDimAst, ArrayDimType, ArrayDomainBound, ArrayGeorefAst,
+    ArrayTileOrderAst,
 };
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::array_catalog::ArrayCatalogEntry;
+use crate::control::array_catalog::georef::{georef_from_ast, schema_error};
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::ArrayOp;
 
@@ -33,6 +35,7 @@ pub(in super::super) struct CreateArrayArgs<'a> {
     pub tile_extents: &'a [i64],
     pub cell_order: ArrayCellOrderAst,
     pub tile_order: ArrayTileOrderAst,
+    pub georef: Option<&'a ArrayGeorefAst>,
     pub prefix_bits: u8,
     pub audit_retain_ms: Option<u64>,
     pub minimum_audit_retain_ms: Option<u64>,
@@ -50,6 +53,7 @@ pub(in super::super) fn convert_create_array(
         tile_extents,
         cell_order,
         tile_order,
+        georef,
         prefix_bits,
         audit_retain_ms,
         minimum_audit_retain_ms,
@@ -76,7 +80,15 @@ pub(in super::super) fn convert_create_array(
     }
 
     // 1. Build typed schema.
-    let schema = build_schema(name, dims, attrs, tile_extents, cell_order, tile_order)?;
+    let schema = build_schema(SchemaParts {
+        name,
+        dims,
+        attrs,
+        tile_extents,
+        cell_order,
+        tile_order,
+        georef,
+    })?;
 
     // 2. Encode + hash.
     let schema_msgpack =
@@ -191,25 +203,47 @@ pub(in super::super) fn convert_drop_array(
 
 // ── Schema construction helpers ──────────────────────────────────────
 
-pub(super) fn build_schema(
-    name: &str,
-    dims: &[ArrayDimAst],
-    attrs: &[ArrayAttrAst],
-    tile_extents: &[i64],
-    cell_order: ArrayCellOrderAst,
-    tile_order: ArrayTileOrderAst,
-) -> crate::Result<Arc<ArraySchema>> {
+/// The SQL parts of an array schema.
+pub(super) struct SchemaParts<'a> {
+    pub name: &'a str,
+    pub dims: &'a [ArrayDimAst],
+    pub attrs: &'a [ArrayAttrAst],
+    pub tile_extents: &'a [i64],
+    pub cell_order: ArrayCellOrderAst,
+    pub tile_order: ArrayTileOrderAst,
+    pub georef: Option<&'a ArrayGeorefAst>,
+}
+
+pub(super) fn build_schema(parts: SchemaParts<'_>) -> crate::Result<Arc<ArraySchema>> {
+    let SchemaParts {
+        name,
+        dims,
+        attrs,
+        tile_extents,
+        cell_order,
+        tile_order,
+        georef,
+    } = parts;
+    let engine_dims: Vec<DimSpec> = dims
+        .iter()
+        .map(|d| {
+            let dtype = match d.dtype {
+                ArrayDimType::Int64 => EngineDimType::Int64,
+                ArrayDimType::Float64 => EngineDimType::Float64,
+                ArrayDimType::TimestampMs => EngineDimType::TimestampMs,
+                ArrayDimType::String => EngineDimType::String,
+            };
+            let lo = bound_to_engine(&d.lo);
+            let hi = bound_to_engine(&d.hi);
+            DimSpec::new(d.name.clone(), dtype, Domain::new(lo, hi))
+        })
+        .collect();
     let mut builder = ArraySchemaBuilder::new(name);
-    for d in dims {
-        let dtype = match d.dtype {
-            ArrayDimType::Int64 => EngineDimType::Int64,
-            ArrayDimType::Float64 => EngineDimType::Float64,
-            ArrayDimType::TimestampMs => EngineDimType::TimestampMs,
-            ArrayDimType::String => EngineDimType::String,
-        };
-        let lo = bound_to_engine(&d.lo);
-        let hi = bound_to_engine(&d.hi);
-        builder = builder.dim(DimSpec::new(d.name.clone(), dtype, Domain::new(lo, hi)));
+    if let Some(georef) = georef {
+        builder = builder.georef(georef_from_ast(name, georef, &engine_dims)?);
+    }
+    for d in engine_dims {
+        builder = builder.dim(d);
     }
     for a in attrs {
         let dtype = super::attr_type::engine_attr_type(a.dtype);
@@ -220,9 +254,9 @@ pub(super) fn build_schema(
         .tile_extents(extents)
         .cell_order(map_cell_order(cell_order))
         .tile_order(map_tile_order(tile_order));
-    let schema = builder.build().map_err(|e| crate::Error::PlanError {
-        detail: format!("CREATE ARRAY {name}: {e}"),
-    })?;
+    let schema = builder
+        .build()
+        .map_err(|e| schema_error(&format!("CREATE ARRAY {name}"), e))?;
     Ok(Arc::new(schema))
 }
 

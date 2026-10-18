@@ -14,7 +14,7 @@ use super::core::{Gateway, QueryContext, authorized_plan_for_context};
 use super::lowered_plan::LoweredPlan;
 use super::plan_cache::{PlanCacheKey, SqlKey, hash_placeholder_types, hash_sql};
 use super::version_set::{
-    continuous_aggregate_of_key, permission_tree_version_key, rls_version_key,
+    array_of_key, continuous_aggregate_of_key, permission_tree_version_key, rls_version_key,
 };
 
 impl Gateway {
@@ -69,6 +69,14 @@ impl Gateway {
                 }
                 if name == rls_key.as_str() {
                     return rls_version;
+                }
+                if let Some(array) = array_of_key(name, ctx.database_id.as_u64(), tenant_id) {
+                    return super::version_set::array_version(
+                        &shared.array_catalog,
+                        ctx.database_id.as_u64(),
+                        tenant_id,
+                        array,
+                    );
                 }
                 if let Some(aggregate) =
                     continuous_aggregate_of_key(name, ctx.database_id.as_u64(), tenant_id)

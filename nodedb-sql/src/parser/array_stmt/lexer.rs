@@ -156,16 +156,26 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SqlError> {
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            // Float? Require a digit after the dot — `..` is a range token.
-            let is_float = j + 1 < bytes.len()
+            // Fraction? Require a digit after the dot — `..` is a range token.
+            let has_fraction = j + 1 < bytes.len()
                 && bytes[j] == b'.'
                 && bytes[j + 1] != b'.'
                 && bytes[j + 1].is_ascii_digit();
-            if is_float {
+            if has_fraction {
                 j += 1;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     j += 1;
                 }
+            }
+            // Exponent? `e` or `E`, an optional sign, then at least one digit.
+            let exponent_digits_at = exponent_digits_start(bytes, j);
+            if let Some(digits_at) = exponent_digits_at {
+                j = digits_at;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+            }
+            if has_fraction || exponent_digits_at.is_some() {
                 let txt = &src[start..j];
                 let f: f64 = txt.parse().map_err(|_| SqlError::Parse {
                     detail: format!("invalid float literal '{txt}'"),
@@ -217,6 +227,23 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, SqlError> {
     Ok(out)
 }
 
+/// Offset of the first exponent digit when an exponent starts at `at`.
+///
+/// An exponent is `e` or `E`, an optional `+` or `-`, then a digit.
+fn exponent_digits_start(bytes: &[u8], at: usize) -> Option<usize> {
+    if !matches!(bytes.get(at), Some(b'e' | b'E')) {
+        return None;
+    }
+    let digits_at = match bytes.get(at + 1) {
+        Some(b'+' | b'-') => at + 2,
+        _ => at + 1,
+    };
+    bytes
+        .get(digits_at)
+        .is_some_and(u8::is_ascii_digit)
+        .then_some(digits_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +271,41 @@ mod tests {
     fn tokenize_negative() {
         let toks = tokenize("-7").unwrap();
         assert!(matches!(toks[0].tok, Tok::Int(-7)));
+    }
+
+    fn single_float(src: &str) -> f64 {
+        let toks = tokenize(src).unwrap();
+        assert_eq!(toks.len(), 1, "{src}: {toks:?}");
+        match toks[0].tok {
+            Tok::Float(f) => f,
+            ref other => panic!("{src}: expected float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenize_exponent_floats() {
+        assert_eq!(single_float("8.983152841195214e-05"), 8.983152841195214e-05);
+        assert_eq!(single_float("1E3"), 1000.0);
+        assert_eq!(single_float("-2.5e+2"), -250.0);
+        assert_eq!(single_float("6e0"), 6.0);
+        assert_eq!(single_float("-1.5E-3"), -0.0015);
+    }
+
+    #[test]
+    fn exponent_without_digits_is_not_consumed() {
+        // `2e` is an integer then an identifier.
+        let toks = tokenize("2e").unwrap();
+        assert!(matches!(toks[0].tok, Tok::Int(2)));
+        assert!(matches!(toks[1].tok, Tok::Ident(ref s) if s == "e"));
+        let toks = tokenize("2e+").unwrap_err();
+        assert!(matches!(toks, SqlError::Parse { .. }));
+    }
+
+    #[test]
+    fn range_with_exponent_bounds() {
+        let toks = tokenize("[0..1e3]").unwrap();
+        assert!(matches!(toks[1].tok, Tok::Int(0)));
+        assert!(matches!(toks[2].tok, Tok::DotDot));
+        assert!(matches!(toks[3].tok, Tok::Float(f) if f == 1000.0));
     }
 }

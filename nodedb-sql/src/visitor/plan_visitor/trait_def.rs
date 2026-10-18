@@ -6,20 +6,20 @@
 //! bundled params struct from [`super::args`] instead of raw positional arguments.
 
 use super::args::{
-    AggregateVisitArgs, ArrayAggVisitArgs, CreateArrayVisitArgs, DocumentIndexLookupVisitArgs,
-    HybridSearchTripleVisitArgs, HybridSearchVisitArgs, InsertVisitArgs, JoinVisitArgs,
-    LateralLoopVisitArgs, LateralTopKVisitArgs, MergeVisitArgs, RecursiveScanVisitArgs,
-    RecursiveValueVisitArgs, ScanVisitArgs, SpatialScanVisitArgs, SubqueryVisitArgs,
-    TextSearchVisitArgs, TimeseriesScanVisitArgs, UpdateFromVisitArgs, UpsertVisitArgs,
-    VectorPrimaryDeleteVisitArgs, VectorPrimaryInsertVisitArgs, VectorPrimaryUpdateVisitArgs,
-    VectorSearchVisitArgs,
+    AggregateVisitArgs, AlterArrayVisitArgs, ArrayAggVisitArgs, ArraySliceVisitArgs,
+    CreateArrayVisitArgs, DocumentIndexLookupVisitArgs, HybridSearchTripleVisitArgs,
+    HybridSearchVisitArgs, InsertVisitArgs, JoinVisitArgs, LateralLoopVisitArgs,
+    LateralTopKVisitArgs, MergeVisitArgs, RecursiveScanVisitArgs, RecursiveValueVisitArgs,
+    ScanVisitArgs, SpatialScanVisitArgs, SubqueryVisitArgs, TextSearchVisitArgs,
+    TimeseriesScanVisitArgs, UpdateFromVisitArgs, UpsertVisitArgs, VectorPrimaryDeleteVisitArgs,
+    VectorPrimaryInsertVisitArgs, VectorPrimaryUpdateVisitArgs, VectorSearchVisitArgs,
 };
 use crate::temporal::TemporalScope;
 use crate::types::SqlPlan;
 use crate::types::filter::Filter;
 use crate::types::plan::KvInsertIntent;
 use crate::types::query::EngineType;
-use crate::types_array::{ArrayBinaryOpAst, ArrayCoordLiteral, ArrayInsertRow, ArraySliceAst};
+use crate::types_array::{ArrayBinaryOpAst, ArrayCoordLiteral, ArrayInsertRow};
 use crate::types_expr::{SqlExpr, SqlValue};
 
 /// Executor parity contract: every [`SqlPlan`] variant must be handled.
@@ -239,12 +239,7 @@ pub trait PlanVisitor {
     fn drop_array(&mut self, name: &str, if_exists: bool) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::AlterArray`].
-    fn alter_array(
-        &mut self,
-        name: &str,
-        audit_retain_ms: Option<Option<i64>>,
-        minimum_audit_retain_ms: Option<u64>,
-    ) -> Result<Self::Output, Self::Error>;
+    fn alter_array(&mut self, args: AlterArrayVisitArgs<'_>) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::InsertArray`].
     fn insert_array(
@@ -261,14 +256,7 @@ pub trait PlanVisitor {
     ) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::ArraySlice`].
-    fn array_slice(
-        &mut self,
-        name: &str,
-        slice: &ArraySliceAst,
-        attr_projection: &[String],
-        limit: u32,
-        temporal: &TemporalScope,
-    ) -> Result<Self::Output, Self::Error>;
+    fn array_slice(&mut self, args: ArraySliceVisitArgs<'_>) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::ArrayAgg`].
     fn array_agg(&mut self, args: ArrayAggVisitArgs<'_>) -> Result<Self::Output, Self::Error>;

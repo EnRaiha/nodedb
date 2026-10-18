@@ -49,6 +49,7 @@ mod tests {
                 dims: Vec::new(),
                 attrs: Vec::new(),
                 tile_extents: Vec::new(),
+                georef: None,
             })
         }
     }

@@ -416,6 +416,7 @@ mod tests {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
+            zone_msgpack: vec![],
         };
         zerompk::to_msgpack_vec(&req).unwrap()
     }
@@ -779,6 +780,7 @@ mod tests {
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
             txn_id: None,
+            zone_msgpack: vec![],
         }
     }
 

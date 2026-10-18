@@ -12,8 +12,9 @@
 //!
 //! `COPY <coll> FROM '<path>'` is a real feature, but its path jail
 //! still blocks (a) non-absolute paths and (b) any path containing a
-//! `..` component. Absolute, non-traversal paths are accepted under
-//! the server UID's filesystem permissions.
+//! `..` component. A server-path `COPY FROM` or `COPY TO` needs
+//! superuser (`42501`), and `COPY FROM` reads regular files only
+//! (`58030` for a FIFO, device, or directory).
 
 use crate::harness::TestServer;
 
@@ -210,12 +211,179 @@ async fn copy_from_rejects_path_form_absolute_system_file() {
     assert_structural_rejection(&msg, &["stdin", "copy"]);
 }
 
-// `COPY <coll> FROM '<absolute readable path>'` is a real feature —
-// see `control/server/pgwire/ddl/collection/copy_from/`. The path
-// jail is "no relative paths, no `..` traversal", not "no paths at
-// all". An absolute, non-traversal path that resolves to a readable
-// file under the server's UID is accepted; it's the operator's job
-// to grant or deny that UID access to the path.
+// `COPY <coll> FROM '<absolute readable path>'` is a real feature. The
+// path jail refuses relative paths and `..` traversal. Beyond the jail,
+// a server path needs superuser, and it must open as a regular file.
+// The tests below lock both rules, for COPY FROM and COPY TO.
+
+const COPY_PASSWORD: &str = "pjail-copy-secret-3";
+
+/// Bound on a COPY against a FIFO or device: a hang fails the test.
+const COPY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Create `user` with the default ReadWrite role and run `sql` as that
+/// user. `Err((sqlstate, message))` on refusal.
+async fn run_as_writer(server: &TestServer, user: &str, sql: &str) -> Result<(), (String, String)> {
+    server
+        .exec(&format!("CREATE USER {user} PASSWORD '{COPY_PASSWORD}'"))
+        .await
+        .unwrap_or_else(|e| panic!("create user {user}: {e}"));
+    let (client, handle) = server
+        .connect_as(user, COPY_PASSWORD)
+        .await
+        .unwrap_or_else(|e| panic!("connect as {user}: {e}"));
+    let result = client.simple_query(sql).await;
+    drop(client);
+    handle.abort();
+    result.map(|_| ()).map_err(|e| {
+        e.as_db_error().map_or_else(
+            || (String::new(), e.to_string()),
+            |db| (db.code().code().to_string(), db.message().to_string()),
+        )
+    })
+}
+
+/// Run `sql` as the superuser under [`COPY_DEADLINE`]; the lower-cased
+/// `sqlstate: message` of its refusal.
+async fn superuser_refusal(server: &TestServer, sql: &str) -> String {
+    tokio::time::timeout(COPY_DEADLINE, err_of(server, sql))
+        .await
+        .unwrap_or_else(|_| panic!("COPY hung on a non-regular file: {sql}"))
+}
+
+#[tokio::test]
+async fn copy_from_server_path_requires_superuser() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION pj_su (id TEXT PRIMARY KEY, v TEXT) WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create collection");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("rows.ndjson");
+    std::fs::write(&path, "{\"id\":\"a\",\"v\":\"x\"}\n").expect("write rows");
+
+    let refusal = run_as_writer(
+        &server,
+        "pj_writer_from",
+        &format!("COPY pj_su FROM '{}'", path.display()),
+    )
+    .await
+    .expect_err("a non-superuser server-path COPY FROM must be refused");
+    assert_eq!(refusal.0, "42501", "{refusal:?}");
+    assert!(refusal.1.contains("superuser"), "{refusal:?}");
+    let rows = server
+        .query_text("SELECT id FROM pj_su")
+        .await
+        .expect("scan");
+    assert!(rows.is_empty(), "a refused COPY wrote rows: {rows:?}");
+
+    // The superuser runs the same statement.
+    server
+        .exec(&format!("COPY pj_su FROM '{}'", path.display()))
+        .await
+        .expect("superuser COPY FROM");
+}
+
+#[tokio::test]
+async fn copy_to_server_path_requires_superuser() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION pj_su_to (id TEXT PRIMARY KEY, v TEXT) WITH (engine='document_strict')")
+        .await
+        .expect("create collection");
+    server
+        .exec("INSERT INTO pj_su_to (id, v) VALUES ('a', 'x')")
+        .await
+        .expect("seed");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("out.ndjson");
+
+    let refusal = run_as_writer(
+        &server,
+        "pj_writer_to",
+        &format!("COPY pj_su_to TO '{}'", path.display()),
+    )
+    .await
+    .expect_err("a non-superuser server-path COPY TO must be refused");
+    assert_eq!(refusal.0, "42501", "{refusal:?}");
+    assert!(!path.exists(), "a refused COPY TO wrote {}", path.display());
+}
+
+#[tokio::test]
+async fn copy_from_a_device_is_refused() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION pj_dev (id TEXT PRIMARY KEY, v TEXT) WITH (engine='document_strict')")
+        .await
+        .expect("create collection");
+    let msg = superuser_refusal(&server, "COPY pj_dev FROM '/dev/zero' WITH (FORMAT csv)").await;
+    assert!(msg.starts_with("58030"), "{msg}");
+    assert!(msg.contains("not a regular file"), "{msg}");
+}
+
+#[tokio::test]
+async fn copy_from_a_symlink_to_a_fifo_or_a_directory_is_refused() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION pj_fifo (id TEXT PRIMARY KEY, v TEXT) WITH (engine='document_strict')")
+        .await
+        .expect("create collection");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo = dir.path().join("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+    let link = dir.path().join("rows.csv");
+    std::os::unix::fs::symlink(&fifo, &link).expect("symlink to fifo");
+
+    let msg = superuser_refusal(&server, &format!("COPY pj_fifo FROM '{}'", link.display())).await;
+    assert!(msg.starts_with("58030"), "{msg}");
+    assert!(msg.contains("not a regular file"), "{msg}");
+
+    let subdir = dir.path().join("dir.csv");
+    std::fs::create_dir(&subdir).expect("create dir");
+    let msg = superuser_refusal(
+        &server,
+        &format!("COPY pj_fifo FROM '{}'", subdir.display()),
+    )
+    .await;
+    assert!(msg.starts_with("58030"), "{msg}");
+    assert!(msg.contains("not a regular file"), "{msg}");
+}
+
+#[tokio::test]
+async fn geotiff_over_stdin_names_the_server_path_form() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE ARRAY pj_scene DIMS (y INT64 [0..7], x INT64 [0..7]) \
+             ATTRS (b1 FLOAT64) TILE_EXTENTS (4, 4)",
+        )
+        .await
+        .expect("create array");
+    let msg = superuser_refusal(&server, "COPY pj_scene FROM STDIN WITH (FORMAT geotiff)").await;
+    assert!(msg.starts_with("0a000"), "{msg}");
+    assert!(msg.contains("from '<path>.tif'"), "{msg}");
+}
+
+#[tokio::test]
+async fn array_copy_from_a_device_is_refused() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE ARRAY pj_arr DIMS (y INT64 [0..7], x INT64 [0..7]) \
+             ATTRS (b1 FLOAT64) TILE_EXTENTS (4, 4)",
+        )
+        .await
+        .expect("create array");
+    let msg = superuser_refusal(&server, "COPY pj_arr FROM '/dev/zero' WITH (FORMAT csv)").await;
+    assert!(msg.starts_with("58030"), "{msg}");
+    assert!(msg.contains("not a regular file"), "{msg}");
+}
 
 // ────────────────────────────────────────────────────────────────────
 // EXPORT AUDIT LOG TO '<path>' — same removal.

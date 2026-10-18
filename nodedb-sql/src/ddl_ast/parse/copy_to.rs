@@ -3,14 +3,12 @@
 //! Parse `COPY <collection> TO '<path>' [WITH (...)]` and
 //! `COPY (SELECT ...) TO '<path>' [WITH (...)]`.
 
-use crate::ddl_ast::statement::{CopyToSource, MiscStmt, NodedbStatement};
+use crate::ddl_ast::statement::{CopyFormat, CopyToSource, MiscStmt, NodedbStatement};
 use crate::error::SqlError;
 
 use super::clause::{ClauseCursor, tokenize};
-use super::copy_from::{
-    CopyDirection, copy_collection_name, copy_direction, detect_format_from_path,
-    parse_copy_options,
-};
+use super::copy_from::{CopyDirection, copy_collection_name, copy_direction};
+use super::copy_options::{detect_format_from_path, parse_copy_options};
 
 /// Try to parse a COPY TO statement.
 ///
@@ -47,17 +45,24 @@ fn parse_copy_to(sql: &str) -> Result<NodedbStatement, SqlError> {
             c.describe_next()
         ))
     })?;
-    let (format, delimiter, header) = parse_copy_options(&mut c)?;
-    let format = match format {
+    let options = parse_copy_options(&mut c)?;
+    let format = match options.format.clone() {
         Some(f) => Some(f),
         None => detect_format_from_path(&path)?,
     };
+    if format == Some(CopyFormat::GeoTiff) {
+        return Err(SqlError::FeatureNotSupported {
+            detail: "COPY TO does not write GeoTIFF; export with FORMAT ndjson, json, or csv"
+                .to_string(),
+        });
+    }
+    options.check_for(format.as_ref())?;
     Ok(NodedbStatement::Misc(MiscStmt::CopyToFile {
         source,
         path,
         format,
-        delimiter,
-        header,
+        delimiter: options.delimiter,
+        header: options.header.unwrap_or(true),
     }))
 }
 
@@ -181,6 +186,25 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn geotiff_export_is_refused() {
+        for sql in [
+            "COPY users TO '/tmp/out.tif'",
+            "COPY users TO '/tmp/out.bin' WITH (FORMAT geotiff)",
+        ] {
+            assert!(
+                matches!(err(sql), SqlError::FeatureNotSupported { .. }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn raster_options_are_refused_for_export() {
+        let e = err("COPY users TO '/tmp/out.csv' WITH (NODATA 0)");
+        assert!(matches!(e, SqlError::Parse { .. }));
     }
 
     #[test]

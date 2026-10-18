@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Entry point: `copy_from_file`, path validation, and the engine's bulk-load
-//! route, which `EngineRules::plan_bulk_load` answers.
+//! Entry point: `copy_from_file`, the privilege and path checks, and the
+//! engine's bulk-load route, which `EngineRules::plan_bulk_load` answers.
+//!
+//! A server-path `COPY` reads a file as the server's OS user, so only a
+//! superuser may run it. The file is opened once, and every later check and
+//! read uses that handle.
 //!
 //! The result type is [`DdlResult`] / [`DdlError`] throughout. Each error
 //! site builds a `DdlError` directly via [`ddl_err`] so the whole call chain
 //! speaks one error type.
 
 use nodedb_types::DatabaseId;
-use std::path::Path;
-use tokio::io::AsyncReadExt;
 
 use nodedb_sql::SqlError;
-use nodedb_sql::ddl_ast::statement::{CopyFormat, CopyStdinFormat};
+use nodedb_sql::ddl_ast::statement::{CopyFormat, CopyRasterOptions, CopyStdinFormat};
 
 use crate::control::planner::context::{BulkLoadRoute, QueryContext};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::neutral::collection::dml::authorize_write_target;
+use crate::control::server::shared::ddl::neutral::collection::server_path::{
+    require_superuser, validate_path,
+};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
@@ -24,23 +29,31 @@ use crate::control::state::SharedState;
 use crate::control::trigger::statement_txn::{fires_joined_body, in_block, with_statement_txn};
 use crate::control::trigger::{DmlEvent, TriggerScope};
 
+use super::array_load::raster::copy_raster;
 use super::array_load::{ArrayLoadCtx, ArrayLoader, LoadInput, TextFormat};
 use super::csv_import::{CsvOptions, import_csv};
 use super::import_ctx::ImportCtx;
 use super::json_import::{import_json_array, import_ndjson};
-
-/// Maximum file size accepted for COPY FROM (16 GiB).
-pub(super) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+use super::source_file::CopySourceFile;
 
 /// How many bytes one read of an array load's file takes.
 const FILE_READ_BYTES: usize = 1024 * 1024;
 
-/// COPY FROM format and delimiter options.
+/// COPY FROM format, text, and GeoTIFF options.
 #[derive(Clone, Copy, Debug)]
 pub struct CopyFromOptions<'a> {
     pub format: Option<&'a CopyFormat>,
     pub delimiter: Option<char>,
     pub header: bool,
+    /// `BANDS`, `NODATA` and `TIME`. Empty unless `format` is `GeoTiff`.
+    pub raster: &'a CopyRasterOptions,
+}
+
+/// The row format of a collection load.
+enum RowFormat {
+    Ndjson,
+    JsonArray,
+    Csv(CsvOptions),
 }
 
 /// Execute `COPY <collection> FROM '<path>' [WITH (...)]`.
@@ -57,25 +70,12 @@ pub async fn copy_from_file(
         format,
         delimiter,
         header,
+        raster: _,
     } = options;
 
+    require_superuser(identity, "COPY ... FROM '<path>'")?;
     authorize_write_target(state, identity, database_id, collection)?;
-    validate_path(path)?;
-
-    // Check file size before reading.
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|e| ddl_err("58030", format!("COPY: cannot stat file '{path}': {e}")))?;
-    if metadata.len() > MAX_FILE_BYTES {
-        return Err(ddl_err(
-            "54000",
-            format!(
-                "COPY: file '{path}' is {} bytes, exceeds limit of {} bytes",
-                metadata.len(),
-                MAX_FILE_BYTES
-            ),
-        ));
-    }
+    validate_path(path, "COPY")?;
 
     // Determine format (caller has already auto-detected from extension; this is a safety net).
     let resolved_format = format.ok_or_else(|| {
@@ -83,7 +83,7 @@ pub async fn copy_from_file(
             "42601",
             format!(
                 "COPY: cannot infer format for '{path}'; \
-                 add WITH (FORMAT ndjson|json|csv)"
+                 add WITH (FORMAT ndjson|json|csv|geotiff)"
             ),
         )
     })?;
@@ -104,6 +104,22 @@ pub async fn copy_from_file(
         };
         return copy_array_from_file(&ctx, collection, path, options).await;
     }
+
+    let row_format = match resolved_format {
+        CopyFormat::Ndjson => RowFormat::Ndjson,
+        CopyFormat::JsonArray => RowFormat::JsonArray,
+        CopyFormat::Csv => RowFormat::Csv(CsvOptions {
+            delimiter: delimiter.unwrap_or(','),
+            has_header: header,
+        }),
+        CopyFormat::GeoTiff => {
+            return Err(ddl_err(
+                "0A000",
+                format!("COPY: FORMAT geotiff loads into an array; '{collection}' is not an array"),
+            ));
+        }
+    };
+    let bytes = CopySourceFile::open(path).await?.read_all().await?;
 
     // Each row fires its collection's BEFORE, INSTEAD OF and SYNC AFTER
     // bodies, which join the statement's transaction. Outside a transaction
@@ -132,21 +148,12 @@ pub async fn copy_from_file(
                 database_id,
                 txn_ctx,
             };
-            match resolved_format {
-                CopyFormat::Ndjson => import_ndjson(&import_ctx, collection, path).await,
-                CopyFormat::JsonArray => import_json_array(&import_ctx, collection, path).await,
-                CopyFormat::Csv => {
-                    import_csv(
-                        &import_ctx,
-                        collection,
-                        path,
-                        CsvOptions {
-                            delimiter: delimiter.unwrap_or(','),
-                            has_header: header,
-                        },
-                    )
-                    .await
+            match row_format {
+                RowFormat::Ndjson => import_ndjson(&import_ctx, collection, path, &bytes).await,
+                RowFormat::JsonArray => {
+                    import_json_array(&import_ctx, collection, path, &bytes).await
                 }
+                RowFormat::Csv(csv) => import_csv(&import_ctx, collection, path, &bytes, csv).await,
             }
         },
     )
@@ -164,33 +171,6 @@ pub async fn copy_from_file(
     }])
 }
 
-/// Reject paths with `..` segments and non-absolute paths.
-fn validate_path(path: &str) -> Result<(), DdlError> {
-    if !path.starts_with('/') {
-        return Err(ddl_err(
-            "42601",
-            format!(
-                "COPY: path '{path}' is not absolute; \
-                 only absolute server-side paths are accepted"
-            ),
-        ));
-    }
-    let p = Path::new(path);
-    for component in p.components() {
-        use std::path::Component;
-        if matches!(component, Component::ParentDir) {
-            return Err(ddl_err(
-                "42501",
-                format!(
-                    "COPY: path '{path}' contains '..'; \
-                     directory traversal is not permitted"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// The DDL error of a refused bulk-load route. An engine's refusal keeps its
 /// exact text under `0A000`.
 pub(super) fn bulk_load_refusal(e: SqlError, tenant_id: nodedb_types::TenantId) -> DdlError {
@@ -202,7 +182,7 @@ pub(super) fn bulk_load_refusal(e: SqlError, tenant_id: nodedb_types::TenantId) 
 
 /// `COPY <array> FROM '<path>'`: the file's CSV rows stream through the
 /// array bulk-load core in reads of [`FILE_READ_BYTES`], as
-/// `COPY <array> FROM STDIN` does.
+/// `COPY <array> FROM STDIN` does. A GeoTIFF streams its decoded blocks.
 async fn copy_array_from_file(
     ctx: &ArrayLoadCtx<'_>,
     array: &str,
@@ -213,25 +193,34 @@ async fn copy_array_from_file(
         format,
         delimiter,
         header,
+        raster,
     } = options;
-    if format != Some(&CopyFormat::Csv) {
-        return Err(ddl_err(
-            "0A000",
-            format!("COPY: array '{array}' loads CSV rows; use WITH (FORMAT csv)"),
-        ));
+    match format {
+        Some(CopyFormat::Csv) => {}
+        Some(CopyFormat::GeoTiff) => {
+            let rows = copy_raster(ctx, array, path, raster).await?;
+            return Ok(vec![DdlResult::Status {
+                command: format!("COPY {rows}"),
+                rows_affected: None,
+            }]);
+        }
+        Some(CopyFormat::Ndjson | CopyFormat::JsonArray) | None => {
+            return Err(ddl_err(
+                "0A000",
+                format!("COPY: array '{array}' loads CSV rows; use WITH (FORMAT csv)"),
+            ));
+        }
     }
     let format = TextFormat {
         format: CopyStdinFormat::Csv,
         delimiter,
         header,
     };
+    let mut source = CopySourceFile::open(path).await?;
     let mut loader = ArrayLoader::open(ctx, array, LoadInput::Text(format))?;
-    let read_error =
-        |e: std::io::Error| ddl_err("58030", format!("COPY: cannot read '{path}': {e}"));
-    let mut file = tokio::fs::File::open(path).await.map_err(read_error)?;
     let mut buf = vec![0u8; FILE_READ_BYTES];
     loop {
-        let n = file.read(&mut buf).await.map_err(read_error)?;
+        let n = source.read_some(&mut buf).await?;
         if n == 0 {
             break;
         }

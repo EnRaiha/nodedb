@@ -51,6 +51,7 @@ impl DataPlaneArrayExecutor {
             shard_bucket: req.shard_bucket,
             system_time: req.system_time,
             valid_at_ms: req.valid_at_ms,
+            zone_msgpack: req.zone_msgpack.clone(),
         });
 
         let resp = self

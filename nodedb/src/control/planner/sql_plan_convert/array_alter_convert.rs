@@ -6,11 +6,14 @@
 //! change. The front door proposes the updated entry as a replicated
 //! `PutArray` (`array_catalog::ddl`).
 
+use nodedb_sql::AlterArrayVisitArgs;
+
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::array_catalog::ArrayCatalogEntry;
+use crate::control::array_catalog::georef::regeoref_schema;
+use crate::control::array_catalog::retention::check_retention_floor;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::MetaOp;
-use nodedb_types::config::retention::BitemporalRetention;
 
 use super::convert::ConvertContext;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -21,13 +24,20 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 /// - `None`          = key absent from SET clause → field unchanged.
 /// - `Some(None)`    = key present with value `NULL` → unregister.
 /// - `Some(Some(v))` = key present with value `v` → update.
+///
+/// A georef change re-encodes the schema. Its content bytes stay equal, so
+/// `schema_hash`, segments, and the Data Plane open check stay valid.
 pub(super) fn convert_alter_array(
-    name: &str,
-    audit_retain_ms: Option<Option<i64>>,
-    minimum_audit_retain_ms: Option<u64>,
+    args: AlterArrayVisitArgs<'_>,
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    let AlterArrayVisitArgs {
+        name,
+        audit_retain_ms,
+        minimum_audit_retain_ms,
+        georef,
+    } = args;
     ctx.require_execute("ALTER ARRAY")?;
     let array_catalog = ctx
         .array_catalog
@@ -46,25 +56,20 @@ pub(super) fn convert_alter_array(
             })?
     };
 
-    // 2. Compute updated fields.
-    let new_min =
-        minimum_audit_retain_ms.unwrap_or_else(|| current.minimum_audit_retain_ms.unwrap_or(0));
-    let new_retain = match audit_retain_ms {
-        None => current.audit_retain_ms,
-        Some(inner) => inner,
-    };
+    // 2. Floor validation before any state mutation. The catalog apply
+    // repeats it against the committed entry.
+    check_retention_floor(
+        name,
+        &current,
+        audit_retain_ms,
+        minimum_audit_retain_ms.map(Some),
+    )?;
 
-    // 3. Floor validation before any state mutation.
-    if let Some(retain_ms) = new_retain {
-        let retention = BitemporalRetention {
-            data_retain_ms: 0,
-            audit_retain_ms: retain_ms as u64,
-            minimum_audit_retain_ms: new_min,
-        };
-        retention.validate().map_err(|e| crate::Error::PlanError {
-            detail: format!("ALTER ARRAY {name}: {e}"),
-        })?;
-    }
+    // 3. Re-encode the schema for a georef change.
+    let statement = format!("ALTER ARRAY {name}");
+    let schema_msgpack = georef
+        .map(|change| regeoref_schema(&statement, &current.schema_msgpack, change))
+        .transpose()?;
 
     let vshard = ctx.collection_key(name).vshard();
     Ok(vec![PhysicalTask {
@@ -75,6 +80,7 @@ pub(super) fn convert_alter_array(
             array_id: name.to_string(),
             audit_retain_ms,
             minimum_audit_retain_ms: minimum_audit_retain_ms.map(Some),
+            schema_msgpack,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

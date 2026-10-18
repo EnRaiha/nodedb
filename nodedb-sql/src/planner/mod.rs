@@ -9,6 +9,7 @@ pub mod aggregate_order;
 pub mod array_ddl;
 pub mod array_dml;
 pub mod array_fn;
+pub mod array_georef;
 pub mod ast_helpers;
 pub mod bitmap_emit;
 pub mod catalog_expr_fold;

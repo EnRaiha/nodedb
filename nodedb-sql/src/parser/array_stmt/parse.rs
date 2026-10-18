@@ -275,6 +275,13 @@ mod tests {
         assert!(try_parse_array_statement(sql).is_err());
     }
 
+    fn set_options(a: &super::super::ast::AlterArrayAst) -> &[(String, Option<i64>)] {
+        match &a.action {
+            super::super::ast::AlterArrayAction::SetOptions(set) => set,
+            other => panic!("expected SET options, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_alter_array_single_key() {
         let sql = "ALTER ARRAY my_array SET (audit_retain_ms = 86400000)";
@@ -282,9 +289,10 @@ mod tests {
         match stmt {
             ArrayStatement::Alter(a) => {
                 assert_eq!(a.name, "my_array");
-                assert_eq!(a.set.len(), 1);
-                assert_eq!(a.set[0].0, "audit_retain_ms");
-                assert_eq!(a.set[0].1, Some(86_400_000));
+                let set = set_options(&a);
+                assert_eq!(set.len(), 1);
+                assert_eq!(set[0].0, "audit_retain_ms");
+                assert_eq!(set[0].1, Some(86_400_000));
             }
             _ => panic!("expected Alter variant"),
         }
@@ -296,8 +304,9 @@ mod tests {
         let stmt = try_parse_array_statement(sql).unwrap().unwrap();
         match stmt {
             ArrayStatement::Alter(a) => {
-                assert_eq!(a.set[0].0, "audit_retain_ms");
-                assert_eq!(a.set[0].1, None);
+                let set = set_options(&a);
+                assert_eq!(set[0].0, "audit_retain_ms");
+                assert_eq!(set[0].1, None);
             }
             _ => panic!("expected Alter variant"),
         }
@@ -309,15 +318,14 @@ mod tests {
         let stmt = try_parse_array_statement(sql).unwrap().unwrap();
         match stmt {
             ArrayStatement::Alter(a) => {
-                assert_eq!(a.set.len(), 2);
+                let set = set_options(&a);
+                assert_eq!(set.len(), 2);
                 assert!(
-                    a.set
-                        .iter()
+                    set.iter()
                         .any(|(k, v)| k == "audit_retain_ms" && *v == Some(5000))
                 );
                 assert!(
-                    a.set
-                        .iter()
+                    set.iter()
                         .any(|(k, v)| k == "minimum_audit_retain_ms" && *v == Some(1000))
                 );
             }

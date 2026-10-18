@@ -8,6 +8,7 @@ pub mod descriptor_set;
 pub mod implicit_edges;
 pub mod materialized_sum;
 pub mod period_lock;
+pub mod plan_children;
 pub(crate) mod plan_error_map;
 pub mod procedural;
 pub mod redaction_refusal;

@@ -7,6 +7,8 @@
 //! leak into Control-Plane catalog code. The Data Plane decodes the
 //! blob on open.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use nodedb_array::types::ArrayId;
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +60,18 @@ pub struct ArrayCatalogEntry {
     /// lives. `Hlc::ZERO` on a row no proposer stamped.
     #[serde(default)]
     pub incarnation: nodedb_types::Hlc,
+}
+
+impl ArrayCatalogEntry {
+    /// The version a plan cache keys this array on. It changes with every
+    /// replicated put (CREATE, ALTER) and is never `0`, the "absent" value.
+    /// Both HLC parts count: a clock step back repeats `wall_ns` and moves
+    /// `logical`. Only equality is meaningful.
+    pub fn catalog_version(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (self.modification_hlc.wall_ns, self.modification_hlc.logical).hash(&mut hasher);
+        hasher.finish().max(1)
+    }
 }
 
 /// The target of a MOVE TENANT array rekey.

@@ -10,8 +10,10 @@
 pub(crate) mod cell_route;
 pub(crate) mod ddl;
 pub mod entry;
+pub(crate) mod georef;
 pub mod persist;
 pub mod registry;
+pub(crate) mod retention;
 
 pub use entry::{ArrayCatalogEntry, ArrayMove};
 pub use registry::{ArrayCatalog, ArrayCatalogHandle};

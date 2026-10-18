@@ -22,7 +22,7 @@ pub enum BulkLoadRoute {
     /// Each row loads as one `INSERT` statement.
     RowInserts,
     /// The rows decode against this array schema and load in cell chunks.
-    ArrayCells(ArrayCatalogView),
+    ArrayCells(Box<ArrayCatalogView>),
 }
 
 impl QueryContext {
@@ -47,7 +47,7 @@ impl QueryContext {
             BulkLoadPlan::RowInserts => Ok(BulkLoadRoute::RowInserts),
             BulkLoadPlan::CellChunks(_) => catalog
                 .lookup_array(collection)
-                .map(BulkLoadRoute::ArrayCells)
+                .map(|view| BulkLoadRoute::ArrayCells(Box::new(view)))
                 .ok_or_else(|| nodedb_sql::SqlError::Unsupported {
                     detail: format!("COPY: array '{collection}' was dropped"),
                 }),

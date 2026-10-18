@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parse `COPY <collection> FROM '<path>' [WITH (FORMAT ..., DELIMITER ..., HEADER ...)]`.
+//! Parse `COPY <collection> FROM '<path>' [WITH (...)]`.
 //!
-//! The server-side file-path form parses here. The STDIN streaming shape
+//! The server-side file-path form parses here. Its options parse in
+//! `copy_options`. The STDIN streaming shape
 //! (`COPY <name> FROM STDIN`) parses in `copy_from_stdin`. The restore shape
 //! `COPY tenant_restore(<id>) FROM STDIN` returns `None`, so dispatch falls
 //! through to the backup/restore handler. `COPY ... TO` and
@@ -12,7 +13,8 @@
 //! `FROM` or `TO` inside a path, a name, or a query.
 
 use super::clause::{ClauseCursor, Tok, Token, tokenize};
-use crate::ddl_ast::statement::{CopyFormat, MiscStmt, NodedbStatement};
+use super::copy_options::{detect_format_from_path, parse_copy_options};
+use crate::ddl_ast::statement::{MiscStmt, NodedbStatement};
 use crate::error::SqlError;
 
 /// Which way a `COPY` statement moves rows.
@@ -110,17 +112,19 @@ fn parse_copy_from(sql: &str) -> Result<NodedbStatement, SqlError> {
     let path = c
         .string("FROM")
         .map_err(|_| c.error("expected single-quoted path after FROM"))?;
-    let (format, delimiter, header) = parse_copy_options(&mut c)?;
-    let format = match format {
+    let options = parse_copy_options(&mut c)?;
+    let format = match options.format.clone() {
         Some(f) => Some(f),
         None => detect_format_from_path(&path)?,
     };
+    options.check_for(format.as_ref())?;
     Ok(NodedbStatement::Misc(MiscStmt::CopyFromFile {
         collection,
         path,
         format,
-        delimiter,
-        header,
+        delimiter: options.delimiter,
+        header: options.header.unwrap_or(true),
+        raster: options.raster,
     }))
 }
 
@@ -135,103 +139,11 @@ pub(super) fn copy_collection_name(c: &mut ClauseCursor<'_, '_>) -> Result<Strin
     Ok(unquoted.to_lowercase())
 }
 
-/// Read an optional `WITH (key [=] value, ...)` and require the end of the
-/// statement. Returns `(format, delimiter, header)`; `header` defaults to
-/// true.
-pub(super) fn parse_copy_options(
-    c: &mut ClauseCursor<'_, '_>,
-) -> Result<(Option<CopyFormat>, Option<char>, bool), SqlError> {
-    let mut format = None;
-    let mut delimiter = None;
-    let mut header = true;
-    if c.eat_keyword("WITH") {
-        let options = c.paren_list("WITH options", |c| {
-            let key = c.word("option name")?.to_ascii_uppercase();
-            c.eat_punct('=');
-            let value = match c.string(&key) {
-                Ok(value) => value,
-                Err(_) => c.word(&key)?.to_string(),
-            };
-            Ok((key, value))
-        })?;
-        for (key, value) in options {
-            match key.as_str() {
-                "FORMAT" => format = Some(parse_format_value(&value)?),
-                "DELIMITER" => delimiter = Some(parse_delimiter_value(&value)?),
-                "HEADER" => {
-                    header = parse_bool_value(&value).ok_or_else(|| {
-                        c.error(format!("HEADER must be true or false — found '{value}'"))
-                    })?;
-                }
-                other => return Err(c.error(format!("WITH: unknown option '{other}'"))),
-            }
-        }
-    }
-    if !c.at_end() {
-        return Err(c.error(format!("unexpected trailing content {}", c.describe_next())));
-    }
-    Ok((format, delimiter, header))
-}
-
-fn parse_format_value(s: &str) -> Result<CopyFormat, SqlError> {
-    match s.trim().to_lowercase().as_str() {
-        "ndjson" | "jsonl" => Ok(CopyFormat::Ndjson),
-        "json" => Ok(CopyFormat::JsonArray),
-        "csv" => Ok(CopyFormat::Csv),
-        other => Err(SqlError::Parse {
-            detail: format!("COPY: unknown FORMAT '{other}'; expected ndjson, json, or csv"),
-        }),
-    }
-}
-
-pub(super) fn parse_delimiter_value(s: &str) -> Result<char, SqlError> {
-    let mut chars = s.chars();
-    let ch = chars.next().ok_or_else(|| SqlError::Parse {
-        detail: "COPY: DELIMITER must be a single character".to_string(),
-    })?;
-    if chars.next().is_some() {
-        return Err(SqlError::Parse {
-            detail: "COPY: DELIMITER must be a single character".to_string(),
-        });
-    }
-    Ok(ch)
-}
-
-pub(super) fn parse_bool_value(s: &str) -> Option<bool> {
-    match s.trim().to_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Some(true),
-        "false" | "0" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-/// Detect the copy format from the file path extension.
-///
-/// Returns `Err` if the extension is unrecognised or absent (suggests an
-/// explicit WITH clause).
-pub(super) fn detect_format_from_path(path: &str) -> Result<Option<CopyFormat>, SqlError> {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".ndjson") || lower.ends_with(".jsonl") {
-        return Ok(Some(CopyFormat::Ndjson));
-    }
-    if lower.ends_with(".json") {
-        return Ok(Some(CopyFormat::JsonArray));
-    }
-    if lower.ends_with(".csv") {
-        return Ok(Some(CopyFormat::Csv));
-    }
-    Err(SqlError::Parse {
-        detail: format!(
-            "COPY: cannot infer format from path '{path}'; \
-             add WITH (FORMAT ndjson|json|csv)"
-        ),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ddl_ast::parse::dispatch::parse;
+    use crate::ddl_ast::statement::CopyFormat;
 
     fn ok(sql: &str) -> NodedbStatement {
         parse(sql).expect("expected Some").expect("expected Ok")
@@ -267,12 +179,14 @@ mod tests {
                 format,
                 delimiter,
                 header,
+                raster,
             }) => {
                 assert_eq!(collection, "users");
                 assert_eq!(path, "/tmp/users.ndjson");
                 assert_eq!(format, Some(CopyFormat::Ndjson));
                 assert_eq!(delimiter, None);
                 assert!(header);
+                assert!(raster.is_empty());
             }
             other => panic!("unexpected: {other:?}"),
         }

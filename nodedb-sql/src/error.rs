@@ -188,6 +188,14 @@ pub enum SqlError {
     #[error("unsupported: {detail}")]
     Unsupported { detail: String },
 
+    /// A well-formed statement asks for a feature NodeDB does not provide
+    /// in that form, such as GeoTIFF over `COPY ... FROM STDIN`. `detail`
+    /// names the supported form.
+    ///
+    /// Rendered as SQLSTATE `0A000` (feature_not_supported).
+    #[error("feature not supported: {detail}")]
+    FeatureNotSupported { detail: String },
+
     /// A declared column DEFAULT the server cannot evaluate to a value.
     ///
     /// The column is never omitted instead. A DEFAULT that disappears stores

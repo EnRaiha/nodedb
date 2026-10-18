@@ -113,6 +113,12 @@ impl ArrayStore {
         &self.schema
     }
 
+    /// Replace the schema of this open store. The caller passes a schema
+    /// with this store's `schema_hash`, so only its georef can differ.
+    pub fn adopt_schema(&mut self, schema: Arc<ArraySchema>) {
+        self.schema = schema;
+    }
+
     pub fn schema_hash(&self) -> u64 {
         self.schema_hash
     }

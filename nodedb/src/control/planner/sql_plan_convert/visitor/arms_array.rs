@@ -15,6 +15,7 @@ macro_rules! impl_array_arms_for_convert_visitor {
                 tile_extents,
                 cell_order,
                 tile_order,
+                georef,
                 prefix_bits,
                 audit_retain_ms,
                 minimum_audit_retain_ms,
@@ -27,6 +28,7 @@ macro_rules! impl_array_arms_for_convert_visitor {
                     tile_extents,
                     cell_order,
                     tile_order,
+                    georef,
                     prefix_bits,
                     audit_retain_ms,
                     minimum_audit_retain_ms,
@@ -51,17 +53,9 @@ macro_rules! impl_array_arms_for_convert_visitor {
 
         fn alter_array(
             &mut self,
-            name: &str,
-            audit_retain_ms: Option<Option<i64>>,
-            minimum_audit_retain_ms: Option<u64>,
+            args: nodedb_sql::AlterArrayVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::array_alter_convert::convert_alter_array(
-                name,
-                audit_retain_ms,
-                minimum_audit_retain_ms,
-                self.tenant_id,
-                self.ctx,
-            )
+            super::super::array_alter_convert::convert_alter_array(args, self.tenant_id, self.ctx)
         }
 
         fn insert_array(
@@ -87,21 +81,9 @@ macro_rules! impl_array_arms_for_convert_visitor {
 
         fn array_slice(
             &mut self,
-            name: &str,
-            slice: &nodedb_sql::types_array::ArraySliceAst,
-            attr_projection: &[String],
-            limit: u32,
-            temporal: &nodedb_sql::temporal::TemporalScope,
+            args: nodedb_sql::ArraySliceVisitArgs<'_>,
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
-            super::super::array_fn_convert::convert_slice(
-                name,
-                slice,
-                attr_projection,
-                limit,
-                *temporal,
-                self.tenant_id,
-                self.ctx,
-            )
+            super::super::array_fn_convert::convert_slice(args, self.tenant_id, self.ctx)
         }
 
         fn array_agg(

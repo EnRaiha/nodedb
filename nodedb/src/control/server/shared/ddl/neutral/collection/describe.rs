@@ -54,6 +54,11 @@ pub fn describe_collection(
     let coll = match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         Ok(Some(c)) if c.is_active => c,
         _ => {
+            if let Some(described) =
+                super::describe_array::describe_array(state, tenant_id, database_id, name)
+            {
+                return described;
+            }
             return Err(DdlError::new(
                 "42P01",
                 format!("collection '{name}' not found"),

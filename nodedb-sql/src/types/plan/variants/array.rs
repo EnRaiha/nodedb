@@ -14,6 +14,8 @@ pub struct CreateArrayPlan {
     pub tile_extents: Vec<i64>,
     pub cell_order: types_array::ArrayCellOrderAst,
     pub tile_order: types_array::ArrayTileOrderAst,
+    /// `GEOREF (...)` clause, checked against `dims`. `None` = no georef.
+    pub georef: Option<types_array::ArrayGeorefAst>,
     /// Hilbert-prefix bits for vShard routing (1–16, default 8).
     pub prefix_bits: u8,
     /// Audit-retention horizon in milliseconds. `None` = non-bitemporal.
@@ -31,6 +33,8 @@ pub struct AlterArrayPlan {
     pub audit_retain_ms: Option<Option<i64>>,
     /// New value for `minimum_audit_retain_ms`. Cannot be NULL.
     pub minimum_audit_retain_ms: Option<u64>,
+    /// Georef change. `None` = georef unchanged.
+    pub georef: Option<types_array::ArrayGeorefAlter>,
 }
 
 /// Payload of [`SqlPlan::InsertArray`](crate::types::SqlPlan::InsertArray).
@@ -56,6 +60,8 @@ pub struct ArraySlicePlan {
     pub attr_projection: Vec<String>,
     /// 0 = unlimited.
     pub limit: u32,
+    /// Polygon zone inside the box. `None` = the whole box.
+    pub zone: Option<types_array::ArrayZoneAst>,
     /// Bitemporal qualifier. When both axes are `None` / `Any`, the Data
     /// Plane returns the live (current) state — the default fast path.
     /// Populated from `AS OF SYSTEM TIME` / `AS OF VALID TIME` clauses.

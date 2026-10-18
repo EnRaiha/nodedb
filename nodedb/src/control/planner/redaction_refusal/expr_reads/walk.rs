@@ -22,6 +22,7 @@
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_task::PhysicalTask;
 
+use crate::control::planner::plan_children::children;
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::redaction::RedactionStore;
@@ -188,26 +189,6 @@ fn refuse_key_lookup(
         }
     }
     Ok(())
-}
-
-/// The plans whose rows `plan` reads. Exhaustive over [`PhysicalPlan`].
-fn children(plan: &PhysicalPlan) -> Vec<&PhysicalPlan> {
-    match plan {
-        PhysicalPlan::Query(op) => query::children(op),
-        PhysicalPlan::Document(op) => document::child(op).into_iter().collect(),
-        PhysicalPlan::Vector(op) => search::vector_child(op).into_iter().collect(),
-        PhysicalPlan::Graph(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => Vec::new(),
-    }
 }
 
 /// The columns `plan` itself reads. Exhaustive over [`PhysicalPlan`].

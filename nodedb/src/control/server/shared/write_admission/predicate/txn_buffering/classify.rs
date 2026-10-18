@@ -1978,6 +1978,7 @@ mod tests {
                 array_id: "a".into(),
                 audit_retain_ms: None,
                 minimum_audit_retain_ms: None,
+                schema_msgpack: None,
             }),
             PhysicalPlan::Meta(MetaOp::ApplyContinuousAggRetention),
             PhysicalPlan::Meta(MetaOp::QueryAggregateWatermark {
@@ -2086,6 +2087,7 @@ mod tests {
                 shard_bucket: None,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
+                zone_msgpack: Vec::new(),
             }),
             PhysicalPlan::Array(ArrayOp::Aggregate {
                 array_id: array_id.clone(),
@@ -2149,6 +2151,7 @@ mod tests {
                 prefix_bits: 0,
                 system_time: SystemTimeScope::Current,
                 valid_at_ms: None,
+                zone_msgpack: Vec::new(),
             }),
             PhysicalPlan::ClusterArray(ClusterArrayOp::Agg {
                 array_id: array_id.clone(),

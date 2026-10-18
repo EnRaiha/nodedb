@@ -40,6 +40,7 @@ nodedb-spatial = { workspace = true }
 nodedb-graph = { workspace = true }
 nodedb-vector = { workspace = true }
 nodedb-array = { workspace = true }
+nodedb-raster = { workspace = true }
 nodedb-sql = { workspace = true }
 arrow = { workspace = true }
 
@@ -179,6 +180,8 @@ nodedb-test-support = { workspace = true }
 rcgen = { workspace = true }
 zerompk = { workspace = true }
 loro = { workspace = true }
+# Writes the GeoTIFF fixtures of the raster COPY wire tests.
+tiff = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # io_uring for Data Plane batched I/O (columnar reads, WAL)

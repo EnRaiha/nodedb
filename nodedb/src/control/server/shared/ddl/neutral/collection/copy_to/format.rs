@@ -26,6 +26,11 @@ pub(super) fn serialize_rows(
         CopyFormat::Ndjson => serialize_ndjson(rows),
         CopyFormat::JsonArray => serialize_json_array(rows),
         CopyFormat::Csv => serialize_csv(rows, delimiter, header),
+        // The parser refuses a GeoTIFF export, so no plan names one.
+        CopyFormat::GeoTiff => Err(ddl_err(
+            "0A000",
+            "COPY TO does not write GeoTIFF; export with FORMAT ndjson, json, or csv",
+        )),
     }
 }
 

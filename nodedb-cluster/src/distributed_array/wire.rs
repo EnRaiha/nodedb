@@ -54,6 +54,9 @@ pub struct ArrayShardSliceReq {
     /// own leader and stages there, and this read resolves the same leader,
     /// so the overlay keyed by this id is on the node that serves the read.
     pub txn_id: Option<u64>,
+    /// Zerompk encoding of `nodedb_array::query::PolygonZone`, forwarded from
+    /// `ArrayOp::Slice::zone_msgpack`. Empty = no zone.
+    pub zone_msgpack: Vec<u8>,
 }
 
 /// Gather response: shard returns matching rows as opaque msgpack row bytes.

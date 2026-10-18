@@ -155,6 +155,7 @@ impl SqlCatalog for TestCatalog {
                     nullable: true,
                 }],
                 tile_extents: vec![1, 1_000_000],
+                georef: None,
             })
         } else {
             None

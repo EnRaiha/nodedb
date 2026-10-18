@@ -54,6 +54,7 @@ struct SliceArgs<'a> {
     prefix_bits: u8,
     system_time: nodedb_types::SystemTimeScope,
     valid_at_ms: Option<i64>,
+    zone_msgpack: &'a [u8],
     txn_id: Option<TxnId>,
 }
 
@@ -121,6 +122,7 @@ impl ClusterArrayExecutor {
                 prefix_bits,
                 system_time,
                 valid_at_ms,
+                zone_msgpack,
             } => {
                 self.execute_slice(SliceArgs {
                     array_id,
@@ -131,6 +133,7 @@ impl ClusterArrayExecutor {
                     prefix_bits: *prefix_bits,
                     system_time: *system_time,
                     valid_at_ms: *valid_at_ms,
+                    zone_msgpack,
                     txn_id,
                 })
                 .await
@@ -237,6 +240,7 @@ impl ClusterArrayExecutor {
             prefix_bits,
             system_time,
             valid_at_ms,
+            zone_msgpack,
             txn_id,
         } = args;
         let coordinator = ArrayCoordinator::for_slice(
@@ -265,6 +269,7 @@ impl ClusterArrayExecutor {
             system_time,
             valid_at_ms,
             txn_id: txn_id.map(TxnId::as_u64),
+            zone_msgpack: zone_msgpack.to_vec(),
         };
         let result = coordinator
             .coord_slice(req, limit, system_time)

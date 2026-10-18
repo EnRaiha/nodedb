@@ -2,4 +2,5 @@
 
 pub mod attrs;
 pub mod dims;
+pub mod georef;
 pub mod tiles;

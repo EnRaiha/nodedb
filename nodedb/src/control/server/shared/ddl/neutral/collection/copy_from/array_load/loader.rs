@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The shared core of an array bulk load. pgwire `COPY <array> FROM STDIN`,
-//! `COPY <array> FROM '<path>'` and the native `ArrayPutBatch` opcode are
-//! thin transports over it.
+//! `COPY <array> FROM '<path>'` (CSV or GeoTIFF) and the native
+//! `ArrayPutBatch` opcode are thin transports over it.
 //!
 //! A load streams. Each slice of input decodes and checks row by row, and
 //! each full chunk dispatches through the write funnel and is awaited
@@ -42,6 +42,8 @@ pub(crate) enum LoadInput {
     Text(TextFormat),
     /// Native request columns, fed with [`ArrayLoader::feed_cells`].
     Cells,
+    /// Decoded GeoTIFF pixels, fed with [`ArrayLoader::feed_rows`].
+    Raster,
 }
 
 /// One open array bulk load. Errors carry their SQLSTATE: `22P02` for a
@@ -109,7 +111,7 @@ impl ArrayLoader {
             .bulk_load_route(array, tenant_id, ctx.database_id)
             .map_err(|e| bulk_load_refusal(e, tenant_id))?
         {
-            BulkLoadRoute::ArrayCells(view) => view,
+            BulkLoadRoute::ArrayCells(view) => *view,
             BulkLoadRoute::RowInserts => {
                 return Err(DdlError::new(
                     "42P01",
@@ -134,6 +136,7 @@ impl ArrayLoader {
                 (format.label(), Some(stream))
             }
             LoadInput::Cells => ("batch", None),
+            LoadInput::Raster => ("GeoTIFF", None),
         };
         Ok(Self {
             target: LoadTarget {
@@ -217,6 +220,37 @@ impl ArrayLoader {
         let mut source = RowSource::cells(dims, attrs, &target.view)
             .map_err(|e| refuse_row(e, target.label, progress.committed))?;
         progress.take_source(ctx, target, &mut source).await
+    }
+
+    /// Load checked rows in input order. Each item is a row and its 1-based
+    /// number, or the refusal of that row.
+    pub(super) async fn feed_rows<I>(
+        &mut self,
+        ctx: &ArrayLoadCtx<'_>,
+        rows: I,
+    ) -> Result<(), DdlError>
+    where
+        I: Iterator<Item = Result<(usize, ArrayInsertRow), RowError>>,
+    {
+        let Self {
+            target, progress, ..
+        } = self;
+        for next in rows {
+            let (row_no, row) =
+                next.map_err(|e| refuse_row(e, target.label, progress.committed))?;
+            progress.take_row(ctx, target, row_no, row).await?;
+        }
+        Ok(())
+    }
+
+    /// The array the load writes.
+    pub(crate) fn view(&self) -> &ArrayCatalogView {
+        &self.target.view
+    }
+
+    /// `e` as this load's refusal, naming its input and committed row count.
+    pub(super) fn refuse(&self, e: RowError) -> DdlError {
+        refuse_row(e, self.target.label, self.progress.committed)
     }
 
     /// Load the stream's last record and every chunk still pending. Returns

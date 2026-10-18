@@ -17,6 +17,8 @@ use nodedb_types::Hlc;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::array_catalog::ArrayCatalogEntry;
+use crate::control::array_catalog::georef::check_same_content;
+use crate::control::array_catalog::retention::check_retention_floor;
 use crate::control::catalog_entry::CatalogEntry;
 use crate::control::metadata_proposer::propose_catalog_batch_async;
 use crate::control::security::catalog::SystemCatalog;
@@ -159,14 +161,35 @@ fn entry_for(
             array_id,
             audit_retain_ms,
             minimum_audit_retain_ms,
+            schema_msgpack,
         }) => {
             let current = committed(array_id)?.ok_or_else(|| crate::Error::PlanError {
                 detail: format!("ALTER ARRAY {array_id}: not found"),
             })?;
+            check_retention_floor(
+                array_id,
+                &current,
+                *audit_retain_ms,
+                *minimum_audit_retain_ms,
+            )?;
+            // A georef change keeps every field `schema_hash` covers. Checked
+            // against the committed schema, so the kept hash stays true.
+            let schema_msgpack = match schema_msgpack {
+                Some(altered) => {
+                    check_same_content(
+                        &format!("ALTER ARRAY {array_id}"),
+                        &current.schema_msgpack,
+                        altered,
+                    )?;
+                    altered.clone()
+                }
+                None => current.schema_msgpack.clone(),
+            };
             Ok(CatalogEntry::PutArray(Box::new(ArrayCatalogEntry {
                 audit_retain_ms: audit_retain_ms.unwrap_or(current.audit_retain_ms),
                 minimum_audit_retain_ms: minimum_audit_retain_ms
                     .unwrap_or(current.minimum_audit_retain_ms),
+                schema_msgpack,
                 ..current
             })))
         }
@@ -264,6 +287,7 @@ mod tests {
             array_id: "grid".to_string(),
             audit_retain_ms: Some(Some(60_000)),
             minimum_audit_retain_ms: None,
+            schema_msgpack: None,
         });
         let CatalogEntry::PutArray(altered) = entry(catalog, &alter).expect("alter") else {
             unreachable!("ALTER ARRAY builds a put");
@@ -271,7 +295,102 @@ mod tests {
         assert_eq!(altered.audit_retain_ms, Some(60_000));
         assert_eq!(altered.minimum_audit_retain_ms, None);
         assert_eq!(altered.schema_hash, created.schema_hash);
+        assert_eq!(altered.schema_msgpack, created.schema_msgpack);
         assert_eq!(altered.array_id, created.array_id);
+    }
+
+    fn raster_schema() -> nodedb_array::schema::ArraySchema {
+        use nodedb_array::schema::{ArraySchemaBuilder, AttrSpec, AttrType, DimSpec, DimType};
+        use nodedb_array::types::domain::{Domain, DomainBound};
+        let dim = |name: &str| {
+            DimSpec::new(
+                name,
+                DimType::Int64,
+                Domain::new(DomainBound::Int64(0), DomainBound::Int64(1023)),
+            )
+        };
+        ArraySchemaBuilder::new("scene")
+            .dim(dim("row"))
+            .dim(dim("col"))
+            .attr(AttrSpec::new("b1", AttrType::UInt16, true))
+            .tile_extents(vec![256, 256])
+            .build()
+            .expect("raster schema")
+    }
+
+    fn put_raster(catalog: &SystemCatalog) -> ArrayCatalogEntry {
+        let plan = PhysicalPlan::Array(ArrayOp::OpenArray {
+            array_id: ArrayId::in_database(TenantId::new(1), DatabaseId::DEFAULT, "scene"),
+            schema_msgpack: zerompk::to_msgpack_vec(&raster_schema()).expect("encode"),
+            schema_hash: 0xFEED,
+            prefix_bits: 8,
+            audit_retain_ms: Some(1_000),
+            minimum_audit_retain_ms: Some(10),
+        });
+        let CatalogEntry::PutArray(created) = entry(catalog, &plan).expect("create") else {
+            unreachable!("CREATE ARRAY builds a put");
+        };
+        catalog.put_array(&created).expect("apply the create");
+        *created
+    }
+
+    fn alter_schema(schema_msgpack: Vec<u8>) -> PhysicalPlan {
+        PhysicalPlan::Meta(MetaOp::AlterArray {
+            array_id: "scene".to_string(),
+            audit_retain_ms: None,
+            minimum_audit_retain_ms: None,
+            schema_msgpack: Some(schema_msgpack),
+        })
+    }
+
+    /// A georef change replaces the schema bytes and keeps every other field.
+    #[test]
+    fn alter_georef_keeps_hash_and_every_other_field() {
+        let (store, _tmp) = catalog();
+        let catalog = store.catalog();
+        let created = put_raster(catalog);
+        let georef = nodedb_array::schema::ArrayGeoref {
+            srid: nodedb_types::geometry::Srid::Utm47N,
+            x_dim: 1,
+            y_dim: 0,
+            transform: Some(nodedb_array::schema::GeoTransform([
+                600_000.0, 10.0, 0.0, 700_000.0, 0.0, -10.0,
+            ])),
+        };
+        let with_georef = raster_schema()
+            .with_georef(Some(georef.clone()))
+            .expect("georef");
+        let bytes = zerompk::to_msgpack_vec(&with_georef).expect("encode");
+        let CatalogEntry::PutArray(altered) =
+            entry(catalog, &alter_schema(bytes.clone())).expect("alter")
+        else {
+            unreachable!("ALTER ARRAY builds a put");
+        };
+        assert_eq!(altered.schema_msgpack, bytes);
+        assert_eq!(altered.schema_hash, created.schema_hash);
+        assert_eq!(altered.prefix_bits, created.prefix_bits);
+        assert_eq!(altered.audit_retain_ms, created.audit_retain_ms);
+        assert_eq!(
+            altered.minimum_audit_retain_ms,
+            created.minimum_audit_retain_ms
+        );
+        assert_eq!(altered.array_id, created.array_id);
+        assert_eq!(altered.created_at_ms, created.created_at_ms);
+        let decoded: nodedb_array::schema::ArraySchema =
+            zerompk::from_msgpack(&altered.schema_msgpack).expect("decode");
+        assert_eq!(decoded.georef, Some(georef));
+    }
+
+    /// The apply refuses a schema that changes a field `schema_hash` covers.
+    #[test]
+    fn alter_refuses_a_content_change() {
+        let (store, _tmp) = catalog();
+        let catalog = store.catalog();
+        put_raster(catalog);
+        let mut changed = raster_schema();
+        changed.tile_extents = vec![128, 128];
+        let bytes = zerompk::to_msgpack_vec(&changed).expect("encode");
+        assert!(entry(catalog, &alter_schema(bytes)).is_err());
     }
 
     #[test]

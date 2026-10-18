@@ -7,6 +7,7 @@ use super::pk_prefilter::apply_vector_pk_prefilter;
 use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::aggregate_cp_wrap::wrap_aggregate_cp_items;
+use crate::planner::select::array_cell_geom::rewrite_cell_read_query;
 use crate::planner::select::limit::apply_limit;
 use crate::planner::select::order_by::{apply_order_by, try_hybrid_from_projection};
 use crate::planner::select::query_tail::QueryTail;
@@ -23,11 +24,18 @@ pub(super) fn plan_select_query(
     temporal: TemporalScope,
     statement_output: bool,
 ) -> Result<SqlPlan> {
+    // Cell geometry calls over an array cell read become spatial functions
+    // before the SELECT body, its ORDER BY and its SELECT-list wrap plan.
+    let rewritten = rewrite_cell_read_query(select, query.order_by.as_ref(), catalog, temporal)?;
+    let (select, query_order_by) = match &rewritten {
+        Some(rewrite) => (&rewrite.select, rewrite.order_by.as_ref()),
+        None => (select, query.order_by.as_ref()),
+    };
     // ORDER BY / LIMIT belong to the query, not to its SELECT body,
     // but the scan planner needs them to pick an access path that can
     // honour them — so they travel down with the SELECT.
     let tail = QueryTail {
-        order_by: query.order_by.as_ref(),
+        order_by: query_order_by,
         limit_clause: &query.limit_clause,
         fetch: query.fetch.as_ref(),
     };
@@ -51,7 +59,7 @@ pub(super) fn plan_select_query(
         SqlPlan::Scan { collection, .. } => Some(collection.clone()),
         _ => None,
     };
-    if let Some(order_by) = &query.order_by {
+    if let Some(order_by) = query_order_by {
         plan = apply_order_by(&plan, order_by, functions, &select.projection, &scope)?;
     }
     // Fall back to a SELECT-projection scan for hybrid-search and

@@ -1187,12 +1187,14 @@ COPY users TO '/exports/users.ndjson';
 COPY (SELECT id, name FROM users WHERE status = 'active') TO '/exports/active.csv' WITH (FORMAT csv);
 ```
 
+- A server-path `COPY FROM` or `COPY TO` reads or writes as the server's OS user, so it needs superuser. Any other user is `42501`.
 - A path must be absolute and must not contain `..`. A relative path is `42601`. A path with `..` is `42501`.
+- `COPY FROM` reads regular files only. A FIFO, a device, or a directory is `58030`, also through a symlink.
 - `FORMAT` is `ndjson` (or `jsonl`), `json`, or `csv`. Without `FORMAT`, the extension decides: `.ndjson`, `.jsonl`, `.json`, `.csv`. `DELIMITER` is one character. `HEADER` defaults to `true`.
 - `COPY <collection> FROM STDIN` is refused with `0A000`. Use the server-path form.
 - A collection on the `timeseries` or `spatial` engine refuses `COPY FROM` with `0A000`.
 - A file over 16 GiB is `54000`.
-- `COPY TO` writes `<path>.tmp` and renames it to `<path>`. It is not transactional.
+- `COPY TO` writes `<path>.tmp` and renames it to `<path>`. `<path>.tmp` must not exist, else `58030`. It is not transactional.
 - `COPY <array> FROM '<path>'` loads CSV only. Use `WITH (FORMAT csv)`.
 
 ### Array bulk load

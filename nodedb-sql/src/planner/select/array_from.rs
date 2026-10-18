@@ -15,6 +15,7 @@
 
 use sqlparser::ast::{self, Select};
 
+use super::array_cell_geom::rewrite_cell_geometry;
 use super::cte_catalog::CteCatalog;
 use super::helpers::{convert_projection, plain_table_factor};
 use super::query_tail::QueryTail;
@@ -68,7 +69,27 @@ fn plan_cell_read(
     let view = array_view(ctx.catalog, &slice.name)?;
     let read = RelationRead::new(ctx, fn_name, &view.name)?;
     let columns = array_slice_columns(&view, &slice);
-    let outer = read.plan_outer(ctx, columns)?;
+    // Cell geometry calls become spatial functions over the dim columns
+    // before the outer SELECT resolves its expressions.
+    let rewritten = rewrite_cell_geometry(ctx.select, ctx.tail.order_by, &view, &read.qualifier)?;
+    let outer = match &rewritten {
+        None => read.plan_outer(ctx, columns)?,
+        Some(rewrite) => {
+            let tail = QueryTail {
+                order_by: rewrite.order_by.as_ref(),
+                limit_clause: ctx.tail.limit_clause,
+                fetch: ctx.tail.fetch,
+            };
+            let rewritten_ctx = OuterContext {
+                select: &rewrite.select,
+                catalog: ctx.catalog,
+                functions: ctx.functions,
+                tail: &tail,
+                statement_output: ctx.statement_output,
+            };
+            read.plan_outer(&rewritten_ctx, columns)?
+        }
+    };
     push_down_into_slice(&mut slice, &view, &outer.plan, &read.name);
     Ok(read.into_cte(SqlPlan::ArraySlice(slice), outer))
 }
@@ -403,6 +424,7 @@ mod tests {
                 dims: vec![dim("x"), dim("y")],
                 attrs: vec![attr("nir"), attr("red")],
                 tile_extents: vec![2, 2],
+                georef: None,
             })
         }
     }

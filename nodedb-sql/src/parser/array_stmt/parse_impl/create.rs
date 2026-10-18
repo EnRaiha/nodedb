@@ -56,6 +56,11 @@ impl<'a> Parser<'a> {
         if self.match_kw("TILE_ORDER") {
             tile_order = self.parse_tile_order()?;
         }
+        let georef = if self.match_kw("GEOREF") {
+            Some(self.parse_georef()?)
+        } else {
+            None
+        };
 
         // Optional `WITH (key = value, ...)` clause.
         let mut prefix_bits: u8 = 8;
@@ -120,6 +125,7 @@ impl<'a> Parser<'a> {
             tile_extents,
             cell_order,
             tile_order,
+            georef,
             prefix_bits,
             audit_retain_ms,
             minimum_audit_retain_ms,

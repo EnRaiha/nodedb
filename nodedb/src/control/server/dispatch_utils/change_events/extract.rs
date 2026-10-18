@@ -585,6 +585,7 @@ mod tests {
             prefix_bits: 8,
             system_time: nodedb_types::SystemTimeScope::Current,
             valid_at_ms: None,
+            zone_msgpack: Vec::new(),
         });
         assert!(extract_write_metadata(&slice, TenantId::new(1)).is_empty());
 

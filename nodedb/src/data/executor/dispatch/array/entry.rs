@@ -92,6 +92,7 @@ impl CoreLoop {
                 shard_bucket,
                 system_time,
                 valid_at_ms,
+                zone_msgpack,
             } => self.dispatch_array_slice(
                 task,
                 SliceParams {
@@ -103,6 +104,7 @@ impl CoreLoop {
                     shard_bucket: *shard_bucket,
                     system_time: *system_time,
                     valid_at_ms: *valid_at_ms,
+                    zone_msgpack,
                 },
             ),
             ArrayOp::SurrogateBitmapScan {

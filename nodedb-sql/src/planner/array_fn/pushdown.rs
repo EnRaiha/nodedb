@@ -342,6 +342,7 @@ mod tests {
                 nullable: true,
             }],
             tile_extents: vec![2, 2],
+            georef: None,
         }
     }
 
@@ -351,6 +352,7 @@ mod tests {
             slice: ArraySliceAst::default(),
             attr_projection: Vec::new(),
             limit,
+            zone: None,
             temporal: TemporalScope::default(),
         }
     }

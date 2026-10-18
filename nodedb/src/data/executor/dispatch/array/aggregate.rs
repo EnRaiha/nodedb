@@ -227,12 +227,14 @@ impl CoreLoop {
             &mut resolved_tiles,
         )
         .map_err(|e| format!("array aggregate overlay merge: {e}"))?;
+        // One prepared region per scan: a zone's transformer is built once.
+        let prepared = region.map(ArrayRegion::prepare);
         let mut tiles = Vec::with_capacity(resolved_tiles.len());
         for (hp, tile) in resolved_tiles {
             if !shard_bucket_admits(shard_bucket, hp) {
                 continue;
             }
-            let tile = match region {
+            let tile = match &prepared {
                 Some(region) => filter_region_owned(schema, tile, region)
                     .map_err(|e| format!("array aggregate region filter: {e}"))?,
                 None => tile,
@@ -836,6 +838,7 @@ mod tests {
                 x_dim: 0,
                 y_dim: 1,
                 polygons: vec![ZonePolygon { exterior, holes }],
+                frame: None,
             }),
         )
     }
