@@ -285,6 +285,10 @@ pub(crate) async fn handle_direct_op(
         // source of a cross-shard materialized sum, runs in one transaction, as
         // the SQL path's does. The loop there clone-checks, authorizes and
         // meters each task itself.
+        if let Err(error) = crate::control::planner::calvin::refuse_several_settling_writes(&tasks)
+        {
+            return error_to_native(seq, &error);
+        }
         if statement_needs_implicit_txn(ctx.state, &tasks) {
             let _request = ctx.state.tenant_request_guard(tenant_id);
             needs_top_level_metering = false;

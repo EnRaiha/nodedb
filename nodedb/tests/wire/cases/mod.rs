@@ -154,6 +154,7 @@ mod kv_write_row_level_security;
 mod kv_write_row_level_security_atomics;
 mod materialized_sum_cross_shard_expanders;
 mod materialized_sum_cross_shard_http;
+mod materialized_sum_same_request;
 mod materialized_sum_txn_command_tag;
 mod materialized_sum_txn_predicate_writes;
 mod materialized_sum_txn_preimage;

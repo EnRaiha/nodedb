@@ -24,7 +24,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 use crate::control::lease::QueryLeaseScope;
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, TxnDispatchPosition, classify_dispatch,
-    dispatch_authorized_tasks_to_calvin, read_vshards_of,
+    dispatch_authorized_tasks_to_calvin, read_vshards_of, refuse_several_settling_writes,
 };
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::calvin_fold::{
@@ -95,6 +95,9 @@ pub(crate) async fn route_atomic_statement(
     .map_err(|error| StatementError::Error(crate::Error::from(error)))?;
 
     let in_txn_block = in_block(session);
+    if !in_txn_block {
+        refuse_several_settling_writes(&tasks).map_err(StatementError::Error)?;
+    }
     if !in_txn_block && statement_needs_implicit_txn(state, &tasks) {
         if !all_writes_bufferable(&tasks) {
             return Err(StatementError::Error(unbufferable_joined_statement()));
