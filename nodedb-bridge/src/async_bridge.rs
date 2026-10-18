@@ -23,6 +23,7 @@
 //! with eventfd-based waking.
 
 use std::marker::PhantomData;
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use crate::backpressure::{BackpressureController, PressureState};
@@ -181,13 +182,13 @@ impl<Req, Rsp> ControlHandle<Req, Rsp> {
         self.backpressure.state()
     }
 
-    /// Raw fd for the response-available signal (register with Tokio's AsyncFd).
-    pub fn response_wake_fd(&self) -> std::os::unix::io::RawFd {
+    /// Borrowed fd for the response-available signal.
+    pub fn response_wake_fd(&self) -> BorrowedFd<'_> {
         self.rsp_wake.consumer_wake.as_fd()
     }
 
-    /// Raw fd for the request-space-available signal.
-    pub fn request_space_fd(&self) -> std::os::unix::io::RawFd {
+    /// Borrowed fd for the request-space-available signal.
+    pub fn request_space_fd(&self) -> BorrowedFd<'_> {
         self.req_wake.producer_wake.as_fd()
     }
 }
@@ -255,13 +256,13 @@ impl<Req, Rsp> DataHandle<Req, Rsp> {
         self.pressure() == PressureState::Suspended
     }
 
-    /// Raw fd for the request-available signal (register with TPC event loop).
-    pub fn request_wake_fd(&self) -> std::os::unix::io::RawFd {
+    /// Borrowed fd for the request-available signal (register with TPC event loop).
+    pub fn request_wake_fd(&self) -> BorrowedFd<'_> {
         self.req_wake.consumer_wake.as_fd()
     }
 
-    /// Raw fd for the response-space-available signal.
-    pub fn response_space_fd(&self) -> std::os::unix::io::RawFd {
+    /// Borrowed fd for the response-space-available signal.
+    pub fn response_space_fd(&self) -> BorrowedFd<'_> {
         self.rsp_wake.producer_wake.as_fd()
     }
 }
@@ -297,13 +298,13 @@ impl<Req, Rsp> PinnedDataHandle<Req, Rsp> {
         self.inner.should_suspend()
     }
 
-    /// Raw fd for the request-available signal.
-    pub fn request_wake_fd(&self) -> std::os::unix::io::RawFd {
+    /// Borrowed fd for the request-available signal.
+    pub fn request_wake_fd(&self) -> BorrowedFd<'_> {
         self.inner.request_wake_fd()
     }
 
-    /// Raw fd for the response-space-available signal.
-    pub fn response_space_fd(&self) -> std::os::unix::io::RawFd {
+    /// Borrowed fd for the response-space-available signal.
+    pub fn response_space_fd(&self) -> BorrowedFd<'_> {
         self.inner.response_space_fd()
     }
 }

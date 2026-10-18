@@ -14,6 +14,7 @@
 
 #![cfg(all(feature = "tokio", target_os = "linux"))]
 
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -35,7 +36,8 @@ fn tpc_event_loop(
     assert!(epoll_fd >= 0, "epoll_create1 failed");
 
     // Register the request-available eventfd with epoll (edge-triggered).
-    let req_fd = data.request_wake_fd();
+    // `data` outlives the epoll registration, so the raw number stays valid.
+    let req_fd = data.request_wake_fd().as_raw_fd();
     let mut event = libc::epoll_event {
         events: (libc::EPOLLIN | libc::EPOLLET) as u32,
         u64: req_fd as u64,

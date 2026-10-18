@@ -16,42 +16,68 @@
 //! instance. When the eventfd becomes readable (the TPC core wrote to it),
 //! Tokio wakes the waiting task — no polling, no busy-waiting.
 
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
 use crate::async_bridge::ControlHandle;
 use crate::error::{BridgeError, Result};
+use crate::eventfd::{EventFd, WakePair};
 
-/// Wraps a raw eventfd for use with Tokio's `AsyncFd`.
+/// One eventfd of a shared `WakePair`, watched by a Tokio `AsyncFd`.
 ///
-/// Needed because `AsyncFd` requires `AsRawFd` on the inner type.
-struct RawFdWrapper {
-    fd: RawFd,
+/// Holds an `Arc` to the pair, so the descriptor stays open for the whole
+/// life of the `AsyncFd`. No drop order elsewhere can close it early.
+struct WatchedWakeFd {
+    pair: Arc<WakePair>,
+    select: fn(&WakePair) -> &EventFd,
 }
 
-impl AsRawFd for RawFdWrapper {
+impl AsRawFd for WatchedWakeFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        (self.select)(&self.pair).as_fd().as_raw_fd()
     }
+}
+
+/// The eventfd the consumer signals when the request queue frees a slot.
+fn producer_wake(pair: &WakePair) -> &EventFd {
+    &pair.producer_wake
+}
+
+/// The eventfd the producer signals when the response queue has data.
+fn consumer_wake(pair: &WakePair) -> &EventFd {
+    &pair.consumer_wake
+}
+
+/// Register one eventfd of `pair` with the current Tokio reactor.
+fn watch(
+    pair: &Arc<WakePair>,
+    select: fn(&WakePair) -> &EventFd,
+) -> std::io::Result<AsyncFd<WatchedWakeFd>> {
+    let watched = WatchedWakeFd {
+        pair: Arc::clone(pair),
+        select,
+    };
+    // SAFETY: `watched` owns an `Arc` to the pair, so the descriptor stays
+    // open for the whole life of the `AsyncFd`. `select` is a fixed function
+    // of an immutable pair, so every `as_raw_fd` call returns the same fd.
+    unsafe { AsyncFd::register_with_interest(watched, Interest::READABLE) }
+        .map_err(|error| error.into_parts().1)
 }
 
 /// Async-capable Control Plane handle.
 ///
 /// Wraps `ControlHandle` with Tokio `AsyncFd` instances for non-blocking
-/// async push/pop across the bridge.
-///
-/// Fields drop in declaration order. Both `AsyncFd`s come before `inner`, which
-/// owns the eventfds they watch, so each `AsyncFd` deregisters while its fd is
-/// still open.
+/// async push/pop across the bridge. Each `AsyncFd` shares ownership of
+/// the eventfd it watches.
 pub struct AsyncControlHandle<Req, Rsp> {
     /// AsyncFd for "request queue has space" signal (producer can push).
-    req_space_fd: AsyncFd<RawFdWrapper>,
+    req_space_fd: AsyncFd<WatchedWakeFd>,
     /// AsyncFd for "response available" signal (consumer can pop).
-    rsp_ready_fd: AsyncFd<RawFdWrapper>,
-    /// The underlying synchronous handle. Private, so it cannot be moved out
-    /// and dropped while the `AsyncFd`s above still watch its fds.
+    rsp_ready_fd: AsyncFd<WatchedWakeFd>,
+    /// The underlying synchronous handle.
     inner: ControlHandle<Req, Rsp>,
 }
 
@@ -60,28 +86,8 @@ impl<Req, Rsp> AsyncControlHandle<Req, Rsp> {
     ///
     /// Must be called from within a Tokio runtime context.
     pub fn new(handle: ControlHandle<Req, Rsp>) -> std::io::Result<Self> {
-        // SAFETY: both fds belong to `handle`, which `Self` keeps in `inner`
-        // and drops after both `AsyncFd`s. Each fd stays open, and each
-        // wrapper returns the same fd, for the whole life of its `AsyncFd`.
-        let req_space_fd = unsafe {
-            AsyncFd::register_with_interest(
-                RawFdWrapper {
-                    fd: handle.request_space_fd(),
-                },
-                Interest::READABLE,
-            )
-        }
-        .map_err(|error| error.into_parts().1)?;
-        // SAFETY: as above.
-        let rsp_ready_fd = unsafe {
-            AsyncFd::register_with_interest(
-                RawFdWrapper {
-                    fd: handle.response_wake_fd(),
-                },
-                Interest::READABLE,
-            )
-        }
-        .map_err(|error| error.into_parts().1)?;
+        let req_space_fd = watch(&handle.req_wake, producer_wake)?;
+        let rsp_ready_fd = watch(&handle.rsp_wake, consumer_wake)?;
 
         Ok(Self {
             req_space_fd,

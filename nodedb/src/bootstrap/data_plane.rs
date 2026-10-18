@@ -375,8 +375,8 @@ pub fn spawn_data_plane_cores(
         notifiers.push((core_id, notifier));
     }
 
-    for (core_id, notifier) in &notifiers {
-        dispatcher.set_notifier(*core_id, *notifier);
+    for (core_id, notifier) in notifiers {
+        dispatcher.set_notifier(core_id, notifier);
     }
 
     info!(num_cores, "data plane cores running (eventfd-driven)");

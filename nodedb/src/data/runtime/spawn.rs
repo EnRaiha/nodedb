@@ -54,7 +54,9 @@ pub fn spawn_core(
 
     let data_dir = data_dir.to_path_buf();
 
-    // Create eventfd and extract notifier before moving EventFd to core thread.
+    // The notifier shares ownership of the eventfd with the core thread.
+    // The descriptor stays open after the thread exits. A late wake lands
+    // in the dead core's eventfd, never in a reused descriptor number.
     let efd = EventFd::new().map_err(std::io::Error::other)?;
     let notifier = efd.notifier();
 
@@ -210,4 +212,101 @@ fn wire_core_dependencies(core: &mut CoreLoop, deps: WiredDependencies) {
 
     // 2b. Wire the quarantine registry for corrupt-segment detection.
     core.set_quarantine_registry(quarantine_registry);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::bridge::dispatch::test_requests::make_request;
+    use crate::bridge::envelope::{ErrorCode, Status};
+
+    /// A core that panics while it opens its engines drops its `EventFd`.
+    /// Later Control Plane wakes for that core must not touch a file opened
+    /// after the panic, and the request must fail with "core-0 is gone".
+    #[test]
+    fn wakes_after_a_core_panicked_at_open_leave_a_later_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file in place of the data directory makes every engine open fail.
+        let data_dir = dir.path().join("not-a-directory");
+        std::fs::write(&data_dir, b"").unwrap();
+
+        let (mut dispatcher, data_sides) = Dispatcher::new(1, 64);
+        let data_side = data_sides.into_iter().next().unwrap();
+        // no-plane-separation: the one-shot readiness Sender `SpawnCoreParams` requires; no tokio runtime runs here.
+        let (replay_done_tx, _replay_done_rx) = tokio::sync::oneshot::channel();
+        let (handle, notifier) = spawn_core(SpawnCoreParams {
+            core_id: 0,
+            node_id: 1,
+            request_rx: data_side.request_rx,
+            response_tx: data_side.response_tx,
+            data_dir: &data_dir,
+            wal_records: Arc::from(Vec::new()),
+            tombstones: nodedb_wal::TombstoneSet::default(),
+            num_cores: 1,
+            compaction_config: crate::data::runtime::CoreCompactionConfig::default(),
+            system_metrics: None,
+            event_producer: None,
+            event_interest: crate::event::interest::EventInterest::new(),
+            governor: crate::data::executor::core_loop::test_governor(),
+            quiesce: None,
+            hlc: Arc::new(nodedb_types::OrdinalClock::new()),
+            array_catalog: crate::control::array_catalog::ArrayCatalog::handle(),
+            quarantine_registry: Arc::new(crate::storage::quarantine::QuarantineRegistry::new()),
+            maintenance_budget: Arc::new(
+                crate::control::maintenance::MaintenanceBudgetTracker::new(),
+            ),
+            doc_config_seed: Arc::new(Vec::new()),
+            vector_index_param_seed: Arc::new(Vec::new()),
+            columnar_schema_seed: Arc::new(Vec::new()),
+            replay_done: replay_done_tx,
+        })
+        .unwrap();
+        assert!(
+            handle.join().is_err(),
+            "the core thread must panic while it opens its engines"
+        );
+        dispatcher.set_notifier(0, notifier);
+
+        // The core is gone. A file opened now takes the lowest free number.
+        let path = dir.path().join("system.redb");
+        let mut header = b"redb\x1a\n\xa9\r\n".to_vec();
+        header.resize(4096, 0);
+        std::fs::write(&path, &header).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        dispatcher.wake_all_cores();
+        dispatcher.dispatch(make_request(0)).unwrap();
+        dispatcher.wake_all_cores();
+        drop(file);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after, header,
+            "a wake for the dead core modified a later file"
+        );
+
+        let responses = dispatcher.poll_responses();
+        assert_eq!(
+            responses.len(),
+            1,
+            "the request to the dead core must be answered"
+        );
+        assert_eq!(responses[0].status, Status::Error);
+        match responses[0].error_code.as_deref() {
+            Some(ErrorCode::Internal { detail }) => {
+                assert!(
+                    detail.contains("core-0 is gone"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected a core-gone refusal, got {other:?}"),
+        }
+    }
 }
