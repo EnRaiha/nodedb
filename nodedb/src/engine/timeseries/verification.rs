@@ -545,17 +545,18 @@ mod tests {
         assert!(!orphan_dir.exists());
     }
 
-    // ── Ingest throughput: 1M rows ───────────────────────────────────
+    // ── Ingest: 1M rows ──────────────────────────────────────────────
 
+    /// One million rows over 100 series all land in the memtable. Throughput
+    /// lives in the ingest benchmark, never in a unit test.
     #[test]
-    fn ingest_throughput_1m_rows() {
+    fn ingest_1m_rows() {
         let mut mt = ColumnarMemtable::new_metric(ColumnarMemtableConfig {
             max_memory_bytes: 256 * 1024 * 1024,
             hard_memory_limit: 512 * 1024 * 1024,
             max_tag_cardinality: 100_000,
         });
 
-        let start = std::time::Instant::now();
         for i in 0..1_000_000u64 {
             mt.ingest_row(
                 i % 100,
@@ -566,29 +567,20 @@ mod tests {
             )
             .unwrap();
         }
-        let elapsed = start.elapsed();
-        let rows_per_sec = 1_000_000.0 / elapsed.as_secs_f64();
-
         assert_eq!(mt.row_count(), 1_000_000);
-        // Should achieve at least 1M rows/sec on any modern CPU.
-        assert!(
-            rows_per_sec > 500_000.0,
-            "ingest too slow: {rows_per_sec:.0} rows/sec (expected >500K)"
-        );
     }
 
     // ── SIMD aggregation: SUM over 10M f64 values ────────────────────
 
+    /// SUM, COUNT, MIN and MAX over 10M values match a scalar reference.
     #[test]
-    fn simd_aggregation_performance() {
+    fn simd_aggregation_over_10m_values() {
         use crate::engine::timeseries::columnar_agg::aggregate_f64;
 
         // 10M values (80MB).
         let values: Vec<f64> = (0..10_000_000).map(|i| (i as f64) * 0.001).collect();
 
-        let start = std::time::Instant::now();
         let result = aggregate_f64(&values);
-        let elapsed = start.elapsed();
 
         // Verify correctness: sum of 0..9,999,999 * 0.001
         let expected_sum = (0..10_000_000u64).map(|i| i as f64 * 0.001).sum::<f64>();
@@ -603,15 +595,5 @@ mod tests {
         assert_eq!(result.count, 10_000_000);
         assert!((result.min - 0.0).abs() < f64::EPSILON);
         assert!((result.max - 9999.999).abs() < 0.001);
-
-        // Should complete in <100ms on any modern CPU with SIMD (release mode).
-        // Debug builds are significantly slower due to no optimizations — use a
-        // generous threshold to avoid flaky test failures in CI debug runs.
-        let threshold_ms = if cfg!(debug_assertions) { 5000 } else { 500 };
-        assert!(
-            elapsed.as_millis() < threshold_ms,
-            "SIMD aggregation too slow: {}ms for 10M values (threshold {threshold_ms}ms)",
-            elapsed.as_millis()
-        );
     }
 }

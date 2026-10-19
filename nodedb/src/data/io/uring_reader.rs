@@ -32,10 +32,14 @@ use std::os::unix::io::AsRawFd;
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
-use super::aligned_buf::{ALIGNMENT, AlignedBuf};
+use super::aligned_buf::AlignedBuf;
 use super::io_metrics::IoMetrics;
 #[cfg(target_os = "linux")]
 use super::io_metrics::{TIER_CRITICAL, TIER_HIGH, TIER_LOW};
+#[cfg(target_os = "linux")]
+use super::uring_read_state::{
+    BufSource, PendingRead, ReadState, leak_kernel_owned_buffers, read_sequential, round_up_read,
+};
 use crate::bridge::envelope::Priority;
 
 /// Queue depth for the io_uring instance.
@@ -71,6 +75,9 @@ pub struct UringReader {
     buf_size: usize,
     /// Submission queue depth the ring was created with.
     queue_depth: u32,
+    /// Set when a stalled ring could not be replaced. A poisoned ring is
+    /// never entered again, so its queued SQEs never reach the kernel.
+    poisoned: bool,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -111,6 +118,7 @@ impl UringReader {
             free,
             buf_size,
             queue_depth: queue_depth.max(1),
+            poisoned: false,
         })
     }
 
@@ -127,6 +135,9 @@ impl UringReader {
     pub fn read_files(&mut self, paths: &[&Path]) -> Vec<Vec<u8>> {
         if paths.is_empty() {
             return Vec::new();
+        }
+        if self.poisoned && !self.replace_ring() {
+            return read_sequential(paths);
         }
 
         // Open files, determine sizes, assign buffers.
@@ -235,6 +246,8 @@ impl UringReader {
             // submit/reap calls below only advance ring state, so a buffer
             // whose SQE is already in flight is untouched by them. File fds
             // stay valid until `reads` is dropped at the end of the function.
+            // A stalled ring is retired before that drop, so no queued SQE
+            // can reach the kernel after its file closes.
             let mut pushed = unsafe { self.ring.submission().push(&read_op).is_ok() };
             if !pushed {
                 self.submit_queued(&mut queued, &mut in_flight, &mut states);
@@ -302,13 +315,57 @@ impl UringReader {
                 }
                 ReadState::InFlight => {
                     // The ring stopped reporting completions, so the kernel may
-                    // still write into this buffer. The pool slot is withheld
-                    // rather than handed to a later read.
+                    // still write into this buffer. `retire_stalled_batch`
+                    // below decides what happens to it.
                 }
             }
         }
 
+        if queued + in_flight > 0 {
+            self.retire_stalled_batch(&reads, &states, oversized);
+        }
+
         results
+    }
+
+    /// Stop using a ring that stopped delivering completions.
+    ///
+    /// Its queued SQEs carry raw fds of this batch's files, which close when
+    /// `read_files` returns. Entering the ring again would submit them
+    /// against whatever file reuses those numbers. The ring is replaced, or
+    /// poisoned so it is never entered again. Buffers the kernel can still
+    /// write are leaked, so a late completion never lands in freed memory.
+    fn retire_stalled_batch(
+        &mut self,
+        reads: &[PendingRead],
+        states: &[ReadState],
+        oversized: Vec<AlignedBuf>,
+    ) {
+        self.poisoned = true;
+        self.replace_ring();
+        leak_kernel_owned_buffers(
+            reads,
+            states,
+            &mut self.pool,
+            &mut self.free,
+            self.buf_size,
+            oversized,
+        );
+    }
+
+    /// Swap in a fresh ring. Dropping the old ring discards its queued SQEs.
+    ///
+    /// Returns `false` and leaves the reader poisoned when io_uring setup
+    /// fails.
+    fn replace_ring(&mut self) -> bool {
+        match io_uring::IoUring::new(self.queue_depth) {
+            Ok(fresh) => {
+                self.ring = fresh;
+                self.poisoned = false;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Hand every queued SQE to the kernel, moving them to in-flight.
@@ -428,57 +485,6 @@ impl UringReader {
     ) -> Vec<Vec<u8>> {
         self.read_files(paths)
     }
-}
-
-/// Progress of one read through the submit/complete cycle.
-#[derive(Clone, Copy)]
-#[cfg(target_os = "linux")]
-enum ReadState {
-    /// Never accepted by the submission queue — the kernel never saw the buffer.
-    NotSubmitted,
-    /// Handed to the kernel, completion not yet reaped.
-    InFlight,
-    /// Completed successfully.
-    Done,
-    /// Completed with a kernel error.
-    Failed,
-}
-
-/// Tracks which buffer a read uses.
-#[derive(Clone, Copy)]
-#[cfg(target_os = "linux")]
-enum BufSource {
-    Pool(usize),
-    Oversized(usize),
-    None,
-}
-
-/// A pending read operation.
-#[cfg(target_os = "linux")]
-struct PendingRead {
-    index: usize,
-    file: Option<std::fs::File>,
-    size: usize,
-    buf_source: BufSource,
-}
-
-#[cfg(target_os = "linux")]
-impl PendingRead {
-    fn failed(index: usize) -> Self {
-        Self {
-            index,
-            file: None,
-            size: 0,
-            buf_source: BufSource::None,
-        }
-    }
-}
-
-/// Round a read size up to ALIGNMENT.
-#[inline]
-#[cfg(target_os = "linux")]
-fn round_up_read(size: usize) -> usize {
-    super::aligned_buf::round_up(size, ALIGNMENT)
 }
 
 #[cfg(all(test, target_os = "linux"))]

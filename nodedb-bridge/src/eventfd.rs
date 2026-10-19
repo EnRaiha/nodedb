@@ -19,7 +19,7 @@
 //! done by the caller. This module only provides raw fd-based signaling.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 /// A cross-runtime wake signal backed by a Linux eventfd.
 ///
@@ -147,26 +147,25 @@ impl EventFd {
         }
     }
 
-    /// Get the raw file descriptor for registration with an event loop.
+    /// Borrow the readable descriptor for registration with an event loop.
     ///
-    /// The caller can register this fd with:
-    /// - Tokio: `AsyncFd::new()`
-    /// - Glommio: `GlommioDma::from_raw_fd()` or similar
-    /// - io_uring: `IORING_OP_READ` on the fd
-    pub fn as_fd(&self) -> RawFd {
+    /// The borrow cannot outlive this `EventFd`, so a registration can never
+    /// keep a descriptor number past its close. A holder that must outlive
+    /// the borrow shares the owning `Arc<WakePair>` instead.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
         #[cfg(target_os = "linux")]
         {
-            self.fd.as_raw_fd()
+            self.fd.as_fd()
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.read_fd.as_raw_fd()
+            self.read_fd.as_fd()
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_pipe_flags(fd: RawFd) -> io::Result<()> {
+fn set_pipe_flags(fd: std::os::fd::RawFd) -> io::Result<()> {
     // SAFETY: fcntl is called with a valid fd returned by pipe().
     let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if status_flags < 0 {
@@ -268,6 +267,6 @@ mod tests {
     #[test]
     fn fd_is_valid() {
         let efd = EventFd::new().unwrap();
-        assert!(efd.as_fd() >= 0);
+        assert!(efd.as_fd().as_raw_fd() >= 0);
     }
 }
