@@ -7,14 +7,19 @@
 //! # The determinism rule
 //!
 //! Staging resolves EXACTLY the CP-injected `ollp_predicted_surrogates` set,
-//! verbatim, on every replica, via the `ollp_predicted_doc_ids` primitive. A
-//! live predicate rescan is NOT used as the row set, because a follower's
-//! local snapshot can legitimately lag the leader's verified prediction
-//! window. Re-deriving the row set locally would diverge across replicas.
-//! The install applies the redo record `CalvinResolve` builds from this
-//! staging, so the staged rows are the rows the install writes. The
-//! `stage_bulk_delete` / `stage_bulk_update` session-transaction handlers do
-//! a live rescan and are NOT reused here for this reason.
+//! verbatim, via the `ollp_predicted_doc_ids` primitive. The install applies
+//! the redo record `CalvinResolve` builds from this staging, so the staged
+//! rows are the rows the install writes.
+//!
+//! # The prediction check
+//!
+//! Before a bulk plan stages, the leader checks its prediction against the
+//! rows the predicate matches at the plan's turn: BASE with the overlay of
+//! the plans staged before it. The surrogate set, the implicit edges of
+//! matched edge documents, and the materialized-sum coverage must all hold.
+//! A miss refuses the stage with `OllpRetryRequired`, which votes
+//! `PredictionDrift`. Only the data-group leader stages, and a bulk plan
+//! holds its collection's lock, so a lagging follower never judges.
 //!
 //! Reading each predicted surrogate's CURRENT body (for `BulkUpdate`'s
 //! post-image and read-your-own-writes) is still safe to source from local
@@ -31,17 +36,31 @@
 //! Each stage returns the number of rows it staged, the affected count the
 //! statement reports.
 
-use nodedb_physical::physical_plan::UpdateValue;
+use nodedb_physical::physical_plan::{ResolvedSumTarget, UpdateValue};
 use nodedb_types::Surrogate;
 
+use crate::bridge::envelope::ErrorCode;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
 use crate::data::executor::handlers::bulk_dml::scan::ollp_predicted_doc_ids;
+use crate::data::executor::handlers::bulk_dml::{TxnPrediction, decode_bulk_filters};
 use crate::data::executor::handlers::transaction::overlay::Staged;
 use crate::data::executor::handlers::transaction::stage_write::{
     StagedStatement, stored_row_identity,
 };
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId, TxnId};
+
+/// What a Calvin bulk plan carries for its prediction check.
+#[derive(Clone, Copy)]
+pub(in crate::data::executor) struct CalvinBulkCheck<'a> {
+    /// The predicate's serialized filters.
+    pub filters: &'a [u8],
+    /// The rows the Control Plane predicted. `None` when the plan carries none.
+    pub prediction: Option<TxnPrediction<'a>>,
+    /// The materialized-sum resolution the plan carries.
+    pub resolved_sum_targets: &'a [ResolvedSumTarget],
+}
 
 /// Borrowed inputs for [`CoreLoop::stage_calvin_bulk_delete`], grouped so the
 /// method stays within the argument-count limit.
@@ -50,7 +69,7 @@ pub(in crate::data::executor) struct CalvinBulkDeleteStage<'a> {
     pub tid: u64,
     pub txn_id: TxnId,
     pub collection: &'a str,
-    pub ollp_predicted_surrogates: Option<&'a [u32]>,
+    pub check: CalvinBulkCheck<'a>,
     /// Compiled RLS write policy deciding each removed row's pre-image.
     pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// The collection's DDL-declared primary key, when it has one. Names the
@@ -81,7 +100,7 @@ pub(in crate::data::executor) struct CalvinBulkUpdateStage<'a> {
     pub txn_id: TxnId,
     pub collection: &'a str,
     pub updates: &'a [(String, UpdateValue)],
-    pub ollp_predicted_surrogates: Option<&'a [u32]>,
+    pub check: CalvinBulkCheck<'a>,
     /// Compiled RLS write policy gating each staged post-image.
     pub rls_write_check: &'a nodedb_types::RlsWriteCheck,
     /// The collection's DDL-declared primary key, when it has one. A staged
@@ -104,16 +123,18 @@ impl CoreLoop {
             tid,
             txn_id,
             collection,
-            ollp_predicted_surrogates,
+            check,
             rls_write_check,
             declared_primary_key,
         } = params;
-        let Some(predicted) = ollp_predicted_surrogates else {
+        let Some(prediction) = check.prediction else {
             return Err(missing_prediction_error(collection));
         };
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
             (database_id, TenantId::new(tid), collection.to_string());
+        self.check_calvin_prediction(txn_id, &coll_key, &[], &check, prediction)?;
+        let predicted = prediction.surrogates;
 
         let mut predicted_sorted: Vec<u32> = predicted.to_vec();
         predicted_sorted.sort_unstable();
@@ -125,7 +146,6 @@ impl CoreLoop {
         // body removes nothing; its tombstone is keyed by the decimal
         // surrogate.
         let strict_schema = self.resolve_strict_schema(database_id.as_u64(), tid, collection);
-        let bitemporal = self.is_bitemporal(database_id.as_u64(), tid, collection);
         let mut rows: Vec<(u32, nodedb_types::RowIdentity, Option<Vec<u8>>)> =
             Vec::with_capacity(doc_ids.len());
         for (surrogate, doc_id) in predicted_sorted.into_iter().zip(doc_ids) {
@@ -134,7 +154,6 @@ impl CoreLoop {
                 coll_key: &coll_key,
                 surrogate,
                 storage_key: &doc_id,
-                bitemporal,
             })?;
             let identity = match &body {
                 Some(body) => {
@@ -199,17 +218,18 @@ impl CoreLoop {
             txn_id,
             collection,
             updates,
-            ollp_predicted_surrogates,
+            check,
             rls_write_check,
             declared_primary_key,
         } = params;
-        let Some(predicted) = ollp_predicted_surrogates else {
+        let Some(prediction) = check.prediction else {
             return Err(missing_prediction_error(collection));
         };
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
             (database_id, TenantId::new(tid), collection.to_string());
-        let bitemporal = self.is_bitemporal(database_id.as_u64(), tid, collection);
+        self.check_calvin_prediction(txn_id, &coll_key, updates, &check, prediction)?;
+        let predicted = prediction.surrogates;
 
         let mut predicted_sorted: Vec<u32> = predicted.to_vec();
         predicted_sorted.sort_unstable();
@@ -226,7 +246,6 @@ impl CoreLoop {
                 coll_key: &coll_key,
                 surrogate,
                 storage_key: &storage_key,
-                bitemporal,
             })?
             else {
                 continue;
@@ -281,6 +300,46 @@ impl CoreLoop {
         }
         Ok(updated)
     }
+
+    /// Refuse a Calvin bulk plan whose prediction does not hold at its turn
+    /// in the transaction: BASE with the overlay of the plans staged before
+    /// it. The surrogate set and the implicit edges must equal the rows'. The
+    /// materialized-sum resolution must cover every join value the rows
+    /// require, read after `updates` for an update. A miss refuses with
+    /// `OllpRetryRequired`, which votes `PredictionDrift`.
+    fn check_calvin_prediction(
+        &self,
+        txn_id: TxnId,
+        coll_key: &(DatabaseId, TenantId, String),
+        updates: &[(String, UpdateValue)],
+        check: &CalvinBulkCheck<'_>,
+        prediction: TxnPrediction<'_>,
+    ) -> crate::Result<()> {
+        let drift = || crate::Error::DataPlane(ErrorCode::OllpRetryRequired);
+        let filters = decode_bulk_filters(check.filters)?;
+        let rows = self.txn_matching_rows(txn_id, coll_key, &filters)?;
+        if !prediction.holds(&rows) {
+            return Err(drift());
+        }
+        let sum_check = SumTargetCheck {
+            database_id: coll_key.0.as_u64(),
+            tid: coll_key.1.as_u64(),
+            collection: coll_key.2.as_str(),
+            updates,
+            resolved: check.resolved_sum_targets,
+        };
+        if !self.declares_materialized_sums(&sum_check) {
+            return Ok(());
+        }
+        let images: Vec<serde_json::Value> = rows
+            .iter()
+            .filter_map(|(_, body)| self.decode_source_row(&sum_check, body))
+            .collect();
+        if self.sum_targets_diverged(&sum_check, &images) {
+            return Err(drift());
+        }
+        Ok(())
+    }
 }
 
 /// One row a Calvin bulk stage reads under BASE ∪ OVERLAY.
@@ -289,7 +348,6 @@ struct CalvinRowRead<'a> {
     coll_key: &'a (DatabaseId, TenantId, String),
     surrogate: u32,
     storage_key: &'a nodedb_types::StorageKey,
-    bitemporal: bool,
 }
 
 impl CoreLoop {
@@ -308,20 +366,11 @@ impl CoreLoop {
             return Ok(None);
         }
         let (database_id, tenant, collection) = read.coll_key;
-        if read.bitemporal {
-            self.sparse.versioned_get_current(
-                database_id.as_u64(),
-                tenant.as_u64(),
-                collection,
-                read.storage_key,
-            )
-        } else {
-            self.sparse.get(
-                database_id.as_u64(),
-                tenant.as_u64(),
-                collection,
-                read.storage_key,
-            )
-        }
+        self.current_row_body(
+            database_id.as_u64(),
+            tenant.as_u64(),
+            collection,
+            read.storage_key,
+        )
     }
 }

@@ -166,11 +166,19 @@ pub async fn convert_collection(
             // The declared-field record follows the converted columns, as
             // `CREATE COLLECTION` records them.
             coll.fields = converted_fields(&columns, &generated_sources);
-            let schema = nodedb_types::columnar::StrictSchema {
-                columns,
-                version: 1,
-                dropped_columns: Vec::new(),
-                bitemporal: false,
+            // A bitemporal collection keeps its flag across the CONVERT, so
+            // its strict schema carries the reserved version columns the Data
+            // Plane encoded every version with.
+            let schema = if coll.bitemporal {
+                nodedb_types::columnar::StrictSchema::new_bitemporal(columns)
+                    .map_err(|e| err("42P16", format!("bitemporal strict schema: {e}")))?
+            } else {
+                nodedb_types::columnar::StrictSchema {
+                    columns,
+                    version: 1,
+                    dropped_columns: Vec::new(),
+                    bitemporal: false,
+                }
             };
             if target_type == "kv" {
                 nodedb_types::CollectionType::kv(schema)

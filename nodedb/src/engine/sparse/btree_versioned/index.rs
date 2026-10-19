@@ -105,6 +105,39 @@ impl SparseEngine {
         Ok(())
     }
 
+    /// Remove every versioned index entry of `field` in `coll`: each value,
+    /// each row and each system time, tombstones included. A dropped index
+    /// leaves nothing, so a later index on the same field starts clean.
+    ///
+    /// Runs inside a caller-owned write transaction and does NOT commit.
+    /// Returns the number of entries removed.
+    pub fn versioned_index_drop_field_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        database_id: u64,
+        tenant: u64,
+        coll: &str,
+        field: &str,
+    ) -> crate::Result<usize> {
+        let lo = format!("{database_id}:{tenant}:{coll}:{field}:");
+        // `:` = 0x3A, next byte `;` = 0x3B gives a clean exclusive bound.
+        let hi = format!("{database_id}:{tenant}:{coll}:{field};");
+        let mut t = txn
+            .open_table(INDEXES_VERSIONED)
+            .map_err(|e| redb_err("open table", e))?;
+        let keys: Vec<String> = t
+            .range(lo.as_str()..hi.as_str())
+            .map_err(|e| redb_err("range", e))?
+            .map(|r| r.map(|(k, _)| k.value().to_string()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| redb_err("entry", e))?;
+        for key in &keys {
+            t.remove(key.as_str())
+                .map_err(|e| redb_err("remove entry", e))?;
+        }
+        Ok(keys.len())
+    }
+
     /// Look up doc_ids for a `(field, value)` pair at a system-time cutoff.
     /// Returns only doc_ids whose newest entry ≤ cutoff is live.
     pub fn versioned_index_lookup_as_of(

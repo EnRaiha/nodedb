@@ -45,7 +45,8 @@ impl CoreLoop {
         let Some(key) = hit.id.storage_key() else {
             return Ok(hit);
         };
-        if let Some(bytes) = self.sparse.get(database_id, tid, collection, &key)? {
+        // The row at its current version, so a bitemporal collection attaches.
+        if let Some(bytes) = self.current_row_body(database_id, tid, collection, &key)? {
             let format = self.sparse_body_format(
                 crate::types::DatabaseId::new(database_id),
                 crate::types::TenantId::new(tid),

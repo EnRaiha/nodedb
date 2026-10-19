@@ -45,6 +45,10 @@ pub(in crate::data::executor) struct ProjectUpdateRows<'a> {
     /// Declared `PRIMARY KEY` column of a schemaless collection, `None`
     /// otherwise. `Some` makes the post-image guard below run.
     pub(in crate::data::executor) declared_primary_key: Option<&'a str>,
+    /// The system time of the new versions on a bitemporal collection,
+    /// `None` on any other. A bitemporal strict tuple carries it in its
+    /// reserved slot.
+    pub(in crate::data::executor) bitemporal_sys_from_ms: Option<i64>,
 }
 
 /// What every row of one update projects under.
@@ -56,12 +60,14 @@ struct RowShape<'a> {
     updates: &'a [(String, UpdateValue)],
     strict_schema: Option<&'a StrictSchema>,
     declared_primary_key: Option<&'a str>,
+    bitemporal_sys_from_ms: Option<i64>,
 }
 
 /// The rows an update projects.
 pub(in crate::data::executor) enum MatchedRows<'a> {
-    /// Row keys whose current bodies are read from the store. A key whose
-    /// row is gone is skipped.
+    /// Row keys whose current bodies are read from the store, at the
+    /// current version on a bitemporal collection. A key whose row is gone
+    /// is skipped.
     Stored(&'a [StorageKey]),
     /// Rows with the current bodies the caller already read, such as a
     /// transaction's own staged writes merged over the store.
@@ -84,6 +90,7 @@ impl CoreLoop {
             updates,
             strict_schema,
             declared_primary_key,
+            bitemporal_sys_from_ms,
         } = p;
         let shape = RowShape {
             database_id,
@@ -92,13 +99,16 @@ impl CoreLoop {
             updates,
             strict_schema,
             declared_primary_key,
+            bitemporal_sys_from_ms,
         };
         let rows = match rows {
             MatchedRows::Read(rows) => rows,
             MatchedRows::Stored(keys) => {
                 let mut rows = Vec::with_capacity(keys.len());
                 for key in keys {
-                    if let Some(current) = self.sparse.get(database_id, tid, collection, key)? {
+                    if let Some(current) =
+                        self.current_row_body(database_id, tid, collection, key)?
+                    {
                         rows.push((*key, current));
                     }
                 }
@@ -127,6 +137,7 @@ impl CoreLoop {
             updates,
             strict_schema,
             declared_primary_key,
+            bitemporal_sys_from_ms,
         } = shape;
         let config_key = (
             DatabaseId::new(database_id),
@@ -247,14 +258,27 @@ impl CoreLoop {
         // Re-encode — format depends on storage mode. An encode error
         // carries its own typed cause, such as a field the strict schema
         // does not declare.
-        let updated_bytes = match strict_schema {
-            Some(schema) => {
+        // A bitemporal strict tuple stamps the version's system time, valid
+        // for all time, as the point update encodes it.
+        let updated_bytes = match (strict_schema, bitemporal_sys_from_ms) {
+            (Some(schema), Some(sys_from_ms)) if schema.bitemporal => {
+                let ndb_val: nodedb_types::Value = doc.clone().into();
+                crate::data::executor::strict_format::value_to_binary_tuple_bitemporal(
+                    &ndb_val,
+                    schema,
+                    sys_from_ms,
+                    i64::MIN,
+                    i64::MAX,
+                    collection,
+                )?
+            }
+            (Some(schema), _) => {
                 let ndb_val: nodedb_types::Value = doc.clone().into();
                 crate::data::executor::strict_format::value_to_binary_tuple(
                     &ndb_val, schema, collection,
                 )?
             }
-            None => doc_format::encode_to_msgpack(&doc),
+            (None, _) => doc_format::encode_to_msgpack(&doc),
         };
 
         Ok(ProjectedUpdateRow {
@@ -312,8 +336,7 @@ impl CoreLoop {
             // that assigns the period column into it.
             if let Some(lock) = period_lock {
                 for image in [&row.current_bytes, &row.updated_bytes] {
-                    crate::data::executor::enforcement::period_lock::check_period_lock(
-                        &self.sparse,
+                    self.check_period_lock_at(
                         database_id,
                         tid,
                         collection,

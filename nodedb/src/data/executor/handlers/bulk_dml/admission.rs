@@ -71,8 +71,8 @@ impl CoreLoop {
         // or an edge appeared or disappeared among the matched docs — since then,
         // the wrong edge would be retracted and a stale one would dangle. The
         // surrogate-set check above cannot see this: the surrogate set is
-        // unchanged. This runs BEFORE any write, so `sparse.get` still returns
-        // pre-mutation content.
+        // unchanged. This runs BEFORE any write, so `current_row_body` still
+        // returns pre-mutation content.
         if let Some(predicted) = admission.predicted_edges {
             let actual = self.ollp_actual_edges(database_id, tid, admission.collection, &apply_ids);
             if !super::scan::ollp_edges_match(actual, predicted) {
@@ -105,8 +105,8 @@ impl CoreLoop {
 
     /// Compute the sorted ACTUAL implicit-edge set for the matched docs.
     ///
-    /// For each matched storage key, fetch the stored doc bytes via the SAME
-    /// `sparse.get` path the delete loop uses, decode it, and — only when
+    /// For each matched storage key, read the current stored doc bytes via the
+    /// SAME `current_row_body` read the delete loop uses, decode it, and — only when
     /// it carries BOTH `_from` and `_to` as strings — record an
     /// [`OllpPredictedEdge`] with the raw `_type` as `label`. A matched doc
     /// without both endpoints is not an edge and is skipped; if it gained an
@@ -125,32 +125,38 @@ impl CoreLoop {
         collection: &str,
         matching_ids: &[StorageKey],
     ) -> Vec<OllpPredictedEdge> {
-        // `decode_document` returns `serde_json::Value`, whose `get`/`as_str`
-        // are inherent methods — no extra trait import needed.
         let mut edges: Vec<OllpPredictedEdge> = Vec::new();
         for key in matching_ids {
-            let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, key) else {
+            let Ok(Some(bytes)) = self.current_row_body(database_id, tid, collection, key) else {
                 continue;
             };
-            let Ok(doc) = doc_format::decode_document(&bytes) else {
-                continue;
-            };
-            let from = doc.get("_from").and_then(|v| v.as_str());
-            let to = doc.get("_to").and_then(|v| v.as_str());
-            if let (Some(from), Some(to)) = (from, to) {
-                let label = doc
-                    .get("_type")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                edges.push(OllpPredictedEdge {
-                    surrogate: key.surrogate().as_u32(),
-                    from: from.to_string(),
-                    to: to.to_string(),
-                    label,
-                });
-            }
+            edges.extend(implicit_edge_of(*key, &bytes));
         }
         edges.sort_unstable();
         edges
     }
+}
+
+/// The implicit edge a stored edge document carries: both `_from` and `_to`
+/// as strings, with the raw `_type` as label. `None` for any other row.
+///
+/// `decode_document` returns `serde_json::Value`, whose `get`/`as_str` are
+/// inherent methods. Bytes that do not decode, such as a strict Binary
+/// Tuple, carry no edge.
+pub(in crate::data::executor) fn implicit_edge_of(
+    key: StorageKey,
+    bytes: &[u8],
+) -> Option<OllpPredictedEdge> {
+    let doc = doc_format::decode_document(bytes).ok()?;
+    let from = doc.get("_from").and_then(|v| v.as_str())?;
+    let to = doc.get("_to").and_then(|v| v.as_str())?;
+    Some(OllpPredictedEdge {
+        surrogate: key.surrogate().as_u32(),
+        from: from.to_string(),
+        to: to.to_string(),
+        label: doc
+            .get("_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
 }

@@ -27,17 +27,7 @@ impl CoreLoop {
             None if !self.stage_base_visible(ctx.txn_id, &ctx.coll_key) => Ok(None),
             None => {
                 let storage_key = StorageKey::for_surrogate(ctx.surrogate);
-                if self.is_bitemporal(ctx.database_id, ctx.tid, ctx.collection) {
-                    self.sparse.versioned_get_current(
-                        ctx.database_id,
-                        ctx.tid,
-                        ctx.collection,
-                        &storage_key,
-                    )
-                } else {
-                    self.sparse
-                        .get(ctx.database_id, ctx.tid, ctx.collection, &storage_key)
-                }
+                self.current_row_body(ctx.database_id, ctx.tid, ctx.collection, &storage_key)
             }
         }
     }

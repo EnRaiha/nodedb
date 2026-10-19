@@ -297,15 +297,8 @@ async fn dispatch_dependent_edge_recon_inner(
             //
             // `predicted_edges` mirrors the recon `edges` (which carry the
             // surrogate of each edge doc) into the plan-carried wire type.
-            let predicted_edges: Vec<OllpPredictedEdge> = edges
-                .iter()
-                .map(|e| OllpPredictedEdge {
-                    surrogate: e.surrogate,
-                    from: e.from.clone(),
-                    to: e.to.clone(),
-                    label: e.label.clone(),
-                })
-                .collect();
+            let predicted_edges: Vec<OllpPredictedEdge> =
+                edges.iter().map(OllpPredictedEdge::from).collect();
 
             let mut edge_tasks: Vec<PhysicalTask> = Vec::new();
             // Node-delete guards run before every other task of the

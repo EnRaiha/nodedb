@@ -7,13 +7,12 @@
 //! - [`chunks`]: the streams a redo past the entry limit travels in.
 //! - [`propose`]: the proposal of a committed redo, inline or chunked.
 //! - [`abandon`]: the retry of a failed stream abandon.
-//! - [`collections`] / [`sum_targets`]: what the payload derives from the
-//!   commit's buffered plans.
+//! - [`sum_targets`]: what the payload derives from the commit's buffered
+//!   plans.
 
 pub mod abandon;
 pub mod apply;
 pub mod chunks;
-pub mod collections;
 pub mod payload;
 pub mod propose;
 pub mod sum_targets;

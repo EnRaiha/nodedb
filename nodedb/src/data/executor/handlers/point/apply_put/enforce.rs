@@ -13,10 +13,10 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::enforcement::append_only;
 use crate::data::executor::enforcement::update_transitions::{
     UpdateTransitionRules, check_update_transitions,
 };
-use crate::data::executor::enforcement::{append_only, period_lock};
 use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::ResolvedSumTarget;
 
@@ -77,16 +77,8 @@ impl CoreLoop {
         append_only::check_point_put(collection, &config.enforcement, old_value)
             .map_err(map_enforcement_error)?;
         if let Some(ref pl) = config.enforcement.period_lock {
-            period_lock::check_period_lock(
-                &self.sparse,
-                database_id,
-                tid,
-                collection,
-                value,
-                pl,
-                resolved_targets,
-            )
-            .map_err(map_enforcement_error)?;
+            self.check_period_lock_at(database_id, tid, collection, value, pl, resolved_targets)
+                .map_err(map_enforcement_error)?;
         }
         // Both images must be readable whenever a transition rule is
         // configured: skipping a configured check because an image would

@@ -9,9 +9,7 @@ use nodedb_types::RowIdentity;
 use super::constraint::OverlayPk;
 use super::context::StageCtx;
 use super::stage_returning::{StageReturning, StagedImage};
-use super::{
-    StageBalanceDeltaParams, StageBulkDeleteParams, StageBulkUpdateParams, StageSpatialInsertParams,
-};
+use super::{StageBalanceDeltaParams, StageSpatialInsertParams};
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::{MAX_TXN_OVERLAY_BYTES, Staged};
@@ -35,21 +33,13 @@ impl CoreLoop {
                 },
             );
         };
-        // Every core that stages a write for this transaction holds its
-        // overlay, even when the write stages no row. COMMIT's resolve refuses
-        // a transaction with staged writes whose overlay is missing. The
-        // overlay tags what a trigger body stages by this request's source.
-        let database_id = task.request.database_id;
-        let tenant_id = crate::types::TenantId::new(tid);
-        let collections =
-            crate::control::wal_replication::transaction_redo::collections::written_collections(
-                std::slice::from_ref(plan),
-            );
-        self.txn_overlay_mut(txn_id).begin_staging(
+        // The overlay tags what a trigger body stages by this request's source.
+        self.begin_plan_staging(
+            txn_id,
             task.request.event_source,
-            collections
-                .into_iter()
-                .map(|collection| (database_id, tenant_id, collection)),
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            plan,
         );
 
         let doc_op = match plan {
@@ -268,56 +258,10 @@ impl CoreLoop {
                     },
                 )
             }
-            // Predicate UPDATE staged like a point update, resolved against
-            // base ∪ overlay. A RETURNING spec projects the staged
-            // post-images.
-            DocumentOp::BulkUpdate {
-                collection,
-                filters,
-                updates,
-                returning,
-                ollp_predicted_surrogates: _,
-                ollp_predicted_edges: _,
-                rls_filters,
-                rls_write_check,
-                // Staged post-images become concrete point ops at commit.
-                resolved_sum_targets: _,
-                declared_primary_key,
-            } => self.stage_bulk_update(StageBulkUpdateParams {
-                task,
-                tid,
-                txn_id,
-                collection: collection.as_str(),
-                filter_bytes: filters,
-                updates,
-                rls_write_check,
-                declared_primary_key: declared_primary_key.as_deref(),
-                returning: StageReturning::of(returning, rls_filters),
-            }),
-
-            // Predicate DELETE staged like a point delete, resolved against
-            // base ∪ overlay. A RETURNING spec projects the removed rows.
-            DocumentOp::BulkDelete {
-                collection,
-                filters,
-                returning,
-                ollp_predicted_surrogates: _,
-                ollp_predicted_edges: _,
-                rls_filters,
-                rls_write_check,
-                // See the `BulkUpdate` arm: staging carries no delta.
-                resolved_sum_targets: _,
-                declared_primary_key,
-            } => self.stage_bulk_delete(StageBulkDeleteParams {
-                task,
-                tid,
-                txn_id,
-                collection: collection.as_str(),
-                filter_bytes: filters,
-                rls_write_check,
-                declared_primary_key: declared_primary_key.as_deref(),
-                returning: StageReturning::of(returning, rls_filters),
-            }),
+            // Predicate UPDATE and DELETE, resolved against base ∪ overlay.
+            DocumentOp::BulkUpdate { .. } | DocumentOp::BulkDelete { .. } => {
+                self.stage_bulk_document_write(task, tid, txn_id, doc_op)
+            }
 
             // `UPSERT INTO`: resolve the current body under base ∪ overlay,
             // mirroring `execute_upsert`. A RETURNING spec projects the row

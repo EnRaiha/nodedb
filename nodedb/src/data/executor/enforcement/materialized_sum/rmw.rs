@@ -214,31 +214,21 @@ impl CoreLoop {
 
     /// Read the target row's current stored bytes.
     ///
-    /// The plain read goes through the CALLER'S write transaction so a second
-    /// delta against the same row in the same transaction sees the first one's
-    /// result. A bitemporal target reads its current version the same way
-    /// `apply_point_put` reads its own pre-image.
+    /// The read goes through the CALLER'S write transaction so a second delta
+    /// against the same row in the same transaction sees the first one's
+    /// result, at the current version on a bitemporal target.
     fn read_balance_row(
         &self,
         txn: &WriteTransaction,
         params: &BalanceRmw<'_>,
         storage_key: &nodedb_types::StorageKey,
     ) -> crate::Result<Option<Vec<u8>>> {
-        if self.is_bitemporal(params.database_id, params.tid, params.target_collection) {
-            self.sparse.versioned_get_current(
-                params.database_id,
-                params.tid,
-                params.target_collection,
-                storage_key,
-            )
-        } else {
-            self.sparse.get_in_txn(
-                txn,
-                params.database_id,
-                params.tid,
-                params.target_collection,
-                storage_key,
-            )
-        }
+        self.current_row_body_in_txn(
+            txn,
+            params.database_id,
+            params.tid,
+            params.target_collection,
+            storage_key,
+        )
     }
 }

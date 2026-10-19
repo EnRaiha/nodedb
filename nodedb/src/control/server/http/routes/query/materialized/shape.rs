@@ -83,7 +83,7 @@ pub(super) async fn run_task_loop(
         };
 
         if let Some(orchestrated) = run_orchestrated(&state.shared, identity, &task).await? {
-            append_payload(&mut result_rows, &orchestrated.payload, &append)?;
+            append_payload(&mut result_rows, &orchestrated.payload, &append).await?;
             if orchestrated.metered {
                 meter_task_dispatch(
                     &state.shared,
@@ -115,7 +115,7 @@ pub(super) async fn run_task_loop(
         .map_err(gateway_error)?
         {
             crate::control::server::shared::clone_write::CloneCheckedOutcome::Handled(resp) => {
-                append_response(&mut result_rows, resp, &append)?;
+                append_response(&mut result_rows, resp, &append).await?;
                 meter_task_dispatch(
                     &state.shared,
                     &scope,
@@ -144,7 +144,7 @@ pub(super) async fn run_task_loop(
             .await
             .map_err(gateway_error)?;
         for payload in &payloads {
-            append_payload(&mut result_rows, payload, &append)?;
+            append_payload(&mut result_rows, payload, &append).await?;
         }
         meter_task_dispatch(
             &state.shared,

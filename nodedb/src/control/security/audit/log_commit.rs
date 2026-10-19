@@ -223,17 +223,71 @@ mod tests {
         }
     }
 
+    /// Recorders in the group-commit test.
+    const RECORDERS: usize = 32;
+
+    /// The real audit WAL, with every sync held until `expected` entries are appended.
+    ///
+    /// Each recorder appends under the audit lock and syncs after releasing it.
+    /// So the gate opens only when every recorder staged before any sync ran.
+    struct AppendGatedSink {
+        wal: Arc<WalManager>,
+        expected: usize,
+        appended: Mutex<usize>,
+        all_appended: Condvar,
+    }
+
+    impl AuditWalSink for AppendGatedSink {
+        fn append_batch(&self, entries: &[AuditEntry]) -> crate::Result<Vec<u64>> {
+            let positions = AuditWalSink::append_batch(&*self.wal, entries)?;
+            let mut appended = self.appended.lock().unwrap_or_else(|p| p.into_inner());
+            *appended += entries.len();
+            self.all_appended.notify_all();
+            Ok(positions)
+        }
+
+        fn sync_through(&self, position: u64) -> crate::Result<()> {
+            let appended = self.appended.lock().unwrap_or_else(|p| p.into_inner());
+            let (appended, _) = self
+                .all_appended
+                .wait_timeout_while(appended, Duration::from_secs(30), |appended| {
+                    *appended < self.expected
+                })
+                .unwrap_or_else(|p| p.into_inner());
+            if *appended < self.expected {
+                return Err(crate::Error::Internal {
+                    detail: format!(
+                        "only {} of {} recorders appended within 30s; a sync wait holds the audit lock",
+                        *appended, self.expected
+                    ),
+                });
+            }
+            drop(appended);
+            AuditWalSink::sync_through(&*self.wal, position)
+        }
+
+        fn truncate_through(&self, position: u64) -> crate::Result<()> {
+            AuditWalSink::truncate_through(&*self.wal, position)
+        }
+    }
+
     #[test]
     fn concurrent_recorders_share_fsyncs_and_keep_seq_order() {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal =
             Arc::new(WalManager::open_for_testing(&dir.path().join("group.wal")).expect("WAL"));
+        let sink = Arc::new(AppendGatedSink {
+            wal: Arc::clone(&wal),
+            expected: RECORDERS,
+            appended: Mutex::new(0),
+            all_appended: Condvar::new(),
+        });
         let audit = Arc::new(Mutex::new(AuditLog::new(1_000)));
-        lock_audit_log(&audit).set_wal_sink(Arc::clone(&wal) as Arc<dyn AuditWalSink>);
+        lock_audit_log(&audit).set_wal_sink(sink as Arc<dyn AuditWalSink>);
         let syncs_before = wal.audit_sync_count();
-        let start = Arc::new(Barrier::new(32));
+        let start = Arc::new(Barrier::new(RECORDERS));
 
-        let threads: Vec<_> = (0..32)
+        let threads: Vec<_> = (0..RECORDERS)
             .map(|i| {
                 let (audit, start) = (Arc::clone(&audit), Arc::clone(&start));
                 std::thread::spawn(move || {
@@ -248,16 +302,18 @@ mod tests {
             thread.join().expect("recorder thread").expect("durable");
         }
 
+        // The first leader syncs every record appended so far, which is all of them.
+        // Every other recorder finds its LSN covered and issues no sync.
         let syncs = wal.audit_sync_count() - syncs_before;
-        assert!(
-            syncs < 32,
-            "32 single recorders must share fsyncs, saw {syncs}"
+        assert_eq!(
+            syncs, 1,
+            "{RECORDERS} recorders staged before any sync must share one fsync, saw {syncs}"
         );
         let log = lock_audit_log(&audit);
         let published: Vec<u64> = log.all().iter().map(|e| e.seq).collect();
         assert_eq!(
             published,
-            (1..=32).collect::<Vec<u64>>(),
+            (1..=RECORDERS as u64).collect::<Vec<u64>>(),
             "every entry is published once"
         );
         drop(log);

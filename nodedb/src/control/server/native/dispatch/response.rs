@@ -17,7 +17,7 @@ use super::{
     shape_error_to_native, to_native_columns_rows,
 };
 
-pub(crate) fn data_plane_response_to_native(
+pub(crate) async fn data_plane_response_to_native(
     ctx: &DispatchCtx<'_>,
     seq: u64,
     plan: &PhysicalPlan,
@@ -57,7 +57,9 @@ pub(crate) fn data_plane_response_to_native(
         redaction: Some(redaction.ctx(&ctx.state.redaction)),
         // No projection, so no Control-Plane computed column to resolve.
         sequences: None,
-    }) {
+    })
+    .await
+    {
         Ok(ShapeOutcome::Rows(shaped)) => {
             let (columns, rows) = to_native_columns_rows(&shaped);
             NativeResponse {

@@ -50,18 +50,20 @@ impl CoreLoop {
             }
         };
 
-        let matching_ids = match self.scan_matching_documents(
+        // Each matching row at its current version: the newest version on a
+        // bitemporal collection, the plain table on any other.
+        let matching_rows = match self.current_matching_rows(
             task.request.database_id.as_u64(),
             tid,
             collection,
             &filters,
         ) {
-            Ok(ids) => ids,
+            Ok(rows) => rows,
             Err(e) => return self.response_error(task, e),
         };
 
         let matching_set: HashSet<nodedb_types::StorageKey> =
-            matching_ids.iter().copied().collect();
+            matching_rows.iter().map(|(key, _)| *key).collect();
 
         // Step 2: For each facet field, count values.
         let mut facet_result = serde_json::Map::new();
@@ -78,7 +80,7 @@ impl CoreLoop {
                 collection,
                 field,
                 &matching_set,
-                &matching_ids,
+                &matching_rows,
             ) {
                 Ok(counts) => counts,
                 Err(e) => return self.response_error(task, e),
@@ -135,7 +137,7 @@ impl CoreLoop {
         collection: &str,
         field: &str,
         matching_set: &HashSet<nodedb_types::StorageKey>,
-        matching_ids: &[nodedb_types::StorageKey],
+        matching_rows: &[(nodedb_types::StorageKey, Vec<u8>)],
     ) -> crate::Result<Vec<(String, usize)>> {
         // Fast path: index-backed counting with filtered doc set.
         let groups = self.sparse.scan_index_groups_filtered(
@@ -156,44 +158,39 @@ impl CoreLoop {
         // strict collection's Binary Tuple untouched — `extract_field` then
         // finds nothing in every row and the facet reports an empty count
         // rather than an error, so the facet silently disagrees with the scan
-        // that produced `matching_ids`.
+        // that produced `matching_rows`.
         let body_format = self.sparse_body_format(
             crate::types::DatabaseId::new(database_id),
             crate::types::TenantId::new(tid),
             collection,
         );
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for key in matching_ids {
-            if let Some(bytes) = self.sparse.get(database_id, tid, collection, key)? {
-                let mp = crate::data::executor::scan_normalize::sparse_body_to_msgpack(
-                    &bytes,
-                    body_format.as_format_ref(),
-                );
-                if let Some((start, end)) = nodedb_query::msgpack_scan::extract_field(&mp, 0, field)
-                {
-                    let value_str = if let Some(s) =
-                        nodedb_query::msgpack_scan::read_str(&mp, start)
-                    {
-                        s.to_string()
-                    } else if let Some(i) = nodedb_query::msgpack_scan::read_integer(&mp, start) {
-                        i.to_string()
-                    } else if let Some(f) = nodedb_query::msgpack_scan::read_f64(&mp, start) {
-                        f.to_string()
-                    } else if let Some(b) = nodedb_query::msgpack_scan::read_bool(&mp, start) {
-                        b.to_string()
-                    } else if nodedb_query::msgpack_scan::read_null(&mp, start) {
-                        continue;
-                    } else {
-                        // Complex value — stringify via transcoder.
-                        nodedb_types::msgpack_to_json_string(&mp[start..end]).map_err(|e| {
-                            crate::Error::Serialization {
-                                format: "msgpack".to_string(),
-                                detail: format!("facet value of '{field}' in {key}: {e}"),
-                            }
-                        })?
-                    };
-                    *counts.entry(value_str).or_default() += 1;
-                }
+        for (key, bytes) in matching_rows {
+            let mp = crate::data::executor::scan_normalize::sparse_body_to_msgpack(
+                bytes,
+                body_format.as_format_ref(),
+            );
+            if let Some((start, end)) = nodedb_query::msgpack_scan::extract_field(&mp, 0, field) {
+                let value_str = if let Some(s) = nodedb_query::msgpack_scan::read_str(&mp, start) {
+                    s.to_string()
+                } else if let Some(i) = nodedb_query::msgpack_scan::read_integer(&mp, start) {
+                    i.to_string()
+                } else if let Some(f) = nodedb_query::msgpack_scan::read_f64(&mp, start) {
+                    f.to_string()
+                } else if let Some(b) = nodedb_query::msgpack_scan::read_bool(&mp, start) {
+                    b.to_string()
+                } else if nodedb_query::msgpack_scan::read_null(&mp, start) {
+                    continue;
+                } else {
+                    // Complex value — stringify via transcoder.
+                    nodedb_types::msgpack_to_json_string(&mp[start..end]).map_err(|e| {
+                        crate::Error::Serialization {
+                            format: "msgpack".to_string(),
+                            detail: format!("facet value of '{field}' in {key}: {e}"),
+                        }
+                    })?
+                };
+                *counts.entry(value_str).or_default() += 1;
             }
         }
 

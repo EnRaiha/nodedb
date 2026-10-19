@@ -2,30 +2,30 @@
 
 //! `FROM ARRAY_*(...)`: an array table-function call as a SELECT's source.
 //!
-//! `ARRAY_SLICE` and `ARRAY_PROJECT` read cells. Their rows form a relation
-//! whose columns are the array's dims and the requested attrs, so the SELECT
-//! plans over it like over a derived table: the call becomes the one
-//! definition of a CTE, and the SELECT reads that definition by name through
-//! the generic relational tail (WHERE, projection, GROUP BY, HAVING, ORDER
-//! BY, DISTINCT, LIMIT / OFFSET, windows).
+//! Every call's rows form a relation, so the SELECT plans over it like over
+//! a derived table: the call becomes the one definition of a CTE, and the
+//! SELECT reads that definition by name through the generic relational tail
+//! (WHERE, projection, GROUP BY, HAVING, ORDER BY, DISTINCT, LIMIT / OFFSET,
+//! windows).
 //!
-//! `ARRAY_AGG` and `ARRAY_ELEMENTWISE` emit rows of their own shape. A
-//! SELECT over them takes `*` or plain output columns and a row bound;
-//! every other clause is refused by name.
+//! - `ARRAY_SLICE` and `ARRAY_PROJECT` read cells. Their columns are the
+//!   array's dims and the requested attrs.
+//! - `ARRAY_AGG` and `ARRAY_ELEMENTWISE` emit rows of their own shape. Their
+//!   columns are the call's output columns.
 
 use sqlparser::ast::{self, Select};
 
 use super::array_cell_geom::rewrite_cell_geometry;
 use super::cte_catalog::CteCatalog;
-use super::helpers::{convert_projection, plain_table_factor};
+use super::helpers::plain_table_factor;
 use super::query_tail::QueryTail;
-use super::select_stmt::{PlannedSelect, has_aggregation, plan_select};
+use super::select_stmt::{PlannedSelect, plan_select};
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
 use crate::planner::array_fn::{ArrayTableFn, push_down_into_slice, try_plan_array_table_fn};
-use crate::planner::ast_helpers::{single_table_qualifiers, strip_single_table_qualifiers};
-use crate::resolver::array_tvf::{ARRAY_SYSTEM_TIME_COLUMN, array_slice_columns};
-use crate::resolver::columns::TableScope;
+use crate::resolver::array_tvf::{
+    ARRAY_SYSTEM_TIME_COLUMN, array_slice_columns, array_table_fn_columns,
+};
 use crate::temporal::TemporalScope;
 use crate::types::*;
 
@@ -53,7 +53,7 @@ pub(in crate::planner::select) fn try_plan_array_from(
         ArrayTableFn::Slice(slice) => plan_cell_read(&ctx, "ARRAY_SLICE", slice)?,
         ArrayTableFn::Project(slice) => plan_cell_read(&ctx, "ARRAY_PROJECT", slice)?,
         call @ (ArrayTableFn::Agg(_) | ArrayTableFn::Elementwise(_)) => {
-            plan_non_relational(&ctx, temporal, call)?
+            plan_result_read(&ctx, call)?
         }
     };
     Ok(Some(planned))
@@ -73,7 +73,7 @@ fn plan_cell_read(
     // before the outer SELECT resolves its expressions.
     let rewritten = rewrite_cell_geometry(ctx.select, ctx.tail.order_by, &view, &read.qualifier)?;
     let outer = match &rewritten {
-        None => read.plan_outer(ctx, columns)?,
+        None => read.plan_outer(ctx, columns, StarRead::Columns)?,
         Some(rewrite) => {
             let tail = QueryTail {
                 order_by: rewrite.order_by.as_ref(),
@@ -87,11 +87,36 @@ fn plan_cell_read(
                 tail: &tail,
                 statement_output: ctx.statement_output,
             };
-            read.plan_outer(&rewritten_ctx, columns)?
+            read.plan_outer(&rewritten_ctx, columns, StarRead::Columns)?
         }
     };
     push_down_into_slice(&mut slice, &view, &outer.plan, &read.name);
     Ok(read.into_cte(SqlPlan::ArraySlice(slice), outer))
+}
+
+/// Plan the SELECT over the rows an `ARRAY_AGG` or `ARRAY_ELEMENTWISE` call
+/// emits, as the relation the call names.
+///
+/// The relation's columns are the call's output columns. A plain `*` stays a
+/// star, so it reads every key the call's rows carry, as the call announces
+/// them.
+fn plan_result_read(ctx: &OuterContext<'_>, call: ArrayTableFn) -> Result<PlannedSelect> {
+    let read = RelationRead::new(ctx, call.sql_name(), call.array_name())?;
+    let columns = array_table_fn_columns(ctx.catalog, &call)?;
+    let outer = read.plan_outer(ctx, columns, StarRead::SourceRows)?;
+    Ok(read.into_cte(call.into_plan(), outer))
+}
+
+/// How a plain `*` in the SELECT list reads the relation.
+#[derive(Clone, Copy)]
+enum StarRead {
+    /// One typed column per relation column, in schema order. A cell read
+    /// announces its dims and attrs this way.
+    Columns,
+    /// The star itself. It reads every key the source rows carry, under the
+    /// names the source announces, so a temporal call keeps its summary-row
+    /// flag.
+    SourceRows,
 }
 
 /// The parts of the enclosing SELECT every arm reads.
@@ -146,12 +171,18 @@ impl RelationRead {
         &self,
         ctx: &OuterContext<'_>,
         columns: Vec<ColumnInfo>,
+        star: StarRead,
     ) -> Result<PlannedSelect> {
-        let star_columns: Vec<String> = columns
-            .iter()
-            .map(|c| c.name.clone())
-            .filter(|name| name != ARRAY_SYSTEM_TIME_COLUMN)
-            .collect();
+        let star_columns: Option<Vec<String>> = match star {
+            StarRead::Columns => Some(
+                columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .filter(|name| name != ARRAY_SYSTEM_TIME_COLUMN)
+                    .collect(),
+            ),
+            StarRead::SourceRows => None,
+        };
         let info = CollectionInfo {
             name: self.name.clone(),
             engine: EngineType::DocumentSchemaless,
@@ -180,10 +211,12 @@ impl RelationRead {
                 at: None,
             }),
         );
-        outer_select.projection =
-            expand_wildcards(&ctx.select.projection, &qualifier, &star_columns)?;
+        if let Some(star_columns) = &star_columns {
+            outer_select.projection =
+                expand_wildcards(&ctx.select.projection, &qualifier, star_columns)?;
+        }
         // The temporal qualifier reads the array's versions and rides on the
-        // slice plan. The relation the SELECT reads is those versions'
+        // call's plan. The relation the SELECT reads is those versions'
         // rows, with no history of its own.
         plan_select(
             &outer_select,
@@ -282,91 +315,6 @@ fn is_plain_wildcard(options: &ast::WildcardAdditionalOptions) -> bool {
         && options.opt_replace.is_none()
         && options.opt_rename.is_none()
         && options.opt_alias.is_none()
-}
-
-/// Plan a SELECT over `ARRAY_AGG` / `ARRAY_ELEMENTWISE`.
-///
-/// The call's rows are its result. The SELECT may list `*` or the call's
-/// own output columns, and bound the rows with LIMIT / FETCH. A filter,
-/// grouping, ordering, dedup, offset, window or computed column has no
-/// dims-and-attrs relation to read, so each is refused by name.
-fn plan_non_relational(
-    ctx: &OuterContext<'_>,
-    temporal: TemporalScope,
-    call: ArrayTableFn,
-) -> Result<PlannedSelect> {
-    let fn_name = call.sql_name();
-    let select = ctx.select;
-    let refuse = |clause: &str| -> Result<PlannedSelect> {
-        Err(SqlError::Unsupported {
-            detail: format!(
-                "{clause} over {fn_name} is not supported: {fn_name} emits its own result \
-                 rows, not the array's dims and attrs; read the cells with ARRAY_SLICE"
-            ),
-        })
-    };
-    if select.selection.is_some() {
-        return refuse("WHERE");
-    }
-    if has_aggregation(select, ctx.functions) {
-        return refuse("GROUP BY or an aggregate");
-    }
-    if select.having.is_some() {
-        return refuse("HAVING");
-    }
-    if select.qualify.is_some() {
-        return refuse("QUALIFY");
-    }
-    if !select.named_window.is_empty() {
-        return refuse("WINDOW");
-    }
-    if select.distinct.is_some() {
-        return refuse("DISTINCT");
-    }
-    if ctx.tail.order_by.is_some() {
-        return refuse("ORDER BY");
-    }
-    if ctx.tail.limit_offset()?.1 != 0 {
-        return refuse("OFFSET");
-    }
-
-    let scope = TableScope::resolve_from(ctx.catalog, ctx.functions, temporal, &select.from)?;
-    let table = scope
-        .single_table()
-        .cloned()
-        .ok_or_else(|| SqlError::Unsupported {
-            detail: format!("{fn_name}: FROM must name the call alone"),
-        })?;
-    let normalized = strip_single_table_qualifiers(select, &single_table_qualifiers(&table))?;
-    let projection = convert_projection(&normalized.projection, &scope)?;
-    let plain = projection.iter().all(|p| match p {
-        Projection::Star | Projection::QualifiedStar(_) | Projection::Column(_) => true,
-        Projection::Computed { expr, .. } => matches!(expr, SqlExpr::Column { .. }),
-        Projection::CpComputed { .. } => false,
-    });
-    if !plain {
-        return refuse("a computed SELECT-list expression");
-    }
-
-    let source = call.into_plan();
-    let star_only = projection
-        .iter()
-        .all(|p| matches!(p, Projection::Star | Projection::QualifiedStar(_)));
-    let plan = if star_only {
-        source
-    } else {
-        SqlPlan::Subquery {
-            input: Box::new(source),
-            filters: Vec::new(),
-            projection,
-            window_functions: Vec::new(),
-            sort_keys: Vec::new(),
-            offset: 0,
-            distinct: false,
-            limit: None,
-        }
-    };
-    Ok(PlannedSelect { plan, scope })
 }
 
 #[cfg(test)]
@@ -609,33 +557,107 @@ mod tests {
         }
     }
 
-    #[test]
-    fn where_over_array_agg_is_refused_by_name() {
-        let err = plan("SELECT * FROM ARRAY_AGG('img', 'nir', 'sum') WHERE result > 1")
-            .expect_err("refused");
-        let SqlError::Unsupported { detail } = err else {
-            panic!("expected Unsupported, got {err:?}");
+    /// The relation name, the call body and the outer read of a planned
+    /// `ARRAY_AGG` / `ARRAY_ELEMENTWISE` read.
+    fn call_parts(plan: SqlPlan) -> (String, SqlPlan, SqlPlan) {
+        let SqlPlan::Cte(CtePlan {
+            mut definitions,
+            outer,
+        }) = plan
+        else {
+            panic!("expected Cte, got {plan:?}");
         };
-        assert!(detail.starts_with("WHERE over ARRAY_AGG"), "{detail}");
+        let (name, body) = definitions.remove(0);
+        (name, body, *outer)
+    }
+
+    /// The plan the executor lowers for `sql`: the outer read with the call
+    /// inlined.
+    fn inlined(sql: &str) -> SqlPlan {
+        let (name, body, outer) = call_parts(plan(sql).expect("plans"));
+        crate::planner::cte::inline_cte(&outer, &name, &body)
     }
 
     #[test]
-    fn order_by_over_array_elementwise_is_refused_by_name() {
-        let err =
-            plan("SELECT * FROM ARRAY_ELEMENTWISE('img', 'img', 'add', 'nir') ORDER BY coords")
-                .expect_err("refused");
-        let SqlError::Unsupported { detail } = err else {
-            panic!("expected Unsupported, got {err:?}");
+    fn order_by_alias_and_round_over_array_agg_ride_the_tail() {
+        match inlined(
+            "SELECT \"group\" AS g, ROUND(result, 4) AS r \
+             FROM ARRAY_AGG('img', 'nir', 'mean', 'x') ORDER BY g",
+        ) {
+            SqlPlan::Subquery {
+                input,
+                projection,
+                sort_keys,
+                ..
+            } => {
+                assert!(matches!(*input, SqlPlan::ArrayAgg(_)));
+                assert_eq!(sort_keys.len(), 1);
+                assert!(
+                    projection
+                        .iter()
+                        .any(|p| matches!(p, Projection::Computed { alias, .. } if alias == "r")),
+                    "{projection:?}"
+                );
+            }
+            other => panic!("expected Subquery over ArrayAgg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_by_group_with_limit_over_array_agg_rides_the_tail() {
+        match inlined(
+            "SELECT \"group\", result FROM ARRAY_AGG('img', 'nir', 'sum', 'x') \
+             ORDER BY \"group\" DESC LIMIT 2",
+        ) {
+            SqlPlan::Subquery {
+                input,
+                sort_keys,
+                limit,
+                ..
+            } => {
+                assert!(matches!(*input, SqlPlan::ArrayAgg(_)));
+                assert_eq!(sort_keys.len(), 1);
+                assert_eq!(limit, Some(2));
+            }
+            other => panic!("expected Subquery over ArrayAgg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn where_on_result_over_array_agg_filters_the_rows() {
+        match inlined("SELECT * FROM ARRAY_AGG('img', 'nir', 'sum') WHERE result > 1") {
+            SqlPlan::Subquery { input, filters, .. } => {
+                assert!(matches!(*input, SqlPlan::ArrayAgg(_)));
+                assert_eq!(filters.len(), 1);
+            }
+            other => panic!("expected Subquery over ArrayAgg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn star_over_array_agg_reads_the_call_unchanged() {
+        let (name, body, outer) =
+            call_parts(plan("SELECT * FROM ARRAY_AGG('img', 'nir', 'sum', 'x')").expect("plans"));
+        assert_eq!(name, "ARRAY_AGG(img)");
+        let SqlPlan::Scan { projection, .. } = &outer else {
+            panic!("expected outer Scan, got {outer:?}");
         };
         assert!(
-            detail.starts_with("ORDER BY over ARRAY_ELEMENTWISE"),
-            "{detail}"
+            projection
+                .iter()
+                .all(|p| matches!(p, Projection::Star | Projection::QualifiedStar(_))),
+            "the star stays a star: {projection:?}"
         );
+        assert!(crate::planner::cte::reads_cte_body_unchanged(&outer, &name));
+        assert!(matches!(
+            crate::planner::cte::inline_cte(&outer, &name, &body),
+            SqlPlan::ArrayAgg(_)
+        ));
     }
 
     #[test]
-    fn plain_agg_columns_wrap_in_a_projecting_tail() {
-        match plan("SELECT result FROM ARRAY_AGG('img', 'nir', 'sum') LIMIT 1").expect("plans") {
+    fn plain_agg_column_with_limit_rides_the_tail() {
+        match inlined("SELECT result FROM ARRAY_AGG('img', 'nir', 'sum') LIMIT 1") {
             SqlPlan::Subquery {
                 input,
                 projection,
@@ -648,5 +670,28 @@ mod tests {
             }
             other => panic!("expected Subquery over ArrayAgg, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn group_by_over_array_elementwise_aggregates_the_relation() {
+        let (name, body, outer) = call_parts(
+            plan("SELECT COUNT(*) AS n FROM ARRAY_ELEMENTWISE('img', 'img', 'add', 'nir')")
+                .expect("plans"),
+        );
+        assert_eq!(name, "ARRAY_ELEMENTWISE(img)");
+        assert!(matches!(body, SqlPlan::ArrayElementwise(_)));
+        let SqlPlan::Aggregate { input, .. } = outer else {
+            panic!("expected Aggregate, got {outer:?}");
+        };
+        assert!(matches!(*input, SqlPlan::Scan { ref collection, .. } if *collection == name));
+    }
+
+    #[test]
+    fn an_unknown_column_over_array_agg_is_refused() {
+        let err = plan("SELECT nir FROM ARRAY_AGG('img', 'nir', 'sum')").expect_err("refused");
+        assert!(
+            matches!(err, SqlError::UnknownColumn { .. }),
+            "unexpected error {err:?}"
+        );
     }
 }

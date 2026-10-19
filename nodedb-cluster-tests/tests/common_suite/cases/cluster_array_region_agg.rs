@@ -137,3 +137,29 @@ async fn cluster_array_agg_groups_by_a_float_dim_value() {
     }
     cluster.shutdown().await;
 }
+
+/// A grouped `ARRAY_AGG` read as a relation: a WHERE, a computed column and
+/// an ORDER BY by alias run over the merged groups on every node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_array_agg_result_rows_take_a_relational_tail() {
+    let cluster = spawn_genome().await;
+    let sql = "SELECT \"group\" AS chr, ROUND(result, 1) AS total \
+               FROM ARRAY_AGG('genome', 'qual', 'sum', 'chr') \
+               WHERE result > 10 ORDER BY chr DESC";
+    for (idx, node) in cluster.nodes.iter().enumerate() {
+        let rows = node
+            .query_named_rows(sql)
+            .await
+            .unwrap_or_else(|e| panic!("node {idx}: {sql}: {e}"));
+        let got: Vec<(f64, f64)> = rows
+            .iter()
+            .map(|row| (number(&row["chr"]), number(&row["total"])))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(2.0, 600.0), (1.0, 60.0)],
+            "node {idx}: filtered groups, descending"
+        );
+    }
+    cluster.shutdown().await;
+}

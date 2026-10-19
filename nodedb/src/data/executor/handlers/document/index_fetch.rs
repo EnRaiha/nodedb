@@ -42,6 +42,9 @@ pub(in crate::data::executor) struct IndexedFetchParams<'a> {
     pub projection: &'a [String],
     pub limit: usize,
     pub offset: usize,
+    /// `FOR SYSTEM_TIME AS OF <ms>` cutoff on a bitemporal collection,
+    /// `None` for the current state.
+    pub system_as_of_ms: Option<i64>,
 }
 
 impl CoreLoop {
@@ -157,6 +160,7 @@ impl CoreLoop {
             projection: _projection,
             limit,
             offset,
+            system_as_of_ms,
         } = params;
         debug!(
             core = self.core_id,
@@ -170,15 +174,29 @@ impl CoreLoop {
 
         let database_id = task.request.database_id.as_u64();
         let bitemporal = self.is_bitemporal(database_id, tid, collection);
-        let doc_engine =
-            crate::engine::document::store::DocumentEngine::new(&self.sparse, database_id, tid);
-        let mut doc_ids: Vec<StorageKey> =
-            match doc_engine.index_lookup(collection, path, value, bitemporal) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    return self.response_error(task, ErrorCode::from(e));
-                }
-            };
+        // An `AS OF` read answers from the versioned index at its cutoff: a
+        // row matches when its newest entry at or before the cutoff is live.
+        // The planner refuses `AS OF` on a plain collection, so only a
+        // bitemporal collection carries a cutoff.
+        let as_of_ms = system_as_of_ms.filter(|_| bitemporal);
+        let looked_up = match as_of_ms {
+            Some(ms) => self.sparse.versioned_index_lookup_as_of(
+                database_id,
+                tid,
+                collection,
+                path,
+                value,
+                Some(ms),
+            ),
+            None => {
+                crate::engine::document::store::DocumentEngine::new(&self.sparse, database_id, tid)
+                    .index_lookup(collection, path, value, bitemporal)
+            }
+        };
+        let mut doc_ids: Vec<StorageKey> = match looked_up {
+            Ok(ids) => ids,
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
+        };
 
         // Strict collections store Binary Tuple bytes; the response codec
         // expects msgpack maps. Decode-then-encode here so cross-engine
@@ -234,7 +252,9 @@ impl CoreLoop {
                 }
             }
         };
-        if let Some(txn_id) = task.request.txn_id {
+        // An `AS OF` read never sees the overlay, whose staged bodies are
+        // current-version only, as the document scan does.
+        if let (Some(txn_id), None) = (task.request.txn_id, as_of_ms) {
             let (is_array, case_insensitive) = self.index_path_flags(&config_key, path);
             if let Err(e) = self.merge_overlay_into_index_lookup(
                 super::super::transaction::overlay::IndexOverlayMergeParams {
@@ -267,20 +287,25 @@ impl CoreLoop {
             if rows.len() >= limit {
                 break;
             }
-            // Bitemporal collections keep the current body on the versioned
-            // document table; the plain DOCUMENTS table is empty for them.
             // A doc ID the overlay merge added or superseded above has no
             // correct body in base storage — `overlay_or_base_body` prefers
-            // the staged `Put` bytes and only falls back to a base fetch
-            // when the overlay has nothing staged for this surrogate.
-            let fetched = self.overlay_or_base_body(task.request.txn_id, &coll_key, doc_id, || {
-                if bitemporal {
-                    self.sparse
-                        .versioned_get_current(database_id, tid, collection, doc_id)
-                } else {
-                    self.sparse.get(database_id, tid, collection, doc_id)
-                }
-            });
+            // the staged `Put` bytes and only falls back to a base fetch of
+            // the current version when the overlay has nothing staged for
+            // this surrogate.
+            // An `AS OF` read takes each row's version as of the cutoff.
+            let fetched = match as_of_ms {
+                Some(ms) => self.sparse.versioned_get_as_of(
+                    database_id,
+                    tid,
+                    collection,
+                    doc_id,
+                    Some(ms),
+                    None,
+                ),
+                None => self.overlay_or_base_body(task.request.txn_id, &coll_key, doc_id, || {
+                    self.current_row_body(database_id, tid, collection, doc_id)
+                }),
+            };
             match fetched {
                 Ok(Some(bytes)) => {
                     // A row matching the indexed term but failing the residual

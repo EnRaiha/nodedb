@@ -3,9 +3,9 @@
 //! Control operation handlers — module root.
 
 pub mod calvin;
-mod calvin_active_verify;
 mod calvin_overlay_stage;
 mod calvin_overlay_stage_bulk;
+mod calvin_overlay_stage_bulk_dispatch;
 mod calvin_passive_read;
 pub mod calvin_reply;
 mod calvin_resolve;

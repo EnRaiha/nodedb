@@ -251,6 +251,7 @@ where
                 state,
                 &op,
                 sessions.tx_id(session_id),
+                None,
             )
             .await
             .map_err(StagingGateError::Dispatch)?;

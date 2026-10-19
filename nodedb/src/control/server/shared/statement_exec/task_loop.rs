@@ -158,11 +158,12 @@ pub(crate) async fn run_statement_loop(
                         continue;
                     }
                     Ok(TxnTaskOutcome::Staged(outcome)) => {
-                        fold.fold_staged(exec, &plan, outcome)?;
+                        fold.fold_staged(exec, &plan, outcome).await?;
                         continue;
                     }
                     Ok(TxnTaskOutcome::CloneHandled(clone_response)) => {
-                        fold.fold_answer(exec, &plan, clone_response.payload.as_ref())?;
+                        fold.fold_answer(exec, &plan, clone_response.payload.as_ref())
+                            .await?;
                         continue;
                     }
                     Ok(TxnTaskOutcome::InsteadOf) => {
@@ -260,7 +261,9 @@ pub(crate) async fn run_statement_loop(
         }
 
         fold.last_lsn = task_response.watermark_lsn.as_u64();
-        let task_rows = fold.fold_answer(exec, &plan, task_response.payload.as_ref())?;
+        let task_rows = fold
+            .fold_answer(exec, &plan, task_response.payload.as_ref())
+            .await?;
 
         // Metered once per successfully dispatched task.
         if let Some(info) = &plan_metering_info {

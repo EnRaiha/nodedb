@@ -126,7 +126,8 @@ pub(super) async fn dispatch_single_task(
                 read_versions: crate::types::ReadVersions::new(),
                 write_set: Vec::new(),
             };
-            return data_plane_response_to_native(ctx, seq, &plan_for_staged_response, &synthetic);
+            return data_plane_response_to_native(ctx, seq, &plan_for_staged_response, &synthetic)
+                .await;
         }
         Err(StagingGateError::Dispatch(e)) => return error_to_native(seq, &e),
         Err(StagingGateError::Rejected { code }) => {
@@ -221,7 +222,7 @@ pub(super) async fn dispatch_single_task(
                 )
                 .await;
             }
-            let native = data_plane_response_to_native(ctx, seq, &plan_for_response, &resp);
+            let native = data_plane_response_to_native(ctx, seq, &plan_for_response, &resp).await;
             // Metered here, once this task's real dispatch has already
             // succeeded — covers the `Read` route (autocommit writes/reads,
             // in-transaction reads); see `plan_metering_info`'s doc comment

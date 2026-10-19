@@ -3,8 +3,6 @@
 //! The rows a predicate document write matches: the base rows its filters
 //! match, and, inside a transaction, that transaction's own staged writes.
 
-use std::cell::Cell;
-
 use crate::bridge::envelope::ErrorCode;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
@@ -15,7 +13,8 @@ use crate::types::TenantId;
 use super::context::DocResolveCtx;
 
 impl CoreLoop {
-    /// Every `(row key, current body)` that `filters` match in `collection`.
+    /// Every `(row key, current body)` that `filters` match in `collection`,
+    /// each at the current version the mutation's precondition reads.
     ///
     /// A request that carries a transaction id reads its own writes: a
     /// staged delete drops its row, a staged put is matched again against
@@ -27,39 +26,17 @@ impl CoreLoop {
         collection: &str,
         filters: &[ScanFilter],
     ) -> Result<Vec<(StorageKey, Vec<u8>)>, ErrorCode> {
-        let keys = self
-            .scan_matching_documents(ctx.database_id, ctx.tid, collection, filters)
-            .map_err(ErrorCode::from)?;
-        let mut rows = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(stored) = self.doc_resolve_read(ctx, collection, &key)? {
-                rows.push((key, stored));
+        let rows = match task.request.txn_id {
+            Some(txn_id) => {
+                let coll_key = (
+                    task.request.database_id,
+                    TenantId::new(ctx.tid),
+                    collection.to_string(),
+                );
+                self.txn_matching_rows(txn_id, &coll_key, filters)
             }
-        }
-        let Some(txn_id) = task.request.txn_id else {
-            return Ok(rows);
+            None => self.current_matching_rows(ctx.database_id, ctx.tid, collection, filters),
         };
-
-        let coll_key = (
-            task.request.database_id,
-            TenantId::new(ctx.tid),
-            collection.to_string(),
-        );
-        let raw_matches = self.strict_aware_matcher(ctx.database_id, ctx.tid, collection, filters);
-        // The merge takes an infallible predicate, so an evaluation error
-        // (division by zero) is held here and raised once the merge returns.
-        let predicate_err: Cell<Option<nodedb_query::EvalError>> = Cell::new(None);
-        let matches = |row_key: &StorageKey, body: &[u8]| match raw_matches(row_key, body) {
-            Ok(matched) => matched,
-            Err(e) => {
-                predicate_err.set(Some(e));
-                false
-            }
-        };
-        self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
-        if let Some(e) = predicate_err.take() {
-            return Err(ErrorCode::from(crate::Error::from(e)));
-        }
-        Ok(rows)
+        rows.map_err(ErrorCode::from)
     }
 }

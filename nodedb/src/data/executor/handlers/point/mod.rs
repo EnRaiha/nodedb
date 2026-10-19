@@ -10,6 +10,7 @@
 pub mod apply_delete;
 pub mod apply_put;
 pub mod delete;
+pub mod delete_version;
 pub mod get;
 pub mod insert;
 pub mod overlay_lookup;

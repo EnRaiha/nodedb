@@ -88,19 +88,6 @@ pub(in crate::data::executor) struct SubgraphEdge<'a> {
     pub dst: &'a str,
 }
 
-#[derive(Serialize, zerompk::ToMessagePack)]
-#[msgpack(map)]
-pub(crate) struct GraphRagResult {
-    pub node_id: String,
-    pub rrf_score: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vector_rank: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vector_distance: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hop_distance: Option<usize>,
-}
-
 /// Structured response for DML with RETURNING clause.
 ///
 /// Carries one entry per affected row, with the projected column values.
@@ -227,30 +214,6 @@ impl<'a> zerompk::ToMessagePack for HybridSearchHit<'a> {
         }
         Ok(())
     }
-}
-
-#[derive(Serialize, zerompk::ToMessagePack)]
-#[msgpack(map)]
-pub(crate) struct GraphRagResponse {
-    pub results: Vec<GraphRagResult>,
-    pub metadata: GraphRagMetadata,
-}
-
-#[derive(Serialize, zerompk::ToMessagePack)]
-#[msgpack(map)]
-pub(crate) struct GraphRagMetadata {
-    pub vector_candidates: usize,
-    pub graph_expanded: usize,
-    pub truncated: bool,
-    /// Expanded nodes that carry no surrogate and therefore cannot intersect
-    /// another engine's candidates. They are traversed and returned like any
-    /// other node; what this reports is that the *cross-engine* view of the
-    /// expansion is narrower than the expansion itself. Non-zero alongside a
-    /// low result count means missing identity bindings, not a small graph.
-    pub graph_unaddressable: usize,
-    /// Snapshot watermark LSN at the time of query execution.
-    /// Consumers can use this to verify they are reading a consistent view.
-    pub watermark_lsn: u64,
 }
 
 #[cfg(test)]

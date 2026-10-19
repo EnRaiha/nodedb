@@ -140,13 +140,7 @@ impl CoreLoop {
             0
         };
         let database_id = task.request.database_id.as_u64();
-        let get_result = if bitemporal {
-            self.sparse
-                .versioned_get_current(database_id, tid, collection, &storage_key)
-        } else {
-            self.sparse.get(database_id, tid, collection, &storage_key)
-        };
-        match get_result {
+        match self.current_row_body(database_id, tid, collection, &storage_key) {
             Ok(Some(current_bytes)) => {
                 // A period lock gates both images of an update: the PRE-image,
                 // because a closed period must reject any edit to a row it
@@ -157,16 +151,14 @@ impl CoreLoop {
                 // both refuse.
                 if let Some(config) = self.doc_configs.get(&config_key)
                     && let Some(ref pl) = config.enforcement.period_lock
-                    && let Err(e) =
-                        crate::data::executor::enforcement::period_lock::check_period_lock(
-                            &self.sparse,
-                            database_id,
-                            tid,
-                            collection,
-                            &current_bytes,
-                            pl,
-                            resolved_sum_targets,
-                        )
+                    && let Err(e) = self.check_period_lock_at(
+                        database_id,
+                        tid,
+                        collection,
+                        &current_bytes,
+                        pl,
+                        resolved_sum_targets,
+                    )
                 {
                     return self.response_error(task, e);
                 }
@@ -199,16 +191,14 @@ impl CoreLoop {
                 // even when the pre-image lived in an open one.
                 if let Some(config) = self.doc_configs.get(&config_key)
                     && let Some(ref pl) = config.enforcement.period_lock
-                    && let Err(e) =
-                        crate::data::executor::enforcement::period_lock::check_period_lock(
-                            &self.sparse,
-                            database_id,
-                            tid,
-                            collection,
-                            &updated_bytes,
-                            pl,
-                            resolved_sum_targets,
-                        )
+                    && let Err(e) = self.check_period_lock_at(
+                        database_id,
+                        tid,
+                        collection,
+                        &updated_bytes,
+                        pl,
+                        resolved_sum_targets,
+                    )
                 {
                     return self.response_error(task, e);
                 }

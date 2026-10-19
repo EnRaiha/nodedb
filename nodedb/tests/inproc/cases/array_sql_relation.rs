@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `ARRAY_SLICE` as a relation: every SELECT clause applies over its rows.
+//! `ARRAY_SLICE` and `ARRAY_AGG` as relations: every SELECT clause applies
+//! over their rows.
 //!
 //! The fixture is a 4x4 image with two bands. Cell `(x, y)` has index
 //! `k = 4x + y`, `nir = (k + 1) / 20` and `red = (16 - k) / 40`, so every
@@ -253,18 +254,26 @@ async fn array_slice_derived_table_matches_direct() {
 }
 
 #[tokio::test]
-async fn array_agg_where_refused() {
+async fn array_agg_result_rows_take_where_and_order_by() {
     let srv = TestServer::start().await;
     prepare_img(&srv).await;
 
-    srv.expect_error(
-        "SELECT * FROM ARRAY_AGG('img', 'nir', 'sum') WHERE result > 1",
-        "WHERE over ARRAY_AGG is not supported",
-    )
-    .await;
-    srv.expect_error(
-        "SELECT * FROM ARRAY_AGG('img', 'nir', 'sum') ORDER BY result",
-        "ORDER BY over ARRAY_AGG is not supported",
-    )
-    .await;
+    // Group `x` sums to `(16x + 10) / 20`: 0.5, 1.3, 2.1, 2.9.
+    let sql = "SELECT \"group\", ROUND(result, 1) AS total \
+               FROM ARRAY_AGG('img', 'nir', 'sum', 'x') \
+               WHERE result > 1 ORDER BY \"group\" DESC";
+    let rows = srv
+        .query_rows(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let got: Vec<(i64, f64)> = rows
+        .iter()
+        .map(|row| (int(&row[0]), float(&row[1])))
+        .collect();
+    let expected = [(3, 2.9), (2, 2.1), (1, 1.3)];
+    assert_eq!(got.len(), expected.len(), "{got:?}");
+    for ((g, v), (eg, ev)) in got.iter().zip(expected) {
+        assert_eq!(*g, eg, "{got:?}");
+        assert!((v - ev).abs() < 1e-9, "{got:?}");
+    }
 }

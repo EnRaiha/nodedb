@@ -101,14 +101,14 @@ impl NodeDbPgHandler {
     /// does, through `shape_response_materialized` with the task's plan. A
     /// forwarded Data-Plane payload has the shape a local core produces, and
     /// the plan-dependent steps (the KV point-get `{key, value}` row wrap, the
-    /// vector surrogate-to-PK translation) must run on it too: shaped without
+    /// search surrogate-to-PK naming) must run on it too: shaped without
     /// them, a KV point read's stored value decodes as a scalar and yields no
     /// row. `shape_plan` is the task's plan, which a row-producing kind always
     /// carries (see [`plan_produces_rows`]).
     ///
     /// Returns the rows the payload decoded to, `None` for a passthrough
     /// payload with no row count.
-    pub(super) fn fold_gateway_payload(
+    pub(super) async fn fold_gateway_payload(
         &self,
         fold: &mut GatewayFold,
         payload: &[u8],
@@ -133,6 +133,7 @@ impl NodeDbPgHandler {
                 redaction: Some(shaping.redaction.ctx(&self.state.redaction)),
                 sequences: None,
             })
+            .await
             .map_err(|e| shape_error_to_pg(&e))?,
             (true, None) => {
                 return Err(error_to_pg(&crate::Error::Internal {

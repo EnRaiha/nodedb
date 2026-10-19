@@ -290,6 +290,86 @@ impl SparseEngine {
     ) -> crate::Result<Option<Vec<u8>>> {
         self.versioned_get_as_of(database_id, tenant, coll, doc_id, None, None)
     }
+
+    /// Visit every version of every row of `coll`, in row order and, within
+    /// a row, in ascending system time. A live version hands over its body.
+    /// A tombstone or an erasure hands over `None`. A visit error ends the
+    /// scan and is returned.
+    pub fn versioned_for_each_version(
+        &self,
+        database_id: u64,
+        tenant: u64,
+        coll: &str,
+        mut visit: impl FnMut(&StorageKey, i64, Option<&[u8]>) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let lo = super::key::coll_prefix(database_id, tenant, coll);
+        let hi = super::key::coll_prefix_end(database_id, tenant, coll);
+        let txn = self.db.begin_read().map_err(|e| redb_err("read txn", e))?;
+        let t = txn
+            .open_table(DOCUMENTS_VERSIONED)
+            .map_err(|e| redb_err("open table", e))?;
+        let range = t
+            .range(lo.as_str()..hi.as_str())
+            .map_err(|e| redb_err("range", e))?;
+        for entry in range {
+            let (k, v) = entry.map_err(|e| redb_err("entry", e))?;
+            let key_str = k.value();
+            let Some((id_part, suffix)) = key_str.rsplit_once('\x00') else {
+                continue;
+            };
+            let Some(seg) = id_part.strip_prefix(lo.as_str()) else {
+                continue;
+            };
+            let doc_id = StorageKey::parse(seg).ok_or_else(|| {
+                crate::engine::sparse::btree::invalid_storage_key_err(
+                    crate::engine::sparse::btree::KeyedTable::DocumentsVersioned,
+                    coll,
+                    seg,
+                )
+            })?;
+            let Ok(sys_from_ms) = suffix.parse::<i64>() else {
+                continue;
+            };
+            let bytes = v.value();
+            let decoded = decode_value(bytes)?;
+            visit(
+                &doc_id,
+                sys_from_ms,
+                decoded.is_live().then_some(decoded.body),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::versioned_get_current`] read inside `txn`, so it sees the
+    /// versions `txn` staged. The newest version decides: a tombstone or an
+    /// erasure hides the row.
+    pub fn versioned_get_current_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        database_id: u64,
+        tenant: u64,
+        coll: &str,
+        doc_id: &StorageKey,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        let lo = doc_prefix(database_id, tenant, coll, doc_id);
+        let hi = doc_prefix_end(database_id, tenant, coll, doc_id);
+        let t = txn
+            .open_table(DOCUMENTS_VERSIONED)
+            .map_err(|e| redb_err("open table", e))?;
+        let newest = t
+            .range(lo.as_str()..hi.as_str())
+            .map_err(|e| redb_err("range", e))?
+            .next_back()
+            .transpose()
+            .map_err(|e| redb_err("entry", e))?;
+        let Some((_key, value)) = newest else {
+            return Ok(None);
+        };
+        let bytes = value.value();
+        let decoded = decode_value(bytes)?;
+        Ok(decoded.is_live().then(|| decoded.body.to_vec()))
+    }
 }
 
 #[cfg(test)]

@@ -79,6 +79,39 @@ impl SystemCatalog {
         Ok(found)
     }
 
+    /// The PK bound to each of `surrogates` in `key` under `tenant_id`, in
+    /// `surrogates` order, read in one read transaction. `None` for a
+    /// surrogate with no binding.
+    pub fn get_pks_for_surrogates(
+        &self,
+        key: CollectionKey<'_>,
+        tenant_id: TenantId,
+        surrogates: &[Surrogate],
+    ) -> crate::Result<Vec<Option<Vec<u8>>>> {
+        if surrogates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("surrogate_pk_rev batch read txn", e))?;
+        let Some(scope) = read_scope(&txn, key, tenant_id)? else {
+            return Ok(vec![None; surrogates.len()]);
+        };
+        let table = txn
+            .open_table(SURROGATE_PK_REV)
+            .map_err(|e| catalog_err("open surrogate_pk_rev", e))?;
+        surrogates
+            .iter()
+            .map(|surrogate| {
+                Ok(table
+                    .get(rev_key(scope, surrogate.as_u32()))
+                    .map_err(|e| catalog_err("get surrogate_pk_rev", e))?
+                    .map(|v| v.value().to_vec()))
+            })
+            .collect()
+    }
+
     /// Remove a surrogate ↔ PK binding atomically. Idempotent.
     pub fn delete_surrogate(
         &self,
@@ -295,6 +328,33 @@ mod tests {
             cat.get_pk_for_surrogate(coll("users"), T0, Surrogate::new(7))
                 .unwrap(),
             Some(b"alice".to_vec())
+        );
+    }
+
+    /// One batch read answers every surrogate in order, `None` for an
+    /// unbound one, and an unknown collection answers `None` throughout.
+    #[test]
+    fn batch_reverse_read_answers_in_order() {
+        let (_dir, cat) = open_catalog();
+        cat.put_surrogate(coll("users"), T0, b"alice", Surrogate::new(7))
+            .unwrap();
+        cat.put_surrogate(coll("users"), T0, b"bob", Surrogate::new(9))
+            .unwrap();
+        let wanted = [Surrogate::new(9), Surrogate::new(8), Surrogate::new(7)];
+        assert_eq!(
+            cat.get_pks_for_surrogates(coll("users"), T0, &wanted)
+                .unwrap(),
+            vec![Some(b"bob".to_vec()), None, Some(b"alice".to_vec())]
+        );
+        assert_eq!(
+            cat.get_pks_for_surrogates(coll("nobody"), T0, &wanted)
+                .unwrap(),
+            vec![None, None, None]
+        );
+        assert!(
+            cat.get_pks_for_surrogates(coll("users"), T0, &[])
+                .unwrap()
+                .is_empty()
         );
     }
 

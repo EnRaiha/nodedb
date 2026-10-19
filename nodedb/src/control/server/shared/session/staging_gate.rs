@@ -30,7 +30,7 @@ use crate::control::server::shared::metering::{PlanMeteringInfo, meter_staged_wr
 use crate::control::server::shared::quota_admission::admit_quota_for_dispatch;
 use crate::control::server::shared::session::StatementDeadline;
 use crate::control::server::shared::sql::staging_predicates::{
-    is_stageable_write, require_affected_count, stageable_write_shape, stages_returning,
+    require_affected_count, stageable_write_shape, stages_returning,
 };
 use crate::control::server::shared::write_admission::{plan_is_write, plan_requires_txn_buffering};
 use crate::control::state::SharedState;
@@ -43,7 +43,6 @@ use super::connection::SessionId;
 use super::leader_forward::{forward_to_leader, resolve_leader};
 use super::state::TransactionState;
 use super::store::SessionStore;
-use super::txn_expand::expand_for_buffering;
 pub use crate::control::server::shared::sql::staging_predicates::StagedTagKind;
 
 /// Outcome of routing a single task through the in-transaction staging gate.
@@ -232,40 +231,14 @@ where
         ));
     }
 
-    // A delete on an edge-bearing collection carries the edge tasks of each
-    // row it deletes. They are read before the delete stages, so the read
-    // still sees the rows.
-    let node_delete_tasks =
-        crate::control::planner::calvin::node_delete_txn::txn_node_delete_tasks(
-            state,
-            &task,
-            sessions.tx_id(session_id),
-        )
-        .await
-        .map_err(StagingGateError::Dispatch)?;
-
     // Point writes execute at STATEMENT time via the staging overlay (real
     // tag + statement-time constraint errors); the plan is still buffered so
     // COMMIT stays the sole durable apply. Other writes keep buffer + "OK",
-    // reshaped first into the per-shard plans COMMIT can replay.
-    let route = if is_stageable_write(&task.plan) {
-        InTxnRoute::Staged(stage_write(state, sessions, session_id, task, &dispatch).await?)
-    } else {
-        let buffered = expand_for_buffering(task).map_err(StagingGateError::Dispatch)?;
-        for shard_task in buffered {
-            sessions.buffer_write(session_id, shard_task);
-        }
-        InTxnRoute::Buffered
-    };
-    super::node_delete_stage::stage_node_delete_tasks(
-        state,
-        sessions,
-        session_id,
-        node_delete_tasks,
-        &dispatch,
-    )
-    .await?;
-    Ok(route)
+    // reshaped first into the per-shard plans COMMIT can replay. A predicate
+    // write stages with its prediction, and every write with the edge tasks
+    // it derives.
+    super::predicted_stage::stage_predicted_write(state, sessions, session_id, task, &dispatch)
+        .await
 }
 
 /// Wrap `plan` in a `MetaOp::StageWrite` task addressed to `vshard_id`,

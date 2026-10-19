@@ -64,34 +64,16 @@ impl CoreLoop {
         }
     }
 
-    /// The row's raw stored body, or `None` when absent. Reads through the
-    /// same current-state view the live write path uses; becomes the
-    /// mutation's `precondition`.
+    /// The row's current stored body as a resolve error type, or `None` when
+    /// absent. It becomes the mutation's `precondition`.
     pub(super) fn doc_resolve_read(
         &self,
         ctx: &DocResolveCtx,
         collection: &str,
         row_key: &StorageKey,
     ) -> Result<Option<Vec<u8>>, ErrorCode> {
-        self.doc_current_bytes(ctx.database_id, ctx.tid, collection, row_key)
-    }
-
-    /// The same current-state read, for a caller with no [`DocResolveCtx`] —
-    /// the apply path, which checks one precondition per mutation.
-    pub(in crate::data::executor) fn doc_current_bytes(
-        &self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        row_key: &StorageKey,
-    ) -> Result<Option<Vec<u8>>, ErrorCode> {
-        let read = if self.is_bitemporal(database_id, tid, collection) {
-            self.sparse
-                .versioned_get_current(database_id, tid, collection, row_key)
-        } else {
-            self.sparse.get(database_id, tid, collection, row_key)
-        };
-        read.map_err(ErrorCode::from)
+        self.current_row_body(ctx.database_id, ctx.tid, collection, row_key)
+            .map_err(ErrorCode::from)
     }
 }
 

@@ -83,12 +83,9 @@ impl CoreLoop {
     /// `commit_pending`, so a subsequent `CalvinResolve` builds one redo record
     /// and [`CoreLoop::install_calvin_redo`] installs it.
     ///
-    /// The one divergence from the static path: OLLP predicate verification
-    /// (leader-only) runs HERE, before staging, via
-    /// [`CoreLoop::verify_calvin_active_ollp`]. The dependent-read path has no
-    /// write-versioned read-set to vote on; its conflict detector is the OLLP
-    /// `actual != predicted` re-check. A mismatch returns `OllpRetryRequired`
-    /// and stages nothing, so no redo entry exists for it. The Control
+    /// A predicate plan checks its OLLP prediction as it stages, on this path
+    /// and the static one alike. A mismatch returns `OllpRetryRequired` and
+    /// drops everything staged, so no redo entry exists for it. The Control
     /// Plane scheduler releases locks and re-recons on `OllpRetryRequired`.
     ///
     /// The coordinator bakes the values it read into concrete point ops, so
@@ -128,16 +125,6 @@ impl CoreLoop {
             trace_id = ?task.request.trace_id,
         )
         .entered();
-
-        // OLLP verification runs HERE, before staging, so a predicate-drift
-        // mismatch surfaces on THIS stage response (where the scheduler releases
-        // locks and re-recons) and nothing is staged or resolved.
-        let verified = self.verify_calvin_active_ollp(task, tenant_id.as_u64(), plans);
-        match verified {
-            Ok(true) => {}
-            Ok(false) => return self.calvin_stage_refusal(task, ErrorCode::OllpRetryRequired),
-            Err(e) => return self.calvin_stage_refusal(task, e.into()),
-        }
 
         let synthetic_txn_id = match calvin_synthetic_txn_id(epoch, position, vshard_id) {
             Ok(id) => id,
@@ -399,9 +386,8 @@ mod tests {
 
     /// On the data-group leader, a predicate-write plan whose carried OLLP
     /// predicted set no longer matches live state returns `OllpRetryRequired`
-    /// BEFORE staging anything — so no stale redo is WAL-appended and the
-    /// coordinator can re-recon under a fresh attempt. Verifying at stage time
-    /// (not install) is the one divergence from the static path.
+    /// and keeps nothing staged — so no stale redo is WAL-appended and the
+    /// coordinator can re-recon under a fresh attempt.
     #[test]
     fn calvin_execute_active_ollp_drift_returns_retry_and_stages_nothing() {
         let dir = tempfile::tempdir().unwrap();

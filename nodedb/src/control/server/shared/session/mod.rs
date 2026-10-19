@@ -32,6 +32,7 @@ pub mod overlay_drop;
 mod own_writes;
 mod params;
 pub mod pending_shard_reads;
+mod predicted_stage;
 pub mod read_consistency;
 pub mod read_set;
 pub mod record_reads;

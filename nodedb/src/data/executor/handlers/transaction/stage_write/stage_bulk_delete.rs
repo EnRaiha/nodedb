@@ -7,7 +7,7 @@
 //!
 //! Mirrors point `DELETE` staging in `dispatch.rs` (`stage_point_delete`):
 //! each row in the BASE ∪ OVERLAY matching set (resolved via
-//! [`CoreLoop::merge_overlay_into_scan`]) is recorded as a staged tombstone.
+//! [`CoreLoop::txn_matching_rows`]) is recorded as a staged tombstone.
 //! Nothing is written durably here — cascades (inverted index, secondary
 //! indexes, graph edges) run only at COMMIT replay through the real apply
 //! path, exactly as a staged point delete defers its cascade today.
@@ -17,8 +17,8 @@ use nodedb_types::StorageKey;
 use super::body::stored_row_identity;
 use super::stage_returning::{StageReturning, StagedRowsOf};
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::bulk_dml::{TxnPrediction, decode_bulk_filters};
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{DatabaseId, TenantId, TxnId};
@@ -39,6 +39,9 @@ pub(in crate::data::executor) struct StageBulkDeleteParams<'a> {
     pub declared_primary_key: Option<&'a str>,
     /// The plan's `RETURNING` spec, `None` when it carries none.
     pub returning: Option<StageReturning<'a>>,
+    /// The rows the Control Plane read at this statement. `None` when the
+    /// plan carries none.
+    pub prediction: Option<TxnPrediction<'a>>,
 }
 
 impl CoreLoop {
@@ -59,61 +62,28 @@ impl CoreLoop {
             rls_write_check,
             declared_primary_key,
             returning,
+            prediction,
         } = params;
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
             (database_id, TenantId::new(tid), collection.to_string());
 
-        let filters: Vec<ScanFilter> = if filter_bytes.is_empty() {
-            Vec::new()
-        } else {
-            match zerompk::from_msgpack(filter_bytes) {
-                Ok(f) => f,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("deserialize filters: {e}"),
-                        },
-                    );
-                }
-            }
-        };
-
-        // BASE matching set: the same scan-and-filter primitive the
-        // autocommit bulk handler uses, then fetch each matched row's
-        // current body so the overlay merge can re-check staged puts.
-        let mut rows = match self.stage_bulk_base_rows(
-            task,
-            database_id.as_u64(),
-            tid,
-            collection,
-            &filters,
-        ) {
-            Ok(rows) => rows,
-            Err(resp) => return resp,
-        };
-
+        // The BASE ∪ OVERLAY matching set, BASE read at each row's current
+        // version.
+        let rows = match decode_bulk_filters(filter_bytes)
+            .and_then(|filters| self.txn_matching_rows(txn_id, &coll_key, &filters))
         {
-            // `merge_overlay_into_scan` takes an infallible
-            // `Fn(&StorageKey, &[u8]) -> bool` predicate, so a division/modulo-
-            // by-zero is captured via this `Cell` side-channel and checked once
-            // the merge returns.
-            let raw_matches =
-                self.strict_aware_matcher(database_id.as_u64(), tid, collection, &filters);
-            let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-                std::cell::Cell::new(None);
-            let matches = |row_key: &StorageKey, body: &[u8]| match raw_matches(row_key, body) {
-                Ok(b) => b,
-                Err(e) => {
-                    predicate_err.set(Some(e));
-                    false
-                }
-            };
-            self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
-            if let Some(e) = predicate_err.take() {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
+
+        // The carried prediction is the read the Control Plane took at this
+        // statement. Rows that differ refuse the stage before anything stages,
+        // and the Control Plane reads again.
+        if let Some(prediction) = prediction
+            && !prediction.holds(&rows)
+        {
+            return self.response_error(task, ErrorCode::OllpRetryRequired);
         }
 
         // Gate every matched row on the collection's write policy BEFORE any
@@ -185,5 +155,83 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+    use nodedb_types::{DatabaseId, QualifiedCollection, Surrogate};
+
+    use crate::bridge::envelope::{ErrorCode, Status};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+    use crate::data::executor::doc_format;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{TenantId, TxnId};
+
+    fn delete_all(predicted: Option<Vec<u32>>) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::BulkDelete {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, "orders"),
+            filters: Vec::new(),
+            returning: None,
+            ollp_predicted_surrogates: predicted,
+            ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
+        })
+    }
+
+    fn seed(core: &mut CoreLoop, task: &ExecutionTask, surrogate: u32) {
+        let body = doc_format::encode_to_msgpack(&serde_json::json!({"a": "1"}));
+        core.sparse
+            .put(
+                task.request.database_id.as_u64(),
+                task.request.tenant_id.as_u64(),
+                "orders",
+                &nodedb_types::StorageKey::for_surrogate(Surrogate::new(surrogate)),
+                &body,
+            )
+            .expect("seed row");
+    }
+
+    /// A predicate delete whose carried prediction misses a matching row
+    /// refuses with `OllpRetryRequired` and stages no tombstone.
+    #[test]
+    fn stale_prediction_refuses_the_stage_and_stages_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _tx, _rx): (CoreLoop, _, _) = make_core_with_dir(dir.path());
+        let txn_id = TxnId::new(7);
+        let mut request = make_default_task().request;
+        request.txn_id = Some(txn_id);
+        let task = ExecutionTask::new(request);
+        seed(&mut core, &task, 1);
+        seed(&mut core, &task, 2);
+        let tid = task.request.tenant_id.as_u64();
+
+        let plan = delete_all(Some(vec![1]));
+        let refused = core.execute_stage_write(&task, tid, &plan);
+        assert_eq!(refused.status, Status::Error);
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some(&ErrorCode::OllpRetryRequired)
+        );
+        let coll_key = (
+            task.request.database_id,
+            TenantId::new(tid),
+            "orders".to_string(),
+        );
+        let staged = core
+            .txn_overlays
+            .get(&txn_id)
+            .map(|overlay| overlay.iter_for_collection(&coll_key).count())
+            .unwrap_or(0);
+        assert_eq!(staged, 0, "a refused stage stages no tombstone");
+
+        let plan = delete_all(Some(vec![1, 2]));
+        let accepted = core.execute_stage_write(&task, tid, &plan);
+        assert_eq!(accepted.status, Status::Ok, "{:?}", accepted.error_code);
     }
 }

@@ -205,44 +205,9 @@ impl CoreLoop {
                 }
                 affected_reply(documents.len()).map_err(ErrorCode::from)
             }
-            PhysicalPlan::Document(DocumentOp::BulkDelete {
-                collection,
-                ollp_predicted_surrogates,
-                rls_write_check,
-                declared_primary_key,
-                ..
-            }) => self
-                .stage_calvin_bulk_delete(super::calvin_overlay_stage_bulk::CalvinBulkDeleteStage {
-                    task,
-                    tid,
-                    txn_id,
-                    collection: collection.as_str(),
-                    ollp_predicted_surrogates: ollp_predicted_surrogates.as_deref(),
-                    rls_write_check,
-                    declared_primary_key: declared_primary_key.as_deref(),
-                })
-                .and_then(affected_reply)
-                .map_err(ErrorCode::from),
-            PhysicalPlan::Document(DocumentOp::BulkUpdate {
-                collection,
-                updates,
-                ollp_predicted_surrogates,
-                rls_write_check,
-                declared_primary_key,
-                ..
-            }) => self
-                .stage_calvin_bulk_update(super::calvin_overlay_stage_bulk::CalvinBulkUpdateStage {
-                    task,
-                    tid,
-                    txn_id,
-                    collection: collection.as_str(),
-                    updates,
-                    ollp_predicted_surrogates: ollp_predicted_surrogates.as_deref(),
-                    rls_write_check,
-                    declared_primary_key: declared_primary_key.as_deref(),
-                })
-                .and_then(affected_reply)
-                .map_err(ErrorCode::from),
+            PhysicalPlan::Document(
+                op @ (DocumentOp::BulkDelete { .. } | DocumentOp::BulkUpdate { .. }),
+            ) => self.stage_calvin_bulk_plan(task, tid, txn_id, op),
             PhysicalPlan::Document(DocumentOp::BatchInsert {
                 collection,
                 documents,

@@ -239,21 +239,15 @@ impl CoreLoop {
 
         let mut stopped = false;
         if overlay.is_none_or(|o| o.base_visible(&coll_key)) {
-            self.for_each_text_base_row(
-                database_id.as_u64(),
-                p.tid,
-                p.collection,
-                |key, bytes| {
-                    // A row the transaction staged is emitted from its staged body.
-                    if overlay.is_some_and(|o| o.get(&coll_key, key.surrogate().as_u32()).is_some())
-                    {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    let flow = emit(key, bytes)?;
-                    stopped = flow.is_break();
-                    Ok(flow)
-                },
-            )?;
+            self.for_each_current_row(database_id.as_u64(), p.tid, p.collection, |key, bytes| {
+                // A row the transaction staged is emitted from its staged body.
+                if overlay.is_some_and(|o| o.get(&coll_key, key.surrogate().as_u32()).is_some()) {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let flow = emit(key, bytes)?;
+                stopped = flow.is_break();
+                Ok(flow)
+            })?;
         }
         if let Some(overlay) = overlay
             && !stopped

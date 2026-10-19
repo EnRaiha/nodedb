@@ -38,7 +38,7 @@ use super::super::execute_dml_hooks::{self, PreDispatchHandled};
 use super::super::result_shaping::ResultShaping;
 use super::super::streaming::StreamSelectContext;
 use super::finish::StatementTail;
-use super::task::ShapeTaskParams;
+use super::task::{ShapeTaskParams, staged_rows_response};
 use super::tracking::DispatchedTask;
 use super::txn_task::StatementTxnOutcome;
 use crate::control::server::shared::txn_route::{StatementEvents, TxnTaskContext};
@@ -198,7 +198,8 @@ impl NodeDbPgHandler {
                                 &mut responses,
                                 &mut returning_rows,
                                 &mut statement_tag,
-                            )?;
+                            )
+                            .await?;
                         }
                         continue;
                     }
@@ -446,7 +447,8 @@ impl NodeDbPgHandler {
                     &mut responses,
                     &mut returning_rows,
                     &mut statement_tag,
-                )?
+                )
+                .await?
             };
 
             // Metered here, once per successfully dispatched task — every
@@ -482,21 +484,5 @@ impl NodeDbPgHandler {
         )?;
 
         Ok(responses)
-    }
-}
-
-/// A staged write's `RETURNING` rows as the response the shaper reads.
-fn staged_rows_response(rows: Vec<u8>) -> crate::bridge::envelope::Response {
-    crate::bridge::envelope::Response {
-        request_id: crate::types::RequestId::new(0),
-        status: crate::bridge::envelope::Status::Ok,
-        attempt: 0,
-        partial: false,
-        payload: crate::bridge::envelope::Payload::from_vec(rows),
-        watermark_lsn: crate::types::Lsn::ZERO,
-        error_code: None,
-        stage_vote: None,
-        read_versions: crate::types::ReadVersions::new(),
-        write_set: Vec::new(),
     }
 }

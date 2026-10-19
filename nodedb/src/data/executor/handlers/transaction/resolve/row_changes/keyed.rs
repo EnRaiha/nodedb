@@ -257,13 +257,9 @@ impl CoreLoop {
         surrogate: u32,
     ) -> crate::Result<bool> {
         let key = StorageKey::for_surrogate(Surrogate::new(surrogate));
-        let body = if self.is_bitemporal(database_id, tid, collection) {
-            self.sparse
-                .versioned_get_current(database_id, tid, collection, &key)?
-        } else {
-            self.sparse.get(database_id, tid, collection, &key)?
-        };
-        Ok(body.is_some())
+        Ok(self
+            .current_row_body(database_id, tid, collection, &key)?
+            .is_some())
     }
 }
 

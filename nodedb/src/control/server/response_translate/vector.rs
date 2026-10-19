@@ -16,9 +16,9 @@
 //!  - decode failures are non-fatal — the original payload is returned
 //!    so the client still sees the raw search hits.
 //!
-//! [`resolve_surrogate_pk`] is the single catalog lookup shared by this
-//! translator and the full-text / hybrid translators in `text_hybrid.rs` —
-//! see `dispatch.rs` for the plan-to-translator routing.
+//! A hit names its row through [`super::pk_resolve::resolve_surrogate_pks`],
+//! the one resolver every search translator runs. See `dispatch.rs` for the
+//! plan-to-translator routing.
 
 use nodedb_types::DatabaseId;
 use nodedb_types::Surrogate;
@@ -26,6 +26,7 @@ use nodedb_types::TenantId;
 use serde::{Deserialize, Serialize};
 
 use super::hit_key::parse_surrogate_hex;
+use super::pk_resolve::resolve_surrogate_pks;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::control::state::SharedState;
 
@@ -130,72 +131,77 @@ pub(crate) fn filter_vector_hits(
     })
 }
 
-/// Resolve one surrogate to its user-facing primary key via the catalog.
-///
-/// Shared by the vector, full-text, and hybrid (RRF) response translators —
-/// every search-hit path resolves the internal `u32` surrogate back to the
-/// user's PK through this single catalog call. Returns `None` when the
-/// catalog has no PK mapping for the surrogate (headless row, or a document
-/// that was never written) — callers must leave the row's identifier
-/// untouched in that case rather than fabricate a value. `collection` is the
-/// plan's database-qualified name, de-qualified into the canonical key; a
-/// name that does not de-qualify also resolves to `None`.
-pub(crate) fn resolve_surrogate_pk(
-    state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
-    collection: &str,
-    surrogate: Surrogate,
-) -> Option<String> {
-    let catalog = state.credentials.catalog();
-    let key = nodedb_types::CollectionKey::from_qualified_str(database_id, collection).ok()?;
-    let pk_bytes = catalog
-        .get_pk_for_surrogate(key, tenant_id, surrogate)
-        .ok()??;
-    String::from_utf8(pk_bytes).ok()
-}
-
-/// Decode the DP-side msgpack array of `VectorSearchHit`, fill each
-/// row's `doc_id` from the catalog using `id` as the surrogate, and
-/// re-encode. On any decode failure the payload is returned unchanged.
-pub fn translate_vector_search_payload(
+/// Decode the DP-side msgpack array of `VectorSearchHit`, flatten each hit
+/// into a row, and name each row whose body carries no `id` by its primary
+/// key. A payload that is not a hit array returns unchanged.
+pub async fn translate_vector_search_payload(
     payload: &[u8],
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
     cut: VectorHitCut<'_>,
-) -> Vec<u8> {
+) -> crate::Result<Vec<u8>> {
     if payload.is_empty() {
-        return payload.to_vec();
+        return Ok(payload.to_vec());
     }
-    let first = payload[0];
-    if first == b'[' || first == b'{' || first == b'"' {
-        return payload.to_vec();
+    // A payload that opens with no msgpack array marker carries no hit
+    // array: JSON text starts with `[`, `{` or `"`, and a msgpack scalar or
+    // map has its own marker. It passes through. A msgpack array that does
+    // not decode as hits is an error.
+    if !is_msgpack_array(payload[0]) {
+        return Ok(payload.to_vec());
     }
 
-    let mut hits: Vec<Hit> = match zerompk::from_msgpack(payload) {
-        Ok(h) => h,
-        Err(_) => return payload.to_vec(),
-    };
+    let mut hits: Vec<Hit> =
+        zerompk::from_msgpack(payload).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("vector search hits do not decode: {e}"),
+        })?;
 
     apply_rls_filter(&mut hits, cut.rls_filters, cut.top_k, cut.strip_bodies);
 
-    for hit in &mut hits {
-        if hit.doc_id.is_some() {
-            continue;
-        }
-        // A headless hit (no surrogate binding) has no PK to resolve; leave
-        // it untouched exactly as `text_hybrid.rs` does for the same sentinel.
-        let Some(surrogate) = parse_surrogate_hex(&hit.id) else {
-            continue;
-        };
-        if let Some(pk) = resolve_surrogate_pk(state, database_id, tenant_id, collection, surrogate)
-        {
-            hit.doc_id = Some(pk);
+    let FlattenedHits { mut rows, unnamed } = flatten_hits(&hits)?;
+    let keys = resolve_surrogate_pks(
+        state,
+        database_id,
+        tenant_id,
+        collection,
+        unnamed.iter().map(|(_, surrogate)| *surrogate),
+    )
+    .await?;
+    for (index, surrogate) in &unnamed {
+        if let (Some(key), Some(row)) = (keys.get(*surrogate), rows.get_mut(*index)) {
+            row.insert("id".into(), serde_json::json!(key));
         }
     }
+    sonic_rs::to_string(&rows)
+        .map(String::into_bytes)
+        .map_err(|e| crate::Error::Serialization {
+            format: "json".into(),
+            detail: format!("vector search rows do not encode: {e}"),
+        })
+}
 
+/// Whether `marker` opens a msgpack array: fixarray, array 16 or array 32.
+fn is_msgpack_array(marker: u8) -> bool {
+    matches!(marker, 0x90..=0x9f | 0xdc | 0xdd)
+}
+
+/// One flattened hit row, keyed by column.
+type HitRow = std::collections::BTreeMap<String, serde_json::Value>;
+
+/// The rows `flatten_hits` builds, and the rows the caller names.
+struct FlattenedHits {
+    rows: Vec<HitRow>,
+    /// The index and surrogate of each row that carries no `id` of its own.
+    unnamed: Vec<(usize, Surrogate)>,
+}
+
+/// Flatten `hits` into rows. Also returns the index and surrogate of each
+/// row that carries no `id` of its own, for the caller to name. A stored
+/// body that does not decode fails the call.
+fn flatten_hits(hits: &[Hit]) -> crate::Result<FlattenedHits> {
     // Slow-path column projection: when `body` is a msgpack-encoded payload
     // map, decode it and surface fields alongside `id` / `distance` so client
     // SQL projections like `SELECT id, label, vector_distance(...)` see the
@@ -210,45 +216,55 @@ pub fn translate_vector_search_payload(
     // Decoding with the tagged `Value` codec here instead would read exactly
     // one of the two collection kinds and silently drop the columns of the
     // other.
-    use std::collections::BTreeMap;
-    let flattened: Vec<BTreeMap<String, serde_json::Value>> = hits
-        .iter()
-        .map(|h| {
-            let mut obj: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            obj.insert("distance".into(), serde_json::json!(h.distance));
-            // Flatten body fields first so the document's own `id` field wins
-            // over the internal surrogate integer. Body fields are only present
-            // when the Data Plane performed the slow-path fetch.
-            if let Some(ref body) = h.body
-                && let Ok(serde_json::Value::Object(map)) = nodedb_types::json_from_msgpack(body)
-            {
+    let mut rows: Vec<HitRow> = Vec::with_capacity(hits.len());
+    let mut unnamed: Vec<(usize, Surrogate)> = Vec::new();
+    for h in hits {
+        let mut obj = HitRow::new();
+        obj.insert("distance".into(), serde_json::json!(h.distance));
+        // Body fields go first, so the document's own `id` field wins over
+        // the surrogate. Only a slow-path fetch attaches a body. A stored
+        // body that does not decode is corruption and fails the response.
+        if let Some(ref body) = h.body {
+            let decoded =
+                nodedb_types::json_from_msgpack(body).map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!(
+                        "vector hit {} carries a stored body that does not decode: {e}",
+                        h.id
+                    ),
+                })?;
+            if let serde_json::Value::Object(map) = decoded {
                 for (k, v) in map {
                     obj.insert(k, v);
                 }
             }
-            // A storage key never reaches a client: a bound hit's client
-            // identity is its surrogate's decimal string; a headless hit has
-            // no surrogate, so the sentinel is the only identity it carries.
-            let identity = match parse_surrogate_hex(&h.id) {
-                Some(surrogate) => surrogate.as_u32().to_string(),
-                None => h.id.clone(),
-            };
-            // Fall back to catalog-resolved doc_id or the decimal identity
-            // when the body didn't provide an "id" field (e.g. skip_payload_fetch).
-            if !obj.contains_key("id") {
-                if let Some(ref doc) = h.doc_id {
+        }
+        // A storage key never reaches a client: a bound hit's identity is its
+        // surrogate's decimal string. A headless hit carries only the sentinel.
+        let surrogate = parse_surrogate_hex(&h.id);
+        let identity = match surrogate {
+            Some(surrogate) => surrogate.as_u32().to_string(),
+            None => h.id.clone(),
+        };
+        // A row with no `id` of its own takes its key, named by the caller,
+        // and keeps its decimal identity when no binding names it.
+        if !obj.contains_key("id") {
+            match (&h.doc_id, surrogate) {
+                (Some(doc), _) => {
                     obj.insert("id".into(), serde_json::json!(doc));
-                } else {
+                }
+                (None, Some(surrogate)) => {
+                    unnamed.push((rows.len(), surrogate));
+                    obj.insert("id".into(), serde_json::json!(identity));
+                }
+                (None, None) => {
                     obj.insert("id".into(), serde_json::json!(identity));
                 }
             }
-            // Always expose internal surrogate for debugging / join use.
-            obj.insert("_surrogate".into(), serde_json::json!(identity));
-            obj
-        })
-        .collect();
-    if let Ok(s) = sonic_rs::to_string(&flattened) {
-        return s.into_bytes();
+        }
+        // The surrogate is exposed for join use.
+        obj.insert("_surrogate".into(), serde_json::json!(identity));
+        rows.push(obj);
     }
-    zerompk::to_msgpack_vec(&hits).unwrap_or_else(|_| payload.to_vec())
+    Ok(FlattenedHits { rows, unnamed })
 }

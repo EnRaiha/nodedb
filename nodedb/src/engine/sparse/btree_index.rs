@@ -124,39 +124,54 @@ impl SparseEngine {
         collection: &str,
         field: &str,
     ) -> crate::Result<usize> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| redb_err("write txn", e))?;
+        let removed = self.delete_index_entries_for_field_in_txn(
+            &write_txn,
+            database_id,
+            tenant_id,
+            collection,
+            field,
+        )?;
+        write_txn
+            .commit()
+            .map_err(|e| redb_err("commit index delete", e))?;
+        Ok(removed)
+    }
+
+    /// [`Self::delete_index_entries_for_field`] inside a caller-owned write
+    /// transaction. Does NOT commit. A read error fails the removal.
+    pub fn delete_index_entries_for_field_in_txn(
+        &self,
+        txn: &WriteTransaction,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        field: &str,
+    ) -> crate::Result<usize> {
         let prefix = format!(
             "{}{field}:",
             coll_prefix(database_id, tenant_id, collection)
         );
         let end = format!("{prefix}\u{ffff}");
 
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| redb_err("write txn", e))?;
-
-        let removed;
-        {
-            let mut table = write_txn
-                .open_table(INDEXES)
-                .map_err(|e| redb_err("open indexes", e))?;
-
-            let keys_to_remove: Vec<String> = table
-                .range(prefix.as_str()..end.as_str())
-                .map_err(|e| redb_err("index range", e))?
-                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
-                .collect();
-
-            removed = keys_to_remove.len();
-            for key in &keys_to_remove {
-                table
-                    .remove(key.as_str())
-                    .map_err(|e| redb_err("remove index entry", e))?;
-            }
+        let mut table = txn
+            .open_table(INDEXES)
+            .map_err(|e| redb_err("open indexes", e))?;
+        let keys_to_remove: Vec<String> = table
+            .range(prefix.as_str()..end.as_str())
+            .map_err(|e| redb_err("index range", e))?
+            .map(|r| r.map(|(k, _)| k.value().to_string()))
+            .collect::<Result<_, _>>()
+            .map_err(|e| redb_err("index entry", e))?;
+        let removed = keys_to_remove.len();
+        for key in &keys_to_remove {
+            table
+                .remove(key.as_str())
+                .map_err(|e| redb_err("remove index entry", e))?;
         }
-        write_txn
-            .commit()
-            .map_err(|e| redb_err("commit index delete", e))?;
 
         if removed > 0 {
             debug!(

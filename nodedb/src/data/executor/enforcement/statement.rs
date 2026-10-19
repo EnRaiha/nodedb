@@ -88,7 +88,7 @@ impl CoreLoop {
         };
         let mut entries = Vec::new();
         for key in document_ids {
-            let Some(stored) = self.sparse.get(database_id, tid, collection, key)? else {
+            let Some(stored) = self.current_row_body(database_id, tid, collection, key)? else {
                 continue;
             };
             // A stored row of a collection that declares constraints over its

@@ -9,9 +9,36 @@
 use sonic_rs;
 
 use crate::bridge::envelope::ErrorCode;
-use crate::engine::sparse::btree::SparseEngine;
+use crate::data::executor::core_loop::CoreLoop;
 use nodedb_physical::physical_plan::{PeriodLockConfig, ResolvedSumTarget, resolved_sum_surrogate};
 use nodedb_types::StorageKey;
+
+/// Reads the current stored body of one row of a named reference collection.
+pub type RefRowReader<'a> = dyn Fn(&str, &StorageKey) -> crate::Result<Option<Vec<u8>>> + 'a;
+
+impl CoreLoop {
+    /// [`check_period_lock`] with the reference row read at its current
+    /// version, so a bitemporal reference collection resolves too.
+    pub(in crate::data::executor) fn check_period_lock_at(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        doc_bytes: &[u8],
+        config: &PeriodLockConfig,
+        resolved_targets: &[ResolvedSumTarget],
+    ) -> Result<(), ErrorCode> {
+        check_period_lock(
+            &|ref_table: &str, key: &StorageKey| {
+                self.current_row_body(database_id, tid, ref_table, key)
+            },
+            collection,
+            doc_bytes,
+            config,
+            resolved_targets,
+        )
+    }
+}
 
 /// Check whether a write is allowed given the period lock configuration.
 ///
@@ -26,12 +53,12 @@ use nodedb_types::StorageKey;
 /// `(config.ref_table, period value)` — the same slot and lookup every other
 /// cross-collection resolution in this codebase uses.
 ///
+/// `read_ref_row` reads the reference row by collection name and key.
+///
 /// Returns `Ok(())` if the write is allowed, or `Err(PeriodLocked)` if the
 /// period is closed, locked, or names no row the Control Plane could resolve.
 pub fn check_period_lock(
-    sparse: &SparseEngine,
-    database_id: u64,
-    tid: u64,
+    read_ref_row: &RefRowReader<'_>,
     collection: &str,
     doc_bytes: &[u8],
     config: &PeriodLockConfig,
@@ -55,12 +82,7 @@ pub fn check_period_lock(
             collection: collection.to_string(),
         });
     };
-    let ref_bytes = match sparse.get(
-        database_id,
-        tid,
-        &config.ref_table,
-        &StorageKey::for_surrogate(surrogate),
-    ) {
+    let ref_bytes = match read_ref_row(&config.ref_table, &StorageKey::for_surrogate(surrogate)) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             // Period key not found in reference table — reject (unknown period).
@@ -131,7 +153,15 @@ fn extract_field_string(bytes: &[u8], field_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sparse::btree::SparseEngine;
     use nodedb_types::Surrogate;
+
+    /// Reads a reference row from the plain table of `sparse`.
+    fn reader(
+        sparse: &SparseEngine,
+    ) -> impl Fn(&str, &StorageKey) -> crate::Result<Option<Vec<u8>>> + '_ {
+        move |table: &str, key: &StorageKey| sparse.get(DB, TID, table, key)
+    }
 
     fn make_config(allowed: &[&str]) -> PeriodLockConfig {
         PeriodLockConfig {
@@ -236,9 +266,7 @@ mod tests {
 
         assert!(
             check_period_lock(
-                &sparse,
-                DB,
-                TID,
+                &reader(&sparse),
                 "journal_entries",
                 &entry("2024-Q1"),
                 &config,
@@ -256,9 +284,7 @@ mod tests {
         let config = make_config(&["OPEN", "ADJUSTING"]);
 
         let err = check_period_lock(
-            &sparse,
-            DB,
-            TID,
+            &reader(&sparse),
             "journal_entries",
             &entry("2024-Q1"),
             &config,
@@ -278,9 +304,7 @@ mod tests {
         let config = make_config(&["OPEN", "ADJUSTING"]);
 
         let err = check_period_lock(
-            &sparse,
-            DB,
-            TID,
+            &reader(&sparse),
             "journal_entries",
             &entry("2024-Q1"),
             &config,
@@ -310,9 +334,7 @@ mod tests {
         let config = make_config(&["OPEN", "ADJUSTING"]);
 
         let err = check_period_lock(
-            &sparse,
-            DB,
-            TID,
+            &reader(&sparse),
             "journal_entries",
             &entry("2024-Q1"),
             &config,
@@ -343,6 +365,6 @@ mod tests {
         let config = make_config(&["OPEN"]);
         let doc = nodedb_types::json_to_msgpack(&serde_json::json!({"amount": 100})).unwrap();
 
-        assert!(check_period_lock(&sparse, DB, TID, "journal_entries", &doc, &config, &[]).is_ok());
+        assert!(check_period_lock(&reader(&sparse), "journal_entries", &doc, &config, &[]).is_ok());
     }
 }

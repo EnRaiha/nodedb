@@ -6,7 +6,7 @@
 //! identically; the reply projects those post-images per the clause.
 //!
 //! Mirrors the point-write staging in `dispatch.rs`: the matched rows are
-//! evaluated against BASE ∪ OVERLAY (via [`CoreLoop::merge_overlay_into_scan`])
+//! evaluated against BASE ∪ OVERLAY (via [`CoreLoop::txn_matching_rows`])
 //! so a same-transaction earlier write to a row is observed, each matched
 //! row's update is applied with the SAME per-row primitive point `UPDATE`
 //! uses ([`CoreLoop::stage_apply_update`]), and the result is staged into the
@@ -14,14 +14,14 @@
 //! replay remains the sole durable apply.
 
 use nodedb_physical::physical_plan::UpdateValue;
-use nodedb_types::{RowIdentity, StorageKey};
+use nodedb_types::RowIdentity;
 
 use super::body::stored_row_identity;
 use super::constraint::StagedStatement;
 use super::stage_returning::{StageReturning, StagedRowsOf};
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::bulk_dml::{TxnPrediction, decode_bulk_filters};
 use crate::data::executor::handlers::generated;
 use crate::data::executor::handlers::transaction::overlay::MAX_TXN_OVERLAY_BYTES;
 use crate::data::executor::response_codec;
@@ -44,6 +44,9 @@ pub(in crate::data::executor) struct StageBulkUpdateParams<'a> {
     pub declared_primary_key: Option<&'a str>,
     /// The plan's `RETURNING` spec, `None` when it carries none.
     pub returning: Option<StageReturning<'a>>,
+    /// The rows the Control Plane read at this statement. `None` when the
+    /// plan carries none.
+    pub prediction: Option<TxnPrediction<'a>>,
 }
 
 impl CoreLoop {
@@ -65,6 +68,7 @@ impl CoreLoop {
             rls_write_check,
             declared_primary_key,
             returning,
+            prediction,
         } = params;
         let database_id = task.request.database_id;
         let coll_key: (DatabaseId, TenantId, String) =
@@ -80,60 +84,22 @@ impl CoreLoop {
             return self.response_error(task, e);
         }
 
-        let filters: Vec<ScanFilter> = if filter_bytes.is_empty() {
-            Vec::new()
-        } else {
-            match zerompk::from_msgpack(filter_bytes) {
-                Ok(f) => f,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("deserialize filters: {e}"),
-                        },
-                    );
-                }
-            }
-        };
-
-        // BASE matching set: the same scan-and-filter primitive the
-        // autocommit bulk handler uses, then fetch each matched row's
-        // current body (also the same lookup the autocommit path uses).
-        let mut rows = match self.stage_bulk_base_rows(
-            task,
-            database_id.as_u64(),
-            tid,
-            collection,
-            &filters,
-        ) {
-            Ok(rows) => rows,
-            Err(resp) => return resp,
-        };
-
-        // Fold the transaction's own staged writes into the base result:
-        // drops tombstoned rows, re-checks staged puts against the predicate
-        // (an earlier staged update may have moved a row in or out), and
-        // appends overlay-only rows that now match.
+        // The BASE ∪ OVERLAY matching set: the transaction's own staged
+        // writes fold into BASE, read at each row's current version.
+        let rows = match decode_bulk_filters(filter_bytes)
+            .and_then(|filters| self.txn_matching_rows(txn_id, &coll_key, &filters))
         {
-            // `merge_overlay_into_scan` takes an infallible
-            // `Fn(&StorageKey, &[u8]) -> bool` predicate, so a division/modulo-
-            // by-zero is captured via this `Cell` side-channel and checked once
-            // the merge returns.
-            let raw_matches =
-                self.strict_aware_matcher(database_id.as_u64(), tid, collection, &filters);
-            let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-                std::cell::Cell::new(None);
-            let matches = |row_key: &StorageKey, body: &[u8]| match raw_matches(row_key, body) {
-                Ok(b) => b,
-                Err(e) => {
-                    predicate_err.set(Some(e));
-                    false
-                }
-            };
-            self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
-            if let Some(e) = predicate_err.take() {
-                return self.response_error(task, crate::Error::from(e));
-            }
+            Ok(rows) => rows,
+            Err(e) => return self.response_error(task, e),
+        };
+
+        // The carried prediction is the read the Control Plane took at this
+        // statement. Rows that differ refuse the stage before anything stages,
+        // and the Control Plane reads again.
+        if let Some(prediction) = prediction
+            && !prediction.holds(&rows)
+        {
+            return self.response_error(task, ErrorCode::OllpRetryRequired);
         }
 
         let strict_schema = self.resolve_strict_schema(database_id.as_u64(), tid, collection);
@@ -229,31 +195,6 @@ impl CoreLoop {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
-    }
-
-    /// Resolve the BASE matching set for a bulk predicate stage (shared by
-    /// `stage_bulk_update` and `stage_bulk_delete`): the same
-    /// scan-and-filter primitive the autocommit bulk handlers use
-    /// ([`CoreLoop::scan_matching_documents`]), then each matched row's
-    /// current body via the same per-row lookup the autocommit path uses.
-    pub(super) fn stage_bulk_base_rows(
-        &self,
-        task: &ExecutionTask,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        filters: &[ScanFilter],
-    ) -> Result<Vec<(StorageKey, Vec<u8>)>, Response> {
-        let matching_ids = self
-            .scan_matching_documents(database_id, tid, collection, filters)
-            .map_err(|e| self.response_error(task, e))?;
-        let mut rows: Vec<(StorageKey, Vec<u8>)> = Vec::with_capacity(matching_ids.len());
-        for key in matching_ids {
-            if let Ok(Some(bytes)) = self.sparse.get(database_id, tid, collection, &key) {
-                rows.push((key, bytes));
-            }
-        }
-        Ok(rows)
     }
 
     /// Stage a bulk-matched row's new body after enforcing the same

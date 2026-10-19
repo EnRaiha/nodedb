@@ -93,30 +93,8 @@ impl CoreLoop {
             visit(&key.to_string(), &view);
             Ok(())
         };
-        if self.is_bitemporal(database_id, tid, collection) {
-            let rows = self.sparse.versioned_scan_as_of(
-                crate::engine::sparse::btree_versioned::VersionedScanParams {
-                    database_id,
-                    tenant: tid,
-                    coll: collection,
-                    sys_cutoff_ms: None,
-                    valid_at_ms: None,
-                    limit: usize::MAX,
-                },
-                &|_: &StorageKey, _: &[u8]| true,
-                &crate::engine::sparse::scan_stop::never_stop,
-            )?;
-            for (key, bytes) in &rows {
-                decode_and_visit(key, bytes.as_slice())?;
-            }
-            return Ok(());
-        }
-        self.sparse.scan_documents_for_each(
-            database_id,
-            tid,
-            collection,
-            usize::MAX,
-            |key, bytes| decode_and_visit(key, bytes),
-        )
+        self.for_each_current_row(database_id, tid, collection, |key, bytes| {
+            decode_and_visit(key, bytes).map(|()| std::ops::ControlFlow::Continue(()))
+        })
     }
 }

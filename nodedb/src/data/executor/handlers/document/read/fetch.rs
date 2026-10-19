@@ -20,15 +20,13 @@
 //!   `effective_schema` is `None` and the shared sort/window/computed/projection
 //!   pipeline operates on a uniform shape.
 
-use std::cell::Cell;
-
 use nodedb_types::StorageKey;
 
 use super::audit_body::{inject_temporal_columns, strict_audit_body};
 use super::fetch_types::FetchedRows;
 use super::{DocFetchParams, DocScanMode};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
+use crate::data::executor::core_loop::filter_match::{HeldEvalError, matches_with_resolved_schema};
 use crate::data::executor::scan_normalize::sparse_body_to_msgpack;
 use crate::data::executor::sparse_body_format::{SparseBodyFormat, SparseBodyFormatRef};
 use crate::data::executor::task::ExecutionTask;
@@ -69,26 +67,21 @@ impl CoreLoop {
                 // shared sort/window/computed/projection pipeline (which scans
                 // msgpack) operates uniformly, then hand it downstream with no
                 // schema (bodies are already normalized).
-                // `versioned_scan_as_of` takes an infallible
-                // `Fn(&StorageKey, &[u8]) -> bool` predicate, so a
-                // division/modulo-by-zero is captured via this `Cell`
-                // side-channel and checked once the scan returns, rather
-                // than silently folded away.
-                let predicate_err: Cell<Option<nodedb_query::EvalError>> = Cell::new(None);
-                let predicate =
-                    |doc_id: &StorageKey, body: &[u8]| match matches_with_resolved_schema(
-                        strict_schema,
-                        filter_predicates,
-                        doc_id,
-                        body,
-                        &identity_column,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            predicate_err.set(Some(e));
-                            false
-                        }
-                    };
+                // `versioned_scan_as_of` takes an infallible predicate, so a
+                // division/modulo-by-zero is held and returned once the scan
+                // ends, rather than silently folded away.
+                let held = HeldEvalError::default();
+                let predicate = |doc_id: &StorageKey, body: &[u8]| {
+                    held.check(|| {
+                        matches_with_resolved_schema(
+                            strict_schema,
+                            filter_predicates,
+                            doc_id,
+                            body,
+                            &identity_column,
+                        )
+                    })
+                };
                 let raw = self.sparse.versioned_scan_as_of(
                     crate::engine::sparse::btree_versioned::VersionedScanParams {
                         database_id: task.request.database_id.as_u64(),
@@ -101,9 +94,7 @@ impl CoreLoop {
                     &predicate,
                     &stop,
                 )?;
-                if let Some(e) = predicate_err.take() {
-                    return Err(crate::Error::from(e));
-                }
+                let raw = held.finish::<_, crate::Error>(raw)?;
                 let rows = raw
                     .into_iter()
                     .map(|(doc_id, body)| {
@@ -131,22 +122,19 @@ impl CoreLoop {
                 // normalized to MessagePack and gets the synthetic `_ts_*`
                 // temporal columns injected BEFORE the shared downstream runs,
                 // so a user can `SELECT` / `ORDER BY` / project on them.
-                // See the `AsOf` arm above for the `Cell` side-channel rationale.
-                let predicate_err: Cell<Option<nodedb_query::EvalError>> = Cell::new(None);
-                let predicate =
-                    |doc_id: &StorageKey, body: &[u8]| match matches_with_resolved_schema(
-                        strict_schema,
-                        filter_predicates,
-                        doc_id,
-                        body,
-                        &identity_column,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            predicate_err.set(Some(e));
-                            false
-                        }
-                    };
+                // See the `AsOf` arm above for the held-error rationale.
+                let held = HeldEvalError::default();
+                let predicate = |doc_id: &StorageKey, body: &[u8]| {
+                    held.check(|| {
+                        matches_with_resolved_schema(
+                            strict_schema,
+                            filter_predicates,
+                            doc_id,
+                            body,
+                            &identity_column,
+                        )
+                    })
+                };
                 let raw = self.sparse.versioned_scan_all(
                     crate::engine::sparse::btree_versioned::VersionedScanParams {
                         database_id: task.request.database_id.as_u64(),
@@ -159,9 +147,7 @@ impl CoreLoop {
                     &predicate,
                     &stop,
                 )?;
-                if let Some(e) = predicate_err.take() {
-                    return Err(crate::Error::from(e));
-                }
+                let raw = held.finish::<_, crate::Error>(raw)?;
                 let mut rows: Vec<(StorageKey, Vec<u8>)> = Vec::with_capacity(raw.len());
                 for row in raw {
                     let msgpack_body = match strict_schema {
@@ -232,10 +218,9 @@ impl CoreLoop {
         );
 
         // `scan_documents_filtered`/`versioned_scan_as_of` take an infallible
-        // predicate, so a division/modulo-by-zero is captured via this `Cell`
-        // side-channel and checked once every branch below returns, rather
-        // than silently folded away.
-        let predicate_err: Cell<Option<nodedb_query::EvalError>> = Cell::new(None);
+        // predicate, so a division/modulo-by-zero is held and returned once
+        // every branch below returns, rather than silently folded away.
+        let held = HeldEvalError::default();
         let matches = |key: &StorageKey, value: &[u8]| -> bool {
             if filter_predicates.is_empty() {
                 return true;
@@ -251,19 +236,15 @@ impl CoreLoop {
             } else {
                 value
             };
-            match matches_with_resolved_schema(
-                strict_schema,
-                filter_predicates,
-                key,
-                value,
-                &identity_column,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    predicate_err.set(Some(e));
-                    false
-                }
-            }
+            held.check(|| {
+                matches_with_resolved_schema(
+                    strict_schema,
+                    filter_predicates,
+                    key,
+                    value,
+                    &identity_column,
+                )
+            })
         };
 
         let rows: Vec<(StorageKey, Vec<u8>)> = if filter_predicates.is_empty() {
@@ -319,9 +300,7 @@ impl CoreLoop {
             )?
         };
 
-        if let Some(e) = predicate_err.take() {
-            return Err(crate::Error::from(e));
-        }
+        let rows = held.finish::<_, crate::Error>(rows)?;
 
         // A vector-primary collection's sparse rows are `zerompk` TAGGED
         // metadata sidecars, not document bodies. Normalize them here, at the

@@ -37,7 +37,6 @@ pub(super) struct PageScope<'a> {
     pub database_id: u64,
     pub tid: u64,
     pub collection: &'a str,
-    pub bitemporal: bool,
     pub strict_schema: Option<&'a StrictSchema>,
     pub identity_column: &'a str,
 }
@@ -90,22 +89,14 @@ impl CoreLoop {
                 }
                 None => {
                     let storage_key = StorageKey::for_surrogate(surrogate);
-                    let committed = if scope.bitemporal {
-                        self.sparse.versioned_get_current(
+                    let committed = self
+                        .current_row_body(
                             scope.database_id,
                             scope.tid,
                             scope.collection,
                             &storage_key,
                         )
-                    } else {
-                        self.sparse.get(
-                            scope.database_id,
-                            scope.tid,
-                            scope.collection,
-                            &storage_key,
-                        )
-                    }
-                    .map_err(ErrorCode::from)?;
+                        .map_err(ErrorCode::from)?;
                     let (post, assigned) = match &committed {
                         None => (value.clone(), None),
                         Some(current) => {

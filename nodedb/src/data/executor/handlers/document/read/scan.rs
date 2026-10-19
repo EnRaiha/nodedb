@@ -204,29 +204,24 @@ impl CoreLoop {
                         crate::types::TenantId::new(tid),
                         collection.to_string(),
                     );
-                    // `merge_overlay_into_scan` takes an infallible
-                    // `Fn(&StorageKey, &[u8]) -> bool` predicate, so a
-                    // division/modulo-by-zero is captured via this `Cell`
-                    // side-channel and checked once the merge returns.
-                    let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-                        std::cell::Cell::new(None);
+                    // `merge_overlay_into_scan` takes an infallible predicate,
+                    // so a division/modulo-by-zero is held and returned once
+                    // the merge ends.
+                    let held =
+                        crate::data::executor::core_loop::filter_match::HeldEvalError::default();
                     let matches = |row_key: &StorageKey, value: &[u8]| -> bool {
                         if filter_predicates.is_empty() {
                             return true;
                         }
-                        match crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
-                            effective_schema.as_ref(),
-                            &filter_predicates,
-                            row_key,
-                            value,
-                            &identity_column,
-                        ) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                predicate_err.set(Some(e));
-                                false
-                            }
-                        }
+                        held.check(|| {
+                            crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
+                                effective_schema.as_ref(),
+                                &filter_predicates,
+                                row_key,
+                                value,
+                                &identity_column,
+                            )
+                        })
                     };
                     // A vector-primary row stages its vector with its sidecar;
                     // its merge renders the sidecar the way the fetch stage
@@ -252,8 +247,8 @@ impl CoreLoop {
                     } else {
                         self.merge_overlay_into_scan(txn_id, &coll_key, &mut filtered, &matches);
                     }
-                    if let Some(e) = predicate_err.take() {
-                        return self.response_error(task, ErrorCode::from(e));
+                    if let Err(e) = held.finish::<_, ErrorCode>(()) {
+                        return self.response_error(task, e);
                     }
                 }
 

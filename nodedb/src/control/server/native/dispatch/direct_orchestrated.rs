@@ -56,7 +56,7 @@ pub(super) async fn dispatch_orchestrated(
                 crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
                     .await;
             return Some(match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp),
+                Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp).await,
                 Err(e) => error_to_native(seq, &e),
             });
         }
@@ -86,7 +86,7 @@ pub(super) async fn dispatch_orchestrated(
                 crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized)
                     .await;
             return Some(match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp),
+                Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp).await,
                 Err(e) => error_to_native(seq, &e),
             });
         }
@@ -116,7 +116,7 @@ pub(super) async fn dispatch_orchestrated(
                 )
                 .await;
             return Some(match result {
-                Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp),
+                Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp).await,
                 Err(e) => error_to_native(seq, &e),
             });
         }
@@ -136,7 +136,7 @@ pub(super) async fn dispatch_orchestrated(
         )
         .await;
         return Some(match result {
-            Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp),
+            Ok(resp) => data_plane_response_to_native(ctx, seq, plan, &resp).await,
             Err(e) => error_to_native(seq, &e),
         });
     }

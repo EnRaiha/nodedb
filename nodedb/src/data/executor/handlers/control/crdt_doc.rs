@@ -267,7 +267,8 @@ impl CoreLoop {
         if UpdateTransitionRules::of(&config.enforcement).is_empty() {
             return Ok(None);
         }
-        self.sparse.get(
+        // The row at its current version, as the materialize writes it.
+        self.current_row_body(
             task.request.database_id.as_u64(),
             task.request.tenant_id.as_u64(),
             collection,

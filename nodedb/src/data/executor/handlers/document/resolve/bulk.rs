@@ -21,9 +21,9 @@ use super::context::{
     resolved_response_payload,
 };
 use crate::bridge::envelope::ErrorCode;
-use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::bulk_dml::decode_bulk_filters;
 use crate::data::executor::handlers::bulk_dml::update_project::{
     MatchedRows, ProjectUpdateRows, ProjectedUpdateRow,
 };
@@ -88,7 +88,7 @@ impl CoreLoop {
             )?;
         }
 
-        let filters = decode_filters(filter_bytes)?;
+        let filters = decode_bulk_filters(filter_bytes).map_err(ErrorCode::from)?;
         let matched = self.resolve_matched_rows(task, &ctx, collection, &filters)?;
 
         // The same projection the live handler runs before it writes anything,
@@ -102,6 +102,10 @@ impl CoreLoop {
                 updates,
                 strict_schema: ctx.strict_schema.as_ref(),
                 declared_primary_key,
+                // Stamped as the live handler stamps it, so a strict
+                // bitemporal image takes the bitemporal tuple layout. The
+                // apply mints its own system time on write.
+                bitemporal_sys_from_ms: ctx.bitemporal.then(|| self.bitemporal_now_ms()),
             })
             .map_err(ErrorCode::from)?;
 
@@ -165,7 +169,7 @@ impl CoreLoop {
             resolved_sum_targets,
         } = args;
         let ctx = self.doc_resolve_ctx(task, tid, collection);
-        let filters = decode_filters(filter_bytes)?;
+        let filters = decode_bulk_filters(filter_bytes).map_err(ErrorCode::from)?;
         let matched = self.resolve_matched_rows(task, &ctx, collection, &filters)?;
 
         let mut mutations = Vec::with_capacity(matched.len());
@@ -205,14 +209,4 @@ impl CoreLoop {
             response_payload,
         })
     }
-}
-
-/// Decode a plan's filter payload. Empty means "no WHERE clause" — every row.
-fn decode_filters(filter_bytes: &[u8]) -> Result<Vec<ScanFilter>, ErrorCode> {
-    if filter_bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    zerompk::from_msgpack(filter_bytes).map_err(|e| ErrorCode::Internal {
-        detail: format!("deserialize filters: {e}"),
-    })
 }

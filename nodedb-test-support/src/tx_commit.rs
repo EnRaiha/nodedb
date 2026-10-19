@@ -4,12 +4,11 @@
 
 use nodedb::bridge::dispatch::{BridgeRequest, BridgeResponse};
 use nodedb::bridge::envelope::{Request, Response, Status};
-use nodedb::control::wal_replication::transaction_redo::collections::written_collections;
 use nodedb::control::wal_replication::transaction_redo::sum_targets::redo_sum_targets;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::types::Lsn;
 use nodedb_bridge::buffer::{Consumer, Producer};
-use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{MetaOp, PhysicalPlan, written_collections};
 
 use crate::tx_batch_helpers::make_request;
 

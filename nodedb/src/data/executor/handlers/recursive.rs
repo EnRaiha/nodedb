@@ -104,8 +104,9 @@ impl CoreLoop {
             collection,
         );
 
-        // Scan all documents once (used for both base and recursive steps).
-        let all_docs = match self.sparse.scan_documents(
+        // Scan all documents once (used for both base and recursive steps),
+        // each at its current version.
+        let all_docs = match self.current_rows(
             task.request.database_id.as_u64(),
             tid,
             collection,

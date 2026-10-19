@@ -376,6 +376,7 @@ impl CoreLoop {
                 projection,
                 limit,
                 offset,
+                system_as_of_ms,
             } => self.execute_document_indexed_fetch(
                 task,
                 super::super::handlers::document::index_fetch::IndexedFetchParams {
@@ -387,6 +388,7 @@ impl CoreLoop {
                     projection,
                     limit: *limit,
                     offset: *offset,
+                    system_as_of_ms: *system_as_of_ms,
                 },
             ),
 

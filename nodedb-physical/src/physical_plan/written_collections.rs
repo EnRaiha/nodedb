@@ -1,15 +1,15 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 
-//! Every collection a transaction's buffered write plans write.
+//! Every collection a set of write plans writes.
 //!
-//! The redo apply gives each one a collection-floor write version at the
-//! record's LSN, as the transaction batch did for every written plan. A floor
-//! on a collection the plans only read is harmless: it makes OCC validation
-//! stricter, never looser.
+//! The Control Plane names them on a transaction's redo record and on its
+//! admission keys. The Data Plane names them when it opens a transaction's
+//! staging for a plan. A collection a plan only reads is harmless here: a
+//! floor on it makes OCC validation stricter, never looser.
 
 use std::collections::BTreeSet;
 
-use nodedb_physical::physical_plan::{GraphOp, MetaOp, PhysicalPlan, SpatialOp, VectorOp};
+use super::{GraphOp, MetaOp, PhysicalPlan, SpatialOp, VectorOp};
 
 /// The written collections of `plans`, sorted and deduplicated.
 pub fn written_collections(plans: &[PhysicalPlan]) -> Vec<String> {

@@ -201,24 +201,15 @@ impl CoreLoop {
         overlay: &TxnOverlay,
         coll_key: &(DatabaseId, TenantId, String),
     ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
+        // Each base row at its current version: the newest version of each
+        // row on a bitemporal collection, the plain table on any other.
         let database_id = task.request.database_id.as_u64();
-        let bitemporal = self.is_bitemporal(database_id, tid, collection);
-        let mut rows = Vec::new();
-        for key in self.scan_matching_documents(database_id, tid, collection, &[])? {
-            if overlay.get(coll_key, key.surrogate().as_u32()).is_some() {
-                continue;
-            }
-            let body = if bitemporal {
-                self.sparse
-                    .versioned_get_current(database_id, tid, collection, &key)?
-            } else {
-                self.sparse.get(database_id, tid, collection, &key)?
-            };
-            if let Some(body) = body {
-                rows.push((key, body));
-            }
-        }
-        Ok(rows)
+        self.current_rows_where(
+            database_id,
+            tid,
+            collection,
+            &|key: &StorageKey, _: &[u8]| overlay.get(coll_key, key.surrogate().as_u32()).is_none(),
+        )
     }
 }
 

@@ -16,6 +16,9 @@
 //! The hint carries the collection name, index field, and the predicate value(s)
 //! so the converter layer can build an `IndexedFetch` physical sub-plan.
 
+use nodedb_types::SystemTimeScope;
+
+use crate::temporal::{TemporalScope, ValidTime};
 use crate::types::DocumentIndexLookupPlan;
 use crate::types::{CompareOp, FilterExpr, SqlPlan, SqlValue};
 
@@ -33,6 +36,24 @@ pub struct BitmapHint {
     pub primary_value: SqlValue,
     /// Additional values for IN-list expansion (empty for equality).
     pub extra_values: Vec<SqlValue>,
+    /// The side's system-time cutoff, `None` for the current state. The
+    /// bitmap reads the versioned index at this cutoff, so it holds the rows
+    /// the side reads.
+    pub system_as_of_ms: Option<i64>,
+}
+
+/// The system-time cutoff a side's bitmap reads at. `None` inside the outer
+/// `Option` when the index cannot answer the side's scope: it holds no valid
+/// time and lists no history, so such a side takes no pushdown.
+fn bitmap_cutoff(temporal: &TemporalScope) -> Option<Option<i64>> {
+    if !matches!(temporal.valid_time, ValidTime::Any) {
+        return None;
+    }
+    match temporal.system_time {
+        SystemTimeScope::Current => Some(None),
+        SystemTimeScope::AsOf(ms) => Some(Some(ms)),
+        SystemTimeScope::AllVersions => None,
+    }
 }
 
 /// Inspect `plan` and return a `BitmapHint` if the plan qualifies for bitmap
@@ -47,20 +68,24 @@ pub fn analyze(plan: &SqlPlan) -> Option<BitmapHint> {
             collection,
             field,
             value,
+            temporal,
             ..
         }) => Some(BitmapHint {
             collection: collection.clone(),
             field: field.clone(),
             primary_value: value.clone(),
             extra_values: Vec::new(),
+            system_as_of_ms: bitmap_cutoff(temporal)?,
         }),
 
         // Plain scan: inspect WHERE filters for indexed-column equality / IN-list.
         SqlPlan::Scan {
             collection,
             filters,
+            temporal,
             ..
         } => {
+            let system_as_of_ms = bitmap_cutoff(temporal)?;
             // The `SqlPlan::Scan` does not directly carry `IndexSpec` list — that
             // lives on `TableInfo` which the engine-rules layer consumed when it
             // chose *not* to rewrite to `DocumentIndexLookup`. However, when the
@@ -75,7 +100,7 @@ pub fn analyze(plan: &SqlPlan) -> Option<BitmapHint> {
             // index-backed) is emitted unconditionally.
             //
             // Future: if `Scan` carries index metadata, extend this arm.
-            analyze_scan_filters(collection, filters)
+            analyze_scan_filters(collection, filters, system_as_of_ms)
         }
 
         _ => None,
@@ -90,7 +115,11 @@ pub fn analyze(plan: &SqlPlan) -> Option<BitmapHint> {
 ///
 /// This is called for plain `Scan` nodes whose engine rules could not confirm
 /// a `Ready` index. Returns `None` to be safe.
-fn analyze_scan_filters(collection: &str, filters: &[crate::types::Filter]) -> Option<BitmapHint> {
+fn analyze_scan_filters(
+    collection: &str,
+    filters: &[crate::types::Filter],
+    system_as_of_ms: Option<i64>,
+) -> Option<BitmapHint> {
     // Conservative: only emit when there is exactly one filter and it is an
     // equality or a small IN-list. The caller (engine rules) would have promoted
     // this to `DocumentIndexLookup` if the index was `Ready`; we skip here to
@@ -108,6 +137,7 @@ fn analyze_scan_filters(collection: &str, filters: &[crate::types::Filter]) -> O
             field: field.clone(),
             primary_value: value.clone(),
             extra_values: Vec::new(),
+            system_as_of_ms,
         }),
         FilterExpr::InList { field, values }
             if !values.is_empty() && values.len() <= MAX_IN_LIST =>
@@ -119,6 +149,7 @@ fn analyze_scan_filters(collection: &str, filters: &[crate::types::Filter]) -> O
                 field: field.clone(),
                 primary_value: primary,
                 extra_values: iter.collect(),
+                system_as_of_ms,
             })
         }
         _ => None,

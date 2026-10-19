@@ -575,7 +575,15 @@ mod tests {
     /// Run `WRITES` logged writes through a consumer whose ring holds
     /// `ring_capacity` events, and return what the side effects saw, the
     /// number of ring drops, and the persisted watermark after shutdown.
+    ///
+    /// The caller runs on a current-thread runtime. The consumer task then
+    /// runs only while this function awaits, never during the write burst.
     async fn run(ring_capacity: usize) -> (Totals, u64, Lsn, Lsn) {
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+            "the burst must run with the consumer parked"
+        );
         let dir = tempfile::tempdir().expect("tempdir");
         let (wal, watermark_store, shared, trigger_dlq, cdc_router) =
             crate::event::test_utils::event_test_deps(&dir);
@@ -600,13 +608,15 @@ mod tests {
             slab_account: Arc::new(crate::event::slab_budget::ConsumerSlabAccount::new(0)),
         });
 
-        // Every write is logged, durable and final before its event leaves,
-        // as on the write path. The burst outruns a small ring, which drops events the
-        // consumer then rebuilds from the WAL while the ring still carries
-        // the rest: some events reach the consumer on both paths.
-        // Let the idle consumer ramp to its long poll sleep, so the burst
-        // below lands while it sleeps.
+        // The consumer starts and reads its boot WAL bound while this sleeps.
+        // So the burst below lands mid-run, above that bound.
         tokio::time::sleep(Duration::from_millis(200)).await;
+        // Every write is logged, durable and final before its event leaves,
+        // as on the write path. The burst has no await point, so the parked
+        // consumer takes nothing from the ring until it ends. A small ring
+        // keeps its first events and drops the rest. The consumer then takes
+        // the kept events and rebuilds every write from the WAL: the kept
+        // events reach it on both paths.
         let mut dropped = 0u64;
         let mut last_lsn = Lsn::ZERO;
         for i in 1..=WRITES {
@@ -661,7 +671,7 @@ mod tests {
 
     /// An event carried by both the ring and WAL catch-up reaches every side
     /// effect once, and a dropped event reaches each of them all the same.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "current_thread")]
     async fn catch_up_mid_run_delivers_every_event_exactly_once() {
         let expected = Totals {
             audit_rows: WRITES as usize,

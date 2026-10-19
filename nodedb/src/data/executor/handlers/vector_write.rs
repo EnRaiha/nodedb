@@ -113,16 +113,8 @@ impl CoreLoop {
         // Capture the surrogate before deletion so we can fetch the
         // payload row from the sparse store and update the bitmap. The
         // bitmap stores node-id -> field-value membership; without the
-        // original field values we cannot remove the entries cleanly.
-        //
-        // Asymmetric with the insert path (`vector_upsert`): insert
-        // atomically rolls back the HNSW node if the sparse write fails,
-        // because a phantom node would be returned by future searches.
-        // Delete is best-effort cleanup — if the sparse read or decode
-        // fails we still drop the HNSW node and skip bitmap cleanup.
-        // Phantom bitmap entries are safe (the bitmap is filtered against
-        // live node ids on read), so leaving them is preferable to
-        // aborting the delete and leaking the vector.
+        // original field values we cannot remove the entries cleanly, so
+        // a row that does not read or decode refuses the delete.
         let surrogate_opt = self
             .vector_collections
             .get(&index_key)
@@ -130,14 +122,35 @@ impl CoreLoop {
 
         if let Some(surrogate) = surrogate_opt {
             let row_key = nodedb_types::StorageKey::for_surrogate(surrogate);
-            let fields =
-                match self
-                    .sparse
-                    .get(task.request.database_id.as_u64(), tid, collection, &row_key)
-                {
-                    Ok(Some(bytes)) => decode_payload_lowercased(&bytes).ok(),
-                    _ => None,
-                };
+            // The row at its current version, so a bitemporal collection's
+            // payload entries leave too. A read or decode error refuses the
+            // delete before anything is removed. A row that is gone has no
+            // payload entries to remove.
+            let fields = match self.current_row_body(
+                task.request.database_id.as_u64(),
+                tid,
+                collection,
+                &row_key,
+            ) {
+                Ok(Some(bytes)) => match decode_payload_lowercased(&bytes) {
+                    Ok(fields) => Some(fields),
+                    Err(e) => {
+                        let detail = e.to_string();
+                        crate::diag::vector_payload_undecodable(collection, &detail);
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!(
+                                    "vector delete: payload of the row behind vector \
+                                     {vector_id} in '{collection}' does not decode: {detail}"
+                                ),
+                            },
+                        );
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => return self.response_error(task, ErrorCode::from(e)),
+            };
             if let Some(fields) = fields
                 && let Some(coll) = self.vector_collections.get_mut(&index_key)
             {
