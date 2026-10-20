@@ -65,6 +65,12 @@ impl<'t, 'a> Cursor<'t, 'a> {
         }
     }
 
+    /// The tokens not yet consumed.
+    pub(super) fn rest(&self) -> &'t [Tok<'a>] {
+        let toks: &'t [Tok<'a>] = self.toks;
+        toks.get(self.pos..).unwrap_or_default()
+    }
+
     /// Consume the next token when it is the bare word `keyword`.
     pub(super) fn eat_keyword(&mut self, keyword: &str) -> bool {
         let hit =
