@@ -23,6 +23,46 @@ use crate::types::TenantId;
 
 use super::CoreLoop;
 
+/// The first filter-evaluation error a scan's infallible predicate met.
+///
+/// Storage scans take a `bool` predicate. A fallible matcher runs through
+/// [`Self::check`], which holds its first error and reads it as no match.
+/// The caller returns the held error once the scan ends, so a division by
+/// zero fails the statement instead of excluding the row.
+#[derive(Default)]
+pub(in crate::data::executor) struct HeldEvalError(std::cell::RefCell<Option<EvalError>>);
+
+impl HeldEvalError {
+    /// The verdict of `eval`. After an error is held, no row is evaluated
+    /// and every row reads as no match.
+    pub(in crate::data::executor) fn check(
+        &self,
+        eval: impl FnOnce() -> Result<bool, EvalError>,
+    ) -> bool {
+        if self.0.borrow().is_some() {
+            return false;
+        }
+        match eval() {
+            Ok(matched) => matched,
+            Err(e) => {
+                self.0.replace(Some(e));
+                false
+            }
+        }
+    }
+
+    /// `value`, or the held error when a predicate met one.
+    pub(in crate::data::executor) fn finish<T, E: From<EvalError>>(
+        &self,
+        value: T,
+    ) -> Result<T, E> {
+        match self.0.borrow_mut().take() {
+            Some(e) => Err(E::from(e)),
+            None => Ok(value),
+        }
+    }
+}
+
 /// Evaluate `filters` against a stored row `body`, given the row's ALREADY
 /// RESOLVED strict schema (`Some` for a strict collection, `None` for
 /// schemaless). Callers that check many rows against the same
@@ -97,16 +137,8 @@ impl CoreLoop {
     /// Build a reusable `Fn(&StorageKey, &[u8]) -> Result<bool, EvalError>`
     /// closure evaluating `filters` against a stored row's `(row_key, body)`,
     /// resolving `collection`'s strict schema ONCE up front (not per row) and
-    /// capturing it in the closure. Suitable for a hot per-row scan loop
-    /// directly, or as the fallible half of a Cell-wrapping call pattern —
-    /// [`CoreLoop::merge_overlay_into_scan`] actually expects an
-    /// *infallible* `&dyn Fn(&StorageKey, &[u8]) -> bool`, not this
-    /// function's own `Result`-returning output, so callers that feed it
-    /// into that merge wrap the closure this function returns in a second,
-    /// infallible one that stashes any `Err` into a local
-    /// `Cell<Option<EvalError>>` and checks it once the merge call returns —
-    /// see `stage_bulk_delete.rs`/`stage_bulk_update.rs`'s `raw_matches` /
-    /// `matches` pair for the exact pattern.
+    /// capturing it in the closure. A scan that takes an infallible predicate
+    /// wraps it with [`HeldEvalError::check`].
     pub(in crate::data::executor) fn strict_aware_matcher<'a>(
         &self,
         database_id: u64,

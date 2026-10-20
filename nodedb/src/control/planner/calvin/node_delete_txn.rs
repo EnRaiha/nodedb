@@ -2,8 +2,8 @@
 
 //! Node-delete edge tasks for a delete inside a session transaction.
 //!
-//! An explicit transaction does not take the OLLP reconnaissance route, so
-//! the delete's edge tasks are derived at the statement and buffered with it:
+//! A transaction derives the delete's edge tasks at the statement, from the
+//! read its prediction takes, and buffers them with it:
 //!
 //! - One `EdgeDelete` per edge an edge document's `_from`/`_to` mirrors.
 //! - One `EdgeDelete` per edge of the collection incident on each deleted
@@ -19,7 +19,7 @@ use super::dependent_recon_node_edges::{
     NodeDeletePlan, NodeIncidentEdges, node_delete_tasks, planned_edge_deletes,
     read_node_incident_edges,
 };
-use super::preexec::{PreexecRequest, RowIdentityRead, run_preexec_scan};
+use super::preexec::{PreexecRequest, PreexecScan, RowIdentityRead, run_preexec_scan};
 use crate::control::planner::implicit_edges::append_implicit_edge_delete_tasks;
 use crate::control::state::SharedState;
 use crate::types::{TraceId, TxnId};
@@ -30,11 +30,15 @@ use crate::types::{TraceId, TxnId};
 /// other task, and for a delete on a collection no edge was ever written
 /// into. A TRUNCATE of an edge-bearing collection is refused.
 ///
+/// `prediction` is the statement's own read of a predicate delete's rows.
+/// The edge tasks derive from it, so they cover exactly the rows it stages.
+///
 /// Guards come first in the returned list.
 pub async fn txn_node_delete_tasks(
     state: &SharedState,
     task: &PhysicalTask,
     txn_id: Option<TxnId>,
+    prediction: Option<&PreexecScan>,
 ) -> crate::Result<Vec<PhysicalTask>> {
     let (tenant_id, database_id) = (task.tenant_id, task.database_id);
     // The rows the statement deletes: a predicate, one row by surrogate, or
@@ -108,8 +112,10 @@ pub async fn txn_node_delete_tasks(
     let declared_primary_key = coll.declared_primary_key;
 
     // The rows as this transaction sees them, read before the delete stages.
-    let (identities, scanned_edges) = match target {
-        DeleteTarget::Rows { filters, prefilter } => {
+    let (identities, scanned_edges) = match (target, prediction) {
+        // The statement's prediction read these rows already.
+        (DeleteTarget::Rows { .. }, Some(scan)) => (scan.identities.clone(), scan.edges.clone()),
+        (DeleteTarget::Rows { filters, prefilter }, None) => {
             let scan = run_preexec_scan(
                 state,
                 tenant_id,
@@ -127,7 +133,7 @@ pub async fn txn_node_delete_tasks(
             .await?;
             (scan.identities, scan.edges)
         }
-        DeleteTarget::Document(document_id) => (vec![document_id], Vec::new()),
+        (DeleteTarget::Document(document_id), _) => (vec![document_id], Vec::new()),
     };
     let mut edge_tasks = Vec::new();
     append_implicit_edge_delete_tasks(

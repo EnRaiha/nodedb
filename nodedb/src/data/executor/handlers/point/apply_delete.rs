@@ -12,7 +12,7 @@ use redb::WriteTransaction;
 use tracing::warn;
 
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::enforcement::{append_only, period_lock, retention};
+use crate::data::executor::enforcement::{append_only, retention};
 use nodedb_physical::physical_plan::ResolvedSumTarget;
 use nodedb_types::Surrogate;
 
@@ -166,7 +166,7 @@ impl CoreLoop {
             if let Some(ref body) = prior {
                 if enforce && let Some(config) = self.doc_configs.get(&config_key) {
                     run_delete_enforcement(
-                        &self.sparse,
+                        self,
                         database_id,
                         tid,
                         collection,
@@ -177,54 +177,20 @@ impl CoreLoop {
                 }
                 let sys_from = carried_sys_from.unwrap_or_else(|| self.bitemporal_now_ms());
                 bitemporal_sys_from_ms = Some(sys_from);
-                self.sparse.versioned_tombstone_in_txn(
+                // The tombstone version, plus an index tombstone for every
+                // current value, so a lookup at or after `sys_from` skips
+                // this row.
+                bitemporal_index_tuples = self.tombstone_version_in_txn(
                     txn,
-                    database_id,
-                    tid,
-                    collection,
-                    &storage_key,
-                    sys_from,
+                    super::delete_version::VersionTombstone {
+                        database_id,
+                        tid,
+                        collection,
+                        storage_key: &storage_key,
+                        current_body: body,
+                        sys_from_ms: sys_from,
+                    },
                 )?;
-                // Index tombstones: reflect every current value so
-                // `index_lookup_as_of` at or after `sys_from` skips this
-                // doc_id. `body` is the STORED bytes (MessagePack for
-                // schemaless, Binary Tuple for strict) — use the
-                // storage-mode-aware decoder so strict bitemporal deletes
-                // also tombstone their secondary-index entries instead of
-                // silently skipping this loop.
-                if let Some(config) = self.doc_configs.get(&config_key) {
-                    // A body that will not decode leaves every index entry it
-                    // owns un-tombstoned, so the deleted row stays findable by
-                    // its old indexed values. That must fail the delete, not
-                    // skip the loop.
-                    let doc = self.decode_stored_document(config, body)?;
-                    for path in config.index_paths.clone() {
-                        for v in crate::engine::document::store::extract_index_values(
-                            &doc,
-                            &path.path,
-                            path.is_array,
-                        ) {
-                            let value = if path.case_insensitive {
-                                v.to_lowercase()
-                            } else {
-                                v
-                            };
-                            self.sparse.versioned_index_tombstone_in_txn(
-                                txn,
-                                crate::engine::sparse::btree_versioned::VersionedIndexEntry {
-                                    database_id,
-                                    tenant: tid,
-                                    coll: collection,
-                                    field: &path.path,
-                                    value: &value,
-                                    doc_id: &storage_key,
-                                    sys_from_ms: sys_from,
-                                },
-                            )?;
-                            bitemporal_index_tuples.push((path.path.clone(), value));
-                        }
-                    }
-                }
             }
             prior
         } else {
@@ -233,7 +199,7 @@ impl CoreLoop {
                     .sparse
                     .get(database_id, tid, collection, &storage_key)?;
                 run_delete_enforcement(
-                    &self.sparse,
+                    self,
                     database_id,
                     tid,
                     collection,
@@ -422,7 +388,7 @@ impl CoreLoop {
 /// These checks have no persistent side effect, so a violation here
 /// simply aborts before the write.
 pub(in crate::data::executor) fn run_delete_enforcement(
-    sparse: &crate::engine::sparse::btree::SparseEngine,
+    core: &CoreLoop,
     database_id: u64,
     tid: u64,
     collection: &str,
@@ -435,8 +401,7 @@ pub(in crate::data::executor) fn run_delete_enforcement(
     if let Some(ref pl) = config.enforcement.period_lock
         && let Some(old_bytes) = old_value
     {
-        period_lock::check_period_lock(
-            sparse,
+        core.check_period_lock_at(
             database_id,
             tid,
             collection,

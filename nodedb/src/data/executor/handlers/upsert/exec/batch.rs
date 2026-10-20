@@ -147,7 +147,6 @@ impl CoreLoop {
             database_id,
             tid,
             collection,
-            bitemporal: self.is_bitemporal(database_id, tid, collection),
             strict_schema: strict_schema.as_ref(),
             identity_column: &identity_column,
         };

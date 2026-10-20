@@ -171,8 +171,9 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         for mutation in mutations {
             let row_key = StorageKey::for_surrogate(mutation.surrogate());
-            let current =
-                self.doc_current_bytes(database_id, tid, mutation.collection().as_str(), &row_key)?;
+            let current = self
+                .current_row_body(database_id, tid, mutation.collection().as_str(), &row_key)
+                .map_err(ErrorCode::from)?;
             if current.as_deref() != mutation.precondition() {
                 return Err(ErrorCode::OllpRetryRequired);
             }

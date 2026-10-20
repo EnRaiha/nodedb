@@ -150,7 +150,7 @@ pub(super) async fn dispatch_graph_owner_read(
         }
     };
     Some(match served {
-        Ok(response) => data_plane_response_to_native(ctx, seq, plan, &response),
+        Ok(response) => data_plane_response_to_native(ctx, seq, plan, &response).await,
         Err(error) => error_to_native(seq, &error),
     })
 }

@@ -73,7 +73,7 @@ macro_rules! impl_scan_read_arms_for_convert_visitor {
                 distinct: _distinct,
                 window_functions: _window_functions,
                 case_insensitive: _case_insensitive,
-                temporal: _temporal,
+                temporal,
             } = args;
             super::super::scan::convert_document_index_lookup(
                 super::super::scan::DocumentIndexLookupArgs {
@@ -86,6 +86,7 @@ macro_rules! impl_scan_read_arms_for_convert_visitor {
                     offset,
                     tenant_id: self.tenant_id,
                     database_id: self.ctx.database_id,
+                    temporal,
                 },
             )
         }

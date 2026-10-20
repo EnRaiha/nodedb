@@ -16,11 +16,12 @@
 
 use std::collections::HashMap;
 
-use nodedb_types::{RowIdentity, Surrogate};
+use nodedb_types::Surrogate;
 use nodedb_vector::SearchResult;
 use tracing::{debug, warn};
 
 use super::graph_expansion::{GraphExpansionParams, GraphSeeds};
+use super::rag_key::RagKey;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec::{
@@ -33,21 +34,20 @@ use crate::query::fusion::{FusedResult, RankedResult, reciprocal_rank_fusion_wei
 /// Result of a successful vector search.
 ///
 /// - `Vec<SearchResult>` is the raw HNSW output, for reporting candidate counts.
-/// - `HashMap` maps each hit's *reporting key* to `(rank, distance)`. That key
-///   is what RRF fuses on and what the response returns: the client-visible
-///   identity of the row.
+/// - `HashMap` maps each hit's [`RagKey`] to `(rank, distance)`. That key is
+///   what RRF fuses on. The response renders it after fusion.
 /// - `Vec<Surrogate>` is the same hits in the identity currency, ready to seed
 ///   graph expansion with no translation.
 type VectorNodeScores = (
     Vec<SearchResult>,
-    HashMap<RowIdentity, (usize, f32)>,
+    HashMap<RagKey, (usize, f32)>,
     Vec<Surrogate>,
 );
 
 /// Parameters for `build_rag_response` and [`rag_response_body`].
 pub(crate) struct RagResponseParams<'a> {
-    pub fused: &'a [FusedResult<RowIdentity>],
-    pub vector_scores: &'a HashMap<RowIdentity, (usize, f32)>,
+    pub fused: &'a [FusedResult<RagKey>],
+    pub vector_scores: &'a HashMap<RagKey, (usize, f32)>,
     pub hop_distances: &'a HashMap<String, usize>,
     pub vector_candidate_count: usize,
     pub graph_expanded_count: usize,
@@ -189,15 +189,11 @@ impl CoreLoop {
         // graph leg seeds from directly — no name is minted to seed a walk that
         // would only hash it straight back to the same node.
         //
-        // The reporting key is resolved once per hit: the graph node name when
-        // the surrogate is bound to one, otherwise the surrogate's
-        // client-visible decimal identity. Falling back to the identity rather
-        // than to an index-local sentinel is what lets a hit fuse with the
-        // *text* leg, which keys on exactly that; the old `__local_{hnsw_id}`
-        // sentinel could match nothing and leaked an internal index id into
-        // the response's `node_id`.
+        // The fusion key is resolved once per hit: the graph node name when
+        // the surrogate is bound to one, otherwise the surrogate itself. The
+        // text leg keys by the same rule, so the two legs meet on one key.
         let csr = self.csr_partition(database_id, tenant_id);
-        let mut vector_scores: HashMap<RowIdentity, (usize, f32)> = HashMap::new();
+        let mut vector_scores: HashMap<RagKey, (usize, f32)> = HashMap::new();
         let mut seeds: Vec<Surrogate> = Vec::with_capacity(hits.len());
         let mut vector_results: Vec<SearchResult> = Vec::with_capacity(hits.len());
         for (rank, (result, surrogate)) in hits.into_iter().enumerate() {
@@ -205,15 +201,10 @@ impl CoreLoop {
                 seeds.push(s);
             }
             let key = match surrogate {
-                Some(s) => csr
-                    .and_then(|c| c.node_id_for_surrogate(s))
-                    .map(RowIdentity::from_user_key)
-                    .unwrap_or_else(|| RowIdentity::for_surrogate(s)),
-                // No surrogate at all: the vector entry predates surrogate
-                // plumbing, so it has no cross-engine identity. It still ranks
-                // in the vector leg under a key that deliberately matches
-                // nothing else.
-                None => RowIdentity::from_user_key(format!("__unbound_{}", result.id)),
+                Some(s) => RagKey::of_hit(csr.and_then(|c| c.node_id_for_surrogate(s)), s),
+                // An entry with no surrogate has no cross-engine identity. It
+                // ranks in the vector leg under a key that matches nothing else.
+                None => RagKey::Unbound(result.id),
             };
             vector_scores.insert(key, (rank, result.distance));
             vector_results.push(result);
@@ -299,10 +290,16 @@ pub(crate) fn rag_response_body(p: &RagResponseParams<'_>, watermark_lsn: u64) -
                 .get(&f.document_id)
                 .map(|(rank, dist)| (Some(*rank), Some(*dist)))
                 .unwrap_or((None, None));
-            let hop_distance = p.hop_distances.get(f.document_id.as_str()).copied();
+            let (node_id, surrogate, hop_distance) = match &f.document_id {
+                RagKey::Node(name) => (name.clone(), None, p.hop_distances.get(name).copied()),
+                // The response boundary names this row from the catalog. The
+                // decimal stands only for a row the catalog binds no key to.
+                RagKey::Row(s) => (s.as_u32().to_string(), Some(s.as_u32()), None),
+                RagKey::Unbound(_) => (f.document_id.rendered().into_owned(), None, None),
+            };
             GraphRagResult {
-                // The identity is rendered here, at the response envelope.
-                node_id: f.document_id.clone().into_string(),
+                node_id,
+                surrogate,
                 rrf_score: f.rrf_score,
                 vector_rank,
                 vector_distance,
@@ -322,10 +319,10 @@ pub(crate) fn rag_response_body(p: &RagResponseParams<'_>, watermark_lsn: u64) -
     }
 }
 
-/// The vector leg as a ranked list, keyed by each hit's reporting key.
+/// The vector leg as a ranked list, keyed by each hit's fusion key.
 pub(crate) fn vector_ranked_list(
-    vector_scores: &HashMap<RowIdentity, (usize, f32)>,
-) -> Vec<RankedResult<RowIdentity>> {
+    vector_scores: &HashMap<RagKey, (usize, f32)>,
+) -> Vec<RankedResult<RagKey>> {
     vector_scores
         .iter()
         .map(|(node_id, (rank, dist))| RankedResult {
@@ -339,15 +336,15 @@ pub(crate) fn vector_ranked_list(
 
 /// Sort expanded graph nodes by hop distance and convert to `RankedResult` list.
 ///
-/// A graph node name is the row's client identity, so the list keys on
-/// `RowIdentity`. Used by 2-source GraphRAG, 3-source GraphRAG triple, and the
-/// cluster coordinator.
+/// A graph node name is the row's client key, so the list keys on
+/// [`RagKey::Node`]. Used by 2-source GraphRAG, 3-source GraphRAG triple, and
+/// the cluster coordinator.
 pub(crate) fn graph_nodes_to_ranked_results(
     expanded_nodes: Vec<String>,
     hop_distances: &HashMap<String, usize>,
-) -> Vec<RankedResult<RowIdentity>> {
-    // Takes `expanded_nodes` by value so the name moves straight into
-    // `RowIdentity` below instead of being copied from a borrow.
+) -> Vec<RankedResult<RagKey>> {
+    // Takes `expanded_nodes` by value so the name moves straight into the
+    // key below instead of being copied from a borrow.
     let mut sorted: Vec<(String, usize)> = expanded_nodes
         .into_iter()
         .map(|node| {
@@ -361,7 +358,7 @@ pub(crate) fn graph_nodes_to_ranked_results(
         .into_iter()
         .enumerate()
         .map(|(rank, (node_id, hop_dist))| RankedResult {
-            document_id: RowIdentity::from_user_key(node_id),
+            document_id: RagKey::Node(node_id),
             rank,
             score: hop_dist as f32,
             source: "graph",

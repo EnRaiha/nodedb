@@ -372,7 +372,7 @@ mod tests {
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         let task = make_task();
 
-        // Seed 3 rows; the predicted set names a known 2-row subset.
+        // Seed 3 rows; the empty predicate matches all three, as predicted.
         seed_row(&mut core, "orders", 10, "a", "1");
         seed_row(&mut core, "orders", 11, "a", "1");
         seed_row(&mut core, "orders", 12, "a", "1");
@@ -382,7 +382,7 @@ mod tests {
             &task,
             3,
             0,
-            &[bulk_delete_plan("orders", Some(vec![10, 12]))],
+            &[bulk_delete_plan("orders", Some(vec![10, 11, 12]))],
         );
 
         let resp = core.execute_calvin_resolve(&task, 3, 0);
@@ -390,46 +390,50 @@ mod tests {
         let record = resolved_record(&resp);
         assert_eq!(
             record.ops.len(),
-            2,
+            3,
             "exactly one Delete sub-record per predicted surrogate"
         );
-        assert_eq!(deleted_surrogates(&record), vec![10, 12]);
+        assert_eq!(deleted_surrogates(&record), vec![10, 11, 12]);
     }
 
     #[test]
-    fn calvin_bulk_delete_ignores_drift_from_predicted_set() {
+    fn calvin_bulk_delete_refuses_drift_from_predicted_set() {
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         let task = make_task();
 
-        // 3 rows exist in base and would ALL match an empty-predicate
-        // (match-everything) live rescan. The predicted set names only 2 of
-        // them -- if staging re-derived the row set via a live scan instead
-        // of trusting the predicted set, the redo would carry 3 deletes, not
-        // 2. This is the determinism proof: staging must key off the
-        // predicted set the install applies, not a fresh predicate scan.
+        // 3 rows match the empty (match-everything) predicate, but the plan
+        // predicts only 2 of them. The stage refuses the drifted prediction
+        // and stages nothing, so no stale redo exists to resolve.
         seed_row(&mut core, "orders", 20, "a", "1");
         seed_row(&mut core, "orders", 21, "a", "1");
         seed_row(&mut core, "orders", 22, "a", "1");
 
-        stage(
-            &mut core,
+        let ctx = CalvinExecCtx {
+            epoch: 4,
+            position: 0,
+            epoch_system_ms: 0,
+        };
+        let staged = core.execute_calvin_execute_static(
             &task,
-            4,
-            0,
+            ctx,
+            &TenantId::new(1),
             &[bulk_delete_plan("orders", Some(vec![20, 21]))],
+            &[],
+            &[],
+        );
+        assert_eq!(staged.status, Status::Error);
+        assert_eq!(
+            staged.stage_vote,
+            Some(crate::bridge::envelope::StageVote::PredictionDrift)
         );
 
         let resp = core.execute_calvin_resolve(&task, 4, 0);
-        assert_eq!(resp.status, Status::Ok, "resolve must succeed: {resp:?}");
-        let record = resolved_record(&resp);
         assert_eq!(
-            record.ops.len(),
-            2,
-            "redo must reflect ONLY the predicted surrogates, not the live \
-             (drifted) match-everything set"
+            resp.status,
+            Status::Error,
+            "a refused stage leaves nothing to resolve"
         );
-        assert_eq!(deleted_surrogates(&record), vec![20, 21]);
     }
 
     #[test]

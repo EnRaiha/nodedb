@@ -210,7 +210,7 @@ impl CoreLoop {
         for (surrogate, score, fuzzy) in hits {
             let storage_key = nodedb_types::StorageKey::for_surrogate(surrogate);
             let bytes_opt = self.overlay_or_base_body(txn_id, &coll_key, &storage_key, || {
-                self.text_base_body(database_id, tid, collection, &storage_key)
+                self.current_row_body(database_id, tid, collection, &storage_key)
             })?;
             // A surrogate with no body was indexed for FTS without a document
             // write (FtsIndex frames synced from Lite). Its row is the

@@ -209,14 +209,16 @@ impl NodeDbPgHandler {
                         // The clone-write hook fully handled this task locally —
                         // never forwarded — so its one payload folds exactly
                         // like a forwarded one.
-                        let rows = self.fold_gateway_payload(
-                            &mut fold,
-                            resp.payload.as_ref(),
-                            plan_kind,
-                            shape_plan.as_ref(),
-                            tag_role,
-                            &shaping,
-                        )?;
+                        let rows = self
+                            .fold_gateway_payload(
+                                &mut fold,
+                                resp.payload.as_ref(),
+                                plan_kind,
+                                shape_plan.as_ref(),
+                                tag_role,
+                                &shaping,
+                            )
+                            .await?;
                         meter_gateway_task(
                             &self.state,
                             metering_scope.as_ref(),
@@ -246,24 +248,29 @@ impl NodeDbPgHandler {
             // write is refused by the count reader.
             let mut task_rows: Option<u64> = None;
             if payloads.is_empty() {
-                task_rows = self.fold_gateway_payload(
-                    &mut fold,
-                    &[],
-                    plan_kind,
-                    shape_plan.as_ref(),
-                    tag_role,
-                    &shaping,
-                )?;
+                task_rows = self
+                    .fold_gateway_payload(
+                        &mut fold,
+                        &[],
+                        plan_kind,
+                        shape_plan.as_ref(),
+                        tag_role,
+                        &shaping,
+                    )
+                    .await?;
             }
             for payload in &payloads {
-                if let Some(rows) = self.fold_gateway_payload(
-                    &mut fold,
-                    payload,
-                    plan_kind,
-                    shape_plan.as_ref(),
-                    tag_role,
-                    &shaping,
-                )? {
+                if let Some(rows) = self
+                    .fold_gateway_payload(
+                        &mut fold,
+                        payload,
+                        plan_kind,
+                        shape_plan.as_ref(),
+                        tag_role,
+                        &shaping,
+                    )
+                    .await?
+                {
                     task_rows = Some(task_rows.unwrap_or(0) + rows);
                 }
             }

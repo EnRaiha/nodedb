@@ -57,6 +57,8 @@ mod graph_native_walks_support;
 mod graph_owner_reads_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_rag_fusion_cross_node.rs"]
 mod graph_rag_fusion_cross_node;
+#[path = "../../sql_cluster_cross_node_dml_tests/graph_rag_fusion_naming_cross_node.rs"]
+mod graph_rag_fusion_naming_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_traverse_cross_node.rs"]
 mod graph_traverse_cross_node;
 #[path = "../../sql_cluster_cross_node_dml_tests/graph_traverse_reverse_cross_node.rs"]

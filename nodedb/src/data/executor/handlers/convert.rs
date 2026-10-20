@@ -67,6 +67,21 @@ impl CoreLoop {
 
         let source_format = source_format_of(source_storage_mode);
 
+        // A bitemporal collection holds its rows only as versions. Each
+        // version is rewritten in place, so its history survives.
+        if self.is_bitemporal(task.request.database_id.as_u64(), tid, collection) {
+            return self.convert_bitemporal_collection(
+                task,
+                super::convert_bitemporal::BitemporalConvert {
+                    tid,
+                    collection,
+                    target_type,
+                    schema_json,
+                    source_format,
+                },
+            );
+        }
+
         match target_type {
             "document_strict" => {
                 self.convert_to_strict(task, tid, collection, schema_json, source_format)
@@ -99,48 +114,18 @@ impl CoreLoop {
         schema_json: &str,
         source_format: SparseBodyFormat,
     ) -> Response {
-        // Parse the target schema from JSON column definitions.
-        let columns: Vec<ColumnDef> = match sonic_rs::from_str(schema_json) {
-            Ok(c) => c,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("invalid schema JSON: {e}"),
-                    },
-                );
-            }
+        let columns = match parse_target_columns(schema_json) {
+            Ok(columns) => columns,
+            Err(code) => return self.response_error(task, code),
         };
-
-        if columns.is_empty() {
-            return self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: "schema must have at least one column".into(),
-                },
-            );
-        }
-
         let schema = StrictSchema {
             columns,
             version: 1,
             dropped_columns: Vec::new(),
             bitemporal: false,
         };
-        let declared_primary_key = schema
-            .columns
-            .iter()
-            .find(|c| c.primary_key)
-            .map(|c| c.name.as_str());
-        // A system row id keys a schema with no declared key: it is an integer
-        // the write path fills from the surrogate. Every other key column holds
-        // the client-visible identity text.
-        let identity_column = match declared_primary_key {
-            Some(key) if key == nodedb_types::ROWID_COLUMN => nodedb_types::ROWID_COLUMN,
-            other => {
-                nodedb_types::declared_key(other).unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN)
-            }
-        };
+        let declared_primary_key = target_primary_key(&schema);
+        let identity_column = target_identity_column(declared_primary_key);
 
         // Scan all existing documents.
         let database_id = task.request.database_id.as_u64();
@@ -158,30 +143,7 @@ impl CoreLoop {
 
         for (doc_id, doc_bytes) in &docs {
             let normalized = sparse_body_to_msgpack(doc_bytes, source_format.as_format_ref());
-            // A row that lacks the target's key column has no client-visible
-            // identity yet: inject the surrogate's decimal string there so the
-            // target schema's NOT NULL key column has something to validate.
-            let synth_id = doc_id.to_identity();
-            let with_id = if identity_column == nodedb_types::ROWID_COLUMN {
-                // A row that carries its system row id keeps it. One that
-                // lacks it takes the surrogate, as a write fills it.
-                if msgpack_scan::extract_field(&normalized, 0, nodedb_types::ROWID_COLUMN).is_some()
-                {
-                    normalized.to_vec()
-                } else {
-                    let mut cell = Vec::with_capacity(9);
-                    msgpack_scan::writer::write_i64(
-                        &mut cell,
-                        i64::from(doc_id.surrogate().as_u32()),
-                    );
-                    msgpack_scan::merge_fields(
-                        &normalized,
-                        &[(nodedb_types::ROWID_COLUMN, cell.as_slice())],
-                    )
-                }
-            } else {
-                msgpack_scan::inject_str_field(&normalized, identity_column, synth_id.as_str())
-            };
+            let with_id = with_target_identity(&normalized, identity_column, doc_id);
             // The identity a user recognizes: the declared primary key's value,
             // or `id`, read from the row itself — never the internal surrogate.
             let identity = RowIdentity::of_stored_row(&normalized, declared_primary_key, *doc_id);
@@ -334,6 +296,65 @@ impl CoreLoop {
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
     }
+}
+
+/// The target strict columns a CONVERT carries as JSON. An empty or
+/// unparsable list is an internal error: the Control Plane built it.
+pub(super) fn parse_target_columns(schema_json: &str) -> Result<Vec<ColumnDef>, ErrorCode> {
+    let columns: Vec<ColumnDef> =
+        sonic_rs::from_str(schema_json).map_err(|e| ErrorCode::Internal {
+            detail: format!("invalid schema JSON: {e}"),
+        })?;
+    if columns.is_empty() {
+        return Err(ErrorCode::Internal {
+            detail: "schema must have at least one column".into(),
+        });
+    }
+    Ok(columns)
+}
+
+/// The target schema's declared primary-key column, if it declares one.
+pub(super) fn target_primary_key(schema: &StrictSchema) -> Option<&str> {
+    schema
+        .columns
+        .iter()
+        .find(|c| c.primary_key)
+        .map(|c| c.name.as_str())
+}
+
+/// The column a converted row's identity lands in.
+///
+/// A system row id keys a schema with no declared key: it is an integer the
+/// write path fills from the surrogate. Every other key column holds the
+/// client-visible identity text.
+pub(super) fn target_identity_column(declared_primary_key: Option<&str>) -> &str {
+    match declared_primary_key {
+        Some(key) if key == nodedb_types::ROWID_COLUMN => nodedb_types::ROWID_COLUMN,
+        other => nodedb_types::declared_key(other).unwrap_or(nodedb_types::DEFAULT_IDENTITY_COLUMN),
+    }
+}
+
+/// `normalized` with its identity under `identity_column`.
+///
+/// A row that lacks the target's key column has no client-visible identity
+/// yet: the surrogate's decimal string fills it, so the target schema's NOT
+/// NULL key column has something to validate. A row that carries its system
+/// row id keeps it. One that lacks it takes the surrogate, as a write fills it.
+pub(super) fn with_target_identity(
+    normalized: &[u8],
+    identity_column: &str,
+    doc_id: &nodedb_types::StorageKey,
+) -> Vec<u8> {
+    if identity_column != nodedb_types::ROWID_COLUMN {
+        let synth_id = doc_id.to_identity();
+        return msgpack_scan::inject_str_field(normalized, identity_column, synth_id.as_str());
+    }
+    if msgpack_scan::extract_field(normalized, 0, nodedb_types::ROWID_COLUMN).is_some() {
+        return normalized.to_vec();
+    }
+    let mut cell = Vec::with_capacity(9);
+    msgpack_scan::writer::write_i64(&mut cell, i64::from(doc_id.surrogate().as_u32()));
+    msgpack_scan::merge_fields(normalized, &[(nodedb_types::ROWID_COLUMN, cell.as_slice())])
 }
 
 /// Where one converted row lands.

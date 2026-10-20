@@ -51,10 +51,10 @@ pub(super) enum HttpShaped {
 
 /// Shape one Data-Plane payload for HTTP, mirroring the pgwire/native
 /// materialized-shaping call site.
-pub(super) fn shape_http_payload(
+pub(super) async fn shape_http_payload(
     request: MaterializedShapeRequest<'_>,
 ) -> Result<HttpShaped, NodeDbError> {
-    match shape_response_materialized(request)? {
+    match shape_response_materialized(request).await? {
         // Each row map is already keyed by `ShapedRows::cell_keys`, so it
         // serializes to JSON key for key, each typed cell converted at this
         // edge. When two output columns share a name the later one carries a
@@ -102,6 +102,35 @@ pub(super) fn passthrough_to_ndjson(payload: &[u8], ndjson: &mut String) {
     } else {
         ndjson.push_str(&json_str);
         ndjson.push('\n');
+    }
+}
+
+/// Shape one payload and append it to an NDJSON buffer: one line per row, a
+/// passthrough payload as [`passthrough_to_ndjson`] writes it, or one error
+/// line when shaping fails. Returns the rows it counts for metering.
+pub(super) async fn append_ndjson_payload(
+    ndjson: &mut String,
+    request: MaterializedShapeRequest<'_>,
+) -> u64 {
+    let payload = request.payload;
+    match shape_http_payload(request).await {
+        Ok(HttpShaped::Rows(rows)) => {
+            let count = rows.len() as u64;
+            for row in rows {
+                ndjson.push_str(&row.to_string());
+                ndjson.push('\n');
+            }
+            count
+        }
+        Ok(HttpShaped::Passthrough) => {
+            passthrough_to_ndjson(payload, ndjson);
+            1
+        }
+        Err(e) => {
+            ndjson.push_str(&serde_json::json!({"error": e.message()}).to_string());
+            ndjson.push('\n');
+            0
+        }
     }
 }
 

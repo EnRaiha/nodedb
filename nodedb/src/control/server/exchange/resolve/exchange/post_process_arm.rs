@@ -7,6 +7,7 @@ use nodedb_physical::physical_plan::{
     ExchangeMode, ExchangeOp, GatheredSource, PhysicalPlan, QueryOp, SortKeySpec, TextOp, VectorOp,
     plan_contains_cluster_partitioned_leaf,
 };
+use nodedb_types::Surrogate;
 
 use super::super::array_read_rows::is_cluster_array_read;
 
@@ -16,14 +17,13 @@ use crate::control::server::exchange::gather_outcome::GatherOutcome;
 use crate::control::server::exchange::owning_core::gather_single_owning_core;
 use crate::control::server::exchange::resolve::capture::DistributedReadCapture;
 use crate::control::server::response_translate::hit_key::parse_surrogate_hex;
-use crate::control::server::response_translate::vector::{
-    filter_vector_hits, resolve_surrogate_pk,
-};
+use crate::control::server::response_translate::pk_resolve::resolve_surrogate_pks;
+use crate::control::server::response_translate::vector::filter_vector_hits;
 use crate::control::server::shared::authorization::gathered_sources;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{
     flatten_hybrid_hits_to_relational_rows, flatten_to_relational_rows,
-    flatten_vector_hits_to_relational_rows,
+    flatten_vector_hits_to_relational_rows, hybrid_hit_surrogates, vector_hit_surrogates,
 };
 
 use crate::control::server::exchange::read_scope::ReadScope;
@@ -290,21 +290,23 @@ pub(super) async fn materialize_child_rows(
                 Some((rls_filters, top_k)) => filter_vector_hits(&merged, rls_filters, *top_k)?,
                 None => merged,
             };
+            // Every surrogate the flatten can ask for resolves in one batch.
+            let wanted = vector_hit_surrogates(&merged)
+                .into_iter()
+                .map(Surrogate::new);
+            let keys = resolve_surrogate_pks(state, database_id, tenant_id, &coll, wanted).await?;
             flatten_vector_hits_to_relational_rows(&merged, |surrogate| {
-                resolve_surrogate_pk(
-                    state,
-                    database_id,
-                    tenant_id,
-                    &coll,
-                    nodedb_types::Surrogate::new(surrogate),
-                )
-            })
+                keys.get(Surrogate::new(surrogate)).map(str::to_owned)
+            })?
         }
         HitShape::Hybrid => {
             let merged = outcome.merged_rows(as_aggregate)?;
+            let wanted = hybrid_hit_surrogates(&merged)
+                .into_iter()
+                .map(Surrogate::new);
+            let keys = resolve_surrogate_pks(state, database_id, tenant_id, &coll, wanted).await?;
             flatten_hybrid_hits_to_relational_rows(&merged, |key| {
-                let surrogate = parse_surrogate_hex(key)?;
-                resolve_surrogate_pk(state, database_id, tenant_id, &coll, surrogate)
+                keys.get(parse_surrogate_hex(key)?).map(str::to_owned)
             })
         }
         HitShape::ArrayRows => outcome.merged_array()?,

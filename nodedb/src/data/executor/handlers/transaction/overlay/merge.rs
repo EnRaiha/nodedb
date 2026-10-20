@@ -322,8 +322,8 @@ impl CoreLoop {
         let target = normalize(value.to_string());
         // `value_matches` feeds `Vec::retain` and a plain `for` loop, both of
         // which need a `bool`, so an undecodable staged body is captured via
-        // this `Cell` side-channel and checked once both passes finish —
-        // the same shape `predicate_err` below uses. Treating it as "does not
+        // this `Cell` side-channel and checked once both passes finish, as
+        // the residual's held evaluation error is. Treating it as "does not
         // match" and moving on would drop a staged row from the result with no
         // indication that a row was dropped.
         let decode_err: std::cell::Cell<Option<crate::Error>> = std::cell::Cell::new(None);
@@ -348,30 +348,24 @@ impl CoreLoop {
         // but not the residual is excluded exactly like it would be from a
         // base scan result.
         // `residual_matches` feeds `Vec::retain`/a plain `for` loop below,
-        // both of which need a `bool`, so a division/modulo-by-zero is
-        // captured via this `Cell` side-channel and checked once both
-        // passes finish.
-        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-            std::cell::Cell::new(None);
+        // both of which need a `bool`, so a division/modulo-by-zero is held
+        // and returned once both passes finish.
+        let held = crate::data::executor::core_loop::filter_match::HeldEvalError::default();
         let identity_column =
             self.identity_column(coll_key.0.as_u64(), coll_key.1.as_u64(), &coll_key.2);
         let residual_matches = |row_key: &StorageKey, body: &[u8]| -> bool {
             if residual.is_empty() {
                 return true;
             }
-            match matches_with_resolved_schema(
-                strict_schema,
-                residual,
-                row_key,
-                body,
-                &identity_column,
-            ) {
-                Ok(b) => b,
-                Err(e) => {
-                    predicate_err.set(Some(e));
-                    false
-                }
-            }
+            held.check(|| {
+                matches_with_resolved_schema(
+                    strict_schema,
+                    residual,
+                    row_key,
+                    body,
+                    &identity_column,
+                )
+            })
         };
 
         // Base doc IDs' surrogates, so additions don't re-append a row the
@@ -414,10 +408,7 @@ impl CoreLoop {
         if let Some(e) = decode_err.take() {
             return Err(e);
         }
-        if let Some(e) = predicate_err.take() {
-            return Err(crate::Error::from(e));
-        }
-        Ok(())
+        held.finish(())
     }
 
     /// Resolve the current body for a hex-surrogate `doc_id` in `coll_key`,

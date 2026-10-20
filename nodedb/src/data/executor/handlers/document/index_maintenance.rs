@@ -81,7 +81,9 @@ impl CoreLoop {
         // cap matches the Data Plane's other collection-wide scans; rows
         // beyond this are handled by a future chunked backfill (see
         // `scan_documents_chunked`).
-        let docs = match self.sparse.scan_documents(
+        // Each row at its current version: a bitemporal collection holds its
+        // rows only as versions.
+        let docs = match self.current_rows(
             task.request.database_id.as_u64(),
             tid,
             collection,
@@ -123,6 +125,9 @@ impl CoreLoop {
         // Index keys are accumulated here and written in one sorted pass after
         // the scan; see the bulk insert below.
         let mut pending_keys: Vec<String> = Vec::with_capacity(docs.len());
+        // A bitemporal collection's lookups read the versioned index, which
+        // the history walk below fills. The current rows still judge UNIQUE.
+        let bitemporal = self.is_bitemporal(task.request.database_id.as_u64(), tid, collection);
 
         for (doc_id, bytes) in &docs {
             // A row skipped here is a row the finished index permanently omits,
@@ -165,6 +170,9 @@ impl CoreLoop {
                 if unique {
                     seen.insert(stored.clone(), *doc_id);
                 }
+                if bitemporal {
+                    continue;
+                }
                 pending_keys.push(crate::engine::sparse::btree_index::index_key_for(
                     crate::engine::sparse::btree_index::IndexEntryTxn {
                         database_id: task.request.database_id.as_u64(),
@@ -186,6 +194,24 @@ impl CoreLoop {
         if let Err(e) = self.sparse.index_put_sorted_in_txn(&txn, &mut pending_keys) {
             return self.response_error(task, crate::bridge::envelope::ErrorCode::from(e));
         }
+        // Every version of every row, each at its own system time.
+        if bitemporal
+            && let Err(e) = self.backfill_versioned_index(
+                &txn,
+                &super::index_backfill_versions::VersionedBackfill {
+                    database_id: task.request.database_id.as_u64(),
+                    tid,
+                    collection,
+                    path,
+                    is_array,
+                    case_insensitive,
+                    predicate: parsed_predicate.as_ref(),
+                    body_format: body_format.as_format_ref(),
+                },
+            )
+        {
+            return self.response_error(task, crate::bridge::envelope::ErrorCode::from(e));
+        }
 
         if let Err(e) = txn.commit() {
             return self.response_error(
@@ -201,7 +227,7 @@ impl CoreLoop {
 
     /// Drop all secondary index entries for a field across the entire collection.
     ///
-    /// Calls `SparseEngine::delete_index_entries_for_field` directly.
+    /// Removes the field's plain and versioned index entries.
     /// Returns `{"removed": N}` as the response payload.
     pub(in crate::data::executor) fn execute_drop_document_index(
         &mut self,
@@ -217,12 +243,34 @@ impl CoreLoop {
             "drop document index"
         );
 
-        match self.sparse.delete_index_entries_for_field(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            field,
-        ) {
+        // Both index tables: a bitemporal collection keeps its entries in the
+        // versioned index, any other in the plain one. The other table holds
+        // nothing for the field, so its removal finds no entry.
+        // Both removals share one write transaction, so the field leaves both
+        // tables together or neither.
+        let database_id = task.request.database_id.as_u64();
+        let removed = self.sparse.begin_write().and_then(|txn| {
+            let plain = self.sparse.delete_index_entries_for_field_in_txn(
+                &txn,
+                database_id,
+                tid,
+                collection,
+                field,
+            )?;
+            let versioned = self.sparse.versioned_index_drop_field_in_txn(
+                &txn,
+                database_id,
+                tid,
+                collection,
+                field,
+            )?;
+            txn.commit().map_err(|e| crate::Error::Storage {
+                engine: "sparse".into(),
+                detail: format!("drop index commit: {e}"),
+            })?;
+            Ok(plain + versioned)
+        });
+        match removed {
             Ok(removed) => {
                 match super::super::super::response_codec::encode_count("removed", removed) {
                     Ok(bytes) => self.response_with_payload(task, bytes),

@@ -230,7 +230,8 @@ impl CoreLoop {
             // to standard msgpack maps that `decode_document_value` and
             // `extract_geometry` read identically.
             let sparse_result = match storage_key {
-                Some(key) => self.sparse.get(database_id, tid, collection, &key),
+                // At its current version, so a bitemporal collection resolves.
+                Some(key) => self.current_row_body(database_id, tid, collection, &key),
                 None => Ok(None),
             };
             let doc = match sparse_result {

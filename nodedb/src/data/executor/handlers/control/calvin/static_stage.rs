@@ -171,17 +171,7 @@ impl CoreLoop {
         } else {
             task.request.event_source
         };
-        let database_id = task.request.database_id;
-        let collections =
-            crate::control::wal_replication::transaction_redo::collections::written_collections(
-                std::slice::from_ref(plan),
-            );
-        self.txn_overlay_mut(txn_id).begin_staging(
-            source,
-            collections
-                .into_iter()
-                .map(|collection| (database_id, tenant_id, collection)),
-        );
+        self.begin_plan_staging(txn_id, source, task.request.database_id, tenant_id, plan);
     }
 }
 
@@ -197,8 +187,143 @@ mod tests {
     use crate::types::DatabaseId;
 
     use super::super::shared::test_support::{
-        bulk_delete_plan, canonical_ilp_plan, doc_value, make_task, point_insert_plan,
+        bulk_delete_plan, bulk_update_plan, canonical_ilp_plan, doc_value, make_task,
+        point_insert_plan, seed_row,
     };
+
+    fn stage_at(core: &mut CoreLoop, epoch: u64, plans: &[PhysicalPlan]) -> Response {
+        let ctx = CalvinExecCtx {
+            epoch,
+            position: 0,
+            epoch_system_ms: 0,
+        };
+        core.execute_calvin_execute_static(&make_task(), ctx, &TenantId::new(1), plans, &[], &[])
+    }
+
+    fn assert_drift_stages_nothing(core: &CoreLoop, response: &Response, epoch: u64) {
+        assert_eq!(response.status, Status::Error);
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some(&ErrorCode::OllpRetryRequired)
+        );
+        assert_eq!(response.stage_vote, Some(StageVote::PredictionDrift));
+        let vshard = make_task().request.vshard_id.as_u32();
+        assert!(!core.calvin.commit_pending.contains_key(&(epoch, 0, vshard)));
+        let synthetic = calvin_synthetic_txn_id(epoch, 0, vshard).unwrap();
+        assert!(!core.txn_overlays.contains_key(&synthetic));
+    }
+
+    /// A bulk delete whose predicted set misses a matching row votes
+    /// `PredictionDrift` on the static path and keeps nothing staged.
+    #[test]
+    fn static_stage_bulk_delete_drift_votes_prediction_drift_and_stages_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        seed_row(&mut core, "orders", 10);
+        seed_row(&mut core, "orders", 11);
+
+        let response = stage_at(&mut core, 31, &[bulk_delete_plan("orders", Some(vec![10]))]);
+
+        assert_drift_stages_nothing(&core, &response, 31);
+    }
+
+    #[test]
+    fn static_stage_bulk_update_drift_votes_prediction_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        seed_row(&mut core, "orders", 10);
+        seed_row(&mut core, "orders", 11);
+
+        let response = stage_at(&mut core, 32, &[bulk_update_plan("orders", Some(vec![11]))]);
+
+        assert_drift_stages_nothing(&core, &response, 32);
+    }
+
+    /// The prediction is checked at the plan's turn: a row an earlier plan of
+    /// the same transaction staged is one the predicate matches.
+    #[test]
+    fn static_stage_bulk_delete_matches_rows_an_earlier_plan_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let response = stage_at(
+            &mut core,
+            33,
+            &[
+                point_insert_plan("orders", "o1", 12),
+                bulk_delete_plan("orders", Some(vec![12])),
+            ],
+        );
+
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        assert_eq!(response.stage_vote, Some(StageVote::Commit));
+    }
+
+    #[test]
+    fn static_stage_bulk_delete_without_prediction_votes_participant_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let response = stage_at(&mut core, 34, &[bulk_delete_plan("orders", None)]);
+
+        assert_eq!(response.status, Status::Error);
+        assert_eq!(response.stage_vote, Some(StageVote::ParticipantError));
+    }
+
+    /// A materialized-sum source row whose join value the plan's resolution
+    /// does not cover votes `PredictionDrift`. A covered one stages.
+    #[test]
+    fn static_stage_bulk_delete_with_uncovered_sum_target_votes_prediction_drift() {
+        use crate::data::executor::handlers::transaction::redo_apply::calvin_fold_tests::{
+            SOURCE, TARGET, configure_sum,
+        };
+        let source_row = |core: &mut CoreLoop, surrogate: u32, account: &str| {
+            let body = doc_format::encode_to_msgpack(
+                &serde_json::json!({"account_id": account, "amount": 5}),
+            );
+            core.sparse
+                .put(
+                    DatabaseId::DEFAULT.as_u64(),
+                    1,
+                    SOURCE,
+                    &nodedb_types::StorageKey::for_surrogate(Surrogate::new(surrogate)),
+                    &body,
+                )
+                .expect("seed source row");
+        };
+        let resolved_delete = |predicted: Vec<u32>| {
+            let mut plan = bulk_delete_plan(SOURCE, Some(predicted));
+            if let PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::BulkDelete {
+                    resolved_sum_targets,
+                    ..
+                },
+            ) = &mut plan
+            {
+                *resolved_sum_targets =
+                    vec![nodedb_physical::physical_plan::ResolvedSumTarget::new(
+                        TARGET,
+                        "a1",
+                        Surrogate::new(4242),
+                    )];
+            }
+            plan
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        configure_sum(&mut core);
+        source_row(&mut core, 5, "a2");
+        let drifted = stage_at(&mut core, 35, &[resolved_delete(vec![5])]);
+        assert_drift_stages_nothing(&core, &drifted, 35);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        configure_sum(&mut core);
+        source_row(&mut core, 6, "a1");
+        let covered = stage_at(&mut core, 36, &[resolved_delete(vec![6])]);
+        assert_eq!(covered.status, Status::Ok, "{:?}", covered.error_code);
+    }
 
     #[test]
     fn calvin_execute_static_stages_point_insert_into_overlay() {

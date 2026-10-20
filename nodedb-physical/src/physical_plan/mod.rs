@@ -39,6 +39,7 @@ pub mod timeseries;
 pub mod truncate_target;
 pub mod vector;
 pub mod wire;
+pub mod written_collections;
 
 pub use aggregate_functions::{
     AggregateParam, GENERIC_AGGREGATE_FUNCTIONS, PARAMETERIZED_AGGREGATE_FUNCTIONS,
@@ -91,3 +92,4 @@ pub use vector::{
     VectorResolvedMutation, VectorWriteTargets,
 };
 pub use wire::{decode, encode};
+pub use written_collections::written_collections;

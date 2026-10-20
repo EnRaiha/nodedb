@@ -10,7 +10,7 @@
 
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 
-use super::compose::{ShapeOutcome, shape_response_materialized};
+use super::compose::{ShapeOutcome, shape_returning_materialized};
 use super::redaction::QueryRedaction;
 use super::request::MaterializedShapeRequest;
 use super::schema::OutputSchema;
@@ -115,7 +115,7 @@ pub fn calvin_task_outcome(
     let redaction = QueryRedaction::for_plan(ctx.tenant_id, ctx.database_id, ctx.auth, plan);
     if let (PlanKind::ReturningRows, Some(resp)) = (plan_kind, apply_resp)
         && let Ok(ShapeOutcome::Rows(shaped)) =
-            shape_response_materialized(MaterializedShapeRequest {
+            shape_returning_materialized(MaterializedShapeRequest {
                 payload: resp.payload.as_bytes(),
                 plan,
                 plan_kind: PlanKind::ReturningRows,

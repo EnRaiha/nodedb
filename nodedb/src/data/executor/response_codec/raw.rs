@@ -155,69 +155,145 @@ pub fn flatten_to_relational_rows(bytes: &[u8]) -> Vec<u8> {
 /// `value_to_msgpack`); the derived `zerompk` `Value` codec is tagged and would
 /// corrupt the row. RLS is already enforced by the Data Plane before the gather,
 /// so these hits are post-RLS.
+///
+/// A hit whose stored body does not decode fails the call with a
+/// serialization error: corruption is reported, never named from a fallback.
 pub fn flatten_vector_hits_to_relational_rows(
     bytes: &[u8],
     resolve_pk: impl Fn(u32) -> Option<String>,
-) -> Vec<u8> {
-    use crate::data::executor::handlers::hybrid_key::HybridFusionKey;
+) -> crate::Result<Vec<u8>> {
     use nodedb_types::Value;
 
-    #[derive(zerompk::FromMessagePack)]
-    #[msgpack(map)]
-    struct Hit {
-        id: HybridFusionKey,
-        distance: f32,
-        doc_id: Option<String>,
-        body: Option<Vec<u8>>,
-    }
-
-    let hits: Vec<Hit> = match zerompk::from_msgpack(bytes) {
+    let hits: Vec<GatheredVectorHit> = match zerompk::from_msgpack(bytes) {
         Ok(h) => h,
         // Not a hit array (already flat, or a non-row payload): leave as-is.
-        Err(_) => return bytes.to_vec(),
+        Err(_) => return Ok(bytes.to_vec()),
     };
 
-    let rows: Vec<Vec<u8>> = hits
-        .into_iter()
-        .filter_map(|h| {
-            let mut fields: std::collections::HashMap<String, Value> = match h
-                .body
-                .as_deref()
-                .and_then(|b| nodedb_types::value_from_msgpack(b).ok())
-            {
-                Some(Value::Object(map)) => map,
-                _ => std::collections::HashMap::new(),
+    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(hits.len());
+    for h in hits {
+        // A stored body that does not decode is corruption: the hit is
+        // refused, never named from a fallback.
+        let decoded = match h.body.as_deref() {
+            Some(body) => Some(nodedb_types::value_from_msgpack(body).map_err(|e| {
+                crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!(
+                        "vector hit {} carries a stored body that does not decode: {e}",
+                        h.id
+                    ),
+                }
+            })?),
+            None => None,
+        };
+        let mut fields: std::collections::HashMap<String, Value> = match decoded {
+            Some(Value::Object(map)) => map,
+            _ => std::collections::HashMap::new(),
+        };
+        fields
+            .entry("distance".to_string())
+            .or_insert(Value::Float(h.distance as f64));
+        // `None` for a headless hit (no surrogate binding) — never
+        // resolvable to a user PK.
+        let surrogate = h.id.storage_key().map(|k| k.surrogate().as_u32());
+        let raw_identity = match surrogate {
+            Some(s) => Value::Integer(s as i64),
+            None => Value::String(h.id.to_string()),
+        };
+        if !fields.contains_key("id") {
+            // Prefer a catalog-resolved PK, then the DP-set doc_id, then the
+            // raw surrogate (or the headless sentinel) as a last resort. The
+            // resolver is asked exactly when `vector_hit_surrogates` lists
+            // the hit: both decide through `body_needs_resolved_key`.
+            let resolved = if body_needs_resolved_key(h.body.as_deref()) {
+                surrogate.and_then(&resolve_pk)
+            } else {
+                None
             };
-            fields
-                .entry("distance".to_string())
-                .or_insert(Value::Float(h.distance as f64));
-            // `None` for a headless hit (no surrogate binding) — never
-            // resolvable to a user PK.
-            let surrogate = h.id.storage_key().map(|k| k.surrogate().as_u32());
-            let raw_identity = match surrogate {
-                Some(s) => Value::Integer(s as i64),
-                None => Value::String(h.id.to_string()),
-            };
-            if !fields.contains_key("id") {
-                // Prefer a catalog-resolved PK, then the DP-set doc_id, then the
-                // raw surrogate (or the headless sentinel) as a last resort.
-                match surrogate.and_then(&resolve_pk).or(h.doc_id) {
-                    Some(pk) => {
-                        fields.insert("id".to_string(), Value::String(pk));
-                    }
-                    None => {
-                        fields.insert("id".to_string(), raw_identity.clone());
-                    }
+            match resolved.or(h.doc_id) {
+                Some(pk) => {
+                    fields.insert("id".to_string(), Value::String(pk));
+                }
+                None => {
+                    fields.insert("id".to_string(), raw_identity.clone());
                 }
             }
-            fields
-                .entry("_surrogate".to_string())
-                .or_insert(raw_identity);
-            nodedb_types::value_to_msgpack(&Value::Object(fields)).ok()
-        })
-        .collect();
+        }
+        fields
+            .entry("_surrogate".to_string())
+            .or_insert(raw_identity);
+        let row = nodedb_types::value_to_msgpack(&Value::Object(fields)).map_err(|e| {
+            crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("vector hit row does not encode: {e}"),
+            }
+        })?;
+        rows.push(row);
+    }
 
-    encode_binary_rows(&rows)
+    Ok(encode_binary_rows(&rows))
+}
+
+/// One gathered vector-family hit in the Data-Plane wire shape.
+#[derive(zerompk::FromMessagePack)]
+#[msgpack(map)]
+struct GatheredVectorHit {
+    id: crate::data::executor::handlers::hybrid_key::HybridFusionKey,
+    distance: f32,
+    doc_id: Option<String>,
+    body: Option<Vec<u8>>,
+}
+
+/// Whether a hit takes its key from the resolver: it has no body, or a whole
+/// body with no `id` key. The scan reads the map header and each key, and
+/// skips each value without decoding or allocating. A truncated body takes
+/// no key: the flatten reports it as corruption.
+fn body_needs_resolved_key(body: Option<&[u8]>) -> bool {
+    use nodedb_query::msgpack_scan::{extract_field, skip_value};
+
+    match body {
+        None => true,
+        Some(body) => {
+            skip_value(body, 0).is_some()
+                && extract_field(body, 0, nodedb_types::DEFAULT_IDENTITY_COLUMN).is_none()
+        }
+    }
+}
+
+/// The surrogates of the bound hits in a gathered vector hit array, in hit
+/// order, that [`flatten_vector_hits_to_relational_rows`] asks its resolver
+/// for: those with no body, or a whole body with no `id`. Bodies are scanned,
+/// never decoded. A payload that is not a hit array yields none, as the
+/// flatten leaves it unchanged.
+pub fn vector_hit_surrogates(bytes: &[u8]) -> Vec<u32> {
+    let hits: Vec<GatheredVectorHit> = zerompk::from_msgpack(bytes).unwrap_or_default();
+    hits.iter()
+        .filter(|h| body_needs_resolved_key(h.body.as_deref()))
+        .filter_map(|h| h.id.storage_key().map(|k| k.surrogate().as_u32()))
+        .collect()
+}
+
+/// The surrogates of the bound hits in a gathered hybrid hit array, in hit
+/// order: each `doc_id` storage key [`flatten_hybrid_hits_to_relational_rows`]
+/// hands its resolver. A headless sentinel names no surrogate. A payload that
+/// is not a hit array yields none.
+pub fn hybrid_hit_surrogates(bytes: &[u8]) -> Vec<u32> {
+    use nodedb_types::Value;
+
+    let Ok(Value::Array(hits)) = nodedb_types::value_from_msgpack(bytes) else {
+        return Vec::new();
+    };
+    hits.iter()
+        .filter_map(|hit| match hit {
+            Value::Object(fields) => match fields.get("doc_id") {
+                Some(Value::String(doc_id)) => {
+                    nodedb_types::StorageKey::parse(doc_id).map(|key| key.surrogate().as_u32())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// Flatten a gathered array of hybrid (RRF fusion) search hits into bare
@@ -416,7 +492,7 @@ mod tests {
         .unwrap();
 
         // Body carries `id`, so the resolver is not consulted.
-        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input, |_| None));
+        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input, |_| None).unwrap());
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.get("id"), Some(&Value::String("r0".into())));
@@ -437,9 +513,9 @@ mod tests {
         }])
         .unwrap();
 
-        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input, |s| {
-            Some(format!("pk-{s}"))
-        }));
+        let rows = decode_rows(
+            &flatten_vector_hits_to_relational_rows(&input, |s| Some(format!("pk-{s}"))).unwrap(),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("id"), Some(&Value::String("pk-42".into())));
         assert_eq!(rows[0].get("_surrogate"), Some(&Value::Integer(42)));
@@ -456,7 +532,7 @@ mod tests {
         }])
         .unwrap();
 
-        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input, |_| None));
+        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input, |_| None).unwrap());
         assert_eq!(rows[0].get("id"), Some(&Value::Integer(9)));
     }
 
@@ -484,5 +560,107 @@ mod tests {
             rows[0].get("doc_id"),
             Some(&Value::String("0000000a".into()))
         );
+    }
+
+    fn hit(surrogate: u32, body: Option<Vec<u8>>) -> TestHit {
+        TestHit {
+            id: test_storage_key(surrogate),
+            distance: 0.1,
+            doc_id: None,
+            body,
+        }
+    }
+
+    /// Only the hits the flatten names from the resolver are listed: a body
+    /// with an `id` is left out, a body without one and no body are listed.
+    #[test]
+    fn vector_hit_surrogates_lists_the_hits_the_flatten_resolves() {
+        let input = zerompk::to_msgpack_vec(&vec![
+            hit(9, Some(bare_doc(vec![("id", Value::String("r9".into()))]))),
+            hit(5, Some(bare_doc(vec![("tag", Value::String("t".into()))]))),
+            TestHit {
+                id: "__local_3".into(),
+                distance: 0.2,
+                doc_id: None,
+                body: None,
+            },
+            hit(4, None),
+        ])
+        .unwrap();
+        assert_eq!(vector_hit_surrogates(&input), vec![5, 4]);
+        assert!(vector_hit_surrogates(b"not msgpack hits").is_empty());
+
+        // The flatten asks the resolver for exactly the listed surrogates.
+        let asked = std::cell::RefCell::new(Vec::new());
+        flatten_vector_hits_to_relational_rows(&input, |s| {
+            asked.borrow_mut().push(s);
+            None
+        })
+        .unwrap();
+        assert_eq!(asked.into_inner(), vec![5, 4]);
+    }
+
+    /// A truncated stored body is corruption: the flatten refuses it, and
+    /// `vector_hit_surrogates` asks no key for it.
+    #[test]
+    fn a_truncated_body_fails_the_flatten() {
+        let mut body = bare_doc(vec![("tag", Value::String("keep".into()))]);
+        body.truncate(body.len() - 2);
+        let input = zerompk::to_msgpack_vec(&vec![hit(6, Some(body))]).unwrap();
+        assert!(vector_hit_surrogates(&input).is_empty());
+        let err = flatten_vector_hits_to_relational_rows(&input, |_| Some("resolved".into()))
+            .expect_err("a truncated body fails the flatten");
+        assert!(
+            matches!(err, crate::Error::Serialization { .. }),
+            "corruption is a serialization error: {err:?}"
+        );
+    }
+
+    /// An `id` key after a nested map value is still found.
+    #[test]
+    fn an_id_after_a_nested_map_is_detected() {
+        let nested = Value::Object(
+            [("inner".to_string(), Value::Integer(1))]
+                .into_iter()
+                .collect(),
+        );
+        // A fixmap of two pairs, written by hand so `meta` precedes `id`.
+        let mut body = vec![0x82u8];
+        for (key, value) in [("meta", nested), ("id", Value::String("r7".into()))] {
+            body.extend(nodedb_types::value_to_msgpack(&Value::String(key.into())).unwrap());
+            body.extend(nodedb_types::value_to_msgpack(&value).unwrap());
+        }
+        assert!(!body_needs_resolved_key(Some(body.as_slice())));
+        let without_id = bare_doc(vec![("x", Value::Integer(1))]);
+        assert!(body_needs_resolved_key(Some(without_id.as_slice())));
+        assert!(body_needs_resolved_key(None));
+
+        let input = zerompk::to_msgpack_vec(&vec![hit(7, Some(body))]).unwrap();
+        assert!(vector_hit_surrogates(&input).is_empty());
+        let rows = decode_rows(
+            &flatten_vector_hits_to_relational_rows(&input, |_| Some("resolved".into())).unwrap(),
+        );
+        assert_eq!(rows[0].get("id"), Some(&Value::String("r7".into())));
+    }
+
+    #[test]
+    fn hybrid_hit_surrogates_skips_the_headless_sentinel() {
+        let hit = |doc_id: &str| {
+            Value::Object(
+                [
+                    ("doc_id".to_string(), Value::String(doc_id.into())),
+                    ("score".to_string(), Value::Float(0.5)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let input = nodedb_types::value_to_msgpack(&Value::Array(vec![
+            hit("0000000a"),
+            hit("__local_2"),
+            hit("0000000b"),
+        ]))
+        .unwrap();
+        assert_eq!(hybrid_hit_surrogates(&input), vec![10, 11]);
     }
 }

@@ -22,6 +22,7 @@ use nodedb_types::columnar::StrictSchema;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::redo_image::removed_row_image;
 use crate::data::executor::handlers::partial_refusal::refusal_after_rows;
 use crate::data::executor::handlers::point::apply_put::SpatialEntryId;
 use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
@@ -84,6 +85,9 @@ pub(in crate::data::executor) struct BulkDeleteRowCascade<'a> {
     /// The row's pre-deletion bytes, as `sparse.delete` returned them —
     /// never re-read.
     pub deleted_bytes: &'a [u8],
+    /// The system time of the tombstone that closed a bitemporal row, `None`
+    /// for a row removed from the plain table.
+    pub tombstone_sys_from_ms: Option<i64>,
     /// The collection's strict schema, when it stores Binary Tuples. Decodes
     /// `deleted_bytes` so the row's identity column is readable.
     pub strict_schema: Option<&'a StrictSchema>,
@@ -119,6 +123,7 @@ impl CoreLoop {
             collection,
             storage_key,
             deleted_bytes,
+            tombstone_sys_from_ms,
             strict_schema,
             declared_primary_key,
             has_vectors,
@@ -199,10 +204,13 @@ impl CoreLoop {
             );
         }
         // The removal, journalled after apply: the plan carries no
-        // pre-dispatch record of it. A delete carries no post-image body.
-        write_set.push(WriteSetEntry::delete(
+        // pre-dispatch record of it. A delete carries no post-image body. A
+        // bitemporal tombstone carries its version key, so replay closes the
+        // same version.
+        write_set.push(removed_row_image(
             row_surrogate.as_u32(),
             row_identity.clone(),
+            tombstone_sys_from_ms,
         ));
         // Emit a delete event per affected row to the Event Plane, so
         // AFTER-DELETE triggers and CDC/change-stream consumers see

@@ -12,7 +12,7 @@
 
 use nodedb_fts::FtsSearchParams;
 use nodedb_fts::posting::QueryMode;
-use nodedb_types::{RowIdentity, Surrogate};
+use nodedb_types::Surrogate;
 use tracing::debug;
 
 use crate::bridge::envelope::Response;
@@ -21,6 +21,7 @@ use crate::data::executor::handlers::graph_expansion::{GraphExpansionParams, Gra
 use crate::data::executor::handlers::graph_rag::{
     RagResponseParams, graph_nodes_to_ranked_results, vector_ranked_list,
 };
+use crate::data::executor::handlers::rag_key::RagKey;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
 use crate::query::fusion::{RankedResult, reciprocal_rank_fusion_weighted};
@@ -128,7 +129,10 @@ impl CoreLoop {
         let (vector_k, text_k, graph_k) = rrf_k;
 
         let vector_list = vector_ranked_list(&vector_scores);
-        let text_list = text_ranked_list(&text_results);
+        let csr = self.csr_partition(task.request.database_id.as_u64(), tenant_id);
+        let text_list = text_ranked_list(&text_results, |s| {
+            csr.and_then(|c| c.node_id_for_surrogate(s))
+        });
 
         let graph_expanded_count = expanded_nodes.len();
         let graph_list = graph_nodes_to_ranked_results(expanded_nodes, &hop_distances);
@@ -192,13 +196,16 @@ impl CoreLoop {
     }
 }
 
-/// The BM25 leg as a ranked list. A text hit keys on its row's surrogate
-/// identity, the key a vector hit falls back to.
-pub(crate) fn text_ranked_list(hits: &[(Surrogate, f32)]) -> Vec<RankedResult<RowIdentity>> {
+/// The BM25 leg as a ranked list. A text hit keys as a vector hit does: the
+/// graph node `name_of` names for its surrogate, else the surrogate.
+pub(crate) fn text_ranked_list<'n>(
+    hits: &[(Surrogate, f32)],
+    name_of: impl Fn(Surrogate) -> Option<&'n str>,
+) -> Vec<RankedResult<RagKey>> {
     hits.iter()
         .enumerate()
         .map(|(rank, (doc_id, score))| RankedResult {
-            document_id: RowIdentity::for_surrogate(*doc_id),
+            document_id: RagKey::of_hit(name_of(*doc_id), *doc_id),
             rank,
             score: *score,
             source: "text",

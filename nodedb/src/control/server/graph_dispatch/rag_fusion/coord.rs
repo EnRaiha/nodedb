@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nodedb_physical::physical_plan::{GraphOp, RagStage};
-use nodedb_types::{RowIdentity, Surrogate};
+use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
 use crate::control::server::dispatch_utils::{not_found_response, ok_payload_response};
@@ -37,6 +37,7 @@ use crate::data::executor::handlers::graph_rag::{
     RagResponseParams, graph_nodes_to_ranked_results, rag_response_body, vector_ranked_list,
 };
 use crate::data::executor::handlers::graph_rag_triple::text_ranked_list;
+use crate::data::executor::handlers::rag_key::RagKey;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::query::fusion::reciprocal_rank_fusion_weighted;
@@ -134,12 +135,18 @@ async fn run(state: &SharedState, scope: RagScope, plan: &PhysicalPlan) -> crate
     };
     let legs = exported.legs;
 
-    // 2. Name the hits' graph nodes.
+    // 2. Name the hits' graph nodes. Text hits key by their graph node too,
+    // as on one core, but only vector hits seed the walk.
     let mut hit_surrogates: Vec<u32> = Vec::new();
-    for hit in &legs.vector {
-        if let Some(raw) = hit.surrogate
-            && !hit_surrogates.contains(&raw)
-        {
+    let mut requested: HashSet<u32> = HashSet::new();
+    let text_surrogates = legs.text.iter().map(|hit| hit.surrogate);
+    for raw in legs
+        .vector
+        .iter()
+        .filter_map(|hit| hit.surrogate)
+        .chain(text_surrogates)
+    {
+        if requested.insert(raw) {
             hit_surrogates.push(raw);
         }
     }
@@ -160,18 +167,18 @@ async fn run(state: &SharedState, scope: RagScope, plan: &PhysicalPlan) -> crate
         )
         .await?
     };
-    let mut vector_scores: HashMap<RowIdentity, (usize, f32)> = HashMap::new();
+    let mut vector_scores: HashMap<RagKey, (usize, f32)> = HashMap::new();
     let mut seeds: Vec<String> = Vec::new();
     for (rank, hit) in legs.vector.iter().enumerate() {
         let key = match hit.surrogate {
-            Some(raw) => match seed_bindings.by_surrogate.get(&raw) {
-                Some(name) => {
-                    seeds.push(name.clone());
-                    RowIdentity::from_user_key(name.clone())
+            Some(raw) => {
+                let name = seed_bindings.by_surrogate.get(&raw).map(String::as_str);
+                if let Some(name) = name {
+                    seeds.push(name.to_owned());
                 }
-                None => RowIdentity::for_surrogate(Surrogate::new(raw)),
-            },
-            None => RowIdentity::from_user_key(format!("__unbound_{}", hit.entry_id)),
+                RagKey::of_hit(name, Surrogate::new(raw))
+            }
+            None => RagKey::Unbound(hit.entry_id),
         };
         vector_scores.insert(key, (rank, hit.distance));
     }
@@ -231,7 +238,12 @@ async fn run(state: &SharedState, scope: RagScope, plan: &PhysicalPlan) -> crate
                 .iter()
                 .map(|hit| (Surrogate::new(hit.surrogate), hit.score))
                 .collect();
-            let text_list = text_ranked_list(&text_hits);
+            let text_list = text_ranked_list(&text_hits, |s| {
+                seed_bindings
+                    .by_surrogate
+                    .get(&s.as_u32())
+                    .map(String::as_str)
+            });
             (
                 reciprocal_rank_fusion_weighted(
                     &[vector_list, text_list, graph_list],

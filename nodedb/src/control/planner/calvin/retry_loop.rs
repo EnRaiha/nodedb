@@ -14,6 +14,7 @@ use nodedb_cluster::calvin::{AbortReason, AttemptOutcome, CalvinCompletionRegist
 use crate::control::cluster::calvin::executor::ollp::error::OllpError;
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
 use crate::control::planner::calvin::abort_error::calvin_abort_error;
+use crate::control::planner::calvin::retry_budget::OllpRetryBudget;
 use crate::control::planner::calvin::submit::RoutedAssignment;
 use crate::control::planner::calvin::submit::budget::budget_ms_until;
 use crate::control::planner::calvin::submit::wait::await_completion;
@@ -102,7 +103,7 @@ where
         mut rescan,
     } = args;
     let mut predicted = initial_predicted;
-    let mut retry: u32 = 0;
+    let mut budget = OllpRetryBudget::new(orchestrator, predicate_class_hash, ollp_max_retries);
     loop {
         budget_ms_until(deadline)?;
         let assignment = match submit(&predicted).await {
@@ -125,16 +126,13 @@ where
                 // PRE-ADMISSION failure (routed submit / circuit / budget).
                 // Nothing executed, so there is no aborted attempt to re-scan
                 // around — resubmit the SAME prediction after backoff.
-                if retry >= ollp_max_retries {
+                if budget.exhausted() {
                     return Err(Error::OllpExhausted {
-                        retries: ollp_max_retries.min(u8::MAX as u32) as u8,
+                        retries: budget.max_retries(),
                         cause: pre_admission_cause(ollp_err),
                     });
                 }
-                orchestrator
-                    .on_retry_required(predicate_class_hash, retry)
-                    .await;
-                retry += 1;
+                budget.spend().await;
                 continue;
             }
         };
@@ -179,16 +177,13 @@ where
                 // participant released the attempt's locks before it acked,
                 // so a FRESH reconnaissance is safe — and necessary, since the
                 // stale prediction can never converge under drift.
-                if retry >= ollp_max_retries {
+                if budget.exhausted() {
                     return Err(Error::OllpExhausted {
-                        retries: ollp_max_retries.min(u8::MAX as u32) as u8,
+                        retries: budget.max_retries(),
                         cause: OllpExhaustedCause::PredicateDrift,
                     });
                 }
-                orchestrator
-                    .on_retry_required(predicate_class_hash, retry)
-                    .await;
-                retry += 1;
+                budget.spend().await;
                 predicted = rescan().await?;
             }
         }

@@ -3,7 +3,6 @@
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
-use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::partial_refusal::refusal_after_rows;
@@ -17,6 +16,7 @@ use nodedb_physical::physical_plan::{
 };
 
 use super::delete_cascade::{BulkDeleteRowCascade, TextFlush};
+use crate::data::executor::handlers::point::delete_version::CurrentRowRemoval;
 
 /// OLLP prediction inputs threaded to `execute_bulk_delete`: the predicted
 /// matched-doc surrogate set and the predicted implicit-edge set. Both are
@@ -79,32 +79,12 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
 
         // Empty `filter_bytes` means "no WHERE clause" — match every row.
-        let filters: Vec<ScanFilter> = if filter_bytes.is_empty() {
-            Vec::new()
-        } else {
-            match zerompk::from_msgpack(filter_bytes) {
-                Ok(f) => f,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("deserialize filters: {e}"),
-                        },
-                    );
-                }
-            }
-        };
-
-        let matching_ids = match self.scan_matching_documents(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            &filters,
-        ) {
-            Ok(ids) => ids,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+        // The matched set is each row's current version.
+        let matching_ids = match super::decode_bulk_filters(filter_bytes)
+            .and_then(|filters| self.current_matching_rows(database_id, tid, collection, &filters))
+        {
+            Ok(rows) => rows.into_iter().map(|(key, _)| key).collect(),
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
         };
 
         // Settle the apply set and run every leader-only pre-write
@@ -185,7 +165,7 @@ impl CoreLoop {
             .and_then(|config| config.enforcement.period_lock.as_ref());
         if gate_policy || period_lock.is_some() {
             for key in &apply_ids {
-                let stored = match self.sparse.get(database_id, tid, collection, key) {
+                let stored = match self.current_row_body(database_id, tid, collection, key) {
                     Ok(Some(bytes)) => bytes,
                     Ok(None) => continue,
                     Err(e) => return self.response_error(task, e),
@@ -204,16 +184,14 @@ impl CoreLoop {
                     return self.response_error(task, e);
                 }
                 if let Some(lock) = period_lock
-                    && let Err(e) =
-                        crate::data::executor::enforcement::period_lock::check_period_lock(
-                            &self.sparse,
-                            database_id,
-                            tid,
-                            collection,
-                            &stored,
-                            lock,
-                            resolved_sum_targets,
-                        )
+                    && let Err(e) = self.check_period_lock_at(
+                        database_id,
+                        tid,
+                        collection,
+                        &stored,
+                        lock,
+                        resolved_sum_targets,
+                    )
                 {
                     return self.response_error(task, e);
                 }
@@ -251,6 +229,11 @@ impl CoreLoop {
         // Removed rows whose text has not left the inverted index yet. It
         // leaves in batches, one write transaction each.
         let mut pending_text: Vec<nodedb_types::Surrogate> = Vec::new();
+        // One system time closes every matched row of a bitemporal
+        // collection, so the statement removes them at one instant.
+        let bitemporal_sys_from_ms = self
+            .is_bitemporal(database_id, tid, collection)
+            .then(|| self.bitemporal_now_ms());
         for storage_key in &apply_ids {
             // Capture pre-deletion snapshot if RETURNING was requested, or if
             // the collection is indexed (needed to recompute the removed
@@ -260,42 +243,37 @@ impl CoreLoop {
             // will not decode is a different answer: it would silently drop out
             // of RETURNING and, worse, contribute no removed index tuples, so
             // its old secondary-index entries would survive the delete.
+            // A read error is a refusal too: read as an absent row, it drops
+            // the row from RETURNING and keeps its index values unrecorded.
             let pre_delete_doc: Option<serde_json::Value> =
                 if returning.is_some() || !index_paths.is_empty() {
-                    match self
-                        .sparse
-                        .get(
-                            task.request.database_id.as_u64(),
-                            tid,
-                            collection,
-                            storage_key,
-                        )
-                        .ok()
-                        .flatten()
-                    {
-                        Some(bytes) => {
-                            let identity = storage_key.to_identity();
-                            match returning_doc::from_stored_json(
-                                &bytes,
-                                &identity,
-                                strict_schema.as_ref(),
-                                &identity_column,
-                            ) {
-                                Ok(doc) => Some(doc),
-                                Err(e) => {
-                                    let code = refusal_after_rows(affected, e);
-                                    return self.bulk_delete_refusal(
-                                        task,
-                                        tid,
-                                        collection,
-                                        code,
-                                        &mut pending_text,
-                                        write_set,
-                                    );
-                                }
-                            }
+                    let decoded = self
+                        .current_row_body(database_id, tid, collection, storage_key)
+                        .and_then(|stored| {
+                            stored
+                                .map(|bytes| {
+                                    returning_doc::from_stored_json(
+                                        &bytes,
+                                        &storage_key.to_identity(),
+                                        strict_schema.as_ref(),
+                                        &identity_column,
+                                    )
+                                })
+                                .transpose()
+                        });
+                    match decoded {
+                        Ok(doc) => doc,
+                        Err(e) => {
+                            let code = refusal_after_rows(affected, e);
+                            return self.bulk_delete_refusal(
+                                task,
+                                tid,
+                                collection,
+                                code,
+                                &mut pending_text,
+                                write_set,
+                            );
                         }
-                        None => None,
                     }
                 } else {
                     None
@@ -321,17 +299,33 @@ impl CoreLoop {
                     );
                 }
             };
-            let deleted_bytes = self
-                .sparse
-                .delete_in_txn(
-                    &row_txn,
-                    task.request.database_id.as_u64(),
+            // The row's current version leaves through the same per-row write
+            // a point delete lands. A delete error refuses the statement:
+            // read as an absent row, it leaves the row stored under a success.
+            let removed = match self.remove_current_row_in_txn(
+                &row_txn,
+                CurrentRowRemoval {
+                    database_id,
                     tid,
                     collection,
                     storage_key,
-                )
-                .ok()
-                .flatten();
+                    bitemporal_sys_from_ms,
+                },
+            ) {
+                Ok(removed) => removed,
+                Err(e) => {
+                    let code = refusal_after_rows(affected, e);
+                    return self.bulk_delete_refusal(
+                        task,
+                        tid,
+                        collection,
+                        code,
+                        &mut pending_text,
+                        write_set,
+                    );
+                }
+            };
+            let deleted_bytes = removed.prior;
             let mut target_writes = Vec::new();
             if let Some(bytes) = deleted_bytes.as_deref() {
                 match write_hook::run(
@@ -398,6 +392,7 @@ impl CoreLoop {
                         collection,
                         storage_key: *storage_key,
                         deleted_bytes: bytes,
+                        tombstone_sys_from_ms: removed.tombstone_sys_from_ms,
                         strict_schema: strict_schema.as_ref(),
                         declared_primary_key,
                         has_vectors,

@@ -19,9 +19,12 @@ use crate::types_array::{ArrayBinaryOpAst, ArrayReducerAst, ArraySliceAst};
 
 /// One planned array table-valued function call.
 ///
-/// `Slice` and `Project` read cells: their rows carry the array's dims and
-/// the requested attrs, so a SELECT reads them as a relation. `Agg` and
-/// `Elementwise` emit rows of their own shape and form no such relation.
+/// Each call's rows form a relation a SELECT reads:
+///
+/// - `Slice` and `Project` read cells. Their rows carry the array's dims and
+///   the requested attrs.
+/// - `Agg` rows carry `result`, after `group` when it groups by a dim.
+/// - `Elementwise` rows carry the `coords` and `attrs` of one cell.
 ///
 /// `ARRAY_PROJECT` is a slice over the whole domain with a required attr
 /// list, so it plans to the slice read and keeps only its own name.
@@ -50,6 +53,17 @@ impl ArrayTableFn {
             ArrayTableFn::Project(_) => "ARRAY_PROJECT",
             ArrayTableFn::Agg(_) => "ARRAY_AGG",
             ArrayTableFn::Elementwise(_) => "ARRAY_ELEMENTWISE",
+        }
+    }
+
+    /// The array the call names first: the one array of a slice, project or
+    /// aggregate, or the left operand of an elementwise op. The relation the
+    /// call's rows form takes its name and default qualifier from it.
+    pub fn array_name(&self) -> &str {
+        match self {
+            ArrayTableFn::Slice(plan) | ArrayTableFn::Project(plan) => &plan.name,
+            ArrayTableFn::Agg(plan) => &plan.name,
+            ArrayTableFn::Elementwise(plan) => &plan.left,
         }
     }
 }
@@ -536,7 +550,7 @@ mod tests {
     #[test]
     fn agg_scalar() {
         let p = plan_one("SELECT * FROM ARRAY_AGG('g', 'qual', 'sum')").unwrap();
-        match p {
+        match relation_body(p) {
             SqlPlan::ArrayAgg(ArrayAggPlan {
                 name,
                 attr,
@@ -556,7 +570,7 @@ mod tests {
     #[test]
     fn agg_grouped() {
         let p = plan_one("SELECT * FROM ARRAY_AGG('g', 'qual', 'mean', 'chrom')").unwrap();
-        match p {
+        match relation_body(p) {
             SqlPlan::ArrayAgg(ArrayAggPlan {
                 reducer,
                 group_by_dim,
@@ -581,6 +595,7 @@ mod tests {
              'POLYGON((0 1, 100 1, 100 3, 0 3, 0 1))', ARRAY['pos', 'chrom'])",
         )
         .unwrap();
+        let p = relation_body(p);
         let SqlPlan::ArrayAgg(ArrayAggPlan {
             group_by_dim,
             slice,
@@ -608,6 +623,7 @@ mod tests {
              ARRAY['pos', 'chrom'])",
         )
         .unwrap();
+        let p = relation_body(p);
         let SqlPlan::ArrayAgg(ArrayAggPlan {
             group_by_dim,
             slice,
@@ -703,7 +719,7 @@ mod tests {
     fn elementwise_happy() {
         let p =
             plan_one("SELECT * FROM ARRAY_ELEMENTWISE('left', 'right', 'add', 'qual')").unwrap();
-        assert!(matches!(p, SqlPlan::ArrayElementwise { .. }));
+        assert!(matches!(relation_body(p), SqlPlan::ArrayElementwise { .. }));
     }
 
     /// An elementwise op reads both operands at its `AS OF` scope.
@@ -720,7 +736,7 @@ mod tests {
         };
         let p = crate::planner::select::plan_query(q, &cat(), &FunctionRegistry::new(), temporal)
             .unwrap();
-        match p {
+        match relation_body(p) {
             SqlPlan::ArrayElementwise(ArrayElementwisePlan { temporal: got, .. }) => {
                 assert_eq!(got, temporal);
             }

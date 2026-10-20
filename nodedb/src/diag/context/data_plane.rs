@@ -184,3 +184,73 @@ impl DomainContext for CoreFailStopped<'_> {
         })
     }
 }
+
+/// A Calvin participant refused its slice of a staged transaction with an
+/// internal error. The verdict hands the error to the coordinator's client
+/// only.
+pub(in crate::diag) struct CalvinStageRefusedInternal<'a> {
+    pub vshard_id: u32,
+    pub epoch: u64,
+    pub position: u32,
+    pub detail: &'a str,
+}
+
+impl DomainContext for CalvinStageRefusedInternal<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.calvin_stage_refused_internal"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The detail names the broken invariant before its first quoted name
+        // or colon. The collection, vShard and txn are the occurrence.
+        let class = self.detail.split(['\'', ':']).next().unwrap_or(self.detail);
+        format!("cause={}", class.trim())
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "vshard_id": self.vshard_id,
+            "epoch": self.epoch,
+            "position": self.position,
+            "detail": self.detail,
+            "why_fatal": "an internal stage error is an invariant break no client input \
+                          causes. The transaction aborts on every participant, and only the \
+                          coordinator's client sees the text, so the refusing node keeps no \
+                          other record of it",
+            "operator_action": "the detail names the plan shape the stage refused. It is a \
+                                 coordinator-side planning defect, not a storage fault",
+        })
+    }
+}
+
+/// A vector delete found the row behind the vector, but its stored payload
+/// did not decode, so the payload index entries of the row cannot be found.
+pub(in crate::diag) struct VectorPayloadUndecodable<'a> {
+    pub collection: &'a str,
+    pub detail: &'a str,
+}
+
+impl DomainContext for VectorPayloadUndecodable<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.vector_payload_undecodable"
+    }
+
+    fn grouping_key(&self) -> String {
+        // One root cause: a stored payload the decoder refuses. The
+        // collection and the decoder text are the occurrence.
+        "payload=undecodable".to_string()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "collection": self.collection,
+            "detail": self.detail,
+            "why_fatal": "the payload index keys each vector by the row's field values. \
+                          Without the decoded row, its entries cannot be removed, so the \
+                          delete is refused and leaves the vector and its row in place",
+            "operator_action": "the stored row of the named collection is corrupt or was \
+                                 written in another encoding. Read the row and rewrite it, \
+                                 then repeat the delete",
+        })
+    }
+}

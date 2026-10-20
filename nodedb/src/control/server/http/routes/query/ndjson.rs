@@ -32,7 +32,7 @@ use super::super::super::peer::PeerAddr;
 use super::super::super::transport::ClientTransport;
 use super::super::atomic_statement::{RoutedStatement, route_http_statement};
 use super::super::query_stream::{NdjsonBody, ndjson_body_stream, try_open_stream};
-use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
+use super::super::result_shape::append_ndjson_payload;
 use super::{DatabaseQueryParam, resolve_database_id};
 
 /// POST /v1/query/stream — execute SQL, return results as NDJSON.
@@ -444,33 +444,21 @@ pub async fn query_ndjson(
                     if payload.is_empty() {
                         continue;
                     }
-                    match shape_http_payload(MaterializedShapeRequest {
-                        payload,
-                        plan: &plan_for_shape,
-                        plan_kind,
-                        projection: Some(&output_schema),
-                        state: &state.shared,
-                        database_id,
-                        tenant_id,
-                        redaction: Some(redaction.ctx(&state.shared.redaction)),
-                        sequences: Some(&sequences),
-                    }) {
-                        Ok(HttpShaped::Rows(rows)) => {
-                            task_rows += rows.len() as u64;
-                            for row in rows {
-                                ndjson.push_str(&row.to_string());
-                                ndjson.push('\n');
-                            }
-                        }
-                        Ok(HttpShaped::Passthrough) => {
-                            task_rows += 1;
-                            passthrough_to_ndjson(payload, &mut ndjson);
-                        }
-                        Err(e) => {
-                            ndjson.push_str(&serde_json::json!({"error": e.message()}).to_string());
-                            ndjson.push('\n');
-                        }
-                    }
+                    task_rows += append_ndjson_payload(
+                        &mut ndjson,
+                        MaterializedShapeRequest {
+                            payload,
+                            plan: &plan_for_shape,
+                            plan_kind,
+                            projection: Some(&output_schema),
+                            state: &state.shared,
+                            database_id,
+                            tenant_id,
+                            redaction: Some(redaction.ctx(&state.shared.redaction)),
+                            sequences: Some(&sequences),
+                        },
+                    )
+                    .await;
                 }
                 if let Some(info) = &plan_metering_info {
                     meter_dispatch(&state.shared, &scope, info, Some(task_rows));

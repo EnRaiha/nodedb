@@ -15,6 +15,7 @@ use nodedb_sql::ddl_ast::GraphDirection;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::response_translate::translate_search_response;
 use crate::control::server::shared::ddl::user_dispatch;
 use crate::control::server::shared::session::StatementDeadline;
 use crate::control::state::SharedState;
@@ -125,7 +126,8 @@ pub async fn rag_fusion(
         identity,
         database_id,
         collection: &collection,
-        plan,
+        // The response translation below reads the plan the fusion ran.
+        plan: plan.clone(),
         deadline: StatementDeadline::of_statement(state),
         // Admitted at this request's own transport entry; this handler has no
         // session or peer information of its own.
@@ -135,7 +137,12 @@ pub async fn rag_fusion(
     .await
     .map_err(|e| DdlError::from_error(&e))?;
 
-    let json_text = response_codec::decode_payload_to_json(&payload);
+    // Rows named by no graph node take their primary keys here, through the
+    // resolver every search response uses.
+    let named = translate_search_response(&payload, &plan, state, database_id, identity.tenant_id)
+        .await
+        .map_err(|e| DdlError::from_error(&e))?;
+    let json_text = response_codec::decode_payload_to_json(&named);
     let mut row = Map::new();
     row.insert("result".to_string(), JsonValue::String(json_text));
 

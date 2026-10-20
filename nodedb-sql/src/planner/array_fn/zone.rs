@@ -251,8 +251,13 @@ mod tests {
 
     fn agg_zone(sql: &str) -> ArrayZoneAst {
         match plan(sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
-            SqlPlan::ArrayAgg(ArrayAggPlan { zone, .. }) => zone.expect("zone"),
-            other => panic!("expected ArrayAgg, got {other:?}"),
+            SqlPlan::Cte(CtePlan {
+                mut definitions, ..
+            }) => match definitions.remove(0).1 {
+                SqlPlan::ArrayAgg(ArrayAggPlan { zone, .. }) => zone.expect("zone"),
+                other => panic!("expected ArrayAgg, got {other:?}"),
+            },
+            other => panic!("expected Cte, got {other:?}"),
         }
     }
 

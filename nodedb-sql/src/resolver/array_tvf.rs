@@ -156,6 +156,26 @@ pub fn array_agg_columns(view: &ArrayCatalogView, agg: &ArrayAggPlan) -> Result<
     Ok(cols)
 }
 
+/// The columns an aggregate's rows carry: [`array_agg_columns`], then
+/// [`ARRAY_HORIZON_COLUMN`] when the aggregate is temporal and ends with a
+/// summary row.
+pub fn array_agg_row_columns(
+    view: &ArrayCatalogView,
+    agg: &ArrayAggPlan,
+) -> Result<Vec<ColumnInfo>> {
+    let mut cols = array_agg_columns(view, agg)?;
+    if agg.temporal.is_temporal() {
+        cols.push(horizon_column());
+    }
+    Ok(cols)
+}
+
+/// The flag column of the summary row a temporal aggregate or elementwise
+/// read appends. Every other row holds no value for it.
+fn horizon_column() -> ColumnInfo {
+    column(ARRAY_HORIZON_COLUMN, SqlDataType::Bool, true)
+}
+
 /// Refuse a reducer that an attr of type `attr` cannot answer.
 ///
 /// The engine folds only numeric cells and skips every other cell.
@@ -193,6 +213,8 @@ pub fn check_agg_reducer(
 /// - A slice or project row holds the array's dims and the requested attrs.
 /// - An aggregate row holds `result`, after `group` when it groups by a dim.
 /// - An elementwise row holds the `coords` and `attrs` arrays of one cell.
+/// - A temporal aggregate or elementwise read also holds
+///   [`ARRAY_HORIZON_COLUMN`], set on its trailing summary row.
 pub fn array_table_fn_columns(
     catalog: &dyn SqlCatalog,
     call: &ArrayTableFn,
@@ -201,11 +223,17 @@ pub fn array_table_fn_columns(
         ArrayTableFn::Slice(slice) | ArrayTableFn::Project(slice) => {
             Ok(array_slice_columns(&view_of(catalog, &slice.name)?, slice))
         }
-        ArrayTableFn::Agg(agg) => array_agg_columns(&view_of(catalog, &agg.name)?, agg),
-        ArrayTableFn::Elementwise(_) => Ok(vec![
-            column("coords", SqlDataType::Json, false),
-            column("attrs", SqlDataType::Json, false),
-        ]),
+        ArrayTableFn::Agg(agg) => array_agg_row_columns(&view_of(catalog, &agg.name)?, agg),
+        ArrayTableFn::Elementwise(elementwise) => {
+            let mut cols = vec![
+                column("coords", SqlDataType::Json, false),
+                column("attrs", SqlDataType::Json, false),
+            ];
+            if elementwise.temporal.is_temporal() {
+                cols.push(horizon_column());
+            }
+            Ok(cols)
+        }
     }
 }
 
@@ -350,6 +378,52 @@ mod tests {
         assert_eq!(max.float_width, Some(FloatWidth::F32));
         let min = result(ArrayReducerAst::Min, ArrayAttrType::Int16);
         assert_eq!(min.int_width, Some(IntWidth::I16));
+    }
+
+    #[test]
+    fn temporal_aggregate_rows_carry_the_horizon_flag() {
+        use crate::types_array::{ArrayAttrAst, ArrayDimAst, ArrayDomainBound, ArraySliceAst};
+        let view = ArrayCatalogView {
+            name: "img".into(),
+            dims: vec![ArrayDimAst {
+                name: "x".into(),
+                dtype: ArrayDimType::Int64,
+                lo: ArrayDomainBound::Int64(0),
+                hi: ArrayDomainBound::Int64(3),
+            }],
+            attrs: vec![ArrayAttrAst {
+                name: "nir".into(),
+                dtype: ArrayAttrType::Float64,
+                nullable: true,
+            }],
+            tile_extents: vec![2],
+            georef: None,
+        };
+        let agg = |temporal: TemporalScope| ArrayAggPlan {
+            name: "img".into(),
+            attr: "nir".into(),
+            reducer: ArrayReducerAst::Sum,
+            group_by_dim: Some("x".into()),
+            slice: ArraySliceAst::default(),
+            zone: None,
+            temporal,
+        };
+        let names = |plan: &ArrayAggPlan| -> Vec<String> {
+            array_agg_row_columns(&view, plan)
+                .expect("answerable")
+                .into_iter()
+                .map(|c| c.name)
+                .collect()
+        };
+        assert_eq!(names(&agg(TemporalScope::default())), ["group", "result"]);
+        let as_of = TemporalScope {
+            system_time: nodedb_types::SystemTimeScope::AsOf(1),
+            ..TemporalScope::default()
+        };
+        assert_eq!(
+            names(&agg(as_of)),
+            ["group", "result", ARRAY_HORIZON_COLUMN]
+        );
     }
 
     #[test]

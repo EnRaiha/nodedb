@@ -321,6 +321,12 @@ pub enum DocumentOp {
         projection: Vec<String>,
         limit: usize,
         offset: usize,
+        /// `FOR SYSTEM_TIME AS OF <ms>` cutoff on a bitemporal collection.
+        /// `None` reads the current state. The versioned index answers at the
+        /// cutoff and each row is read at its version as of the cutoff. The
+        /// index holds no valid time and no history listing, so a valid-time
+        /// or all-versions read never plans this variant.
+        system_as_of_ms: Option<i64>,
     },
 
     /// Drop all secondary index entries for a field.

@@ -672,6 +672,7 @@ mod tests {
                 projection: Vec::new(),
                 limit: 0,
                 offset: 0,
+                system_as_of_ms: None,
             }),
             PhysicalPlan::Document(DocumentOp::DropIndex {
                 collection: QualifiedCollection::new(DatabaseId::DEFAULT, "c"),

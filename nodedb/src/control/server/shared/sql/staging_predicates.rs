@@ -262,13 +262,9 @@ pub fn stages_returning(plan: &PhysicalPlan) -> bool {
                 ..
             } | DocumentOp::BulkUpdate {
                 returning: Some(_),
-                ollp_predicted_surrogates: None,
-                ollp_predicted_edges: None,
                 ..
             } | DocumentOp::BulkDelete {
                 returning: Some(_),
-                ollp_predicted_surrogates: None,
-                ollp_predicted_edges: None,
                 ..
             }
         )

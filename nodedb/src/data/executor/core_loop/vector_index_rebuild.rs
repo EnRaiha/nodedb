@@ -73,20 +73,16 @@ impl CoreLoop {
             // Collect first (the scan borrows `&self.sparse`); re-index after
             // the borrow ends so `&mut self` is free for the HNSW insert.
             let mut docs: Vec<(nodedb_types::Surrogate, Vec<u8>)> = Vec::new();
-            let scan = self.sparse.scan_documents_for_each(
-                db,
-                tenant_id,
-                &collection,
-                usize::MAX,
-                |doc_id, value| {
-                    let normalized = crate::data::executor::scan_normalize::sparse_body_to_msgpack(
-                        value,
-                        body_format.as_format_ref(),
-                    );
-                    docs.push((doc_id.surrogate(), normalized.into_owned()));
-                    Ok(())
-                },
-            );
+            // Each row at its current version, so a bitemporal collection's
+            // vectors are rebuilt too.
+            let scan = self.for_each_current_row(db, tenant_id, &collection, |doc_id, value| {
+                let normalized = crate::data::executor::scan_normalize::sparse_body_to_msgpack(
+                    value,
+                    body_format.as_format_ref(),
+                );
+                docs.push((doc_id.surrogate(), normalized.into_owned()));
+                Ok(std::ops::ControlFlow::Continue(()))
+            });
             if let Err(e) = scan {
                 tracing::warn!(
                     core = self.core_id,

@@ -11,19 +11,14 @@
 //! diverge on which rows match or what post-image each carries (mirrors how
 //! `collect_merge_plan` is shared between the MERGE resolve and apply passes).
 
-use redb::{ReadableDatabase, ReadableTable};
-
-use nodedb_types::StorageKey;
 use nodedb_types::columnar::StrictSchema;
 
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::core_loop::filter_match::matches_with_resolved_schema;
 use crate::data::executor::doc_format;
 use crate::data::executor::handlers::join_source_map::JoinSource;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::sparse::btree::{KeyedTable, invalid_storage_key_err};
-use crate::types::{DatabaseId, TenantId, TxnId};
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_plan::UpdateValue;
 
 use super::update_from_join::ResolvedUpdateRow;
@@ -48,20 +43,6 @@ pub(in crate::data::executor) struct CollectUpdateRows<'a> {
     /// target, `None` on any other. A bitemporal target is read at its
     /// current versions, and a strict one encodes the time into each tuple.
     pub bitemporal_sys_from_ms: Option<i64>,
-}
-
-/// Borrowed inputs for [`CoreLoop::scan_target_rows`], bundled to keep the
-/// overlay-aware target scan within argument limits.
-struct ScanTargetRows<'a> {
-    database_id: u64,
-    tid: u64,
-    target_collection: &'a str,
-    target_filters: &'a [ScanFilter],
-    strict_schema: Option<&'a StrictSchema>,
-    txn_id: Option<TxnId>,
-    target_coll_key: &'a (DatabaseId, TenantId, String),
-    /// Read the current versions of a bitemporal target.
-    bitemporal: bool,
 }
 
 impl CoreLoop {
@@ -101,16 +82,13 @@ impl CoreLoop {
         // each matched row's CURRENT body (overlay put superseding base, staged
         // insert appended), so the body is used directly — a base `sparse.get`
         // would miss a row this transaction only staged.
-        let target_rows = self.scan_target_rows(ScanTargetRows {
-            database_id,
-            tid,
-            target_collection,
-            target_filters,
-            strict_schema,
-            txn_id,
-            target_coll_key: &target_coll_key,
-            bitemporal: bitemporal_sys_from_ms.is_some(),
-        })?;
+        // Each row is at its current version, so a bitemporal target matches.
+        let target_rows = match txn_id {
+            Some(txn_id) => self.txn_matching_rows(txn_id, &target_coll_key, target_filters)?,
+            None => {
+                self.current_matching_rows(database_id, tid, target_collection, target_filters)?
+            }
+        };
 
         let mut rows: Vec<ResolvedUpdateRow> = Vec::new();
         for (key, current_bytes) in target_rows {
@@ -268,172 +246,6 @@ impl CoreLoop {
                 old_body: current_bytes,
                 doc: target_doc,
             });
-        }
-        Ok(rows)
-    }
-
-    /// Range-scan the target collection, returning each row that passes every
-    /// target-only filter as `(doc_id, current_stored_body)` — decoding strict
-    /// Binary Tuples to JSON for filter evaluation when the target is
-    /// strict-mode. The body is the row's CURRENT stored form (strict Binary
-    /// Tuple or MessagePack), returned so the caller need not re-fetch it.
-    ///
-    /// When `txn_id` is `Some`, the transaction's staging overlay is folded over
-    /// the base result: a staged tombstone hides its base row, a staged put
-    /// replaces the base body (re-checked against the SAME target filters via the
-    /// strict-aware matcher), and a staged put absent from base is appended when
-    /// it passes the filters. `None` (autocommit) returns the base-filtered rows
-    /// unchanged — byte-identical to the pre-staging behavior.
-    fn scan_target_rows(
-        &self,
-        args: ScanTargetRows<'_>,
-    ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
-        let ScanTargetRows {
-            database_id,
-            tid,
-            target_collection,
-            target_filters,
-            strict_schema,
-            txn_id,
-            target_coll_key,
-            bitemporal,
-        } = args;
-        let identity_column = self.identity_column(database_id, tid, target_collection);
-        let mut rows = if bitemporal {
-            self.scan_current_versions(database_id, tid, target_collection, |key, body| {
-                matches_with_resolved_schema(
-                    strict_schema,
-                    target_filters,
-                    key,
-                    body,
-                    &identity_column,
-                )
-            })?
-        } else {
-            self.scan_plain_rows(database_id, tid, target_collection, |key, body| {
-                matches_with_resolved_schema(
-                    strict_schema,
-                    target_filters,
-                    key,
-                    body,
-                    &identity_column,
-                )
-            })?
-        };
-
-        // Read-your-own-writes: fold the transaction's staging overlay over the
-        // base-filtered rows. The overlay's staged bodies are the same canonical
-        // stored form as base bodies, so the strict-aware matcher re-checks a
-        // staged put against the same target filters — a staged insert/update
-        // that satisfies the predicate is surfaced, one that no longer does is
-        // dropped, exactly as for a base row.
-        if let Some(txn_id) = txn_id {
-            // `merge_overlay_into_scan` takes an infallible
-            // `Fn(&StorageKey, &[u8]) -> bool` predicate, so a division/modulo-
-            // by-zero is captured via this `Cell` side-channel and checked once
-            // the merge returns.
-            let raw_matches =
-                self.strict_aware_matcher(database_id, tid, target_collection, target_filters);
-            let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-                std::cell::Cell::new(None);
-            let matches = |row_key: &StorageKey, body: &[u8]| match raw_matches(row_key, body) {
-                Ok(b) => b,
-                Err(e) => {
-                    predicate_err.set(Some(e));
-                    false
-                }
-            };
-            self.merge_overlay_into_scan(txn_id, target_coll_key, &mut rows, &matches);
-            if let Some(e) = predicate_err.take() {
-                return Err(crate::Error::from(e));
-            }
-        }
-        Ok(rows)
-    }
-
-    /// Every current version of a bitemporal collection whose body passes
-    /// `matches`, as `(doc_id, stored_body)`.
-    fn scan_current_versions(
-        &self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        matches: impl Fn(&StorageKey, &[u8]) -> Result<bool, nodedb_query::EvalError>,
-    ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
-        // The scan's predicate is infallible, so an evaluation error is kept
-        // here and returned once the scan ends.
-        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-            std::cell::Cell::new(None);
-        let predicate = |key: &StorageKey, body: &[u8]| match matches(key, body) {
-            Ok(matched) => matched,
-            Err(e) => {
-                predicate_err.set(Some(e));
-                false
-            }
-        };
-        let rows = self.sparse.versioned_scan_as_of(
-            crate::engine::sparse::btree_versioned::VersionedScanParams {
-                database_id,
-                tenant: tid,
-                coll: collection,
-                sys_cutoff_ms: None,
-                valid_at_ms: None,
-                limit: usize::MAX,
-            },
-            &predicate,
-            &crate::engine::sparse::scan_stop::never_stop,
-        )?;
-        if let Some(e) = predicate_err.take() {
-            return Err(crate::Error::from(e));
-        }
-        Ok(rows)
-    }
-
-    /// Every row of a collection whose body passes `matches`, as
-    /// `(doc_id, stored_body)`.
-    fn scan_plain_rows(
-        &self,
-        database_id: u64,
-        tid: u64,
-        target_collection: &str,
-        matches: impl Fn(&StorageKey, &[u8]) -> Result<bool, nodedb_query::EvalError>,
-    ) -> crate::Result<Vec<(StorageKey, Vec<u8>)>> {
-        let prefix = crate::engine::sparse::btree::coll_prefix(database_id, tid, target_collection);
-        let end = format!("{prefix}\u{ffff}");
-
-        let read_txn = self
-            .sparse
-            .db()
-            .begin_read()
-            .map_err(|e| crate::Error::Storage {
-                engine: "sparse".into(),
-                detail: format!("read txn: {e}"),
-            })?;
-        let table = read_txn
-            .open_table(crate::engine::sparse::btree::DOCUMENTS)
-            .map_err(|e| crate::Error::Storage {
-                engine: "sparse".into(),
-                detail: format!("open table: {e}"),
-            })?;
-
-        let mut rows: Vec<(StorageKey, Vec<u8>)> = Vec::new();
-        if let Ok(range) = table.range(prefix.as_str()..end.as_str()) {
-            for entry in range.flatten() {
-                let full_key = entry.0.value();
-                let value_bytes = entry.1.value();
-                let Some(rest) = full_key.strip_prefix(&prefix) else {
-                    continue;
-                };
-                let key = StorageKey::parse(rest).ok_or_else(|| {
-                    invalid_storage_key_err(KeyedTable::Documents, target_collection, rest)
-                })?;
-                // Goes through the same primitive the overlay fold uses, so a
-                // schemaless row with no `id` field matches `WHERE id ...`
-                // here exactly as it does once staged.
-                if matches(&key, value_bytes).map_err(crate::Error::from)? {
-                    rows.push((key, value_bytes.to_vec()));
-                }
-            }
         }
         Ok(rows)
     }

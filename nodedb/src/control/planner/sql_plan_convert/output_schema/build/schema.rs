@@ -12,7 +12,6 @@ use std::collections::HashMap;
 
 use nodedb_sql::SqlError;
 use nodedb_sql::catalog::SqlCatalog;
-use nodedb_sql::resolver::array_tvf::ARRAY_HORIZON_COLUMN;
 use nodedb_sql::types::query::Projection;
 use nodedb_sql::types::{
     CtePlan, DocumentIndexLookupPlan, HybridSearchPlan, HybridSearchTriplePlan, InsertPlan,
@@ -308,17 +307,9 @@ pub fn build_output_schema<C: SqlCatalog + ?Sized>(
         // the row's `truncated_before_horizon` flag.
         SqlPlan::ArrayAgg(agg) => {
             let view = array_view(catalog, &agg.name)?;
-            let mut schema = array_columns_schema(
-                &nodedb_sql::resolver::array_tvf::array_agg_columns(&view, agg)?,
-            );
-            if agg.temporal.is_temporal() {
-                schema.columns.push(OutputColumn {
-                    display_name: ARRAY_HORIZON_COLUMN.to_string(),
-                    lookup_key: ARRAY_HORIZON_COLUMN.to_string(),
-                    ty: DdlColType::Bool,
-                });
-            }
-            schema
+            array_columns_schema(&nodedb_sql::resolver::array_tvf::array_agg_row_columns(
+                &view, agg,
+            )?)
         }
         // `ArrayElementwise` compiles to `ArrayOp::Elementwise`, which
         // `describe_plan` classifies as `PlanKind::MultiRow`. `MultiRow`

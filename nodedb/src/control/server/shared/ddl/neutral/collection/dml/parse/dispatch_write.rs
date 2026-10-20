@@ -11,7 +11,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::sequence::SessionSequenceAccess;
 use crate::control::server::pgwire::types::error_to_sqlstate;
-use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
+use crate::control::server::response_shape::compose::{ShapeOutcome, shape_returning_materialized};
 use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::schema::OutputSchema;
@@ -241,7 +241,7 @@ impl ReturningShape<'_> {
             self.database_id,
             tenant_id,
         );
-        let outcome = shape_response_materialized(MaterializedShapeRequest {
+        let outcome = shape_returning_materialized(MaterializedShapeRequest {
             payload,
             plan,
             plan_kind: PlanKind::ReturningRows,

@@ -3,14 +3,13 @@
 use tracing::debug;
 
 use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
-use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::redo_image::StoredRow;
 use crate::data::executor::enforcement::unique::PostImage;
 use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::partial_refusal::refusal_after_partial_apply;
 use crate::data::executor::handlers::point::update_reindex::NonbitemporalUpdateReindex;
-use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
+use crate::data::executor::handlers::point::update_reindex_secondary::UpdateSecondaryReindex;
 use crate::data::executor::handlers::returning_doc;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
@@ -95,39 +94,20 @@ impl CoreLoop {
         }
 
         // Empty `filter_bytes` means "no WHERE clause" — match every row.
-        let filters: Vec<ScanFilter> = if filter_bytes.is_empty() {
-            Vec::new()
-        } else {
-            match zerompk::from_msgpack(filter_bytes) {
-                Ok(f) => f,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: format!("deserialize filters: {e}"),
-                        },
-                    );
-                }
-            }
-        };
-
-        let matching_ids = match self.scan_matching_documents(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            &filters,
-        ) {
-            Ok(ids) => ids,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
+        // The matched set is each row's current version.
+        let database_id = task.request.database_id.as_u64();
+        let matching_ids = match super::decode_bulk_filters(filter_bytes)
+            .and_then(|filters| self.current_matching_rows(database_id, tid, collection, &filters))
+        {
+            Ok(rows) => rows.into_iter().map(|(key, _)| key).collect(),
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
         };
 
         // Settle the apply set and run every leader-only pre-write
         // verification the plan's predictions call for. Any divergence returns
         // here, before the first row is touched.
         let apply_ids = match self.admit_bulk_predicate_write(
-            task.request.database_id.as_u64(),
+            database_id,
             tid,
             matching_ids,
             &super::BulkAdmission {
@@ -159,14 +139,19 @@ impl CoreLoop {
         // HNSW vectors — the btree/FTS/graph reconciliation this handler already
         // does never touches the vector index, so KNN search would keep scoring
         // the stale pre-update embedding in the same process.
-        let database_id = task.request.database_id.as_u64();
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
 
-        // The plain `INDEXES` secondary-index paths for this collection, cloned
-        // once for the whole statement. Each row's primary write reconciles
-        // these atomically via `nonbitemporal_update_reindex` so a value the
-        // UPDATE changed can't leave a stale index entry pointing at the old
-        // value (which would make a later lookup on the new value miss the row).
+        // One system time stamps every new version of a bitemporal
+        // collection, so the statement writes its rows at one instant.
+        let bitemporal_sys_from_ms = self
+            .is_bitemporal(database_id, tid, collection)
+            .then(|| self.bitemporal_now_ms());
+
+        // The secondary-index paths for this collection, cloned once for the
+        // whole statement. Each row's primary write reconciles them in the
+        // row's transaction, so a value the UPDATE changed can't leave a stale
+        // index entry pointing at the old value. A bitemporal collection
+        // reconciles the versioned index, any other the plain `INDEXES`.
         let index_paths = self
             .doc_configs
             .get(&config_key)
@@ -198,6 +183,7 @@ impl CoreLoop {
             updates,
             strict_schema: strict_schema.as_ref(),
             declared_primary_key,
+            bitemporal_sys_from_ms,
         }) {
             Ok(projected) => projected,
             Err(e) => return self.response_error(task, e),
@@ -277,6 +263,7 @@ impl CoreLoop {
                     deferred_sum_targets: &[],
                     wal_lsn: task.wal_lsn(),
                 },
+                bitemporal_sys_from_ms,
             );
             let (touched, target_writes) = match persisted {
                 Ok(persisted) => (persisted.touched, persisted.target_writes),
@@ -300,7 +287,8 @@ impl CoreLoop {
                 storage_key,
             );
             // The row's post-image, then one durable redo entry per derived
-            // target row, naming the TARGET collection.
+            // target row, naming the TARGET collection. A bitemporal version
+            // carries its system time, so replay lands the same version.
             let image = self.stored_row_image(
                 StoredRow {
                     database_id,
@@ -310,7 +298,7 @@ impl CoreLoop {
                     identity: row_identity.clone(),
                 },
                 &updated_bytes,
-                None,
+                bitemporal_sys_from_ms,
             );
             match image {
                 Ok(image) => write_set.push(image),
@@ -344,21 +332,19 @@ impl CoreLoop {
             // surrogate + collection.
             let surrogate = storage_key.surrogate();
             self.note_surrogate_write(task, tid, collection, surrogate.as_u32());
-            // Re-index the row's vectors from the new body (soft-delete the
-            // old HNSW node + insert the new one, keyed by the stable
-            // surrogate). No-op unless the collection has a vector field
-            // (gated above).
-            if has_vectors
-                && let Err(e) = self.update_reindex_vector_indexes(UpdateVectorReindex {
-                    database_id,
-                    tid,
-                    collection,
-                    storage_key,
-                    new_body: &updated_bytes,
-                    is_strict: strict_schema.is_some(),
-                    has_vectors,
-                })
-            {
+            // Re-index the row's dense vectors and sparse-vector postings
+            // from the new body, keyed by the stable surrogate, as the point
+            // update does. Each half is a no-op when the collection declares
+            // nothing of that kind.
+            if let Err(e) = self.update_reindex_vector_and_sparse(UpdateSecondaryReindex {
+                database_id,
+                tid,
+                collection,
+                storage_key,
+                new_body: &updated_bytes,
+                is_strict: strict_schema.is_some(),
+                has_vectors,
+            }) {
                 // The row's body already committed.
                 let code = refusal_after_partial_apply(ErrorCode::from(e));
                 return self.refusal_with_landed_rows(task, code, write_set);
@@ -426,6 +412,7 @@ impl CoreLoop {
 mod tests {
     use super::*;
     use crate::bridge::envelope::Status;
+    use crate::bridge::scan_filter::ScanFilter;
     use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
     use crate::data::executor::doc_format;
     use nodedb_physical::physical_plan::UpdateValue;

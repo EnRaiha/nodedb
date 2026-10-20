@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Staging of a transaction delete's node-delete edge tasks.
+//! Staging of the edge tasks a transaction write derives.
 //!
 //! A delete on an edge-bearing collection inside a transaction block carries
-//! the edge tasks `txn_node_delete_tasks` derives. Each `EdgeDelete` stages
-//! into the transaction's graph overlay now, so later reads in the
-//! transaction see the edge gone. Each `NodeEdgeGuard` is buffered, and
-//! COMMIT checks it.
+//! the edge tasks `txn_node_delete_tasks` derives. An update on one carries
+//! its implicit-edge reconciliation. Each `EdgeDelete` and `EdgePut` stages
+//! into the transaction's graph overlay at the statement, so later reads in
+//! the transaction see it. Each `NodeEdgeGuard` is buffered, and COMMIT
+//! checks it.
 
 use std::future::Future;
 

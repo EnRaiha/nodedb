@@ -133,7 +133,7 @@ pub(crate) async fn handle_graph_match(
     }
 
     if response.status == Status::Error {
-        return data_plane_response_to_native(ctx, seq, &plan_for_response, &response);
+        return data_plane_response_to_native(ctx, seq, &plan_for_response, &response).await;
     }
 
     // Unwrap the `{rows, frontier, resume}` envelope into a bare rows array.
@@ -146,7 +146,7 @@ pub(crate) async fn handle_graph_match(
             },
             Err(error) => return error_to_native(seq, &error),
         };
-    let native = data_plane_response_to_native(ctx, seq, &plan_for_response, &unwrapped);
+    let native = data_plane_response_to_native(ctx, seq, &plan_for_response, &unwrapped).await;
     // Metered only on the success path — `data_plane_response_to_native`
     // above already decoded the row envelope to shape the response, so
     // `native.rows` gives the real row count for free (no extra decode).
@@ -222,7 +222,8 @@ async fn match_across_shards(
             seq,
             plan,
             &crate::control::server::dispatch_utils::ok_payload_response(outcome.rows_payload),
-        ),
+        )
+        .await,
         Err(error) => error_to_native(seq, &error),
     }
 }

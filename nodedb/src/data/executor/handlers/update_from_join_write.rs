@@ -101,17 +101,14 @@ impl CoreLoop {
         {
             for row in &rows {
                 for image in [&row.old_body, &row.body] {
-                    if let Err(e) =
-                        crate::data::executor::enforcement::period_lock::check_period_lock(
-                            &self.sparse,
-                            database_id,
-                            tid,
-                            target_collection,
-                            image,
-                            lock,
-                            resolved_sum_targets,
-                        )
-                    {
+                    if let Err(e) = self.check_period_lock_at(
+                        database_id,
+                        tid,
+                        target_collection,
+                        image,
+                        lock,
+                        resolved_sum_targets,
+                    ) {
                         return Err(self.response_error(task, e));
                     }
                 }

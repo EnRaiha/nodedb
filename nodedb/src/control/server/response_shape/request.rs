@@ -35,6 +35,7 @@ pub struct MaterializedShapeRequest<'a> {
     /// Session-scoped sequence access for the projection's Control-Plane
     /// computed columns. `None` only where the producer has no session in
     /// scope; a projection that carries computed columns then fails rather
-    /// than shipping NULL under the alias.
-    pub sequences: Option<&'a dyn SequenceAccess>,
+    /// than shipping NULL under the alias. `Sync`, so an awaiting shaper
+    /// stays `Send` across the search translation.
+    pub sequences: Option<&'a (dyn SequenceAccess + Sync)>,
 }

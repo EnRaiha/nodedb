@@ -105,3 +105,35 @@ pub fn data_plane_core_fail_stopped(core_id: usize, cause: &str, detail: &str) {
     .with_backtrace()
     .emit();
 }
+
+/// Report a Calvin participant that refused its slice with an internal
+/// error. Called from `calvin_stage_refusal`, the one site every refused
+/// stage passes through.
+pub fn calvin_stage_refused_internal(vshard_id: u32, epoch: u64, position: u32, detail: &str) {
+    let ctx = context::CalvinStageRefusedInternal {
+        vshard_id,
+        epoch,
+        position,
+        detail,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "Calvin participant refused its slice with an internal error",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
+/// Report a vector delete whose row payload did not decode. Called from the
+/// vector delete handler, which refuses the delete with nothing removed.
+pub fn vector_payload_undecodable(collection: &str, detail: &str) {
+    let ctx = context::VectorPayloadUndecodable { collection, detail };
+    let _ = Capture::new(
+        EventKind::Corruption,
+        "vector delete refused: the row's stored payload does not decode",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}

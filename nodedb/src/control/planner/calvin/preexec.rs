@@ -24,7 +24,7 @@ use nodedb_types::{
 use super::dependent_recon_node_edges::NodeIncidentEdges;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, TxnId};
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{DocumentOp, OllpPredictedEdge, PhysicalPlan};
 
 /// One implicit graph edge surfaced from the pre-execution reconnaissance scan.
 ///
@@ -53,6 +53,19 @@ pub struct ScannedEdge {
     /// the matching INSERT mirrored — otherwise the re-created edge will silently
     /// revert to the default unit weight. `None` when absent or non-finite.
     pub weight: Option<f64>,
+}
+
+/// The plan-carried prediction of a scanned edge: the edge document's
+/// surrogate and its mirrored `_from`/`_to`/`_type`.
+impl From<&ScannedEdge> for OllpPredictedEdge {
+    fn from(edge: &ScannedEdge) -> Self {
+        Self {
+            surrogate: edge.surrogate,
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            label: edge.label.clone(),
+        }
+    }
 }
 
 /// Whether the recon scan reads each matched row's identity, and which

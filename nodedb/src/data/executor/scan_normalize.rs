@@ -199,21 +199,20 @@ impl CoreLoop {
         }
 
         // 3. Sparse/document engine (schemaless + strict + vector-primary
-        //    sidecar) — TRULY streams row-at-a-time via
-        //    `scan_documents_for_each`. The body encoding is resolved once up
+        //    sidecar) — streams via `for_each_current_row`: row-at-a-time on
+        //    the plain table, a page at a time on a bitemporal collection's
+        //    current versions. The body encoding is resolved once up
         //    front through the same helper `scan_sparse` uses, so the streaming
         //    and materializing scans cannot disagree about a row's shape.
         let database_id = crate::types::DatabaseId::new(did);
         let tenant_id = crate::types::TenantId::new(tid);
         let format = self.sparse_body_format(database_id, tenant_id, collection);
         let identity_column = self.identity_column(did, tid, collection);
-        self.sparse
-            .scan_documents_for_each(did, tid, collection, usize::MAX, |id, raw| {
-                let (id_s, mp) =
-                    sparse_row_to_doc(id, raw, format.as_format_ref(), &identity_column);
-                f(&id_s, &mp)
-            })?;
-        Ok(())
+        // Each row at its current version, so a bitemporal collection scans.
+        self.for_each_current_row(did, tid, collection, |id, raw| {
+            let (id_s, mp) = sparse_row_to_doc(id, raw, format.as_format_ref(), &identity_column);
+            f(&id_s, &mp).map(|()| std::ops::ControlFlow::Continue(()))
+        })
     }
 
     /// Scan KV engine entries → standard msgpack.
@@ -316,7 +315,8 @@ impl CoreLoop {
         collection: &str,
         limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
-        let docs = self.sparse.scan_documents(did, tid, collection, limit)?;
+        // Each row at its current version, so a bitemporal collection scans.
+        let docs = self.current_rows(did, tid, collection, limit)?;
         let database_id = crate::types::DatabaseId::new(did);
         let tenant_id = crate::types::TenantId::new(tid);
         let format = self.sparse_body_format(database_id, tenant_id, collection);

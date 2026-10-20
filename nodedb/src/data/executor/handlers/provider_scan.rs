@@ -79,24 +79,11 @@ impl CoreLoop {
             };
             if !predicates.is_empty() {
                 // `Vec::retain`'s closure must return `bool`, so an
-                // evaluation error is captured via this side-channel and
-                // checked once the retain finishes.
-                let predicate_err: std::cell::RefCell<Option<nodedb_query::EvalError>> =
-                    std::cell::RefCell::new(None);
-                rows.retain(|row| {
-                    if predicate_err.borrow().is_some() {
-                        return true;
-                    }
-                    match ScanFilter::all_match_binary(&predicates, row) {
-                        Ok(keep) => keep,
-                        Err(e) => {
-                            predicate_err.replace(Some(e));
-                            true
-                        }
-                    }
-                });
-                if let Some(e) = predicate_err.take() {
-                    return self.response_error(task, ErrorCode::from(e));
+                // evaluation error is held and returned once the retain ends.
+                let held = crate::data::executor::core_loop::filter_match::HeldEvalError::default();
+                rows.retain(|row| held.check(|| ScanFilter::all_match_binary(&predicates, row)));
+                if let Err(e) = held.finish::<_, ErrorCode>(()) {
+                    return self.response_error(task, e);
                 }
             }
         }

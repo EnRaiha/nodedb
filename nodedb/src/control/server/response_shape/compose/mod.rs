@@ -8,4 +8,6 @@ pub mod kernel;
 pub mod materialized;
 
 pub use kernel::shape_decoded_rows;
-pub use materialized::{ShapeOutcome, shape_payload_no_plan, shape_response_materialized};
+pub use materialized::{
+    ShapeOutcome, shape_payload_no_plan, shape_response_materialized, shape_returning_materialized,
+};

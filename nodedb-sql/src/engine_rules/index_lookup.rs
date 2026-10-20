@@ -27,6 +27,17 @@ pub(crate) fn try_document_index_lookup(
     if !params.sort_keys.is_empty() || !params.window_functions.is_empty() {
         return None;
     }
+    // The versioned index answers the current state and a system-time
+    // cutoff. It holds no valid time and lists no history, so a valid-time
+    // or all-versions read scans the versions instead.
+    if !matches!(params.temporal.valid_time, crate::temporal::ValidTime::Any)
+        || matches!(
+            params.temporal.system_time,
+            nodedb_types::SystemTimeScope::AllVersions
+        )
+    {
+        return None;
+    }
 
     // Iterate filters to find the first equality candidate that lines up
     // with a Ready index. Keep the remaining filters as post-filters.

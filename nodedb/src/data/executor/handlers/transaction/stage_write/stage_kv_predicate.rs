@@ -21,6 +21,7 @@ use super::stage_kv::kv_row_identity;
 use crate::bridge::envelope::Response;
 use crate::bridge::scan_filter::{ScanFilter, decode_scan_filters};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::filter_match::HeldEvalError;
 use crate::data::executor::handlers::kv::field_compute::merge_field_updates;
 use crate::data::executor::response_codec;
 use crate::data::executor::scan_normalize::kv_row_to_doc;
@@ -211,27 +212,18 @@ impl CoreLoop {
             .map_err(|e| self.response_error(task, e))?;
 
         // `merge_kv_overlay_into_scan` takes an infallible predicate, so a
-        // division/modulo-by-zero is captured via this `Cell` side-channel
-        // and checked once the merge returns.
-        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
-            std::cell::Cell::new(None);
+        // division/modulo-by-zero is held and returned once the merge ends.
+        let held = HeldEvalError::default();
         let matches = |key: &[u8], value: &[u8]| {
             if filters.is_empty() {
                 return true;
             }
-            let (_key_str, row) = kv_row_to_doc(key, value);
-            match ScanFilter::all_match_binary(&filters, &row) {
-                Ok(b) => b,
-                Err(e) => {
-                    predicate_err.set(Some(e));
-                    false
-                }
-            }
+            held.check(|| ScanFilter::all_match_binary(&filters, &kv_row_to_doc(key, value).1))
         };
         self.merge_kv_overlay_into_scan(txn_id, coll_key, &mut rows, &matches);
-        if let Some(e) = predicate_err.take() {
-            return Err(self.response_error(task, crate::Error::from(e)));
-        }
+        let rows = held
+            .finish::<_, crate::Error>(rows)
+            .map_err(|e| self.response_error(task, e))?;
 
         let mut matched = Vec::with_capacity(rows.len());
         for (key, body) in rows {

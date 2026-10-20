@@ -119,10 +119,7 @@ impl SliceScope {
     pub(super) fn of_plans(plans: &[nodedb_physical::physical_plan::PhysicalPlan]) -> Self {
         Self {
             writes: !plans.is_empty(),
-            collections:
-                crate::control::wal_replication::transaction_redo::collections::written_collections(
-                    plans,
-                ),
+            collections: nodedb_physical::physical_plan::written_collections(plans),
             sum_targets:
                 crate::control::wal_replication::transaction_redo::sum_targets::redo_sum_targets(
                     plans,

@@ -581,13 +581,11 @@ async fn publish_to_inside_trigger_body_delivers_message() {
         .await
         .unwrap();
 
-    // Give the event plane a moment to dispatch the AFTER trigger.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let rows = server
-        .query_text("SELECT * FROM TOPIC order_events CONSUMER GROUP processors LIMIT 10")
-        .await
-        .expect("SELECT FROM TOPIC should succeed");
+    let rows = published_rows(
+        &server,
+        "SELECT * FROM TOPIC order_events CONSUMER GROUP processors LIMIT 10",
+    )
+    .await;
 
     assert!(
         !rows.is_empty(),
@@ -628,9 +626,7 @@ async fn publish_to_payload_unescapes_doubled_quotes() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let combined = topic_rows_joined(
+    let combined = published_rows(
         &server,
         "SELECT * FROM TOPIC quote_events CONSUMER GROUP qg LIMIT 10",
     )
@@ -643,6 +639,29 @@ async fn publish_to_payload_unescapes_doubled_quotes() {
         !combined.contains("it''s fine"),
         "payload must not retain SQL-escaped form `it''s fine`, got: {combined:?}"
     );
+}
+
+/// How long an AFTER trigger's `PUBLISH TO` may take to reach its topic.
+const PUBLISH_DEADLINE: Duration = Duration::from_secs(15);
+/// The interval between topic reads while a published message is awaited.
+const PUBLISH_POLL: Duration = Duration::from_millis(50);
+
+/// The joined rows `sql` reads once the AFTER trigger's message reaches the
+/// topic. The trigger runs on the event plane after the INSERT returns, so
+/// the read repeats until a row arrives. Panics past [`PUBLISH_DEADLINE`].
+async fn published_rows(server: &TestServer, sql: &str) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let rows = topic_rows_joined(server, sql).await;
+        if !rows.is_empty() {
+            return rows;
+        }
+        assert!(
+            start.elapsed() < PUBLISH_DEADLINE,
+            "no message reached the topic within {PUBLISH_DEADLINE:?}: {sql}"
+        );
+        tokio::time::sleep(PUBLISH_POLL).await;
+    }
 }
 
 async fn topic_rows_joined(server: &TestServer, sql: &str) -> String {
@@ -693,12 +712,11 @@ async fn publish_to_empty_quoted_payload_delivers() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let rows = server
-        .query_text("SELECT * FROM TOPIC empty_events CONSUMER GROUP eg LIMIT 10")
-        .await
-        .unwrap();
+    let rows = published_rows(
+        &server,
+        "SELECT * FROM TOPIC empty_events CONSUMER GROUP eg LIMIT 10",
+    )
+    .await;
 
     assert!(
         !rows.is_empty(),
@@ -740,9 +758,7 @@ async fn publish_to_new_field_substitution_delivers_value() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let combined = topic_rows_joined(
+    let combined = published_rows(
         &server,
         "SELECT * FROM TOPIC user_events CONSUMER GROUP ug LIMIT 10",
     )

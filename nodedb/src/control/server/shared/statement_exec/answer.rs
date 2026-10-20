@@ -78,7 +78,7 @@ impl StatementFold {
 
     /// Shape `payload`, the answer `plan` gave as `plan_kind`, and fold its
     /// rows. Returns the row count, `None` when the payload carries no rows.
-    pub(crate) fn fold_rows(
+    pub(crate) async fn fold_rows(
         &mut self,
         exec: &StatementExec<'_>,
         plan: &PhysicalPlan,
@@ -97,7 +97,9 @@ impl StatementFold {
             tenant_id: exec.tenant_id(),
             redaction: Some(redaction.ctx(&exec.state.redaction)),
             sequences: Some(exec.sequences),
-        }) {
+        })
+        .await
+        {
             Ok(ShapeOutcome::Rows(shaped)) => Ok(Some(self.fold_shaped(shaped))),
             Ok(ShapeOutcome::Passthrough) => Ok(None),
             Err(error) => Err(StatementError::Shape(error)),
@@ -107,7 +109,7 @@ impl StatementFold {
     /// Fold a write its transaction staged. A write that answers `RETURNING`
     /// folds its rows in place of a count, as an autocommit one does. A
     /// computed-value payload (`RawPayload`) is shaped instead of counted.
-    pub(crate) fn fold_staged(
+    pub(crate) async fn fold_staged(
         &mut self,
         exec: &StatementExec<'_>,
         plan: &PhysicalPlan,
@@ -115,7 +117,8 @@ impl StatementFold {
     ) -> Result<(), StatementError> {
         if !outcome.returning_rows.is_empty() {
             for rows in &outcome.returning_rows {
-                self.fold_rows(exec, plan, PlanKind::ReturningRows, rows)?;
+                self.fold_rows(exec, plan, PlanKind::ReturningRows, rows)
+                    .await?;
             }
             return Ok(());
         }
@@ -128,7 +131,8 @@ impl StatementFold {
         }
         // The value rides in the payload, never as a count.
         if self
-            .fold_rows(exec, plan, describe_plan(plan), &outcome.payload)?
+            .fold_rows(exec, plan, describe_plan(plan), &outcome.payload)
+            .await?
             .is_none()
         {
             self.tag.fold_opaque();
@@ -139,7 +143,7 @@ impl StatementFold {
     /// Fold a dispatched task's answer `payload`: its rows, or its count.
     /// Returns the task's own row count for metering, `None` when it carries
     /// none.
-    pub(crate) fn fold_answer(
+    pub(crate) async fn fold_answer(
         &mut self,
         exec: &StatementExec<'_>,
         plan: &PhysicalPlan,
@@ -154,7 +158,7 @@ impl StatementFold {
             self.tag.fold_opaque();
             return Ok(None);
         }
-        if let Some(rows) = self.fold_rows(exec, plan, plan_kind, payload)? {
+        if let Some(rows) = self.fold_rows(exec, plan, plan_kind, payload).await? {
             return Ok(Some(rows));
         }
         // A count-bearing write reports the rows it touched and its verb; an

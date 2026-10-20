@@ -46,7 +46,7 @@ pub(super) struct ShapedAppend<'a> {
 }
 
 /// Shape a response. A refusal becomes the HTTP error its code maps to.
-pub(super) fn append_response(
+pub(super) async fn append_response(
     result_rows: &mut Vec<serde_json::Value>,
     response: crate::bridge::envelope::Response,
     append: &ShapedAppend<'_>,
@@ -54,12 +54,12 @@ pub(super) fn append_response(
     if response.status != Status::Ok {
         return Err(response_error(&response));
     }
-    append_payload(result_rows, &response.payload.to_vec(), append)
+    append_payload(result_rows, &response.payload.to_vec(), append).await
 }
 
 /// Shape one payload into rows, or pass a write's or tag's payload through
 /// as one JSON row. An empty payload adds nothing.
-pub(super) fn append_payload(
+pub(super) async fn append_payload(
     result_rows: &mut Vec<serde_json::Value>,
     payload: &[u8],
     append: &ShapedAppend<'_>,
@@ -85,7 +85,9 @@ pub(super) fn append_payload(
         tenant_id: append.tenant_id,
         redaction: Some(append.redaction.ctx(&append.state.shared.redaction)),
         sequences: Some(&sequences),
-    }) {
+    })
+    .await
+    {
         Ok(HttpShaped::Rows(rows)) => result_rows.extend(rows),
         Ok(HttpShaped::Passthrough) => result_rows.push(passthrough_json_row(payload)),
         Err(e) => return Err(shape_error_to_api(e)),

@@ -229,6 +229,9 @@ pub(in crate::control::planner::sql_plan_convert) struct DocumentIndexLookupArgs
     pub offset: usize,
     pub tenant_id: TenantId,
     pub database_id: crate::types::DatabaseId,
+    /// The read's time scope. Only the current state and a system-time
+    /// cutoff plan an index lookup.
+    pub temporal: &'a nodedb_sql::TemporalScope,
 }
 
 pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_lookup(
@@ -244,7 +247,24 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_look
         offset,
         tenant_id,
         database_id,
+        temporal,
     } = args;
+    // The versioned index answers at a system-time cutoff. It holds no valid
+    // time and lists no history, so the planner never routes those here.
+    if !matches!(temporal.valid_time, nodedb_sql::ValidTime::Any) {
+        return Err(crate::Error::PlanError {
+            detail: format!("index lookup on '{collection}' cannot answer a valid-time read"),
+        });
+    }
+    let system_as_of_ms = match temporal.system_time {
+        SystemTimeScope::Current => None,
+        SystemTimeScope::AsOf(ms) => Some(ms),
+        SystemTimeScope::AllVersions => {
+            return Err(crate::Error::PlanError {
+                detail: format!("index lookup on '{collection}' cannot list every version"),
+            });
+        }
+    };
     let collection_key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let qualified_collection = nodedb_types::QualifiedCollection::new(database_id, collection);
     let filter_bytes = serialize_filters(filters)?;
@@ -259,6 +279,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_document_index_look
         // No LIMIT fetches every matching row under the byte budget.
         limit: limit.unwrap_or(usize::MAX),
         offset,
+        system_as_of_ms,
     });
     Ok(vec![PhysicalTask {
         tenant_id,

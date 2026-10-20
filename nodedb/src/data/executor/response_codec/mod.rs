@@ -26,6 +26,7 @@
 mod arrow;
 mod decode;
 mod encode;
+mod graph_rag;
 mod hits;
 mod raw;
 
@@ -36,11 +37,12 @@ pub(in crate::data::executor) use encode::{
     encode, encode_json_as_msgpack, encode_json_vec_as_msgpack, encode_serde, encode_value_vec,
 };
 pub(crate) use encode::{encode_affected, encode_affected_with_op, encode_count};
+pub(crate) use graph_rag::{GraphRagMetadata, GraphRagResponse, GraphRagResult};
 #[allow(unused_imports)]
 pub(crate) use hits::ArrayAggregateResponse;
 pub(crate) use hits::{
-    ArraySliceResponse, GraphRagMetadata, GraphRagResponse, GraphRagResult, IngestRejection,
-    RejectingRowsPayload, ReturningRowsReply, RowsPayload, StagedReturningReply,
+    ArraySliceResponse, IngestRejection, RejectingRowsPayload, ReturningRowsReply, RowsPayload,
+    StagedReturningReply,
 };
 pub(in crate::data::executor) use hits::{
     DocumentRow, HybridSearchHit, NeighborEntry, NeighborMultiEntry, SubgraphEdge, VectorSearchHit,
@@ -48,5 +50,5 @@ pub(in crate::data::executor) use hits::{
 pub(crate) use raw::{decode_raw_scan_to_docs, encode_raw_document_rows};
 pub use raw::{
     encode_binary_rows, flatten_hybrid_hits_to_relational_rows, flatten_to_relational_rows,
-    flatten_vector_hits_to_relational_rows,
+    flatten_vector_hits_to_relational_rows, hybrid_hit_surrogates, vector_hit_surrogates,
 };

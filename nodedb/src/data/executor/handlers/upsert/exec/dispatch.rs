@@ -106,23 +106,14 @@ impl CoreLoop {
             }
         });
 
-        // Check if document already exists. Bitemporal collections consult
-        // the versioned table's current-state view (reverse-scan to newest
-        // non-tombstone); non-bitemporal collections use the legacy point
-        // lookup.
-        let bitemporal = self.is_bitemporal(database_id, tid, collection);
         // Computed once for the whole statement: the schemaless half of this
         // check is an unindexed `vector_params` scan, so it must not be paid
         // per branch. Gates the overwrite branch's removal of the prior HNSW
         // node; a non-vector collection pays nothing.
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
         let key = nodedb_types::StorageKey::for_surrogate(surrogate);
-        let existing = if bitemporal {
-            self.sparse
-                .versioned_get_current(database_id, tid, collection, &key)
-        } else {
-            self.sparse.get(database_id, tid, collection, &key)
-        };
+        // Whether the row already exists, at its current version.
+        let existing = self.current_row_body(database_id, tid, collection, &key);
 
         match existing {
             Ok(Some(current_bytes)) => self.execute_upsert_overwrite(

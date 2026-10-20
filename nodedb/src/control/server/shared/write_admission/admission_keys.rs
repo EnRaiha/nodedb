@@ -43,8 +43,8 @@ use crate::control::planner::calvin::submit::unique_claims::catalog_unique_claim
 use crate::control::planner::calvin::tx_class::write_keys::{WriteKeys, add_plan_write_keys};
 use crate::control::planner::calvin::write_class::is_write_plan;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::transaction_redo::collections::written_collections;
 use crate::types::{DatabaseId, TenantId};
+use nodedb_physical::physical_plan::written_collections;
 
 /// The moded lock request of one write.
 #[derive(Debug, Default)]

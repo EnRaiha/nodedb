@@ -88,13 +88,8 @@ impl CoreLoop {
         match engine {
             RowEngine::Document | RowEngine::Crdt => {
                 let key = StorageKey::for_surrogate(surrogate);
-                let read = if self.is_bitemporal(database_id, tid, collection) {
-                    self.sparse
-                        .versioned_get_current(database_id, tid, collection, &key)
-                } else {
-                    self.sparse.get(database_id, tid, collection, &key)
-                };
-                read.map_err(ErrorCode::from)
+                self.current_row_body(database_id, tid, collection, &key)
+                    .map_err(ErrorCode::from)
             }
             RowEngine::Kv => {
                 let key = kv_raw_key(identity)?;

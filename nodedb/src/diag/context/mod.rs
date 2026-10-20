@@ -52,7 +52,8 @@ pub(in crate::diag) use crdt_dead_letter_store::{
 pub(in crate::diag) use cut_barrier::CutBarrierNotPlaced;
 pub use data_plane::LostResponseWrite;
 pub(in crate::diag) use data_plane::{
-    CalvinApplyHalted, CalvinCompletionTimeout, CoreFailStopped, DataPlaneResponseLost,
+    CalvinApplyHalted, CalvinCompletionTimeout, CalvinStageRefusedInternal, CoreFailStopped,
+    DataPlaneResponseLost, VectorPayloadUndecodable,
 };
 pub(in crate::diag) use event_image::{StrictRowImageUnrendered, TimeseriesRowImageUndecodable};
 pub(in crate::diag) use held_entry::{ApplyPanicked, HeldEntryDebtNotRecorded, RedoEntryMalformed};

@@ -9,11 +9,11 @@ use nodedb_physical::physical_plan::{
 };
 
 use crate::bridge::envelope::{Response, Status};
-use crate::control::wal_replication::transaction_redo::collections::written_collections;
 use crate::control::wal_replication::transaction_redo::sum_targets::redo_sum_targets;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{Lsn, TenantId};
+use nodedb_physical::physical_plan::written_collections;
 
 use super::shared::CalvinExecCtx;
 

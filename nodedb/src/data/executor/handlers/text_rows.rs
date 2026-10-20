@@ -17,12 +17,7 @@ use crate::data::executor::handlers::transaction::overlay::Staged;
 use crate::data::executor::row_shape::sparse_row_to_doc;
 use crate::data::executor::sparse_body_format::SparseBodyFormatRef;
 use crate::data::executor::task::ExecutionTask;
-use crate::engine::sparse::btree_versioned::VersionedScanParams;
-use crate::engine::sparse::scan_stop::never_stop;
 use crate::types::TenantId;
-
-/// Rows read per page of a bitemporal collection's current versions.
-const BITEMPORAL_PAGE_ROWS: usize = 1024;
 
 /// The row predicates a full-text read applies before ranking: the residual
 /// WHERE filters and the RLS filters.
@@ -73,70 +68,6 @@ pub(in crate::data::executor) fn text_row_image(
 }
 
 impl CoreLoop {
-    /// The current version of one base row: the versioned table's current
-    /// version for a bitemporal collection, the document table otherwise.
-    pub(in crate::data::executor) fn text_base_body(
-        &self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        key: &StorageKey,
-    ) -> crate::Result<Option<Vec<u8>>> {
-        if self.is_bitemporal(database_id, tid, collection) {
-            self.sparse
-                .versioned_get_current(database_id, tid, collection, key)
-        } else {
-            self.sparse.get(database_id, tid, collection, key)
-        }
-    }
-
-    /// Visit the current version of every base row of `collection`, from the
-    /// tables [`Self::text_base_body`] reads, until `f` breaks. A bitemporal
-    /// collection is read a page at a time, so at most one page of rows is in
-    /// memory.
-    pub(in crate::data::executor) fn for_each_text_base_row<F>(
-        &self,
-        database_id: u64,
-        tid: u64,
-        collection: &str,
-        mut f: F,
-    ) -> crate::Result<()>
-    where
-        F: FnMut(&StorageKey, &[u8]) -> crate::Result<ControlFlow<()>>,
-    {
-        if !self.is_bitemporal(database_id, tid, collection) {
-            return self
-                .sparse
-                .scan_documents_while(database_id, tid, collection, f);
-        }
-        let mut after: Option<StorageKey> = None;
-        loop {
-            let page = self.sparse.versioned_scan_as_of_after(
-                VersionedScanParams {
-                    database_id,
-                    tenant: tid,
-                    coll: collection,
-                    sys_cutoff_ms: None,
-                    valid_at_ms: None,
-                    limit: BITEMPORAL_PAGE_ROWS,
-                },
-                after.as_ref(),
-                &|_, _| true,
-                &never_stop,
-            )?;
-            let full = page.len() >= BITEMPORAL_PAGE_ROWS;
-            for (key, body) in &page {
-                if f(key, body)?.is_break() {
-                    return Ok(());
-                }
-            }
-            match page.into_iter().next_back() {
-                Some((key, _)) if full => after = Some(key),
-                _ => return Ok(()),
-            }
-        }
-    }
-
     /// Surrogates of `collection` whose row passes `gate`, judged before
     /// ranking. Staged rows of the issuing transaction are judged on their
     /// staged body. A staged tombstone or TRUNCATE removes base rows. `None`
@@ -175,7 +106,7 @@ impl CoreLoop {
 
         let mut eligible = SurrogateBitmap::new();
         if overlay.is_none_or(|o| o.base_visible(&coll_key)) {
-            self.for_each_text_base_row(database_id.as_u64(), tid, collection, |key, bytes| {
+            self.for_each_current_row(database_id.as_u64(), tid, collection, |key, bytes| {
                 if admits(key, bytes)? {
                     eligible.insert(key.surrogate());
                 }

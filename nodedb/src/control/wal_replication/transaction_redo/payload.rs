@@ -14,8 +14,8 @@ use crate::event::EventSource;
 use crate::types::{DatabaseId, TenantId};
 use crate::wal::RedoRecord;
 
-use super::collections::written_collections;
 use super::sum_targets::redo_sum_targets;
+use nodedb_physical::physical_plan::written_collections;
 
 /// Everything a replica needs to apply one committed transaction's redo.
 #[derive(Debug, Clone)]

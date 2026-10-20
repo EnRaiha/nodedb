@@ -409,12 +409,7 @@ impl CoreLoop {
         collection: &str,
         storage_key: &crate::engine::document::store::StorageKey,
     ) -> crate::Result<Option<Vec<u8>>> {
-        if self.is_bitemporal(database_id, tid, collection) {
-            self.sparse
-                .versioned_get_current(database_id, tid, collection, storage_key)
-        } else {
-            self.sparse.get(database_id, tid, collection, storage_key)
-        }
+        self.current_row_body(database_id, tid, collection, storage_key)
     }
 
     /// The config of a hash-chained collection.

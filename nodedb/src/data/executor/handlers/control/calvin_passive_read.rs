@@ -44,9 +44,10 @@ impl CoreLoop {
             } => surrogates
                 .iter()
                 .map(|&surrogate| {
+                    // The row at its current version, so a bitemporal
+                    // collection reads too.
                     let stored = self
-                        .sparse
-                        .get(
+                        .current_row_body(
                             database_id,
                             tid,
                             collection,

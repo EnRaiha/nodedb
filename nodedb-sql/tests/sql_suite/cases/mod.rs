@@ -2,6 +2,7 @@
 
 mod aggregate_filter_planning;
 mod ddl_constraint_rejection;
+mod index_lookup_temporal;
 mod limit_offset_bounds;
 mod on_conflict_update_range_check;
 mod point_get_operand_order;

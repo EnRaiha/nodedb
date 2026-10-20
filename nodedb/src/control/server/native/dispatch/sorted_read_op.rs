@@ -56,7 +56,7 @@ pub(crate) async fn handle_sorted_read_op(
     )
     .await
     {
-        Ok((plan, response)) => data_plane_response_to_native(ctx, seq, &plan, &response),
+        Ok((plan, response)) => data_plane_response_to_native(ctx, seq, &plan, &response).await,
         Err(error) => ddl_result_to_native(seq, Err(error)),
     }
 }

@@ -153,7 +153,7 @@ impl CoreLoop {
                     // delete judges whatever is stored, as the delete path does.
                     if !scope.bitemporal || prior.is_some() {
                         run_delete_enforcement(
-                            &self.sparse,
+                            self,
                             scope.database_id,
                             scope.tid,
                             scope.collection,
@@ -227,13 +227,7 @@ impl CoreLoop {
         surrogate: u32,
     ) -> crate::Result<Option<Vec<u8>>> {
         let key = StorageKey::for_surrogate(Surrogate::new(surrogate));
-        if scope.bitemporal {
-            self.sparse
-                .versioned_get_current(scope.database_id, scope.tid, scope.collection, &key)
-        } else {
-            self.sparse
-                .get(scope.database_id, scope.tid, scope.collection, &key)
-        }
+        self.current_row_body(scope.database_id, scope.tid, scope.collection, &key)
     }
 }
 

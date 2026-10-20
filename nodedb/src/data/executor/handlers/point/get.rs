@@ -66,7 +66,6 @@ impl CoreLoop {
             collection,
         );
 
-        let bitemporal = self.is_bitemporal(database_id, tid, collection);
         let is_temporal_read = system_as_of_ms.is_some() || valid_at_ms.is_some();
 
         // Fetch data from cache or storage. Temporal reads bypass the
@@ -106,13 +105,7 @@ impl CoreLoop {
             if let Some(data) = cached {
                 data
             } else {
-                let res = if bitemporal {
-                    self.sparse
-                        .versioned_get_current(database_id, tid, collection, &storage_key)
-                } else {
-                    self.sparse.get(database_id, tid, collection, &storage_key)
-                };
-                match res {
+                match self.current_row_body(database_id, tid, collection, &storage_key) {
                     Ok(Some(data)) => {
                         self.doc_cache
                             .put(database_id, tid, collection, &storage_key, &data);

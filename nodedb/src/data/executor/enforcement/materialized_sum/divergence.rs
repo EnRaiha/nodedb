@@ -155,8 +155,7 @@ impl CoreLoop {
         let mut rows: Vec<serde_json::Value> = Vec::with_capacity(doc_ids.len());
         for key in doc_ids {
             let Ok(Some(bytes)) =
-                self.sparse
-                    .get(check.database_id, check.tid, check.collection, key)
+                self.current_row_body(check.database_id, check.tid, check.collection, key)
             else {
                 continue;
             };

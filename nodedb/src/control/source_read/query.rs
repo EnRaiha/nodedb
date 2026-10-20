@@ -41,7 +41,8 @@ pub(crate) async fn read_query_rows(
         tenant_id: ctx.tenant_id,
         redaction: None,
         sequences: None,
-    })?;
+    })
+    .await?;
     let ShapeOutcome::Rows(shaped) = shaped else {
         return Err(crate::Error::Internal {
             detail: format!(

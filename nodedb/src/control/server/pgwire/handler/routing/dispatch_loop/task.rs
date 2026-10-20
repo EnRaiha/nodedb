@@ -53,7 +53,7 @@ impl NodeDbPgHandler {
     ///
     /// Returns the task's own row count for metering, `None` for a
     /// passthrough response with no row payload to count.
-    pub(super) fn shape_task_response(
+    pub(super) async fn shape_task_response(
         &self,
         params: ShapeTaskParams<'_>,
         responses: &mut Vec<Response>,
@@ -91,6 +91,7 @@ impl NodeDbPgHandler {
             redaction: Some(redaction.ctx(&self.state.redaction)),
             sequences: Some(&sequences),
         })
+        .await
         .map_err(|e| shape_error_to_pg(&e))?
         {
             ShapeOutcome::Rows(shaped) => {
@@ -128,5 +129,21 @@ impl NodeDbPgHandler {
                 Ok(None)
             }
         }
+    }
+}
+
+/// A staged write's `RETURNING` rows as the response the shaper reads.
+pub(super) fn staged_rows_response(rows: Vec<u8>) -> crate::bridge::envelope::Response {
+    crate::bridge::envelope::Response {
+        request_id: crate::types::RequestId::new(0),
+        status: crate::bridge::envelope::Status::Ok,
+        attempt: 0,
+        partial: false,
+        payload: crate::bridge::envelope::Payload::from_vec(rows),
+        watermark_lsn: crate::types::Lsn::ZERO,
+        error_code: None,
+        stage_vote: None,
+        read_versions: crate::types::ReadVersions::new(),
+        write_set: Vec::new(),
     }
 }

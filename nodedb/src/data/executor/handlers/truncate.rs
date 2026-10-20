@@ -9,9 +9,8 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::fail_stop::FailStopCause;
 use crate::data::executor::enforcement::materialized_sum::divergence::SumTargetCheck;
-use crate::data::executor::enforcement::write_hook;
 use crate::data::executor::handlers::partial_refusal::refusal_after_rows;
-use crate::data::executor::handlers::transaction::stage_write::stored_row_identity;
+use crate::data::executor::handlers::truncate_row::{TruncateProgress, TruncateScope};
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 
@@ -29,8 +28,10 @@ pub(in crate::data::executor) struct TruncateParams<'a> {
 impl CoreLoop {
     /// TRUNCATE: delete all documents in a collection without filter scanning.
     ///
-    /// Iterates the DOCUMENTS table prefix and deletes every key. Cascades to
-    /// inverted index, secondary indexes, and document cache. The
+    /// Removes every row's current version. A plain collection deletes each
+    /// row. A bitemporal collection closes each row with a tombstone version
+    /// and keeps its history. Cascades to the inverted index, secondary
+    /// indexes, and document cache. The
     /// collection's graph edges are cut by `TruncateEdges`. Returns
     /// `{"truncated": N}` payload.
     ///
@@ -53,23 +54,13 @@ impl CoreLoop {
         } = params;
         debug!(core = self.core_id, %collection, "truncate");
 
-        // Collect all document IDs in this collection.
-        let all_ids = match self.scan_matching_documents(
-            task.request.database_id.as_u64(),
-            tid,
-            collection,
-            &[],
-        ) {
-            Ok(ids) => ids,
-            Err(e) => {
-                return self.response_error(task, ErrorCode::from(e));
-            }
-        };
-
-        // Gate secondary-vector maintenance once for the whole statement so a
-        // collection with no vector field pays nothing — mirrors
-        // `execute_bulk_delete`'s `has_vectors` gate.
+        // Every row's current version: the newest version of each row on a
+        // bitemporal collection, the plain table on any other.
         let database_id = task.request.database_id.as_u64();
+        let all_ids = match self.current_row_keys(database_id, tid, collection) {
+            Ok(keys) => keys,
+            Err(e) => return self.response_error(task, ErrorCode::from(e)),
+        };
 
         // Materialized-sum coverage verification (LEADER-ONLY), identical in
         // contract to the bulk-DML paths: the resolution was derived from a
@@ -127,162 +118,42 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         }
 
-        // Delete each document with full cascade.
-        let mut truncated = 0u64;
-        // One post-apply `Delete` redo entry per removed row, in removal
-        // order, followed by the target rows its fold rewrote.
-        // `wal_append_document_op` mints no pre-dispatch record for
-        // `DocumentOp::Truncate`, so these entries are the only record of the
-        // removals WAL replay and a point-in-time restore apply.
-        let mut write_set: Vec<WriteSetEntry> = Vec::new();
-        // Surrogates removed so far. A refusal part-way removes their text
-        // from the inverted index. A full TRUNCATE empties it in one purge.
-        let mut removed: Vec<nodedb_types::Surrogate> = Vec::new();
+        // A bitemporal row is closed, never erased: its history stays readable
+        // until the retention purge. One system time closes every row, so the
+        // TRUNCATE removes them at one instant, as a `DELETE` with no `WHERE`.
+        let bitemporal_sys_from_ms = self
+            .is_bitemporal(database_id, tid, collection)
+            .then(|| self.bitemporal_now_ms());
+        let scope = TruncateScope {
+            task,
+            database_id,
+            tid,
+            collection,
+            resolved_sum_targets,
+            declared_primary_key,
+            strict_schema: strict_schema.as_ref(),
+            has_vectors,
+            bitemporal_sys_from_ms,
+        };
+        // Each document leaves with full cascade, one transaction per row.
+        let mut progress = TruncateProgress::default();
         for storage_key in &all_ids {
-            // One transaction per removed row, shared with the materialized-sum
-            // delta that row owes — identical to `execute_bulk_delete`, so a
-            // TRUNCATE and a `DELETE` with no predicate leave the same totals.
-            // A refusal after a removal committed keeps the rows removed so
-            // far, and carries their entries so they are journalled.
-            let row_txn = match self.sparse.begin_write() {
-                Ok(txn) => txn,
-                Err(e) => {
-                    let code = refusal_after_rows(truncated, e);
-                    return self.truncate_refusal(task, tid, collection, code, &removed, write_set);
-                }
-            };
-            // A delete error refuses the TRUNCATE: read as an absent row, it
-            // would leave the row stored under a success.
-            let deleted_bytes =
-                match self
-                    .sparse
-                    .delete_in_txn(&row_txn, database_id, tid, collection, storage_key)
-                {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let code = refusal_after_rows(truncated, e);
-                        return self
-                            .truncate_refusal(task, tid, collection, code, &removed, write_set);
-                    }
-                };
-            // The row's secondary-index entries leave in the row's own
-            // transaction, so the row and its entries go together or not at all.
-            if deleted_bytes.is_some()
-                && let Err(e) = self.sparse.delete_indexes_for_document_in_txn(
-                    &row_txn,
-                    database_id,
-                    tid,
-                    collection,
-                    storage_key,
-                )
-            {
-                let code = refusal_after_rows(truncated, e);
-                return self.truncate_refusal(task, tid, collection, code, &removed, write_set);
-            }
-            let mut target_writes = Vec::new();
-            if let Some(bytes) = deleted_bytes.as_deref() {
-                match write_hook::run(
-                    self,
-                    &row_txn,
-                    &write_hook::HookCtx {
-                        database_id,
-                        tid,
-                        collection,
-                        resolved_targets: resolved_sum_targets,
-                        deferred_sum_targets: &[],
-                        wal_lsn: task.wal_lsn(),
-                    },
-                    write_hook::WriteImages::Delete {
-                        old: write_hook::ImageBody::Stored(bytes),
-                    },
-                ) {
-                    // The row's BALANCED contribution was settled for the whole
-                    // statement above, before any row was removed; taking it
-                    // again here counts the same removal twice.
-                    Ok(outcome) => target_writes = outcome.target_writes,
-                    Err(e) => {
-                        let code = refusal_after_rows(truncated, e);
-                        return self
-                            .truncate_refusal(task, tid, collection, code, &removed, write_set);
-                    }
-                }
-            }
-            if let Err(e) = row_txn.commit() {
-                let code = refusal_after_rows(
-                    truncated,
-                    crate::Error::Storage {
-                        engine: "sparse".into(),
-                        detail: format!("truncate commit: {e}"),
-                    },
-                );
-                return self.truncate_refusal(task, tid, collection, code, &removed, write_set);
-            }
-            if let Some(deleted_bytes) = deleted_bytes.as_deref() {
-                let surrogate = storage_key.surrogate();
-                // The identity INSERT minted for this row, read from the
-                // pre-image the delete returned: the declared primary key
-                // when the collection declares one, else the decimal
-                // surrogate. The redo entry and the delete event share it.
-                let row_identity = stored_row_identity(
-                    deleted_bytes,
-                    strict_schema.as_ref(),
-                    declared_primary_key,
-                    *storage_key,
-                );
-                // The removed rows' index values record no version, so the
-                // first removal records a wipe that bounds every index read.
-                if truncated == 0 {
-                    self.note_task_collection_wipe(task, tid, collection);
-                }
-                // Record the removal's version against the row's surrogate
-                // and collection, as a point delete does.
-                self.note_surrogate_write(task, tid, collection, surrogate.as_u32());
-                // The row's text leaves the inverted index with every other
-                // row's, in one purge once the loop ends.
-                removed.push(surrogate);
-                // Cascade: secondary HNSW vector index. The put path indexed
-                // this row's vectors under its surrogate; truncate must
-                // soft-delete those nodes and drop the reverse-map entry, or
-                // the leaked vector keeps scoring in KNN search in the same
-                // process (mirrors `execute_bulk_delete`'s vector cascade).
-                if has_vectors {
-                    self.remove_document_vector_indexes(database_id, tid, collection, *storage_key);
-                }
-                write_set.push(WriteSetEntry::delete(
-                    surrogate.as_u32(),
-                    row_identity.clone(),
-                ));
-                // The collection's edges keep their place here: the
-                // TRUNCATE's transaction cuts them with one `TruncateEdges`
-                // per vShard, at its ordinal.
-                self.doc_cache.invalidate(
-                    task.request.database_id.as_u64(),
-                    tid,
-                    collection,
-                    storage_key,
-                );
-                // Emit a delete event per removed row to the Event Plane, so
-                // AFTER-DELETE triggers and CDC/change-stream consumers see
-                // each row TRUNCATE removed — mirroring `execute_point_delete`
-                // and `execute_bulk_delete`'s single-row emit. `deleted_bytes`
-                // is the prior stored bytes `sparse.delete` returned above.
-                // Emitted per row rather than a single `WriteOp::BulkDelete`
-                // summary: that variant is aggregate metadata the Event
-                // Plane's WAL replay reconstructs only when the live per-row
-                // events were lost, and per-row events are what ROW-level
-                // AFTER-DELETE triggers match on (see
-                // `event::trigger::dispatcher::single`).
-                self.emit_document_delete_event(
+            if let Err(code) = self.truncate_row(&scope, storage_key, &mut progress) {
+                return self.truncate_refusal(
                     task,
                     tid,
                     collection,
-                    row_identity,
-                    Some(deleted_bytes),
+                    code,
+                    &progress.removed,
+                    progress.write_set,
                 );
-                truncated += 1;
             }
-            write_set.extend(write_hook::target_write_set(&target_writes));
         }
+        let TruncateProgress {
+            truncated,
+            write_set,
+            removed: _,
+        } = progress;
 
         // Every row is removed: empty the collection's inverted index in one
         // purge. Its analyzer, language, and fuzzy configuration stay.
@@ -291,6 +162,16 @@ impl CoreLoop {
             crate::types::TenantId::new(tid),
             collection,
         ) {
+            // The rows are removed, but the index still holds their text. That
+            // cannot be undone here, so the core fail-stops, as in
+            // `truncate_refusal`. Restart replay rebuilds the index.
+            self.fail_stop_core(
+                FailStopCause::PostInstallFailed,
+                &format!(
+                    "TRUNCATE of '{collection}' removed {truncated} rows, then emptying its \
+                     inverted index failed: {e}"
+                ),
+            );
             let code = refusal_after_rows(truncated, ErrorCode::from(e));
             return self.refusal_with_landed_rows(task, code, write_set);
         }
@@ -389,5 +270,142 @@ impl CoreLoop {
             }
             Err(e) => self.response_error(task, ErrorCode::from(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! TRUNCATE on a bitemporal collection closes every current version and
+    //! keeps the history before it.
+
+    use super::*;
+    use crate::bridge::envelope::{RowEffect, Status};
+    use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
+    use crate::data::executor::doc_format;
+    use crate::engine::document::store::{CollectionConfig, IndexPath};
+    use crate::engine::sparse::btree_versioned::{VersionedIndexEntry, VersionedPut};
+    use crate::types::{DatabaseId, TenantId};
+    use nodedb_types::{StorageKey, Surrogate};
+
+    const TID: u64 = 1;
+    const LEDGER: &str = "ledger";
+    /// The system time every seeded version lands at, before the TRUNCATE.
+    const SEEDED_AT: i64 = 1_000;
+
+    fn key(surrogate: u32) -> StorageKey {
+        StorageKey::for_surrogate(Surrogate(surrogate))
+    }
+
+    /// A bitemporal `ledger` with a secondary index on `kind`, holding rows
+    /// 1 (`x`), 2 (`y`) and 3 (`x`) at `SEEDED_AT`.
+    fn bitemporal_ledger(core: &mut CoreLoop, database_id: u64) {
+        let mut config = CollectionConfig::new(LEDGER);
+        config.bitemporal = true;
+        config.index_paths.push(IndexPath::new("kind"));
+        core.doc_configs.insert(
+            (
+                DatabaseId::new(database_id),
+                TenantId::new(TID),
+                LEDGER.to_string(),
+            ),
+            config,
+        );
+        for (surrogate, kind) in [(1, "x"), (2, "y"), (3, "x")] {
+            let body = doc_format::encode_to_msgpack(&serde_json::json!({ "kind": kind }));
+            core.sparse
+                .versioned_put(VersionedPut {
+                    database_id,
+                    tenant: TID,
+                    coll: LEDGER,
+                    doc_id: &key(surrogate),
+                    sys_from_ms: SEEDED_AT,
+                    valid_from_ms: i64::MIN,
+                    valid_until_ms: i64::MAX,
+                    body: &body,
+                })
+                .expect("seed version");
+            core.sparse
+                .versioned_index_put(VersionedIndexEntry {
+                    database_id,
+                    tenant: TID,
+                    coll: LEDGER,
+                    field: "kind",
+                    value: kind,
+                    doc_id: &key(surrogate),
+                    sys_from_ms: SEEDED_AT,
+                })
+                .expect("seed index entry");
+        }
+    }
+
+    fn version_at(
+        core: &CoreLoop,
+        database_id: u64,
+        surrogate: u32,
+        sys_cutoff_ms: Option<i64>,
+    ) -> Option<Vec<u8>> {
+        core.sparse
+            .versioned_get_as_of(
+                database_id,
+                TID,
+                LEDGER,
+                &key(surrogate),
+                sys_cutoff_ms,
+                None,
+            )
+            .expect("read version")
+    }
+
+    #[test]
+    fn truncate_closes_every_current_version_of_a_bitemporal_collection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req, _resp) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        let database_id = task.request.database_id.as_u64();
+        bitemporal_ledger(&mut core, database_id);
+
+        let response = core.execute_truncate(
+            &task,
+            TID,
+            TruncateParams {
+                collection: LEDGER,
+                resolved_sum_targets: &[],
+                declared_primary_key: None,
+            },
+        );
+
+        assert_eq!(response.status, Status::Ok, "{:?}", response.error_code);
+        let payload =
+            nodedb_types::json_from_msgpack(response.payload.as_bytes()).expect("payload decodes");
+        assert_eq!(payload["truncated"], serde_json::json!(3));
+        for surrogate in [1, 2, 3] {
+            assert!(
+                version_at(&core, database_id, surrogate, None).is_none(),
+                "row {surrogate} has no current version"
+            );
+            assert!(
+                version_at(&core, database_id, surrogate, Some(SEEDED_AT)).is_some(),
+                "row {surrogate} keeps its history"
+            );
+        }
+        let current_x = core
+            .sparse
+            .versioned_index_lookup_as_of(database_id, TID, LEDGER, "kind", "x", None)
+            .expect("index lookup");
+        assert!(current_x.is_empty(), "the index tombstones every value");
+
+        // Each removal journals its tombstone at one statement system time.
+        let stamps: Vec<Option<i64>> = response
+            .write_set
+            .iter()
+            .filter_map(|entry| match entry.effect {
+                RowEffect::Delete { system_from_ms } => Some(system_from_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamps.len(), 3);
+        let first = stamps[0].expect("a versioned tombstone");
+        assert!(first > SEEDED_AT);
+        assert!(stamps.iter().all(|stamp| *stamp == Some(first)));
     }
 }

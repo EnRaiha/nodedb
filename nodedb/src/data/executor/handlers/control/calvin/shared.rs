@@ -22,9 +22,40 @@ impl CoreLoop {
     /// Refuse a Calvin stage that staged nothing, with the vote `error` names.
     ///
     /// `OllpRetryRequired` votes `PredictionDrift`. Every other error votes
-    /// `ParticipantError`.
-    pub(super) fn calvin_stage_refusal(&self, task: &ExecutionTask, error: ErrorCode) -> Response {
+    /// `ParticipantError`. Only the coordinator's client receives the error,
+    /// so the refusing node records it here. Every refusal is logged. An
+    /// internal error, which no client input causes, is also captured.
+    pub(super) fn calvin_stage_refusal(
+        &self,
+        task: &ExecutionTask,
+        epoch: u64,
+        position: u32,
+        error: ErrorCode,
+    ) -> Response {
         let vote = StageVote::of_stage_error(&error);
+        let vshard_id = task.request.vshard_id.as_u32();
+        if vote == StageVote::PredictionDrift {
+            tracing::debug!(
+                core = self.core_id,
+                vshard_id,
+                epoch,
+                position,
+                ?error,
+                "calvin stage refused: a predicted state moved"
+            );
+        } else {
+            tracing::warn!(
+                core = self.core_id,
+                vshard_id,
+                epoch,
+                position,
+                ?error,
+                "calvin stage refused: this slice aborts the transaction"
+            );
+        }
+        if let ErrorCode::Internal { detail } = &error {
+            crate::diag::calvin_stage_refused_internal(vshard_id, epoch, position, detail);
+        }
         let mut response = self.response_error(task, error);
         response.stage_vote = Some(vote);
         response
@@ -49,7 +80,7 @@ impl CoreLoop {
         self.drop_calvin_synthetic_overlay(epoch, position, vshard_id);
         // The scheduler proposes this abort vote and waits for the global
         // verdict before it drops anything.
-        self.calvin_stage_refusal(task, error.into())
+        self.calvin_stage_refusal(task, epoch, position, error.into())
     }
 }
 
@@ -166,6 +197,29 @@ pub(in crate::data::executor) mod test_support {
         })
     }
 
+    /// A match-all `BulkUpdate` setting `a` to `"2"`.
+    pub(in crate::data::executor) fn bulk_update_plan(
+        collection: &str,
+        predicted: Option<Vec<u32>>,
+    ) -> PhysicalPlan {
+        let literal = nodedb_types::json_to_msgpack(&serde_json::json!("2")).expect("literal");
+        PhysicalPlan::Document(DocumentOp::BulkUpdate {
+            collection: QualifiedCollection::new(DatabaseId::DEFAULT, collection),
+            filters: Vec::new(),
+            updates: vec![(
+                "a".to_string(),
+                nodedb_physical::physical_plan::UpdateValue::Literal(literal),
+            )],
+            returning: None,
+            ollp_predicted_surrogates: predicted,
+            ollp_predicted_edges: None,
+            rls_filters: Vec::new(),
+            rls_write_check: nodedb_types::RlsWriteCheck::NoPolicyApplies,
+            resolved_sum_targets: Vec::new(),
+            declared_primary_key: None,
+        })
+    }
+
     /// Seed a row directly into base storage (bypassing Calvin staging), the
     /// pre-existing state the active-path OLLP verifier scans against.
     pub(in crate::data::executor) fn seed_row(
@@ -216,6 +270,8 @@ mod tests {
 
         let response = core.calvin_stage_refusal(
             &task,
+            1,
+            0,
             ErrorCode::Internal {
                 detail: "stage".into(),
             },

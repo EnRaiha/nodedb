@@ -50,10 +50,13 @@ pub enum ShapeOutcome {
 }
 
 /// Shape a single Data-Plane payload into protocol-neutral rows, applying
-/// the canonical shaping order: KV point-get wrap, vector surrogate->PK
-/// translation, payload decode, scan-envelope unwrap, and (when
+/// the canonical shaping order: KV point-get wrap, walk wrap, search
+/// surrogate->PK naming, payload decode, scan-envelope unwrap, and (when
 /// `projection` names columns) SELECT-list column selection.
-pub fn shape_response_materialized(
+///
+/// Async: the search naming step can ask a collection's home leader for
+/// keys this node's catalog lacks.
+pub async fn shape_response_materialized(
     request: MaterializedShapeRequest<'_>,
 ) -> Result<ShapeOutcome, NodeDbError> {
     let MaterializedShapeRequest {
@@ -79,21 +82,71 @@ pub fn shape_response_materialized(
     }
 
     // The plan-dependent transforms run before any decode or shape step:
-    // KV wrap, then walk wrap, then search translation.
+    // KV wrap, then walk wrap, then search naming.
     let wrapped = apply_walk_wrap(plan, &apply_kv_wrap(plan, payload))?;
-    let translated = translate_search_response(&wrapped, plan, state, database_id, tenant_id);
+    let translated =
+        translate_search_response(&wrapped, plan, state, database_id, tenant_id).await?;
+    shape_translated(
+        &translated,
+        plan_kind,
+        projection,
+        redaction,
+        sequences.map(|s| s as &dyn SequenceAccess),
+    )
+}
 
+/// Shape a write's `RETURNING` payload. Synchronous: a `RETURNING` payload
+/// holds stored rows, never search hits, so it has no surrogate to name.
+/// Any other plan kind is refused, since it can carry search hits.
+pub fn shape_returning_materialized(
+    request: MaterializedShapeRequest<'_>,
+) -> Result<ShapeOutcome, NodeDbError> {
+    let MaterializedShapeRequest {
+        payload,
+        plan,
+        plan_kind,
+        projection,
+        redaction,
+        sequences,
+        ..
+    } = request;
+    if !matches!(plan_kind, PlanKind::ReturningRows) {
+        return Err(crate::Error::Internal {
+            detail: format!(
+                "returning shaping received a {plan_kind:?} payload, which needs search naming"
+            ),
+        }
+        .into());
+    }
+    let wrapped = apply_walk_wrap(plan, &apply_kv_wrap(plan, payload))?;
+    shape_translated(
+        &wrapped,
+        plan_kind,
+        projection,
+        redaction,
+        sequences.map(|s| s as &dyn SequenceAccess),
+    )
+}
+
+/// Shape a payload whose plan-dependent transforms already ran.
+fn shape_translated(
+    translated: &[u8],
+    plan_kind: PlanKind,
+    projection: Option<&OutputSchema>,
+    redaction: Option<RedactionCtx<'_>>,
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<ShapeOutcome, NodeDbError> {
     let shaped = match plan_kind {
-        PlanKind::ArraySlice => shape_array_slice(&translated, projection, redaction, sequences)?,
+        PlanKind::ArraySlice => shape_array_slice(translated, projection, redaction, sequences)?,
         // `RETURNING` rows are held to the columns already announced to the
         // client, when any were — see `super::returning`.
         PlanKind::ReturningRows => {
-            shape_returning_rows(&translated, projection, redaction, sequences)?
+            shape_returning_rows(translated, projection, redaction, sequences)?
         }
         PlanKind::SingleDocument | PlanKind::MultiRow => {
-            shape_generic_rows(&translated, projection, redaction, sequences)?
+            shape_generic_rows(translated, projection, redaction, sequences)?
         }
-        // Handled by the early return above; kept exhaustive (no catch-all,
+        // The callers return early for these; kept exhaustive (no catch-all,
         // no panic) so a future PlanKind desync degrades to passthrough
         // rather than crashing the connection.
         PlanKind::Execution | PlanKind::DmlResult(_) | PlanKind::DmlResultByOp => {
@@ -229,6 +282,7 @@ mod tests {
             redaction: None,
             sequences: None,
         })
+        .await
         .expect("execution plan passthrough");
         assert!(matches!(materialized, ShapeOutcome::Passthrough));
         assert_eq!(
