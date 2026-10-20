@@ -10,6 +10,7 @@ use nodedb_types::protocol::NativeResponse;
 
 use crate::control::server::shared::authorization::AuthorizedTaskSet;
 use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::server::shared::statement_exec::{
     EdgeRecon, try_edge_recon, try_multi_shard_predicate_recon,
 };
@@ -25,11 +26,20 @@ pub(super) async fn try_edge_recon_dispatch(
     seq: u64,
     tasks: Vec<PhysicalTask>,
     authorized: AuthorizedTaskSet,
+    reads: &[ReadSetEntry],
 ) -> EdgeReconResult {
     // The native `handle_begin` / `handle_commit` / `handle_rollback` drive
     // the same `SessionStore` state machine pgwire uses.
     let in_txn_block = ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock;
-    let routed = try_edge_recon(ctx.state, ctx.identity, in_txn_block, tasks, authorized).await;
+    let routed = try_edge_recon(
+        ctx.state,
+        ctx.identity,
+        in_txn_block,
+        tasks,
+        authorized,
+        reads,
+    )
+    .await;
     outcome(ctx, seq, routed)
 }
 
@@ -41,8 +51,10 @@ pub(super) async fn try_multi_shard_predicate_recon_dispatch(
     seq: u64,
     tasks: Vec<PhysicalTask>,
     authorized: AuthorizedTaskSet,
+    reads: &[ReadSetEntry],
 ) -> EdgeReconResult {
-    let routed = try_multi_shard_predicate_recon(ctx.state, ctx.identity, tasks, authorized).await;
+    let routed =
+        try_multi_shard_predicate_recon(ctx.state, ctx.identity, tasks, authorized, reads).await;
     outcome(ctx, seq, routed)
 }
 

@@ -93,6 +93,15 @@ pub(crate) async fn after_calvin_stamp(
     }
 }
 
+/// The recon submit gate of node `node_id`, `recon::before_submit`: a
+/// dependent predicate write has settled its materialized sums and
+/// reconnoitred its rows, and parks before it builds and submits its Calvin
+/// transaction. A test changes a row the settlement read, then releases the
+/// gate.
+pub(crate) async fn before_recon_submit(node_id: u64) {
+    wait(FailScope::Node(node_id), "recon::before_submit").await;
+}
+
 /// The Calvin scheduler's redo gate on node `node_id`: after a committed
 /// slice's redo is resolved and before the data-group leader proposes it.
 /// Named per collection, `calvin::before_redo_propose::<collection>`.

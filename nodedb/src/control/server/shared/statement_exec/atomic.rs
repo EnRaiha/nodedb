@@ -117,17 +117,23 @@ pub(crate) async fn route_atomic_statement(
         return Ok(AtomicRoute::Implicit(answer));
     }
 
-    let (tasks, authorized) =
-        match try_edge_recon(state, exec.identity, in_txn_block, tasks, authorized)
-            .await
-            .map_err(StatementError::Error)?
-        {
-            EdgeRecon::Applied(applied) => {
-                meter_applied(exec, &applied);
-                return Ok(AtomicRoute::Calvin(applied));
-            }
-            EdgeRecon::NotFired(tasks, authorized) => (tasks, authorized),
-        };
+    let (tasks, authorized) = match try_edge_recon(
+        state,
+        exec.identity,
+        in_txn_block,
+        tasks,
+        authorized,
+        &sum_target_reads,
+    )
+    .await
+    .map_err(StatementError::Error)?
+    {
+        EdgeRecon::Applied(applied) => {
+            meter_applied(exec, &applied);
+            return Ok(AtomicRoute::Calvin(applied));
+        }
+        EdgeRecon::NotFired(tasks, authorized) => (tasks, authorized),
+    };
 
     // An autocommit statement has no session read set to widen with. The
     // reads to widen with are those materialized-sum settlement stamped.
@@ -149,17 +155,22 @@ pub(crate) async fn route_atomic_statement(
                 // A predicate write names the rows it matched only after the
                 // coordinator reads them, so it takes the same route as on
                 // pgwire.
-                let (tasks, authorized) =
-                    match try_multi_shard_predicate_recon(state, exec.identity, tasks, authorized)
-                        .await
-                        .map_err(StatementError::Error)?
-                    {
-                        EdgeRecon::Applied(applied) => {
-                            meter_applied(exec, &applied);
-                            return Ok(AtomicRoute::Calvin(applied));
-                        }
-                        EdgeRecon::NotFired(tasks, authorized) => (tasks, authorized),
-                    };
+                let (tasks, authorized) = match try_multi_shard_predicate_recon(
+                    state,
+                    exec.identity,
+                    tasks,
+                    authorized,
+                    &sum_target_reads,
+                )
+                .await
+                .map_err(StatementError::Error)?
+                {
+                    EdgeRecon::Applied(applied) => {
+                        meter_applied(exec, &applied);
+                        return Ok(AtomicRoute::Calvin(applied));
+                    }
+                    EdgeRecon::NotFired(tasks, authorized) => (tasks, authorized),
+                };
                 let plans = tasks.iter().map(|task| task.plan.clone()).collect();
                 let apply_result = dispatch_authorized_tasks_to_calvin(
                     state,

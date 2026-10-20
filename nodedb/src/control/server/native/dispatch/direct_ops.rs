@@ -308,7 +308,9 @@ pub(crate) async fn handle_direct_op(
         // cleanup in the same Calvin transaction, as the SQL path's does.
         use super::edge_recon_gate::{EdgeReconResult, try_edge_recon_dispatch};
         let (tasks, authorized_tasks) =
-            match try_edge_recon_dispatch(ctx, seq, tasks, authorized_tasks).await {
+            match try_edge_recon_dispatch(ctx, seq, tasks, authorized_tasks, &sum_target_reads)
+                .await
+            {
                 EdgeReconResult::Outcome(outcome) => return outcome.into_response(),
                 EdgeReconResult::NotFired(tasks, authorized) => (tasks, authorized),
             };
@@ -357,13 +359,18 @@ pub(crate) async fn handle_direct_op(
             // A predicate write names the rows it matched only after the
             // coordinator reads them, so it takes the same route as on pgwire.
             use super::edge_recon_gate::try_multi_shard_predicate_recon_dispatch;
-            let (tasks, authorized_tasks) =
-                match try_multi_shard_predicate_recon_dispatch(ctx, seq, tasks, authorized_tasks)
-                    .await
-                {
-                    EdgeReconResult::Outcome(outcome) => return outcome.into_response(),
-                    EdgeReconResult::NotFired(tasks, authorized) => (tasks, authorized),
-                };
+            let (tasks, authorized_tasks) = match try_multi_shard_predicate_recon_dispatch(
+                ctx,
+                seq,
+                tasks,
+                authorized_tasks,
+                &sum_target_reads,
+            )
+            .await
+            {
+                EdgeReconResult::Outcome(outcome) => return outcome.into_response(),
+                EdgeReconResult::NotFired(tasks, authorized) => (tasks, authorized),
+            };
             let plans: Vec<PhysicalPlan> = tasks.iter().map(|task| task.plan.clone()).collect();
             match dispatch_authorized_tasks_to_calvin(
                 ctx.state,

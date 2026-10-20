@@ -19,6 +19,7 @@ use crate::control::planner::calvin::{
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::authorization::AuthorizedTaskSet;
+use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
@@ -49,12 +50,16 @@ pub(crate) enum EdgeRecon {
 /// client's transaction needs a two-phase commit across its boundary. A
 /// catalog I/O error propagates. Misrouting on a real fault skips the edge
 /// cleanup.
+///
+/// `reads` are the images materialized-sum settlement stamped on the tasks.
+/// The coordinator carries them into the transaction it submits.
 pub(crate) async fn try_edge_recon(
     state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
     in_txn_block: bool,
     tasks: Vec<PhysicalTask>,
     authorized: AuthorizedTaskSet,
+    reads: &[ReadSetEntry],
 ) -> crate::Result<EdgeRecon> {
     if in_txn_block {
         return Ok(EdgeRecon::NotFired(tasks, authorized));
@@ -65,7 +70,7 @@ pub(crate) async fn try_edge_recon(
     else {
         return Ok(EdgeRecon::NotFired(tasks, authorized));
     };
-    run_recon(state, identity, tasks, authorized, database_id).await
+    run_recon(state, identity, tasks, authorized, database_id, reads).await
 }
 
 /// Route `tasks` through the OLLP/Calvin coordinator when one of them is a
@@ -77,11 +82,16 @@ pub(crate) async fn try_edge_recon(
 /// coordinator reads. A shipped balance of a materialized sum puts a
 /// single-collection write on two vShards, so the edge-bearing gate does not
 /// see it.
+///
+/// `reads` are the images settlement folded that balance from. The cross-shard
+/// delta is fixed at planning, so the transaction must abort when one of those
+/// images moved before it applies.
 pub(crate) async fn try_multi_shard_predicate_recon(
     state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
     tasks: Vec<PhysicalTask>,
     authorized: AuthorizedTaskSet,
+    reads: &[ReadSetEntry],
 ) -> crate::Result<EdgeRecon> {
     let Some(database_id) = tasks
         .iter()
@@ -90,7 +100,7 @@ pub(crate) async fn try_multi_shard_predicate_recon(
     else {
         return Ok(EdgeRecon::NotFired(tasks, authorized));
     };
-    run_recon(state, identity, tasks, authorized, database_id).await
+    run_recon(state, identity, tasks, authorized, database_id, reads).await
 }
 
 async fn run_recon(
@@ -99,6 +109,7 @@ async fn run_recon(
     tasks: Vec<PhysicalTask>,
     authorized: AuthorizedTaskSet,
     database_id: DatabaseId,
+    reads: &[ReadSetEntry],
 ) -> crate::Result<EdgeRecon> {
     // Captured before the coordinator consumes the tasks, so the answer can
     // shape a RETURNING dependent write's rows and read a plain write's
@@ -110,6 +121,7 @@ async fn run_recon(
         identity,
         identity.tenant_id,
         database_id,
+        reads,
     )
     .await?;
     Ok(EdgeRecon::Applied(CalvinApplied {
