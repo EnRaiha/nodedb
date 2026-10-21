@@ -4,7 +4,10 @@
 //!
 //! Split out of `edge.rs` to stay under the per-file line limit. Every triple is
 //! resolved (surrogates + write policy) on its own, then the batch is dispatched
-//! according to the route the process can serve:
+//! according to the route the process can serve. A delete under a write policy
+//! is decided before any write (`edge_batch_resolve::decide_governed_deletes`),
+//! so a denied edge refuses the whole statement and the allowed ones survive:
+//!
 //!
 //!  * Calvin available: ONE Calvin tx class holding ONE `GraphOp::EdgePutBatch` /
 //!    `EdgeDeleteBatch` task that carries every edge, whatever their endpoint
@@ -164,7 +167,9 @@ pub async fn insert_edges(
 /// `GRAPH DELETE EDGES IN '<collection>' VALUES ('<src>','<dst>','<label>'), ...`
 ///
 /// Batched twin of [`delete_edge`]. Every edge is resolved (surrogates + RLS)
-/// individually. The reported count is the Data Plane's own live-removal count:
+/// individually and carries its own write gate. Under a write policy the
+/// governed edges are decided first, in one read-only pass per source home:
+/// one denied edge refuses the whole statement before any write. The reported count is the Data Plane's own live-removal count:
 /// summed across the source-home buckets on the standalone route, and read from
 /// the tx class's summed owned-edge answer on the Calvin route, where each home
 /// counts the edges it owns and the answers add up. It is never the input
@@ -213,11 +218,9 @@ pub async fn delete_edges(
     let calvin_available =
         state.cluster_transport.is_some() && state.sequencer_inbox.get().is_some();
 
-    // Resolve every edge (surrogates + RLS). An edge whose delete carries a
-    // compiled policy predicate cannot ride `BatchEdge` — that type has no
-    // write-gate slot — so it keeps the single-edge path, where the Data Plane
-    // decides the predicate against the stored image. Every other edge batches.
-    let resolved = super::edge_batch_resolve::resolve_delete_edges(
+    // Resolve every edge (surrogates + RLS). Each edge carries its own write
+    // gate in `BatchEdge::write_gate`.
+    let mut batch: Vec<BatchEdge> = super::edge_batch_resolve::resolve_delete_edges(
         state,
         identity,
         database_id,
@@ -225,42 +228,14 @@ pub async fn delete_edges(
         edges,
     )
     .await?;
-    let batch: Vec<BatchEdge> = resolved.batch;
-    let governed: Vec<GraphEdgeTuple> = resolved.governed;
 
-    let mut removed: u64 = 0;
+    // Decide the governed edges before any write: one denied edge refuses the
+    // whole statement and nothing is deleted. The batch then rides the route
+    // below as ONE transaction, policy or not.
+    super::edge_batch_resolve::decide_governed_deletes(state, tenant_id, database_id, &mut batch)
+        .await?;
 
-    // Governed edges first, each through the single-edge path so a denial is
-    // reported per edge rather than silently bypassed by the batch plan.
-    for tuple in governed {
-        removed = removed.saturating_add(
-            super::edge_batch_resolve::delete_one_summing(
-                state,
-                identity,
-                database_id,
-                &collection,
-                tuple.src,
-                tuple.dst,
-                tuple.label,
-                txn_ctx,
-            )
-            .await?,
-        );
-    }
-
-    if calvin_available {
-        // Every edge may already have taken the governed per-edge route above,
-        // leaving nothing to batch. Building a tx class from an empty task list
-        // is `EmptyWriteSet`, which would report the statement as failed after
-        // those deletes already applied — and a write set is empty, not
-        // "written", so there is nothing to sequence.
-        if batch.is_empty() {
-            return Ok(vec![DdlResult::Status {
-                command: "DELETE EDGES".to_string(),
-                rows_affected: Some(removed),
-            }]);
-        }
-
+    let removed: u64 = if calvin_available {
         let task = batch_task(
             tenant_id,
             database_id,
@@ -275,20 +250,17 @@ pub async fn delete_edges(
             ));
         };
         data_plane_verdict(&response)?;
-        removed =
-            removed.saturating_add(super::edge::affected_count(&response, "batch edge delete")?);
+        super::edge::affected_count(&response, "batch edge delete")?
     } else {
         // Single-node: one apply burst per source home.
-        removed = removed.saturating_add(
-            super::edge_batch_resolve::dispatch_delete_batches_by_src_home(
-                state,
-                tenant_id,
-                database_id,
-                batch,
-            )
-            .await?,
-        );
-    }
+        super::edge_batch_resolve::dispatch_delete_batches_by_src_home(
+            state,
+            tenant_id,
+            database_id,
+            batch,
+        )
+        .await?
+    };
 
     Ok(vec![DdlResult::Status {
         command: "DELETE EDGES".to_string(),

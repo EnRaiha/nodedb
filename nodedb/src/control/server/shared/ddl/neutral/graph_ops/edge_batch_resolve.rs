@@ -20,37 +20,23 @@ use super::super::super::result::DdlError;
 use super::bounded_edges::BoundedEdges;
 use super::support::ddl_err;
 
-/// One batch's worth of resolved delete edges, split by how they must be
-/// dispatched.
-pub(super) struct ResolvedDelete {
-    /// Edges that can ride a property-less `EdgeDeleteBatch` plan.
-    pub batch: Vec<BatchEdge>,
-    /// Edges a write policy governs. `BatchEdge` carries no write-gate slot, so
-    /// these keep the single-edge route where the Data Plane decides the
-    /// compiled predicate against the stored image. Batching them instead would
-    /// bypass the policy.
-    pub governed: Vec<GraphEdgeTuple>,
-}
-
 /// Resolve surrogate identities and the RLS verdict for every triple in a
 /// `GRAPH DELETE EDGES` statement.
 ///
 /// The verdict belongs to the injection pass: a delete carries no image, so a
-/// policy compiles into the plan's write-gate slot. Only a plan that ends up
-/// carrying a `Predicate` is governed — `NoPolicyApplies` means injection ran
-/// and found nothing for this identity here, which is the common case and the
-/// one that batches.
+/// policy compiles into the plan's write-gate slot. Each edge carries its own
+/// verdict in `BatchEdge::write_gate`: `Predicate` when a policy restricts the
+/// identity here, `NoPolicyApplies` otherwise. Every edge rides the batch.
 pub(super) async fn resolve_delete_edges(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
     edges: BoundedEdges,
-) -> Result<ResolvedDelete, DdlError> {
+) -> Result<Vec<BatchEdge>, DdlError> {
     let tenant_id = identity.tenant_id;
     let key = nodedb_types::CollectionKey::from_bare(database_id, collection);
     let mut batch: Vec<BatchEdge> = Vec::new();
-    let mut governed: Vec<GraphEdgeTuple> = Vec::new();
 
     let surrogates = assign_endpoints(state, key, tenant_id, &edges).await?;
     for (tuple, (src_surrogate, dst_surrogate)) in edges.into_iter().zip(surrogates) {
@@ -60,9 +46,9 @@ pub(super) async fn resolve_delete_edges(
             database_id,
             nodedb_physical::physical_plan::GraphOp::EdgeDelete {
                 collection: nodedb_types::QualifiedCollection::new(database_id, collection),
-                src_id: tuple.src.clone(),
-                label: tuple.label.clone(),
-                dst_id: tuple.dst.clone(),
+                src_id: tuple.src,
+                label: tuple.label,
+                dst_id: tuple.dst,
                 src_surrogate,
                 dst_surrogate,
                 rls_write_check: nodedb_types::RlsWriteCheck::pending_injection(),
@@ -83,11 +69,6 @@ pub(super) async fn resolve_delete_edges(
                 "edge delete plan changed shape during RLS resolution",
             ));
         };
-
-        if matches!(rls_write_check, nodedb_types::RlsWriteCheck::Predicate(_)) {
-            governed.push(tuple);
-            continue;
-        }
         batch.push(BatchEdge {
             collection: qc,
             src_id,
@@ -95,10 +76,82 @@ pub(super) async fn resolve_delete_edges(
             dst_id,
             src_surrogate,
             dst_surrogate,
+            write_gate: rls_write_check,
         });
     }
 
-    Ok(ResolvedDelete { batch, governed })
+    Ok(batch)
+}
+
+/// Decide the write gate of every governed edge before any edge is written.
+///
+/// A live predicate cannot be sequenced or replicated: a follower has no
+/// writing identity, and a destination home holds no forward row to judge.
+/// So each source home decides its own governed edges in one read-only pass
+/// (`ResolveEdgeDelete` over an `EdgeDeleteBatch`). One denied edge refuses the
+/// whole statement here, with nothing written. Each admitted edge then carries
+/// `decided_earlier_in_request`. An edge with no predicate costs nothing.
+///
+/// The read and the later write are two steps, as in the single-edge delete:
+/// an edge changed between them is decided against its earlier image.
+pub(super) async fn decide_governed_deletes(
+    state: &SharedState,
+    tenant_id: crate::types::TenantId,
+    database_id: DatabaseId,
+    batch: &mut [BatchEdge],
+) -> Result<(), DdlError> {
+    use std::collections::BTreeMap;
+
+    use nodedb_physical::physical_plan::GraphOp;
+
+    let mut buckets: BTreeMap<u32, Vec<BatchEdge>> = BTreeMap::new();
+    for edge in batch.iter().filter(|e| e.write_gate.has_predicate()) {
+        buckets
+            .entry(VShardId::from_key(edge.src_id.as_bytes()).as_u32())
+            .or_default()
+            .push(edge.clone());
+    }
+    for (vshard, group) in buckets {
+        let plan = crate::bridge::envelope::PhysicalPlan::Graph(GraphOp::ResolveEdgeDelete(
+            Box::new(GraphOp::EdgeDeleteBatch { edges: group }),
+        ));
+        let response = crate::control::maintenance::clone_materializer::dispatch_local_on_vshard(
+            state,
+            tenant_id,
+            database_id,
+            VShardId::new(vshard),
+            plan,
+            None,
+        )
+        .await
+        .map_err(|e| DdlError::from_error(&e))?;
+        if response.status != crate::bridge::envelope::Status::Ok {
+            // A policy refusal surfaces as the same `RejectedAuthz` a directly
+            // dispatched statement returns.
+            let error = match response.error_code {
+                Some(code) => match *code {
+                    crate::bridge::envelope::ErrorCode::RejectedAuthz { resource } => {
+                        crate::Error::RejectedAuthz {
+                            tenant_id,
+                            resource,
+                        }
+                    }
+                    other => crate::Error::DataPlane(other),
+                },
+                None => crate::Error::Dispatch {
+                    detail: format!(
+                        "batch edge delete: write-gate pass returned status {:?} with no error code",
+                        response.status
+                    ),
+                },
+            };
+            return Err(DdlError::from_error(&error));
+        }
+    }
+    for edge in batch.iter_mut().filter(|e| e.write_gate.has_predicate()) {
+        edge.write_gate = nodedb_types::RlsWriteCheck::decided_earlier_in_request();
+    }
+    Ok(())
 }
 
 /// Assign the surrogate of every endpoint of `edges`, as `(src, dst)` pairs in
@@ -176,6 +229,8 @@ pub(super) async fn resolve_insert_edges(
                     dst_id,
                     src_surrogate,
                     dst_surrogate,
+                    // A put is decided at injection, over its (empty) image.
+                    write_gate: nodedb_types::RlsWriteCheck::decided_earlier_in_request(),
                 });
             }
             // `BatchEdge` carries no properties, so an image-carrying plan

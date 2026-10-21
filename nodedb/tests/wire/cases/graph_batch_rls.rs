@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Batch write paths must evaluate the write policy **per edge**. A batch that
-//! mixes an allowed and a denied edge must land the allowed one and refuse the
-//! denied one; deciding policy once for the whole statement would be an
-//! isolation bug, and no test would catch it today.
+//! Batch write paths must evaluate the write policy **per edge**, and a
+//! statement is atomic. A batch that mixes an allowed and a denied edge is
+//! refused as a whole and writes nothing; a batch of only allowed edges lands
+//! in full. Deciding policy once for the whole statement would be an isolation
+//! bug.
 //!
 //! The endpoints here are co-resident on one vShard, so a refusal can only come
 //! from policy, never from cross-shard routing.
@@ -93,10 +94,26 @@ async fn has_labeled_edge(server: &TestServer, collection: &str, label: &str) ->
     })
 }
 
-/// A batch delete under a `FOR WRITE` owner policy must delete the conforming
-/// edge and refuse the violating one, both inside the same statement.
+/// Seed one edge per `(label, owner)` pair between the co-resident endpoints.
+async fn seed_owned_edges(server: &TestServer, collection: &str, edges: &[(&str, &str)]) {
+    for (label, owner) in edges {
+        server
+            .exec(&format!(
+                "GRAPH INSERT EDGE IN '{collection}' FROM '{EDGE_SRC}' TO '{EDGE_DST}' \
+                 TYPE '{label}' PROPERTIES '{{\"owner\":\"{owner}\"}}'"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed {label}: {e}"));
+        assert!(has_labeled_edge(server, collection, label).await);
+    }
+}
+
+/// A batch delete under a `FOR WRITE` owner policy is ONE atomic statement: a
+/// batch holding two conforming edges and one violating edge is refused as a
+/// whole. No edge is deleted, the two allowed ones included, and the error
+/// comes from the policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batch_delete_evaluates_the_write_policy_per_edge() {
+async fn batch_delete_with_a_denied_edge_deletes_nothing() {
     let server = TestServer::start().await;
     let user = "g_batch_rls_delete_user";
     let collection = "g_batch_rls_delete";
@@ -106,44 +123,79 @@ async fn batch_delete_evaluates_the_write_policy_per_edge() {
         .expect("create edge collection");
     create_user(&server, user).await;
     write_policy(&server, "g_batch_rls_delete_policy", collection).await;
+    seed_owned_edges(
+        &server,
+        collection,
+        &[("owns1", user), ("steals", "someone-else"), ("owns2", user)],
+    )
+    .await;
 
-    // Two edges between the same endpoints, distinguished by label and owner:
-    // one the user may write, one they may not.
-    for (label, owner) in [("owns", user), ("steals", "someone-else")] {
-        server
-            .exec(&format!(
-                "GRAPH INSERT EDGE IN '{collection}' FROM '{EDGE_SRC}' TO '{EDGE_DST}' \
-                 TYPE '{label}' PROPERTIES '{{\"owner\":\"{owner}\"}}'"
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("seed {label}: {e}"));
-    }
-    assert!(has_labeled_edge(&server, collection, "owns").await);
-    assert!(has_labeled_edge(&server, collection, "steals").await);
-
-    // The allowed edge comes first so a partial effect is observable: if the
-    // handler decided policy once for the statement, both or neither would go.
+    // The denied edge sits between the allowed ones, so a handler that applied
+    // edges in order until the first denial would delete `owns1` and keep the
+    // rest: a partial effect this test makes observable.
     let result = run_as(
         &server,
         user,
         &format!(
             "GRAPH DELETE EDGES IN '{collection}' VALUES \
-             ('{EDGE_SRC}','{EDGE_DST}','owns'), ('{EDGE_SRC}','{EDGE_DST}','steals')"
+             ('{EDGE_SRC}','{EDGE_DST}','owns1'), ('{EDGE_SRC}','{EDGE_DST}','steals'), \
+             ('{EDGE_SRC}','{EDGE_DST}','owns2')"
+        ),
+    )
+    .await;
+    let message = result.expect_err("the denied edge must make the statement report an error");
+    assert!(
+        message.contains("policy") || message.contains("RLS"),
+        "the error must come from the write policy: {message}"
+    );
+
+    for label in ["owns1", "steals", "owns2"] {
+        assert!(
+            has_labeled_edge(&server, collection, label).await,
+            "edge {label} must survive: a refused batch deletes nothing"
+        );
+    }
+}
+
+/// A batch of only conforming edges under the same policy deletes every edge in
+/// one statement and reports the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_delete_of_only_allowed_edges_deletes_all() {
+    let server = TestServer::start().await;
+    let user = "g_batch_rls_delete_ok_user";
+    let collection = "g_batch_rls_delete_ok";
+    server
+        .exec(&format!("CREATE COLLECTION {collection}"))
+        .await
+        .expect("create edge collection");
+    create_user(&server, user).await;
+    write_policy(&server, "g_batch_rls_delete_ok_policy", collection).await;
+    seed_owned_edges(
+        &server,
+        collection,
+        &[("owns1", user), ("owns2", user), ("steals", "someone-else")],
+    )
+    .await;
+
+    let result = run_as(
+        &server,
+        user,
+        &format!(
+            "GRAPH DELETE EDGES IN '{collection}' VALUES \
+             ('{EDGE_SRC}','{EDGE_DST}','owns1'), ('{EDGE_SRC}','{EDGE_DST}','owns2')"
         ),
     )
     .await;
     assert!(
-        result.is_err(),
-        "the denied edge must make the statement report an error: {result:?}"
+        result.is_ok(),
+        "a batch of conforming edges must be admitted: {result:?}"
     );
 
-    assert!(
-        !has_labeled_edge(&server, collection, "owns").await,
-        "the conforming edge must be deleted"
-    );
+    assert!(!has_labeled_edge(&server, collection, "owns1").await);
+    assert!(!has_labeled_edge(&server, collection, "owns2").await);
     assert!(
         has_labeled_edge(&server, collection, "steals").await,
-        "the denied edge must survive, and the error must come from policy, not from the first edge"
+        "an edge outside the batch must survive"
     );
 }
 
