@@ -229,6 +229,7 @@ impl NodeDbPgHandler {
                         formats: shaping.formats,
                     },
                     &auth_ctx,
+                    &sum_target_reads,
                 )
                 .await?
             {

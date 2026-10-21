@@ -74,6 +74,7 @@ impl NodeDbPgHandler {
         session_id: SessionId,
         shaping: ResultShaping<'_>,
         auth: &crate::control::security::auth_context::AuthContext,
+        sum_target_reads: &[crate::control::server::shared::session::read_set::ReadSetEntry],
     ) -> PgWireResult<Option<Vec<Response>>> {
         let ResultShaping {
             projection,
@@ -107,8 +108,9 @@ impl NodeDbPgHandler {
                 auth,
                 projection,
             },
-            // No settled image read to carry — this fires before materialized-sum settlement.
-            &[],
+            // The tasks are already settled: the reads stamped on the source images
+            // their cross-shard balances were folded from travel with them.
+            sum_target_reads,
         )
         .await
         .map(Some)
