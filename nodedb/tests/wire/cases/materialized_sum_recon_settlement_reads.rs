@@ -132,3 +132,65 @@ async fn pgwire_recon_write_keeps_the_sum_when_a_settled_source_row_moved() {
     // Either end is fine: the check is the balance, not the answer.
     let _ = move_source_then_release(&server, &release, parked).await;
 }
+
+/// The same predicate write as `PREDICATE_UPDATE`, over the native protocol's
+/// SQL opcode. It reaches the shared `route_atomic_statement` path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_predicate_write_keeps_the_sum_after_a_concurrent_change() {
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let release = gate_dir.path().join("release-recon");
+    let server = parked_fixture(&release).await;
+
+    let mut stream =
+        nodedb_test_support::native_harness::open_trust_session(server.native_port, "nodedb").await;
+    let parked = tokio::spawn(async move {
+        nodedb_test_support::native_harness::send_sql(&mut stream, 2, PREDICATE_UPDATE)
+            .await
+            .status
+    });
+    // Either end is fine: the check is the balance, not the answer.
+    let _ = move_source_then_release(&server, &release, parked).await;
+}
+
+/// The same predicate write through `OpCode::DocumentBulkUpdate`, which runs in
+/// `handle_direct_op` and passes its own `sum_target_reads` to the recon gates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_bulk_update_keeps_the_sum_after_a_concurrent_change() {
+    use nodedb::bridge::scan_filter::{FilterOp, ScanFilter};
+    use nodedb_test_support::native_harness::{open_trust_session, send_request};
+    use nodedb_types::Value;
+    use nodedb_types::protocol::opcodes::OpCode;
+    use nodedb_types::protocol::text_fields::TextFields;
+
+    let gate_dir = tempfile::tempdir().expect("gate tempdir");
+    let release = gate_dir.path().join("release-recon");
+    let server = parked_fixture(&release).await;
+
+    let filters = zerompk::to_msgpack_vec(&vec![ScanFilter {
+        field: "account_id".to_string(),
+        op: FilterOp::Eq,
+        value: Value::String("acc".to_string()),
+        clauses: Vec::new(),
+        expr: None,
+    }])
+    .expect("encode the filter");
+    let amount = nodedb_types::value_to_msgpack(&Value::String("1".to_string()))
+        .expect("encode the new amount");
+    let mut stream = open_trust_session(server.native_port, "nodedb").await;
+    let parked = tokio::spawn(async move {
+        send_request(
+            &mut stream,
+            2,
+            OpCode::DocumentBulkUpdate,
+            TextFields {
+                collection: Some("ptv_post".to_string()),
+                filters: Some(filters),
+                updates: Some(vec![("amount".to_string(), amount)]),
+                ..Default::default()
+            },
+        )
+        .await
+        .status
+    });
+    let _ = move_source_then_release(&server, &release, parked).await;
+}
