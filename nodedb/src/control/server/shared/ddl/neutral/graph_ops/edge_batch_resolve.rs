@@ -48,7 +48,7 @@ pub(super) async fn resolve_delete_edges(
 ) -> Result<ResolvedDelete, DdlError> {
     let tenant_id = identity.tenant_id;
     let key = nodedb_types::CollectionKey::from_bare(database_id, collection);
-    let mut batch: Vec<BatchEdge> = Vec::with_capacity(edges.len());
+    let mut batch: Vec<BatchEdge> = Vec::new();
     let mut governed: Vec<GraphEdgeTuple> = Vec::new();
 
     let surrogates = assign_endpoints(state, key, tenant_id, &edges).await?;
@@ -140,7 +140,7 @@ pub(super) fn check_and_dedupe(
         super::edge_parse::validate_edge_label(&tuple.label)?;
     }
     let mut seen: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::with_capacity(edges.len());
+        std::collections::HashSet::new();
     edges.retain(|t| seen.insert((t.src.clone(), t.dst.clone(), t.label.clone())));
     Ok(())
 }
@@ -162,7 +162,7 @@ pub(super) async fn resolve_insert_edges(
 ) -> Result<ResolvedInsert, DdlError> {
     let tenant_id = identity.tenant_id;
     let key = nodedb_types::CollectionKey::from_bare(database_id, collection);
-    let mut batch: Vec<BatchEdge> = Vec::with_capacity(edges.len());
+    let mut batch: Vec<BatchEdge> = Vec::new();
 
     let surrogates = assign_endpoints(state, key, tenant_id, &edges).await?;
     for (tuple, (src_surrogate, dst_surrogate)) in edges.into_iter().zip(surrogates) {

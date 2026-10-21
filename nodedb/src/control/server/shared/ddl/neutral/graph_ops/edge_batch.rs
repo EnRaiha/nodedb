@@ -168,8 +168,8 @@ pub async fn insert_edges(
 /// Batched twin of [`delete_edge`]. Every edge is resolved (surrogates + RLS)
 /// individually. The reported count is the Data Plane's own live-removal count:
 /// summed across the source-home buckets on the standalone route, and read from
-/// the tx class's summed owned-edge answer on the Calvin route, where
-/// the one home pair counts every edge of the statement. It is never the input
+/// the tx class's summed owned-edge answer on the Calvin route, where each home
+/// counts the edges it owns and the answers add up. It is never the input
 /// length, because an absent edge (or a duplicate triple) tombstones nothing.
 /// See the module doc for which route the batch takes.
 pub async fn delete_edges(
