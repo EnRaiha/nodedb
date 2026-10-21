@@ -211,7 +211,7 @@ async fn dispatch_dependent_edge_recon_inner(
     // A TRUNCATE empties the collection and tombstones its edges on every
     // vShard, in one transaction.
     if let Some(truncated) =
-        super::edge_truncate::dispatch_truncate(state, &tasks, identity, tenant_id).await?
+        super::edge_truncate::dispatch_truncate(state, &tasks, identity, tenant_id, reads).await?
     {
         return Ok(DependentReconOutcome {
             tasks_dispatched: tasks.len() as u64,
