@@ -10,6 +10,7 @@
 //! `nodedb-sql::ddl_ast::graph_parse`.
 
 pub mod algo;
+mod bounded_edges;
 pub mod dispatch;
 pub mod edge;
 mod edge_batch;

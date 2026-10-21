@@ -17,6 +17,7 @@ use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_types::Surrogate;
 
 use super::super::super::result::DdlError;
+use super::bounded_edges::BoundedEdges;
 use super::support::ddl_err;
 
 /// One batch's worth of resolved delete edges, split by how they must be
@@ -44,7 +45,7 @@ pub(super) async fn resolve_delete_edges(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
-    edges: Vec<GraphEdgeTuple>,
+    edges: BoundedEdges,
 ) -> Result<ResolvedDelete, DdlError> {
     let tenant_id = identity.tenant_id;
     let key = nodedb_types::CollectionKey::from_bare(database_id, collection);
@@ -122,29 +123,6 @@ async fn assign_endpoints(
     Ok(bound.chunks_exact(2).map(|p| (p[0], p[1])).collect())
 }
 
-/// Validate every triple in a batch statement and drop repeats of the same
-/// `(src, dst, label)`. Both callers run this before dispatching or staging any
-/// edge, so a late rejection cannot leave the edges before it already written.
-///
-/// Dedup is about cost, not the count: it saves the redundant dispatch. On the
-/// delete side a repeat contributes nothing anyway, because the second copy
-/// reads the first copy's tombstone as a pre-image and counts zero.
-pub(super) fn check_and_dedupe(
-    edges: &mut Vec<GraphEdgeTuple>,
-    stmt: &str,
-) -> Result<(), DdlError> {
-    for tuple in edges.iter() {
-        if tuple.src.is_empty() || tuple.dst.is_empty() {
-            return Err(ddl_err("42601", format!("{stmt} requires FROM and TO")));
-        }
-        super::edge_parse::validate_edge_label(&tuple.label)?;
-    }
-    let mut seen: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::new();
-    edges.retain(|t| seen.insert((t.src.clone(), t.dst.clone(), t.label.clone())));
-    Ok(())
-}
-
 /// One batch's worth of resolved insert edges.
 pub(super) struct ResolvedInsert {
     /// Edges that can ride a property-less `EdgePutBatch` plan.
@@ -158,7 +136,7 @@ pub(super) async fn resolve_insert_edges(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
-    edges: Vec<GraphEdgeTuple>,
+    edges: BoundedEdges,
 ) -> Result<ResolvedInsert, DdlError> {
     let tenant_id = identity.tenant_id;
     let key = nodedb_types::CollectionKey::from_bare(database_id, collection);
@@ -298,52 +276,4 @@ pub(super) async fn dispatch_delete_batches_by_src_home(
             removed.saturating_add(super::edge::affected_count(&response, "batch edge delete")?);
     }
     Ok(removed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tuple(src: &str, dst: &str, label: &str) -> GraphEdgeTuple {
-        GraphEdgeTuple {
-            src: src.to_string(),
-            dst: dst.to_string(),
-            label: label.to_string(),
-        }
-    }
-
-    /// A repeat of one triple is the same edge, so the insert count must drop
-    /// it. The un-deduped form reports 2 for this input.
-    #[test]
-    fn check_and_dedupe_drops_a_repeated_triple() {
-        let mut edges = vec![
-            tuple("a", "b", "L"),
-            tuple("a", "b", "L"),
-            tuple("a", "b", "M"),
-        ];
-
-        check_and_dedupe(&mut edges, "GRAPH INSERT EDGES").expect("valid triples");
-
-        assert_eq!(
-            edges.len(),
-            2,
-            "the repeated triple must collapse, the distinct label must not"
-        );
-    }
-
-    /// An empty endpoint is rejected for the whole list, before any caller can
-    /// stage the tuples ahead of it.
-    #[test]
-    fn check_and_dedupe_rejects_an_empty_endpoint() {
-        let mut edges = vec![tuple("a", "b", "L"), tuple("", "z", "L")];
-
-        let error = check_and_dedupe(&mut edges, "GRAPH INSERT EDGES")
-            .expect_err("an empty endpoint must be rejected");
-
-        assert!(
-            error.message.contains("FROM and TO"),
-            "the error must name the missing endpoint: {}",
-            error.message
-        );
-    }
 }

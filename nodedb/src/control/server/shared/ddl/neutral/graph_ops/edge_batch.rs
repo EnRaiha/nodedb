@@ -25,7 +25,6 @@ use std::collections::BTreeMap;
 use nodedb_physical::physical_plan::{BatchEdge, GraphOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_sql::ddl_ast::{GraphEdgeTuple, GraphProperties};
-use nodedb_types::protocol::MAX_EDGES_PER_BATCH_STATEMENT;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::bridge::envelope::Response;
@@ -36,6 +35,7 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::bounded_edges::BoundedEdges;
 use super::edge::{EdgeRef, insert_edge};
 use super::support::{data_plane_verdict, ddl_err};
 
@@ -57,14 +57,12 @@ pub async fn insert_edges(
     edges: Vec<GraphEdgeTuple>,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    validate_edge_batch(&collection, &edges, "GRAPH INSERT EDGES")?;
     // Validate the whole list and drop repeats before a single tuple is staged.
     // A rejection on a later tuple must not leave the tuples before it in the
     // transaction's write set: the session stays in the block, so a later
     // COMMIT would apply them. `rows_affected` then counts the edges the
     // statement writes, not the triples it was given.
-    let mut edges = edges;
-    super::edge_batch_resolve::check_and_dedupe(&mut edges, "GRAPH INSERT EDGES")?;
+    let edges = BoundedEdges::new(&collection, edges, "GRAPH INSERT EDGES")?;
     let count = edges.len() as u64;
     let tenant_id = identity.tenant_id;
 
@@ -177,13 +175,12 @@ pub async fn delete_edges(
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: String,
-    mut edges: Vec<GraphEdgeTuple>,
+    edges: Vec<GraphEdgeTuple>,
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    validate_edge_batch(&collection, &edges, "GRAPH DELETE EDGES")?;
     let tenant_id = identity.tenant_id;
 
-    super::edge_batch_resolve::check_and_dedupe(&mut edges, "GRAPH DELETE EDGES")?;
+    let edges = BoundedEdges::new(&collection, edges, "GRAPH DELETE EDGES")?;
 
     // Inside a transaction the staging overlay is per edge; keep the per-edge
     // path so RYOW and rollback semantics stay identical. A delete's count is
@@ -337,71 +334,4 @@ async fn submit_batch_tx(
     submit_calvin_routed(state, tx_class)
         .await
         .map_err(|e| DdlError::from_error(&e))
-}
-
-/// Shared guard for the batch entry points. The parser already enforces the
-/// per-statement cap, but a hand-built AST skips the parser, and the resolve step
-/// sizes its buffers from the edge count. So the handler repeats the cap, and
-/// rejects the empty and collection-less shapes the parser never produces.
-fn validate_edge_batch(
-    collection: &str,
-    edges: &[GraphEdgeTuple],
-    stmt: &str,
-) -> Result<(), DdlError> {
-    if collection.is_empty() {
-        return Err(ddl_err("42601", format!("{stmt} requires IN <collection>")));
-    }
-    if edges.is_empty() {
-        return Err(ddl_err(
-            "42601",
-            format!("{stmt} requires at least one edge"),
-        ));
-    }
-    if edges.len() > MAX_EDGES_PER_BATCH_STATEMENT {
-        return Err(ddl_err(
-            "54000",
-            format!(
-                "{stmt} carries at most {MAX_EDGES_PER_BATCH_STATEMENT} edges per statement, got {}",
-                edges.len()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tuples(n: usize) -> Vec<GraphEdgeTuple> {
-        (0..n)
-            .map(|i| GraphEdgeTuple {
-                src: format!("s{i}"),
-                dst: format!("d{i}"),
-                label: "L".to_owned(),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_batch_at_the_cap_passes() {
-        let edges = tuples(MAX_EDGES_PER_BATCH_STATEMENT);
-        assert!(validate_edge_batch("c", &edges, "GRAPH INSERT EDGES").is_ok());
-    }
-
-    #[test]
-    fn a_batch_over_the_cap_is_refused_before_any_buffer_is_sized() {
-        let edges = tuples(MAX_EDGES_PER_BATCH_STATEMENT + 1);
-        let err = validate_edge_batch("c", &edges, "GRAPH DELETE EDGES")
-            .expect_err("1001 edges must be refused");
-        let text = format!("{err:?}");
-        assert!(text.contains("54000"), "SQLSTATE 54000 expected: {text}");
-        assert!(text.contains("1000"), "the limit must be named: {text}");
-    }
-
-    #[test]
-    fn empty_and_collectionless_shapes_are_still_refused() {
-        assert!(validate_edge_batch("", &tuples(1), "GRAPH INSERT EDGES").is_err());
-        assert!(validate_edge_batch("c", &[], "GRAPH INSERT EDGES").is_err());
-    }
 }
