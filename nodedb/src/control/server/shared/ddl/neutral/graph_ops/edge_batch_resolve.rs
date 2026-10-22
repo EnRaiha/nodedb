@@ -39,6 +39,11 @@ pub(super) async fn resolve_delete_edges(
     let mut batch: Vec<BatchEdge> = Vec::new();
 
     let surrogates = assign_endpoints(state, key, tenant_id, &edges).await?;
+    debug_assert_eq!(
+        edges.len(),
+        surrogates.len(),
+        "one surrogate pair per edge, else zip drops edges"
+    );
     for (tuple, (src_surrogate, dst_surrogate)) in edges.into_iter().zip(surrogates) {
         let resolved = super::edge_rls::resolve_edge_write_rls(
             state,
@@ -196,6 +201,11 @@ pub(super) async fn resolve_insert_edges(
     let mut batch: Vec<BatchEdge> = Vec::new();
 
     let surrogates = assign_endpoints(state, key, tenant_id, &edges).await?;
+    debug_assert_eq!(
+        edges.len(),
+        surrogates.len(),
+        "one surrogate pair per edge, else zip drops edges"
+    );
     for (tuple, (src_surrogate, dst_surrogate)) in edges.into_iter().zip(surrogates) {
         let resolved = super::edge_rls::resolve_edge_write_rls(
             state,

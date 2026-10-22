@@ -127,6 +127,9 @@ pub async fn insert_edges(
             PhysicalPlan::Graph(GraphOp::EdgePutBatch { edges: batch }),
         );
         let response = submit_batch_tx(state, task, tenant_id).await?;
+        // An insert reports no affected count, so a submit that returns no
+        // applied response is accepted. The delete path refuses it, because it
+        // reads its count from that response.
         if let Some(response) = response {
             data_plane_verdict(&response)?;
         }

@@ -264,6 +264,32 @@ mod tests {
         );
     }
 
+    /// Pins the grammar limitation in the module doc: the tokenizer drops
+    /// `(`, `)` and `,`, so the parser reads a flat field list.
+    #[test]
+    fn batch_edge_reads_a_missing_comma_as_two_triples() {
+        let stmt = parsed("GRAPH INSERT EDGES IN 'edges' VALUES ('a','b','L') ('c','d','L')");
+        match stmt {
+            NodedbStatement::Graph(GraphStmt::GraphInsertEdges { edges, .. }) => {
+                assert_eq!(edges.len(), 2);
+            }
+            other => panic!("expected GraphInsertEdges, got {other:?}"),
+        }
+    }
+
+    /// Three bare words with no parentheses read as one triple.
+    #[test]
+    fn batch_edge_reads_three_bare_words_as_a_triple() {
+        let stmt = parsed("GRAPH INSERT EDGES IN 'edges' VALUES a b L");
+        match stmt {
+            NodedbStatement::Graph(GraphStmt::GraphInsertEdges { edges, .. }) => {
+                assert_eq!(edges.len(), 1);
+                assert_eq!(edges[0].src, "a");
+            }
+            other => panic!("expected GraphInsertEdges, got {other:?}"),
+        }
+    }
+
     #[test]
     fn batch_edge_rejects_per_edge_properties() {
         let error = try_parse("GRAPH INSERT EDGES IN 'edges' VALUES ('a','b','L') PROPERTIES '{}'")

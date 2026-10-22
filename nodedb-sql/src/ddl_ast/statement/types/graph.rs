@@ -25,8 +25,7 @@ pub enum GraphStmt {
     ///
     /// The batch is deliberately property-less for now: the physical
     /// `BatchEdge` carries no property object, so per-edge `PROPERTIES`
-    /// stays on the single-edge form until `BatchEdge` grows one
-    ///
+    /// stays on the single-edge form until `BatchEdge` grows one.
     GraphInsertEdges {
         collection: String,
         edges: Vec<GraphEdgeTuple>,
