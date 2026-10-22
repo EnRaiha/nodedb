@@ -251,16 +251,6 @@ async fn deadline_never_leaves_a_partial_batch() {
             .exec(&format!("CREATE COLLECTION {collection}"))
             .await
             .unwrap();
-        // Flag the collection edge-bearing before the bounded statement. A
-        // deadline that expires inside that first metadata proposal leaves the
-        // metadata propose path blocked for 60 s (pre-existing, also hit by a
-        // single `GRAPH INSERT EDGE`), which would fail the next CREATE here.
-        server
-            .exec(&format!(
-                "GRAPH INSERT EDGE IN '{collection}' FROM 'seed' TO 'seed2' TYPE 'S'"
-            ))
-            .await
-            .unwrap();
         let edges = random_edges(0x400 + i as u64, EDGES);
 
         server
