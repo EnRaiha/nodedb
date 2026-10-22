@@ -285,6 +285,8 @@ pub(crate) async fn handle_direct_op(
         // source of a cross-shard materialized sum, runs in one transaction, as
         // the SQL path's does. The loop there clone-checks, authorizes and
         // meters each task itself.
+        // One direct op is one write, so inside a transaction block this refuses
+        // only a single write that ships two deltas to one balance column.
         if let Err(error) = crate::control::planner::calvin::refuse_several_settling_writes(&tasks)
         {
             return error_to_native(seq, &error);

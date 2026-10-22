@@ -10,9 +10,12 @@ use super::is_dependent_predicate;
 use crate::Error;
 
 /// Refuse a request in which a predicate write and another write move the
-/// same materialized-sum balance row. Each write settles its delta from the
+/// same materialized-sum balance. Each write settles its delta from the
 /// committed rows, so a later write cannot see the rows an earlier one
 /// changes and the balance would drift from the sum of the source.
+///
+/// A balance is one column of a target row. Two sum columns of one row, fed
+/// by one write, are two balances and pass.
 pub fn refuse_several_settling_writes(tasks: &[PhysicalTask]) -> crate::Result<()> {
     use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
     if !tasks.iter().any(|task| is_dependent_predicate(&task.plan)) {
@@ -23,9 +26,10 @@ pub fn refuse_several_settling_writes(tasks: &[PhysicalTask]) -> crate::Result<(
         if let PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
             collection,
             document_id,
+            column,
             ..
         }) = &task.plan
-            && !targets.insert((collection.to_string(), document_id.clone()))
+            && !targets.insert((collection.to_string(), document_id.clone(), column.clone()))
         {
             return Err(Error::BadRequest {
                 detail: "several writes of one request move the same materialized-sum balance \
@@ -68,6 +72,39 @@ mod tests {
             resolved_sum_targets: Vec::new(),
             declared_primary_key: None,
         }))
+    }
+
+    fn balance_delta(document_id: &str, column: &str) -> PhysicalTask {
+        task(PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta {
+            collection: nodedb_types::QualifiedCollection::new(DatabaseId::DEFAULT, "accounts"),
+            document_id: document_id.to_owned(),
+            surrogate: nodedb_types::Surrogate::new(1),
+            column: column.to_owned(),
+            delta: "5".to_owned(),
+            join_column: "account_id".to_owned(),
+            join_value: "acc".to_owned(),
+            declared_primary_key: None,
+        }))
+    }
+
+    #[test]
+    fn two_deltas_of_one_balance_beside_a_predicate_write_are_refused() {
+        let tasks = vec![
+            bulk_delete("postings"),
+            balance_delta("0a", "balance"),
+            balance_delta("0a", "balance"),
+        ];
+        assert!(refuse_several_settling_writes(&tasks).is_err());
+    }
+
+    #[test]
+    fn two_sum_columns_of_one_row_are_not_refused() {
+        let tasks = vec![
+            bulk_delete("postings"),
+            balance_delta("0a", "balance"),
+            balance_delta("0a", "fees"),
+        ];
+        assert!(refuse_several_settling_writes(&tasks).is_ok());
     }
 
     #[test]

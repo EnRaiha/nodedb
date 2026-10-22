@@ -187,7 +187,8 @@ fn build_array_prefilter_plan(
 fn check_score_alias(alias: Option<&str>) -> crate::Result<()> {
     match alias {
         Some("doc_id") => Err(crate::Error::BadRequest {
-            detail: "score alias 'doc_id' names the field a hybrid hit identifies its row by"
+            detail: "score alias 'doc_id' names the field a hybrid hit identifies its row by; \
+choose another alias"
                 .to_owned(),
         }),
         _ => Ok(()),
