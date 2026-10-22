@@ -157,6 +157,7 @@ mod materialized_sum_cross_shard_http;
 mod materialized_sum_recon_settlement_reads;
 mod materialized_sum_same_request;
 mod materialized_sum_truncate_edge_bearing;
+mod materialized_sum_two_columns;
 mod materialized_sum_txn_command_tag;
 mod materialized_sum_txn_predicate_writes;
 mod materialized_sum_txn_preimage;
