@@ -222,13 +222,13 @@ impl NodeDbPgHandler {
                 .maybe_dispatch_implicit_edge_recon(
                     &tasks,
                     tenant_id,
-                    identity,
-                    session_id,
-                    ResultShaping {
+                    super::calvin_dispatch::CalvinDispatchSession {
+                        identity,
+                        session_id,
+                        result_formats: shaping.formats,
+                        auth: &auth_ctx,
                         projection: effective_schema,
-                        formats: shaping.formats,
                     },
-                    &auth_ctx,
                     &sum_target_reads,
                 )
                 .await?
