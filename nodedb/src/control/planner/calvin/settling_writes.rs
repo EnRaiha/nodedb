@@ -9,6 +9,12 @@ use nodedb_physical::physical_task::PhysicalTask;
 use super::is_dependent_predicate;
 use crate::Error;
 
+/// The refusal text of [`refuse_several_settling_writes`]. The wire tests
+/// match it, so a rewording cannot pass unseen.
+pub const SEVERAL_WRITES_REFUSAL: &str = "several writes of one request move the same \
+materialized-sum balance and one is a predicate write; run them as separate statements or in \
+a transaction block";
+
 /// Refuse a request in which a predicate write and another write move the
 /// same materialized-sum balance. Each write settles its delta from the
 /// committed rows, so a later write cannot see the rows an earlier one
@@ -32,10 +38,7 @@ pub fn refuse_several_settling_writes(tasks: &[PhysicalTask]) -> crate::Result<(
             && !targets.insert((collection.to_string(), document_id.clone(), column.clone()))
         {
             return Err(Error::BadRequest {
-                detail: "several writes of one request move the same materialized-sum balance \
-                         and one is a predicate write; run them as separate statements or in a \
-                         transaction block"
-                    .to_owned(),
+                detail: SEVERAL_WRITES_REFUSAL.to_owned(),
             });
         }
     }

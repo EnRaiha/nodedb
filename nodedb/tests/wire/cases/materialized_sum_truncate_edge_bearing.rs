@@ -25,18 +25,6 @@ async fn source_sum(server: &TestServer) -> i64 {
         .sum()
 }
 
-async fn post(server: &TestServer, sql: &str) {
-    let response = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{}/v1/query", server.http_port))
-        .json(&serde_json::json!({ "sql": sql }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST /v1/query: {e}"));
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    assert!(status.is_success(), "the request answered {status}: {body}");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncate_of_a_cross_shard_sum_source_zeroes_the_balance() {
     let server = sum_fixture().await;
@@ -49,7 +37,7 @@ async fn truncate_of_a_cross_shard_sum_source_zeroes_the_balance() {
         .expect("write one edge into the source");
     assert_eq!(balance(&server, "acc").await, "15", "seed balance");
 
-    post(&server, &format!("TRUNCATE {POSTINGS}")).await;
+    server.http_exec(&format!("TRUNCATE {POSTINGS}")).await;
 
     assert_eq!(source_sum(&server).await, 0, "the source is empty");
     assert_eq!(
@@ -64,7 +52,7 @@ async fn truncate_of_a_cross_shard_sum_source_zeroes_the_balance() {
 async fn truncate_of_an_edge_free_cross_shard_sum_source_zeroes_the_balance() {
     let server = sum_fixture().await;
 
-    post(&server, &format!("TRUNCATE {POSTINGS}")).await;
+    server.http_exec(&format!("TRUNCATE {POSTINGS}")).await;
 
     assert_eq!(source_sum(&server).await, 0, "the source is empty");
     assert_eq!(

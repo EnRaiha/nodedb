@@ -8,6 +8,7 @@
 
 use super::materialized_sum_cross_shard_expanders::{balance, sum_fixture};
 use crate::harness::TestServer;
+use nodedb::control::planner::calvin::settling_writes::SEVERAL_WRITES_REFUSAL;
 
 /// The sum of the `amount` column of the postings of `acc`.
 async fn posted_sum(server: &TestServer) -> i64 {
@@ -47,19 +48,19 @@ async fn two_predicate_updates_of_one_balance_are_refused_and_change_nothing() {
 }
 
 async fn refused_whole(server: &TestServer, sql: &str) {
-    let response = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{}/v1/query", server.http_port))
-        .json(&serde_json::json!({ "sql": sql }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST /v1/query: {e}"));
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let (status, body) = server.http_query(sql).await;
 
     // The request is refused whole, so no write lands and the balance still
     // equals the sum of the postings.
-    assert!(!status.is_success(), "the request must be refused: {body}");
-    assert!(body.contains("separate statements"), "refusal text: {body}");
+    assert!(
+        !(200..300).contains(&status),
+        "the request must be refused: {body}"
+    );
+    assert_eq!(status, 400, "a refused request is a 400: {body}");
+    assert!(
+        body.contains(SEVERAL_WRITES_REFUSAL),
+        "refusal text: {body}"
+    );
     assert_eq!(posted_sum(server).await, 15);
     assert_eq!(balance(server, "acc").await, "15");
 }

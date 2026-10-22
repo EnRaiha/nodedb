@@ -37,18 +37,6 @@ async fn exec(server: &TestServer, sql: &str) {
         .unwrap_or_else(|e| panic!("run {sql}: {e}"));
 }
 
-async fn post(server: &TestServer, sql: &str) {
-    let response = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{}/v1/query", server.http_port))
-        .json(&serde_json::json!({ "sql": sql }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST /v1/query: {e}"));
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    assert!(status.is_success(), "the request answered {status}: {body}");
-}
-
 async fn column(server: &TestServer, sql: &str) -> Vec<String> {
     server
         .query_text(sql)
@@ -79,12 +67,12 @@ async fn two_increments_of_one_row_in_one_request_both_apply() {
     let server = TestServer::start().await;
     edge_bearing(&server, "ps_inc").await;
 
-    post(
-        &server,
-        "UPDATE ps_inc SET n = n + 1 WHERE id = 'a'; \
+    server
+        .http_exec(
+            "UPDATE ps_inc SET n = n + 1 WHERE id = 'a'; \
          UPDATE ps_inc SET n = n + 1 WHERE id = 'a'",
-    )
-    .await;
+        )
+        .await;
 
     assert_eq!(
         column(&server, "SELECT n FROM ps_inc WHERE id = 'a'").await,
@@ -104,11 +92,9 @@ async fn a_second_update_matches_the_value_the_first_wrote() {
     )
     .await;
 
-    post(
-        &server,
-        "UPDATE ps_dep SET n = 2 WHERE n = 1; UPDATE ps_dep SET n = 3 WHERE n = 2",
-    )
-    .await;
+    server
+        .http_exec("UPDATE ps_dep SET n = 2 WHERE n = 1; UPDATE ps_dep SET n = 3 WHERE n = 2")
+        .await;
 
     assert_eq!(
         column(&server, "SELECT n FROM ps_dep WHERE id = 'a'").await,
@@ -121,12 +107,12 @@ async fn a_later_update_matches_the_tag_an_earlier_one_wrote() {
     let server = TestServer::start().await;
     edge_bearing(&server, "ps_chain").await;
 
-    post(
-        &server,
-        "UPDATE ps_chain SET tag = 'moved' WHERE id = 'a'; \
+    server
+        .http_exec(
+            "UPDATE ps_chain SET tag = 'moved' WHERE id = 'a'; \
          UPDATE ps_chain SET n = 7 WHERE tag = 'moved'",
-    )
-    .await;
+        )
+        .await;
 
     assert_eq!(
         column(&server, "SELECT id FROM ps_chain WHERE n = 7").await,
@@ -154,15 +140,13 @@ async fn a_third_statement_reads_the_first_across_two_vshards() {
         .await;
     }
 
-    post(
-        &server,
-        &format!(
+    server
+        .http_exec(&format!(
             "UPDATE {one} SET v = 'v2' WHERE v = 'v1'; \
              UPDATE {two} SET v = 'w2' WHERE v = 'v1'; \
              UPDATE {one} SET v = 'v3' WHERE v = 'v2'"
-        ),
-    )
-    .await;
+        ))
+        .await;
 
     assert_eq!(
         column(&server, &format!("SELECT v FROM {one} ORDER BY id")).await,
@@ -199,15 +183,13 @@ async fn a_predicate_reads_the_point_write_before_it_across_two_vshards() {
     )
     .await;
 
-    post(
-        &server,
-        &format!(
+    server
+        .http_exec(&format!(
             "UPDATE {one} SET n = 1 WHERE id = 'x'; \
              UPDATE {one} SET n = 2 WHERE n = 1; \
              UPDATE {two} SET n = 9 WHERE id = 'y'"
-        ),
-    )
-    .await;
+        ))
+        .await;
 
     assert_eq!(
         column(&server, &format!("SELECT n FROM {one} WHERE id = 'x'")).await,

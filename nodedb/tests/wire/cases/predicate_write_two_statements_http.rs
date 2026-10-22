@@ -71,15 +71,7 @@ async fn two_predicate_updates_in_one_http_request_each_touch_their_own_rows() {
         "UPDATE {one} SET v = 'one-new' WHERE v = 'one-old'; \
          UPDATE {two} SET v = 'two-new' WHERE v = 'two-old'"
     );
-    let response = reqwest::Client::new()
-        .post(format!("http://127.0.0.1:{}/v1/query", server.http_port))
-        .json(&serde_json::json!({ "sql": sql }))
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("POST /v1/query: {e}"));
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    assert!(status.is_success(), "the request answered {status}: {body}");
+    server.http_exec(&sql).await;
 
     assert_eq!(values(&server, &one).await, ["one-new", "keep"]);
     assert_eq!(values(&server, &two).await, ["two-new", "keep"]);
