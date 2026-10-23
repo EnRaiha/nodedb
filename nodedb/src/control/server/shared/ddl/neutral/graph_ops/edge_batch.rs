@@ -306,7 +306,14 @@ async fn submit_batch_tx(
 ) -> Result<Option<Response>, DdlError> {
     let tx_class = build_single_vshard_tx_class(std::slice::from_ref(&task), tenant_id, &[])
         .map_err(|e| DdlError::from_error(&e))?;
-    submit_calvin_routed(state, tx_class)
-        .await
-        .map_err(|e| DdlError::from_error(&e))
+    submit_calvin_routed(state, tx_class).await.map_err(|e| {
+        let error = DdlError::from_error(&e);
+        // The batch is one sequenced transaction. A deadline ends the wait, not
+        // the transaction, so the client must not read the error as a refusal.
+        if matches!(e, crate::Error::DeadlineExceeded { .. }) {
+            error.in_context("batch outcome unknown, every edge landed or none did, retry is safe")
+        } else {
+            error
+        }
+    })
 }
