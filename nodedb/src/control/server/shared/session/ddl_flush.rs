@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use nodedb_cluster::{MetadataEntry, PendingDdlObject, encode_entry};
+use nodedb_cluster::{DescriptorId, DrainOwner, MetadataEntry, PendingDdlObject, encode_entry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
 use crate::control::constraint_install::{ConstraintTarget, constraint_targets};
@@ -196,6 +196,7 @@ async fn propose_pending_buffered<'a>(
     let lease =
         crate::control::metadata_proposer::acquire_ddl_prepare_lease_async(state, handle.as_ref())
             .await?;
+    let mut started_drains = Vec::new();
     let reserved = reserve_buffered(
         state,
         sessions,
@@ -203,6 +204,7 @@ async fn propose_pending_buffered<'a>(
         handle.as_ref(),
         lease.token(),
         buffered,
+        &mut started_drains,
     )
     .await;
     match reserved {
@@ -218,8 +220,27 @@ async fn propose_pending_buffered<'a>(
             constraint_targets,
         }),
         Err(error) => {
+            end_started_drains(state, started_drains).await;
             lease.release().await;
             Err(error)
+        }
+    }
+}
+
+/// End each drain a failed reserve started. The drain has no expiry, so only
+/// this propose clears it. The propose reaches the log even when its apply
+/// wait passes the statement deadline. An error is logged and the next drain
+/// still ends.
+async fn end_started_drains(state: &SharedState, started: Vec<DescriptorId>) {
+    for id in started {
+        if let Err(error) =
+            crate::control::lease::end_drain_async(state, id.clone(), DrainOwner::Ddl).await
+        {
+            tracing::warn!(
+                descriptor = ?id,
+                %error,
+                "DDL drain end failed after a failed reserve"
+            );
         }
     }
 }
@@ -234,7 +255,8 @@ struct Reserved {
 
 /// Drain, stamp, and reserve `buffered` under the preparation lease `token`.
 /// Returns the reservation's log index, its reserved objects, and the
-/// collections whose constraint version it changes.
+/// collections whose constraint version it changes. Pushes each descriptor
+/// whose drain started onto `started_drains`, also when the reserve fails.
 async fn reserve_buffered(
     state: &SharedState,
     sessions: &SessionStore,
@@ -242,6 +264,7 @@ async fn reserve_buffered(
     handle: &dyn MetadataRaftHandle,
     token: u64,
     buffered: DdlBuffer,
+    started_drains: &mut Vec<DescriptorId>,
 ) -> crate::Result<Reserved> {
     // Checked under the preparation lease, which every DDL takes: no other
     // role or user change commits between this check and the finalize, so
@@ -264,12 +287,13 @@ async fn reserve_buffered(
                 sessions.own_lease_hold_count(session_id, &descriptor_id, prior_version);
             crate::control::lease::drain_for_ddl_async(
                 state,
-                descriptor_id,
+                descriptor_id.clone(),
                 prior_version,
                 crate::control::metadata_proposer::DEFAULT_DRAIN_TIMEOUT,
                 own_holds,
             )
             .await?;
+            started_drains.push(descriptor_id);
         }
     }
 
@@ -827,6 +851,82 @@ mod tests {
             .expect("read sequence")
             .expect("the later incarnation must survive");
         assert_eq!(surviving.modification_hlc, later.modification_hlc);
+        cluster.shutdown().await;
+    }
+
+    /// A reserve that fails after it drained a descriptor ends that drain and
+    /// releases the preparation lease.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_reserve_does_not_leave_a_drain_open() {
+        use nodedb_cluster::{DescriptorId, DescriptorKind};
+
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
+        let first = StoredSequence::new(0, 7, "first_seq".into(), "alice".into());
+        assert!(
+            buffer_and_commit(state, vec![CatalogEntry::PutSequence(Box::new(first))]).await,
+            "the seed commit must not abort"
+        );
+
+        // A sequence row no decoder reads. The drain lookup treats an
+        // unreadable row as version 0 and starts no drain for it, but the
+        // stamp reads the row with `?` and fails.
+        let catalog = state.credentials.catalog();
+        let mut tables = catalog
+            .begin_replicated_read()
+            .expect("begin replicated read")
+            .dump()
+            .expect("dump replicated tables");
+        let (_, rows) = tables
+            .iter_mut()
+            .find(|(label, _)| label.as_str() == "sequences")
+            .expect("sequences table is replicated");
+        rows.push((b"0:7:broken_seq".to_vec(), vec![0xc1]));
+        catalog
+            .replace_replicated_tables(&tables)
+            .expect("install the unreadable row");
+        assert_eq!(
+            state.lease_drain.count_active(),
+            0,
+            "no drain is open before the batch"
+        );
+
+        let (sessions, session_id) = test_session();
+        let refused = conn_scope::scoped(async {
+            ddl_buffer::activate();
+            for name in ["first_seq", "broken_seq"] {
+                let stored = StoredSequence::new(0, 7, name.into(), "alice".into());
+                assert!(ddl_buffer::try_buffer(CatalogEntry::PutSequence(Box::new(
+                    stored
+                ))));
+            }
+            begin_commit(state, &sessions, session_id).await.is_err()
+        })
+        .await;
+
+        assert!(
+            refused,
+            "the stamp of the unreadable row must fail the reserve"
+        );
+        let id = DescriptorId::new(0, 7, DescriptorKind::Sequence, "first_seq".to_string());
+        assert!(
+            !state.lease_drain.is_draining(&id, 1),
+            "the drain of first_seq must end with the failed reserve"
+        );
+        assert_eq!(
+            state.lease_drain.count_active(),
+            0,
+            "a failed reserve must leave no drain open"
+        );
+        assert!(
+            state
+                .metadata_ddl
+                .owner
+                .lock()
+                .expect("owner lock")
+                .is_none(),
+            "a failed reserve must release the preparation lease"
+        );
         cluster.shutdown().await;
     }
 }
