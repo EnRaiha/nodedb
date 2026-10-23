@@ -118,6 +118,7 @@ mod function_security_e2e;
 mod graph_analytics_authorization;
 mod graph_batch_native;
 mod graph_batch_rls;
+mod graph_batch_stats;
 mod graph_crdt_delete_edges;
 mod graph_ddl_create_graph_index;
 mod graph_drop_hides_edges;
