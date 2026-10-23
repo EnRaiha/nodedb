@@ -155,6 +155,7 @@ mod kv_write_row_level_security_atomics;
 mod materialized_sum_crdt_delete_settlement_reads;
 mod materialized_sum_cross_shard_expanders;
 mod materialized_sum_cross_shard_http;
+mod materialized_sum_native_block_reads;
 mod materialized_sum_recon_settlement_reads;
 mod materialized_sum_same_request;
 mod materialized_sum_truncate_edge_bearing;

@@ -414,6 +414,12 @@ pub(crate) async fn handle_direct_op(
                     doc_response = Some(resp);
                 }
             }
+            // The buffered tasks apply at COMMIT, which checks these images
+            // against the rows then. A refused write leaves nothing to guard.
+            if in_txn_block && error.is_none() {
+                ctx.sessions
+                    .record_read_entries(ctx.peer_addr, sum_target_reads);
+            }
             error
                 .or(doc_response)
                 .unwrap_or_else(|| NativeResponse::ok(seq))
