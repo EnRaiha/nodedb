@@ -285,6 +285,16 @@ async fn deadline_never_leaves_a_partial_batch() {
                 "budget {budget}: success must land every edge"
             );
         }
+        // An error that still landed every edge must not read as a refusal.
+        if let Err(error) = &outcome
+            && landed == EDGES
+        {
+            let text = format!("{error:?}");
+            assert!(
+                text.contains("outcome unknown"),
+                "budget {budget}: a deadline error after a landed batch must say the outcome is unknown: {text}"
+            );
+        }
         if landed == EDGES {
             assert_eq!(
                 landed_in(&server, &collection, &edges).await,
