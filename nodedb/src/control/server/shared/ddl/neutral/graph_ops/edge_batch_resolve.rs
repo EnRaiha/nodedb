@@ -178,7 +178,12 @@ async fn assign_endpoints(
     let bound = assign_surrogates_routed(state, key, tenant_id, &pks, TraceId::ZERO)
         .await
         .map_err(|e| DdlError::from_error(&e))?;
-    Ok(bound.chunks_exact(2).map(|p| (p[0], p[1])).collect())
+    Ok(bound
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[s, d]| (*s, *d))
+        .collect())
 }
 
 /// One batch's worth of resolved insert edges.
