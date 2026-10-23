@@ -121,10 +121,12 @@ pub async fn insert_edges(
     let batch: Vec<BatchEdge> = resolved.batch;
 
     if calvin_available {
+        let home = batch_home(&batch)?;
         let task = batch_task(
             tenant_id,
             database_id,
             PhysicalPlan::Graph(GraphOp::EdgePutBatch { edges: batch }),
+            home,
         );
         let response = submit_batch_tx(state, task, tenant_id).await?;
         // An insert reports no affected count, so a submit that returns no
@@ -239,10 +241,12 @@ pub async fn delete_edges(
         .await?;
 
     let removed: u64 = if calvin_available {
+        let home = batch_home(&batch)?;
         let task = batch_task(
             tenant_id,
             database_id,
             PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch { edges: batch }),
+            home,
         );
         let response = submit_batch_tx(state, task, tenant_id).await?;
         let Some(response) = response else {
@@ -271,19 +275,24 @@ pub async fn delete_edges(
     }])
 }
 
+/// The source home of the first edge of a batch. The batch is never empty
+/// here: `BoundedEdges` refuses an empty statement.
+fn batch_home(edges: &[BatchEdge]) -> Result<VShardId, DdlError> {
+    edges
+        .first()
+        .map(|e| VShardId::from_key(e.src_id.as_bytes()))
+        .ok_or_else(|| ddl_err("XX000", "batch edge statement resolved to no edge"))
+}
+
 /// The one task of a batch's tx class. Its plan names every edge, so the
 /// plan's routing is the union of the edges' homes. `vshard_id` is only the
 /// first edge's source home: the submit path routes by the plan.
-fn batch_task(tenant_id: TenantId, database_id: DatabaseId, plan: PhysicalPlan) -> PhysicalTask {
-    let vshard_id = match &plan {
-        PhysicalPlan::Graph(GraphOp::EdgePutBatch { edges })
-        | PhysicalPlan::Graph(GraphOp::EdgeDeleteBatch { edges }) => {
-            edges.first().map_or(VShardId::new(0), |e| {
-                VShardId::from_key(e.src_id.as_bytes())
-            })
-        }
-        _ => VShardId::new(0),
-    };
+fn batch_task(
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: PhysicalPlan,
+    vshard_id: VShardId,
+) -> PhysicalTask {
     PhysicalTask {
         tenant_id,
         vshard_id,

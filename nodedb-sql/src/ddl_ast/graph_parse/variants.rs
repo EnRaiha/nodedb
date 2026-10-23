@@ -57,6 +57,9 @@ pub const MAX_EDGES_PER_BATCH: usize = nodedb_types::protocol::MAX_EDGES_PER_BAT
 /// megabytes. Whichever limit the statement exceeds first is the one reported.
 pub const MAX_BATCH_TEXT_BYTES: usize = nodedb_types::protocol::MAX_BATCH_TEXT_BYTES;
 
+/// The command words of a batch statement: `GRAPH INSERT EDGES`, `GRAPH DELETE EDGES`.
+const BATCH_COMMAND_WORDS: usize = 3;
+
 pub(super) fn parse_insert_edges(toks: &[Tok<'_>], sql: &str) -> Result<NodedbStatement, SqlError> {
     let (collection, edges) = parse_edge_batch(toks, sql, "GRAPH INSERT EDGES")?;
     Ok(NodedbStatement::Graph(GraphStmt::GraphInsertEdges {
@@ -101,7 +104,7 @@ fn parse_edge_batch(
             ),
         });
     }
-    let mut c = Cursor::new(toks, stmt, 3);
+    let mut c = Cursor::new(toks, stmt, BATCH_COMMAND_WORDS);
     if !c.eat_keyword("IN") {
         return Err(missing_clause(stmt, "IN <collection>"));
     }
