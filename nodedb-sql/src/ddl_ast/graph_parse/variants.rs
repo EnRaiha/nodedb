@@ -115,6 +115,7 @@ fn parse_edge_batch(
     let mut fields: Vec<String> = Vec::new();
     for t in c.rest() {
         match t {
+            Tok::Comma => {}
             Tok::Quoted(s) | Tok::Ident(s) => fields.push(s.clone().into_owned()),
             Tok::Word(w) => {
                 if w.eq_ignore_ascii_case("PROPERTIES") {

@@ -817,4 +817,113 @@ mod tests {
         let params = params_of("GRAPH RAG FUSION ON entities QUERY ARRAY[0.1]");
         assert_eq!(params.bm25_field, None);
     }
+
+    // ── Missing separators in lists ───────────────────────────────────────
+
+    /// Two quoted labels with no comma between them are one malformed list.
+    #[test]
+    fn a_label_list_without_a_comma_is_refused_on_traverse() {
+        let sql = "GRAPH TRAVERSE IN 'c' FROM 'x' DEPTH 2 LABEL 'a' 'b'";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_err(),
+            "a LABEL list missing its comma must be refused, got {result:?}"
+        );
+    }
+
+    /// Two quoted labels with no comma between them are one malformed list.
+    #[test]
+    fn a_label_list_without_a_comma_is_refused_on_neighbors() {
+        let sql = "GRAPH NEIGHBORS IN 'c' OF 'x' LABEL 'a' 'b' DIRECTION both";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_err(),
+            "a LABEL list missing its comma must be refused, got {result:?}"
+        );
+    }
+
+    /// Two quoted labels with no comma between them are one malformed list.
+    #[test]
+    fn a_label_list_without_a_comma_is_refused_on_path() {
+        let sql = "GRAPH PATH IN 'c' FROM 'x' TO 'y' MAX_DEPTH 3 LABEL 'a' 'b'";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_err(),
+            "a LABEL list missing its comma must be refused, got {result:?}"
+        );
+    }
+
+    /// Two quoted node labels with no comma between them are refused.
+    #[test]
+    fn a_label_set_without_a_comma_is_refused_on_graph_label() {
+        let sql = "GRAPH LABEL 'alice' AS 'Person' 'User'";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_err(),
+            "an AS list missing its comma must be refused, got {result:?}"
+        );
+    }
+
+    /// An `IN (...)` list in `EDGE WHERE` needs commas between its values.
+    #[test]
+    fn an_edge_where_list_without_a_comma_is_refused() {
+        let sql = "GRAPH TRAVERSE IN 'c' FROM 'x' DEPTH 2 EDGE WHERE kind IN ('a' 'b')";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_err(),
+            "an EDGE WHERE list missing its comma must be refused, got {result:?}"
+        );
+    }
+
+    /// The comma-separated `EDGE WHERE ... IN (...)` list is the accepted form.
+    #[test]
+    fn an_edge_where_list_with_commas_parses() {
+        let sql = "GRAPH TRAVERSE IN 'c' FROM 'x' DEPTH 2 EDGE WHERE kind IN ('a', 'b')";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_ok(),
+            "a comma-separated list must parse: {result:?}"
+        );
+    }
+
+    /// The tokenizer keeps a comma as its own token.
+    #[test]
+    fn tokenizer_emits_a_comma_token() {
+        let toks = tokenizer::tokenize("a, b");
+        assert!(matches!(
+            toks.as_slice(),
+            [
+                tokenizer::Tok::Word("a"),
+                tokenizer::Tok::Comma,
+                tokenizer::Tok::Word("b")
+            ]
+        ));
+    }
+
+    /// Two commas between labels are a malformed list.
+    #[test]
+    fn a_label_list_with_two_commas_is_refused() {
+        let sql = "GRAPH NEIGHBORS IN 'c' OF 'x' LABEL 'a',, 'b'";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(
+            result.is_err(),
+            "a doubled comma must be refused, got {result:?}"
+        );
+    }
+
+    /// A comma after the last label, before a clause keyword, is skipped.
+    #[test]
+    fn a_trailing_label_comma_before_a_clause_parses() {
+        let sql = "GRAPH NEIGHBORS IN 'c' OF 'x' LABEL 'a', DIRECTION out";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(result.is_ok(), "a trailing comma must parse: {result:?}");
+    }
+
+    /// A comma between two clauses is skipped as it was before commas were tokens.
+    #[test]
+    fn a_stray_comma_between_clauses_parses() {
+        let sql = "GRAPH NEIGHBORS IN 'c', OF 'x', DIRECTION out";
+        let result = try_parse(sql).expect("graph DSL");
+        assert!(result.is_ok(), "a stray comma must parse: {result:?}");
+    }
 }
