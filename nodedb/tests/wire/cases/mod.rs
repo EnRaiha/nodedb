@@ -117,6 +117,7 @@ mod fts_read_body_format;
 mod function_security_e2e;
 mod graph_analytics_authorization;
 mod graph_batch_native;
+mod graph_batch_native_rls;
 mod graph_batch_rls;
 mod graph_batch_stats;
 mod graph_crdt_delete_edges;
