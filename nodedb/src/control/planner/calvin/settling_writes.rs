@@ -45,6 +45,24 @@ pub fn refuse_several_settling_writes(tasks: &[PhysicalTask]) -> crate::Result<(
     Ok(())
 }
 
+/// Whether a settled request ships a materialized-sum balance delta to another
+/// vShard, or reads source images its deltas were folded from. Such a request
+/// commits through the deterministic scheduler, which applies the deltas with
+/// the writes that moved them and checks the images against the rows then.
+pub fn ships_balance_delta(
+    tasks: &[PhysicalTask],
+    reads: &[crate::control::server::shared::session::read_set::ReadSetEntry],
+) -> bool {
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+    !reads.is_empty()
+        || tasks.iter().any(|task| {
+            matches!(
+                task.plan,
+                PhysicalPlan::Document(DocumentOp::ApplyBalanceDelta { .. })
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
