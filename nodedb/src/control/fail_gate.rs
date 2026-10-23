@@ -94,10 +94,10 @@ pub(crate) async fn after_calvin_stamp(
 }
 
 /// The recon submit gate of node `node_id`, `recon::before_submit`: a
-/// dependent predicate write has settled its materialized sums and
-/// reconnoitred its rows, and parks before it builds and submits its Calvin
-/// transaction. A test changes a row the settlement read, then releases the
-/// gate.
+/// dependent predicate write or a TRUNCATE has settled its materialized sums
+/// and parks before it submits its Calvin transaction. A predicate write has
+/// also reconnoitred its rows. A test changes a row the settlement read, then
+/// releases the gate.
 pub(crate) async fn before_recon_submit(node_id: u64) {
     wait(FailScope::Node(node_id), "recon::before_submit").await;
 }

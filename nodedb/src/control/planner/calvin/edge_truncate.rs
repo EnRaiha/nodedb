@@ -159,6 +159,8 @@ pub(super) async fn dispatch_truncate(
     submission.extend(edge_shares);
     submission.extend(others);
     let tx_class = build_static_tx_class(&submission, tenant_id, reads)?;
+    #[cfg(feature = "failpoints")]
+    crate::control::fail_gate::before_recon_submit(state.node_id).await;
     let apply_result = submit_calvin_routed(state, tx_class).await?;
     Ok(Some(TruncateOutcome { apply_result }))
 }
