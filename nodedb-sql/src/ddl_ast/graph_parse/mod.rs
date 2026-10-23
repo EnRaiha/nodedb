@@ -18,14 +18,12 @@
 //! vocabulary, means no statement reaches the boundary at all. Both are
 //! reported as a parse error naming what is wrong.
 //!
-//! Accepted-grammar limitation for the batched edge statements: the tokenizer
-//! drops `(`, `)`, and `,`, so `GRAPH INSERT EDGES` reads the `VALUES` tail as
-//! a flat field list and only checks that its length is a multiple of three.
-//! `VALUES ('a','b','L'), ('c','d','L')` and `VALUES ('a','b','L')
-//! ('c','d','L')` produce the same two triples, and a trailing token is read as
-//! another triple's field rather than rejected. Closing that needs a tokenizer
-//! change, so it is tracked as a follow-up rather than fixed here.
+//! The tokenizer drops `(`, `)`, and `,`, so the batched edge statements check
+//! the shape of their `VALUES` tail on the statement text (`batch_shape`): a
+//! comma-separated list of parenthesized triples. A missing comma or a bare
+//! word list is a parse error.
 
+mod batch_shape;
 mod cursor;
 mod edge_predicate;
 mod entry;

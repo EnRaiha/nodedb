@@ -57,22 +57,16 @@ pub const MAX_EDGES_PER_BATCH: usize = nodedb_types::protocol::MAX_EDGES_PER_BAT
 /// megabytes. Whichever limit the statement exceeds first is the one reported.
 pub const MAX_BATCH_TEXT_BYTES: usize = nodedb_types::protocol::MAX_BATCH_TEXT_BYTES;
 
-pub(super) fn parse_insert_edges(
-    toks: &[Tok<'_>],
-    sql_len: usize,
-) -> Result<NodedbStatement, SqlError> {
-    let (collection, edges) = parse_edge_batch(toks, sql_len, "GRAPH INSERT EDGES")?;
+pub(super) fn parse_insert_edges(toks: &[Tok<'_>], sql: &str) -> Result<NodedbStatement, SqlError> {
+    let (collection, edges) = parse_edge_batch(toks, sql, "GRAPH INSERT EDGES")?;
     Ok(NodedbStatement::Graph(GraphStmt::GraphInsertEdges {
         collection,
         edges,
     }))
 }
 
-pub(super) fn parse_delete_edges(
-    toks: &[Tok<'_>],
-    sql_len: usize,
-) -> Result<NodedbStatement, SqlError> {
-    let (collection, edges) = parse_edge_batch(toks, sql_len, "GRAPH DELETE EDGES")?;
+pub(super) fn parse_delete_edges(toks: &[Tok<'_>], sql: &str) -> Result<NodedbStatement, SqlError> {
+    let (collection, edges) = parse_edge_batch(toks, sql, "GRAPH DELETE EDGES")?;
     Ok(NodedbStatement::Graph(GraphStmt::GraphDeleteEdges {
         collection,
         edges,
@@ -83,17 +77,20 @@ pub(super) fn parse_delete_edges(
 ///
 /// Grammar: `IN '<collection>' VALUES ('<src>','<dst>','<label>')[, (...)]*`.
 /// The tokenizer drops commas and parentheses, so the tuple structure is
-/// recovered by consuming value tokens in threes. A count that is not a
+/// recovered by consuming value tokens in threes, and the statement text is
+/// checked for the parenthesized, comma-separated shape. A count that is not a
 /// multiple of three is malformed. Per-edge `PROPERTIES` stays on the
 /// single-edge form until the physical `BatchEdge` can carry one.
 ///
-/// `sql_len` is the length of the statement's own text, which the caller
-/// measures before tokenizing because the tokenizer discards the separators.
+/// `sql` is the statement's own text. Its length bounds the statement before
+/// the field scan, and the shape check reads it because the tokenizer discards
+/// the separators.
 fn parse_edge_batch(
     toks: &[Tok<'_>],
-    sql_len: usize,
+    sql: &str,
     stmt: &'static str,
 ) -> Result<(String, Vec<GraphEdgeTuple>), SqlError> {
+    let sql_len = sql.len();
     // Bounded first: the field scan below clones every value, and a statement
     // over the cap must not pay for that copy before it is refused.
     if sql_len > MAX_BATCH_TEXT_BYTES {
@@ -135,7 +132,10 @@ fn parse_edge_batch(
             }
         }
     }
-    if fields.is_empty() || !fields.len().is_multiple_of(3) {
+    if fields.is_empty()
+        || !fields.len().is_multiple_of(3)
+        || !super::batch_shape::values_tail_is_triples(sql)
+    {
         return Err(SqlError::Parse {
             detail: format!("{stmt}: VALUES takes (src, dst, label) triples"),
         });

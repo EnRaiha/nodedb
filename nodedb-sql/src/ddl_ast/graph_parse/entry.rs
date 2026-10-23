@@ -63,9 +63,9 @@ fn parse_graph(sql: &str) -> Result<NodedbStatement, SqlError> {
     }
 
     if upper.starts_with("GRAPH INSERT EDGES ") {
-        variants::parse_insert_edges(&toks, sql.len())
+        variants::parse_insert_edges(&toks, sql)
     } else if upper.starts_with("GRAPH DELETE EDGES ") {
-        variants::parse_delete_edges(&toks, sql.len())
+        variants::parse_delete_edges(&toks, sql)
     } else if upper.starts_with("GRAPH INSERT EDGE ") {
         variants::parse_insert_edge(&toks)
     } else if upper.starts_with("GRAPH DELETE EDGE ") {
@@ -264,30 +264,22 @@ mod tests {
         );
     }
 
-    /// Pins the grammar limitation in the module doc: the tokenizer drops
-    /// `(`, `)` and `,`, so the parser reads a flat field list.
     #[test]
-    fn batch_edge_reads_a_missing_comma_as_two_triples() {
-        let stmt = parsed("GRAPH INSERT EDGES IN 'edges' VALUES ('a','b','L') ('c','d','L')");
-        match stmt {
-            NodedbStatement::Graph(GraphStmt::GraphInsertEdges { edges, .. }) => {
-                assert_eq!(edges.len(), 2);
-            }
-            other => panic!("expected GraphInsertEdges, got {other:?}"),
-        }
+    fn batch_edge_rejects_a_missing_comma_between_triples() {
+        let error = try_parse("GRAPH INSERT EDGES IN 'edges' VALUES ('a','b','L') ('c','d','L')")
+            .expect("input is graph DSL")
+            .expect_err("two triples without a comma are malformed");
+        assert!(
+            error.to_string().contains("triples"),
+            "the error must name the tuple shape: {error}"
+        );
     }
 
-    /// Three bare words with no parentheses read as one triple.
     #[test]
-    fn batch_edge_reads_three_bare_words_as_a_triple() {
-        let stmt = parsed("GRAPH INSERT EDGES IN 'edges' VALUES a b L");
-        match stmt {
-            NodedbStatement::Graph(GraphStmt::GraphInsertEdges { edges, .. }) => {
-                assert_eq!(edges.len(), 1);
-                assert_eq!(edges[0].src, "a");
-            }
-            other => panic!("expected GraphInsertEdges, got {other:?}"),
-        }
+    fn batch_edge_rejects_bare_words_without_parentheses() {
+        try_parse("GRAPH DELETE EDGES IN 'edges' VALUES a b L")
+            .expect("input is graph DSL")
+            .expect_err("three bare words are not a parenthesized triple");
     }
 
     #[test]
