@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use nodedb_cluster::{DescriptorId, DrainOwner, MetadataEntry, PendingDdlObject, encode_entry};
+use nodedb_cluster::{DescriptorId, MetadataEntry, PendingDdlObject, encode_entry};
 
 use crate::control::catalog_entry::{self, CatalogEntry};
 use crate::control::constraint_install::{ConstraintTarget, constraint_targets};
@@ -23,6 +23,7 @@ use crate::control::state::SharedState;
 
 use super::connection::SessionId;
 use super::ddl_buffer::{DdlBuffer, take};
+use super::ddl_flush_cleanup::cleanup_failed_reserve;
 use super::store::SessionStore;
 
 /// What COMMIT must do with this connection's buffered DDL before any
@@ -196,13 +197,14 @@ async fn propose_pending_buffered<'a>(
     let lease =
         crate::control::metadata_proposer::acquire_ddl_prepare_lease_async(state, handle.as_ref())
             .await?;
+    let token = lease.token();
     let mut started_drains = Vec::new();
     let reserved = reserve_buffered(
         state,
         sessions,
         session_id,
         handle.as_ref(),
-        lease.token(),
+        token,
         buffered,
         &mut started_drains,
     )
@@ -213,34 +215,16 @@ async fn propose_pending_buffered<'a>(
             objects,
             constraint_targets,
         }) => Ok(PendingDdlHandle {
-            token: lease.token(),
+            token,
             log_index,
             lease,
             objects,
             constraint_targets,
         }),
         Err(error) => {
-            end_started_drains(state, started_drains).await;
+            cleanup_failed_reserve(state, handle.as_ref(), token, started_drains).await;
             lease.release().await;
             Err(error)
-        }
-    }
-}
-
-/// End each drain a failed reserve started. The drain has no expiry, so only
-/// this propose clears it. The propose reaches the log even when its apply
-/// wait passes the statement deadline. An error is logged and the next drain
-/// still ends.
-async fn end_started_drains(state: &SharedState, started: Vec<DescriptorId>) {
-    for id in started {
-        if let Err(error) =
-            crate::control::lease::end_drain_async(state, id.clone(), DrainOwner::Ddl).await
-        {
-            tracing::warn!(
-                descriptor = ?id,
-                %error,
-                "DDL drain end failed after a failed reserve"
-            );
         }
     }
 }
@@ -334,6 +318,11 @@ async fn reserve_buffered(
         proposed_at: state.hlc_clock.now(),
     };
     let log_index = propose_and_await(state, handle, &pending).await?;
+    crate::fail_point_err!(
+        crate::fail_point::FailScope::Node(state.node_id),
+        "ddl_flush::after_pending_propose",
+        |detail| crate::Error::Internal { detail }
+    );
     // The propose reserves only while `token` owns the lease. A lease the
     // metadata leader reclaimed meanwhile left no record.
     if !state.pending_ddl.contains(token) {
@@ -917,6 +906,53 @@ mod tests {
             state.lease_drain.count_active(),
             0,
             "a failed reserve must leave no drain open"
+        );
+        assert!(
+            state
+                .metadata_ddl
+                .owner
+                .lock()
+                .expect("owner lock")
+                .is_none(),
+            "a failed reserve must release the preparation lease"
+        );
+        cluster.shutdown().await;
+    }
+
+    /// A reserve that fails after its pending record applied cancels the record.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_reserve_after_the_propose_cancels_the_record() {
+        use nodedb_types::fail_point::{FailAction, FailGuard};
+
+        let cluster = test_one_node::boot().await;
+        let state = &cluster.state;
+        let _fail = FailGuard::for_node(
+            state.node_id,
+            "ddl_flush::after_pending_propose",
+            FailAction::Fail("injected".into()),
+        );
+
+        let (sessions, session_id) = test_session();
+        let refused = conn_scope::scoped(async {
+            ddl_buffer::activate();
+            let stored = StoredSequence::new(0, 7, "orders_seq".into(), "alice".into());
+            assert!(ddl_buffer::try_buffer(CatalogEntry::PutSequence(Box::new(
+                stored
+            ))));
+            begin_commit(state, &sessions, session_id).await.is_err()
+        })
+        .await;
+
+        assert!(refused, "the injected error must fail the reserve");
+        assert!(
+            state
+                .credentials
+                .catalog()
+                .load_pending_ddl()
+                .expect("load pending records")
+                .is_empty(),
+            "a failed reserve must cancel the pending record it applied"
         );
         assert!(
             state
