@@ -105,20 +105,37 @@ pub(crate) fn build_insert_edges_sql(
     collection: &str,
     edges: &[(&str, &str, &str)],
 ) -> NodeDbResult<String> {
+    build_edges_sql("INSERT", "batch_graph_insert_edges", collection, edges)
+}
+
+/// Build one `GRAPH DELETE EDGES` statement for a list of `(src, dst, label)`
+/// triples. The bounds are the ones of [`build_insert_edges_sql`].
+pub(crate) fn build_delete_edges_sql(
+    collection: &str,
+    edges: &[(&str, &str, &str)],
+) -> NodeDbResult<String> {
+    build_edges_sql("DELETE", "batch_graph_delete_edges", collection, edges)
+}
+
+fn build_edges_sql(
+    verb: &str,
+    caller: &str,
+    collection: &str,
+    edges: &[(&str, &str, &str)],
+) -> NodeDbResult<String> {
     if edges.is_empty() {
-        return Err(NodeDbError::storage(
-            "batch_graph_insert_edges requires at least one edge",
-        ));
+        return Err(NodeDbError::storage(format!(
+            "{caller} requires at least one edge"
+        )));
     }
     if edges.len() > MAX_EDGES_PER_BATCH_STATEMENT {
         return Err(NodeDbError::storage(format!(
-            "batch_graph_insert_edges carries at most {MAX_EDGES_PER_BATCH_STATEMENT} edges per \
-             statement, got {}",
+            "{caller} carries at most {MAX_EDGES_PER_BATCH_STATEMENT} edges per statement, got {}",
             edges.len()
         )));
     }
     let mut sql = format!(
-        "GRAPH INSERT EDGES IN {} VALUES ",
+        "GRAPH {verb} EDGES IN {} VALUES ",
         quote_string_literal(collection)
     );
     for (i, (from, to, label)) in edges.iter().enumerate() {
@@ -141,8 +158,7 @@ pub(crate) fn build_insert_edges_sql(
     // actually built, so the client refuses the same statements the parser does.
     if sql.len() > MAX_BATCH_TEXT_BYTES {
         return Err(NodeDbError::storage(format!(
-            "batch_graph_insert_edges builds at most {MAX_BATCH_TEXT_BYTES} bytes of SQL text per \
-             statement, got {}",
+            "{caller} builds at most {MAX_BATCH_TEXT_BYTES} bytes of SQL text per statement, got {}",
             sql.len()
         )));
     }
@@ -226,6 +242,24 @@ mod tests {
         // One statement, one VALUES clause: a per-edge loop would build two.
         assert_eq!(sql.matches("VALUES").count(), 1);
         assert_eq!(sql.matches("GRAPH INSERT EDGES").count(), 1);
+    }
+
+    #[test]
+    fn delete_edges_sql_carries_every_triple_in_one_statement() {
+        let sql = build_delete_edges_sql("c", &[("a", "b", "L"), ("b", "c", "L")]).unwrap();
+        assert_eq!(
+            sql,
+            "GRAPH DELETE EDGES IN 'c' VALUES ('a','b','L'),('b','c','L')"
+        );
+    }
+
+    #[test]
+    fn delete_edges_sql_refuses_an_empty_batch() {
+        let error = build_delete_edges_sql("c", &[]).expect_err("an empty batch has nothing to do");
+        assert!(
+            error.to_string().contains("batch_graph_delete_edges"),
+            "the error must name the caller: {error}"
+        );
     }
 
     #[test]
