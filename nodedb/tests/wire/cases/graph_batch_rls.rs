@@ -16,6 +16,9 @@ use crate::harness::TestServer;
 const PASSWORD: &str = "graph-batch-rls-probe-secret-9";
 const ROLE: &str = "readwrite";
 
+/// SQLSTATE of a write refused by policy (`insufficient_privilege`).
+const DENIED_SQLSTATE: &str = "42501";
+
 /// Endpoints chosen so both hash to one vShard. Mirrors the single-edge probe
 /// premise; a cross-shard edge would be refused before the policy gate.
 const EDGE_SRC: &str = "a";
@@ -52,16 +55,16 @@ async fn write_policy(server: &TestServer, policy: &str, collection: &str) {
         .unwrap_or_else(|e| panic!("create write policy {policy}: {e}"));
 }
 
-/// Run `sql` as `user`, returning the server's error message on failure.
-async fn run_as(server: &TestServer, user: &str, sql: &str) -> Result<(), String> {
+/// Run `sql` as `user`, returning `(sqlstate, message)` on failure.
+async fn run_as(server: &TestServer, user: &str, sql: &str) -> Result<(), (String, String)> {
     let (client, handle) = server
         .connect_as(user, PASSWORD)
         .await
         .unwrap_or_else(|e| panic!("connect as {user}: {e}"));
     let result = client.simple_query(sql).await.map(|_| ()).map_err(|e| {
         e.as_db_error()
-            .map(|db| db.message().to_string())
-            .unwrap_or_else(|| e.to_string())
+            .map(|d| (d.code().code().to_string(), d.message().to_string()))
+            .unwrap_or_else(|| (String::new(), e.to_string()))
     });
     drop(client);
     handle.abort();
@@ -143,7 +146,12 @@ async fn batch_delete_with_a_denied_edge_deletes_nothing() {
         ),
     )
     .await;
-    let message = result.expect_err("the denied edge must make the statement report an error");
+    let (sqlstate, message) =
+        result.expect_err("the denied edge must make the statement report an error");
+    assert_eq!(
+        sqlstate, DENIED_SQLSTATE,
+        "batch refusal SQLSTATE: {message}"
+    );
     assert!(
         message.contains("policy") || message.contains("RLS"),
         "the error must come from the write policy: {message}"
@@ -224,13 +232,62 @@ async fn batch_insert_is_refused_when_the_policy_needs_a_property() {
         ),
     )
     .await;
-    assert!(
-        result.is_err(),
-        "a property-less batch under an owner policy must be refused: {result:?}"
+    let (sqlstate, message) =
+        result.expect_err("a property-less batch under an owner policy must be refused");
+    assert_eq!(
+        sqlstate, DENIED_SQLSTATE,
+        "batch refusal SQLSTATE: {message}"
     );
     assert!(
         !has_labeled_edge(&server, collection, "l1").await
             && !has_labeled_edge(&server, collection, "l2").await,
         "no edge from the refused batch may land"
+    );
+}
+
+/// A single-edge delete of a denied edge under the same policy carries the
+/// same SQLSTATE as the refused batch delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_edge_delete_under_the_same_policy_gives_the_same_sqlstate() {
+    let server = TestServer::start().await;
+    let user = "g_batch_rls_same_user";
+    let collection = "g_batch_rls_same";
+    server
+        .exec(&format!("CREATE COLLECTION {collection}"))
+        .await
+        .expect("create edge collection");
+    create_user(&server, user).await;
+    write_policy(&server, "g_batch_rls_same_policy", collection).await;
+    seed_owned_edges(&server, collection, &[("steals", "someone-else")]).await;
+
+    let single = run_as(
+        &server,
+        user,
+        &format!(
+            "GRAPH DELETE EDGE IN '{collection}' FROM '{EDGE_SRC}' TO '{EDGE_DST}' TYPE 'steals'"
+        ),
+    )
+    .await;
+    let (single_state, single_message) =
+        single.expect_err("the single-edge delete of a denied edge must be refused");
+
+    let batch = run_as(
+        &server,
+        user,
+        &format!(
+            "GRAPH DELETE EDGES IN '{collection}' VALUES ('{EDGE_SRC}','{EDGE_DST}','steals')"
+        ),
+    )
+    .await;
+    let (batch_state, _) = batch.expect_err("the batch delete of a denied edge must be refused");
+
+    assert_eq!(
+        single_state, DENIED_SQLSTATE,
+        "single refusal SQLSTATE: {single_message}"
+    );
+    assert_eq!(single_state, batch_state, "single and batch SQLSTATE");
+    assert!(
+        has_labeled_edge(&server, collection, "steals").await,
+        "the refused deletes must leave the edge in place"
     );
 }
