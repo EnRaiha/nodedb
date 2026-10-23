@@ -128,6 +128,7 @@ mod graph_dsl_handlers;
 mod graph_dsl_label_sets;
 mod graph_edge_predicate;
 mod graph_match_authorization;
+mod graph_neighbors_entries;
 mod graph_rag_fusion;
 mod graph_rag_fusion_naming;
 mod graph_timeseries_rls_probe;
