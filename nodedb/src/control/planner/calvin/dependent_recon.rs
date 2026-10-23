@@ -226,6 +226,7 @@ async fn dispatch_dependent_edge_recon_inner(
             identity,
             tenant_id,
             database_id,
+            reads,
         )
         .await?
     {

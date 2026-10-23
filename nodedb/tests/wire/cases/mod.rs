@@ -152,6 +152,7 @@ mod kv_sql_select;
 mod kv_transfer_decimal;
 mod kv_write_row_level_security;
 mod kv_write_row_level_security_atomics;
+mod materialized_sum_crdt_delete_settlement_reads;
 mod materialized_sum_cross_shard_expanders;
 mod materialized_sum_cross_shard_http;
 mod materialized_sum_recon_settlement_reads;
