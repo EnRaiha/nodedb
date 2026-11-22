@@ -118,6 +118,20 @@ pub fn fold_constant_scoped(
             Some(SqlValue::Decimal(d)) => Some(SqlValue::Decimal(-d)),
             _ => None,
         }),
+        // NOT reads its operand through the boolean cast, as `logical_not`
+        // does at run time. A from-less SELECT has no run time to ask, so a
+        // NOT left unfolded would come out as NULL.
+        SqlExpr::UnaryOp {
+            op: UnaryOp::Not,
+            expr,
+        } => match fold_constant_scoped(expr, registry, scope, crs)? {
+            Some(operand) => Ok(match fold_cast(operand, "BOOLEAN")? {
+                Some(SqlValue::Bool(b)) => Some(SqlValue::Bool(!b)),
+                Some(SqlValue::Null) => Some(SqlValue::Null),
+                _ => None,
+            }),
+            None => Ok(None),
+        },
         SqlExpr::BinaryOp { left, op, right } => {
             let (Some(l), Some(r)) = (
                 fold_constant_scoped(left, registry, scope, crs)?,
@@ -880,5 +894,50 @@ mod tests {
         assert_eq!(err.to_string(), "smallint out of range");
         let err = cast(SqlValue::Int(1 << 31), "INTEGER").unwrap_err();
         assert_eq!(err.to_string(), "integer out of range");
+    }
+
+    fn fold_not(operand: SqlValue) -> FoldResult {
+        let expr = SqlExpr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: Box::new(SqlExpr::Literal(operand)),
+        };
+        fold_constant(&expr, &FunctionRegistry::new(), &crs())
+    }
+
+    /// A from-less `SELECT NOT true` has no run time to ask, so a folder that
+    /// answers "not a constant" turns it into NULL.
+    #[test]
+    fn not_of_a_boolean_constant_folds_to_its_negation() {
+        assert_eq!(
+            fold_not(SqlValue::Bool(true)),
+            Ok(Some(SqlValue::Bool(false)))
+        );
+        assert_eq!(
+            fold_not(SqlValue::Bool(false)),
+            Ok(Some(SqlValue::Bool(true)))
+        );
+    }
+
+    #[test]
+    fn not_of_null_stays_null() {
+        assert_eq!(fold_not(SqlValue::Null), Ok(Some(SqlValue::Null)));
+    }
+
+    /// NOT reads its operand through the boolean cast, as `logical_not` does
+    /// at run time, so a folded NOT and a run-time NOT give one answer and
+    /// fail with one error.
+    #[test]
+    fn not_reads_its_operand_through_the_boolean_cast() {
+        assert_eq!(
+            fold_not(SqlValue::String("t".into())),
+            Ok(Some(SqlValue::Bool(false)))
+        );
+        assert!(matches!(
+            fold_not(SqlValue::String("maybe".into())),
+            Err(SqlError::InvalidTextRepresentation {
+                type_name: "boolean",
+                ..
+            })
+        ));
     }
 }

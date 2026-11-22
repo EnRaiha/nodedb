@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod aggregate_filter_planning;
+mod constant_not;
 mod ddl_constraint_rejection;
 mod index_lookup_sorted;
 mod index_lookup_temporal;
